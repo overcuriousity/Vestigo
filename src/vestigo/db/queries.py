@@ -44,7 +44,14 @@ from vestigo.db._offsets import (
     effective_ts_sql,
     offset_raw_bounds,
 )
-from vestigo.db._scan import EXPORT_SCAN_GATE, HEAVY_SCAN_GATE, heavy_scan_settings
+from vestigo.db._scan import (
+    EXPORT_SCAN_GATE,
+    FOREGROUND_SCAN_GATE,
+    HEAVY_SCAN_GATE,
+    acquire_scan_slot,
+    foreground_scan_settings,
+    heavy_scan_settings,
+)
 from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
@@ -1116,24 +1123,31 @@ class _ParameterizedQueryBuilder:
         return " AND ".join(self.conditions)
 
 
-def _gated_scan(fn):
-    """Admit at most VESTIGO_STAT_SCAN_CONCURRENCY heavy scans to ClickHouse at once.
+#: How long a chart waits for a foreground slot before the API answers 503
+#: "busy" instead of leaving a spinner. Module-level so tests can shorten it.
+FOREGROUND_WAIT_SECONDS = 30.0
 
-    Same admission control as ``anomaly_stats._gated_scan``: each viz
-    aggregation's per-query ``max_memory_usage`` cap is budget/concurrency,
-    so the gate is what makes the total budget actually hold when several
-    charts render concurrently (see ``db/_scan.py``). Applied to the public
-    aggregation entry points only — internal helpers (``_field_terms_impl``,
-    the ``_compare`` layer scans) run while the caller holds the slot, and
-    gating them too would deadlock. Callers run in FastAPI's threadpool, so
-    blocking on the semaphore is safe.
+
+def _foreground_scan(fn):
+    """Admit at most ``_FOREGROUND_CONCURRENCY`` chart aggregations at once.
+
+    The foreground class (#300): its own gate so a histogram never queues
+    behind a detector sweep, its own (smaller) per-query cap so the total
+    budget still holds, and a *bounded* wait — a chart the analyst is looking
+    at must say "busy" rather than spin. Applied to the public aggregation
+    entry points only; internal helpers (``_field_terms_impl``, the
+    ``_compare`` layer scans) run while the caller holds the slot, and gating
+    them too would deadlock. Callers run in FastAPI's threadpool, so blocking
+    on the semaphore is safe. The gate is looked up at call time so tests can
+    substitute it.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with HEAVY_SCAN_GATE:
+        with acquire_scan_slot(FOREGROUND_SCAN_GATE, wait=FOREGROUND_WAIT_SECONDS):
             return fn(*args, **kwargs)
 
+    wrapper._scan_class = "foreground"  # type: ignore[attr-defined]
     return wrapper
 
 
@@ -2015,7 +2029,7 @@ class EventQueryService:
             },
         }
 
-    @_gated_scan
+    @_foreground_scan
     def histogram(self, query: EventQuery, buckets: int = 60) -> dict[str, Any]:
         """Return a bucketed event-count histogram honoring all query filters.
 
@@ -2044,7 +2058,7 @@ class EventQueryService:
                 WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
                 GROUP BY bucket
                 ORDER BY bucket
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2087,7 +2101,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2104,7 +2118,7 @@ class EventQueryService:
             "buckets": [{"start": ensure_utc_iso(row[0]), "count": row[1]} for row in rows],
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
@@ -2149,7 +2163,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY c DESC, val ASC
             LIMIT {int(limit)}
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2233,7 +2247,7 @@ class EventQueryService:
         to turn "the export refuses on the fields it was built for" into "the
         export works".
         """
-        with HEAVY_SCAN_GATE:
+        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
             where, parameters, col_expr = self._inventory_scope(query, field_token)
             result = self._select(
                 f"SELECT count() FROM ("
@@ -2316,12 +2330,15 @@ class EventQueryService:
         )
 
         with EXPORT_SCAN_GATE if hold_export_slot else contextlib.nullcontext():
-            HEAVY_SCAN_GATE.acquire()
+            # Cancellable admission (#300), driven by hand because the release
+            # point is inside the generator loop, not at block exit.
+            slot = acquire_scan_slot(HEAVY_SCAN_GATE, wait=None)
+            slot.__enter__()
             scanning = True
             try:
                 for block in self._select_row_blocks(sql, parameters=parameters):
                     if scanning:
-                        HEAVY_SCAN_GATE.release()
+                        slot.__exit__(None, None, None)
                         scanning = False
                     for value, count, first_seen, last_seen in block:
                         yield {
@@ -2336,7 +2353,7 @@ class EventQueryService:
                         }
             finally:
                 if scanning:
-                    HEAVY_SCAN_GATE.release()
+                    slot.__exit__(None, None, None)
 
     # Quantiles reported for every numeric field — chosen to cover both the
     # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from
@@ -2353,7 +2370,7 @@ class EventQueryService:
     #: Reported as ``bin_rule: "fd_fallback"``, never as ``"fd"``.
     _FD_FALLBACK_BINS = 30
 
-    @_gated_scan
+    @_foreground_scan
     def field_numeric_stats(
         self,
         query: EventQuery,
@@ -2417,7 +2434,7 @@ class EventQueryService:
                    stddevPop(v) AS sd, skewPop(v) AS skew, {quantile_exprs}
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2474,7 +2491,7 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
@@ -2500,7 +2517,7 @@ class EventQueryService:
                 WHERE v IS NOT NULL
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2528,7 +2545,7 @@ class EventQueryService:
     #: past that stops being readable anyway.
     CORRELATION_MAX_FIELDS = 8
 
-    @_gated_scan
+    @_foreground_scan
     def field_correlation(self, query: EventQuery, field_tokens: list[str]) -> dict[str, Any]:
         """Pairwise correlation matrix over several numeric fields.
 
@@ -2589,7 +2606,7 @@ class EventQueryService:
             f"""
             SELECT {", ".join(selects)}
             FROM ({values_subquery}) AS t
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2633,7 +2650,7 @@ class EventQueryService:
             "dropped_fields": dropped,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_numeric_grouped(
         self,
         query: EventQuery,
@@ -2705,7 +2722,7 @@ class EventQueryService:
                 SELECT count(v), min(v), max(v), uniqExact(g)
                 FROM ({pairs_subquery}) AS t
                 WHERE {member_where}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2718,7 +2735,7 @@ class EventQueryService:
                 GROUP BY g
                 ORDER BY c DESC, g ASC
                 LIMIT {int(groups)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2757,7 +2774,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 GROUP BY g, bin_idx
                 ORDER BY g, bin_idx
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=_with_params(parameters, mn=mn, bw=bin_width, kept=kept_values),
             )
@@ -2777,7 +2794,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=_with_params(parameters, kept=kept_values),
             )
@@ -2836,7 +2853,7 @@ class EventQueryService:
             "points": points_block,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_value_timeseries(
         self,
         query: EventQuery,
@@ -2859,7 +2876,7 @@ class EventQueryService:
         keeps sentinel buckets out of the plotted series, matching the old
         bucket scan's ``VESTIGO_NOT_SENTINEL_SQL`` predicate. No window functions:
         those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
-        BY/LIMIT stay within ``heavy_scan_settings()``' memory budget.
+        BY/LIMIT stay within ``foreground_scan_settings()``' memory budget.
 
         The timestamp-range scan (when no explicit window is set) stays a
         separate query on purpose: the bucket grid must cover *all* filtered
@@ -2887,7 +2904,7 @@ class EventQueryService:
                 where,
                 parameters,
                 ts_expr=eff,
-                settings=heavy_scan_settings(),
+                settings=foreground_scan_settings(),
             )
 
         empty: dict[str, Any] = {
@@ -2926,7 +2943,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY total DESC, val ASC
             LIMIT {int(series_limit)}
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3019,7 +3036,7 @@ class EventQueryService:
             where,
             parameters,
             ts_expr=effective_ts_sql(query.source_offsets),
-            settings=heavy_scan_settings(),
+            settings=foreground_scan_settings(),
         )
 
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
@@ -3034,13 +3051,13 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
         return {ensure_utc_iso(row[0]): row[1] for row in result.result_rows}
 
-    @_gated_scan
+    @_foreground_scan
     def compare_time_histogram(
         self,
         primary: EventQuery,
@@ -3133,7 +3150,7 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_expr} != ''
             GROUP BY val
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3145,7 +3162,7 @@ class EventQueryService:
                 counts[val] = count
         return counts, total
 
-    @_gated_scan
+    @_foreground_scan
     def compare_field_terms(
         self,
         primary: EventQuery,
@@ -3219,7 +3236,7 @@ class EventQueryService:
             SELECT count(v), min(v), max(v)
             FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3248,13 +3265,13 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
         return {row[0]: row[1] for row in result.result_rows}
 
-    @_gated_scan
+    @_foreground_scan
     def compare_field_numeric(
         self,
         primary: EventQuery,
@@ -3340,7 +3357,7 @@ class EventQueryService:
             "comparison_total": c_count,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def time_punchcard(self, query: EventQuery) -> dict[str, Any]:
         """Return event counts grouped by (day-of-week × hour-of-day), UTC.
 
@@ -3364,7 +3381,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY dow, hod
             ORDER BY dow, hod
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3379,7 +3396,7 @@ class EventQueryService:
             "cells": cells,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_pivot(
         self,
         query: EventQuery,
@@ -3470,14 +3487,14 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_x} != '' AND {col_y} != ''
             GROUP BY xv, yv
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
         cells = [{"x": row[0], "y": row[1], "count": int(row[2])} for row in result.result_rows]
         return {**base, "cells": cells, "total": sum(c["count"] for c in cells)}
 
-    @_gated_scan
+    @_foreground_scan
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:
@@ -3556,7 +3573,7 @@ class EventQueryService:
                        simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
                 FROM ({pairs_subquery}) AS t
                 WHERE vx IS NOT NULL AND vy IS NOT NULL
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -3612,7 +3629,7 @@ class EventQueryService:
             WHERE vx IS NOT NULL AND vy IS NOT NULL
             ORDER BY ord
             LIMIT {int(limit)}
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )

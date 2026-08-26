@@ -647,6 +647,17 @@ def test_histogram_buckets_over_corrected_timestamp() -> None:
     assert "addSeconds(timestamp, transform(source_id" in query
 
 
+def test_histogram_carries_the_foreground_clause(monkeypatch) -> None:
+    """Charts carry the foreground cap, not a detector's (#300)."""
+    from vestigo.db import _scan
+
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    svc = EventQueryService(store=FakeClickHouseStore())
+    svc.histogram(EventQuery(case_id="case-1", source_ids=["s1"]))
+    query, _ = svc.store.client.queries[-1]
+    assert f"max_memory_usage = {_scan.detect_foreground_memory_budget()}" in query
+
+
 def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
     service.query(
         EventQuery(
@@ -2494,15 +2505,15 @@ def test_embedding_wizard_scans_carry_memory_settings(service):
         assert heavy_scan_settings() in q
 
 
-# ── heavy-scan guardrails + clock-skew on viz aggregations ──────────────────
+# ── foreground-scan guardrails + clock-skew on viz aggregations ──────────────────
 
 
 def test_viz_aggregations_carry_memory_settings() -> None:
-    """Every viz aggregation scan must carry the shared heavy-scan SETTINGS
-    clause (db/_scan.py) — a chart over a high-cardinality field is a
+    """Every viz aggregation scan must carry the foreground SETTINGS clause
+    (db/_scan.py, #300) — a chart over a high-cardinality field is a
     whole-corpus GROUP BY exactly like a detector scan, and without the
     per-query memory cap N concurrent charts can stack unbounded scans."""
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
@@ -2544,11 +2555,11 @@ def test_viz_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert heavy_scan_settings() in sql, f"{name} scan missing settings:\n{sql}"
+            assert foreground_scan_settings() in sql, f"{name} scan missing settings:\n{sql}"
 
 
 def test_viz_compare_aggregations_carry_memory_settings() -> None:
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
@@ -2594,23 +2605,26 @@ def test_viz_compare_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert heavy_scan_settings() in sql, f"compare {name} scan missing settings:\n{sql}"
+            assert foreground_scan_settings() in sql, (
+                f"compare {name} scan missing settings:\n{sql}"
+            )
 
 
 class _CountingGate:
-    """Context-manager stand-in for HEAVY_SCAN_GATE that detects re-entry."""
+    """Semaphore stand-in for FOREGROUND_SCAN_GATE that detects re-entry."""
 
     def __init__(self) -> None:
         self.acquired = 0
         self.depth = 0
         self.max_depth = 0
 
-    def __enter__(self) -> None:
+    def acquire(self, timeout: float | None = None) -> bool:
         self.acquired += 1
         self.depth += 1
         self.max_depth = max(self.max_depth, self.depth)
+        return True
 
-    def __exit__(self, *exc: Any) -> None:
+    def release(self) -> None:
         self.depth -= 1
 
 
@@ -2625,7 +2639,7 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
 
     gate = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate)
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
@@ -2639,7 +2653,7 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     assert gate.max_depth == 1
 
     gate2 = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate2)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate2)
     svc2 = _seq_service(
         [
             ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])]),
@@ -2742,9 +2756,9 @@ def test_time_punchcard_returns_sparse_cells_and_totals() -> None:
     assert "toDayOfWeek(timestamp, 0, 'UTC')" in sql
     assert "toHour(timestamp, 'UTC')" in sql
     assert VESTIGO_NOT_SENTINEL_SQL in sql
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in sql
+    assert foreground_scan_settings() in sql
 
 
 def test_time_punchcard_honors_source_offsets() -> None:
@@ -2793,9 +2807,9 @@ def test_field_pivot_builds_matrix_with_other_rollup() -> None:
     assert matrix_params.get("field_key_y") == "status"
     assert matrix_params.get("pivot_x_values") == ["auth"]
     assert matrix_params.get("pivot_y_values") == ["200"]
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in matrix_sql
+    assert foreground_scan_settings() in matrix_sql
 
 
 def test_field_pivot_empty_axis_skips_matrix_scan() -> None:
@@ -2819,7 +2833,7 @@ def test_field_pivot_acquires_scan_gate_once(monkeypatch: Any) -> None:
     import vestigo.db.queries as queries_mod
 
     gate = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate)
     svc = _viz_service(
         [
             ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
@@ -2882,9 +2896,9 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
         if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in sample_sql
+    assert foreground_scan_settings() in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
     # Reproducibility: the sample is drawn in a stable hash order, never rand().
     assert "cityHash64(event_id)" in sample_sql

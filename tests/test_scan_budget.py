@@ -157,13 +157,13 @@ def test_enrichment_partition_rewrite_takes_a_gate_slot():
     seen: list[str] = []
 
     class _Gate:
-        def __enter__(self):
+        # The shape acquire_scan_slot drives: a semaphore, not a context manager.
+        def acquire(self, timeout=None):
             seen.append("acquired")
-            return self
+            return True
 
-        def __exit__(self, *exc):
+        def release(self):
             seen.append("released")
-            return False
 
     class _Client:
         def command(self, sql):
@@ -893,3 +893,76 @@ def test_report_discloses_the_foreground_class(monkeypatch):
     }
     # `total_bytes` is what both classes may hold at once, not just the heavy gate.
     assert report["total_bytes"] == report["per_query_bytes"] * (_scan._GATE_CONCURRENCY + 1)
+
+
+def test_chart_aggregations_take_the_foreground_gate(monkeypatch):
+    """A histogram must never wait for a detector slot (#300)."""
+    from vestigo.db import queries
+
+    class _Gate:
+        def __init__(self):
+            self.entered = 0
+
+        def acquire(self, timeout=None):
+            self.entered += 1
+            return True
+
+        def release(self):
+            pass
+
+    heavy, fg = _Gate(), _Gate()
+    monkeypatch.setattr(queries, "HEAVY_SCAN_GATE", heavy)
+    monkeypatch.setattr(queries, "FOREGROUND_SCAN_GATE", fg)
+
+    @queries._foreground_scan
+    def probe(self):
+        return "ok"
+
+    assert probe(object()) == "ok"
+    assert (fg.entered, heavy.entered) == (1, 0)
+
+
+def test_every_chart_aggregation_is_foreground():
+    from vestigo.db.queries import EventQueryService
+
+    charts = [
+        "histogram",
+        "field_terms",
+        "field_numeric_stats",
+        "field_correlation",
+        "field_numeric_grouped",
+        "field_value_timeseries",
+        "compare_time_histogram",
+        "compare_field_terms",
+        "compare_field_numeric",
+        "time_punchcard",
+        "field_pivot",
+        "field_scatter",
+    ]
+    for name in charts:
+        fn = getattr(EventQueryService, name)
+        assert getattr(fn, "_scan_class", None) == "foreground", f"{name} is not foreground"
+    inventory = getattr(EventQueryService.count_field_inventory, "_scan_class", None)
+    assert inventory != "foreground"
+
+
+def test_foreground_wait_is_bounded(monkeypatch):
+    from vestigo.db import queries
+
+    class _Full:
+        def acquire(self, timeout=None):
+            return False
+
+        def release(self):
+            raise AssertionError("never acquired")
+
+    monkeypatch.setattr(queries, "FOREGROUND_SCAN_GATE", _Full())
+    monkeypatch.setattr(queries, "FOREGROUND_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(_scan, "_ACQUIRE_POLL_SECONDS", 0.01)
+
+    @queries._foreground_scan
+    def probe(self):
+        raise AssertionError("must not run")
+
+    with pytest.raises(_scan.ScanBusy):
+        probe(object())
