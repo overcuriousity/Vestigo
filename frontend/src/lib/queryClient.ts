@@ -40,6 +40,31 @@ function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+/** A 503 from a full scan lane (#300): the server is saying "wait", not "no". */
+export function isScanBusy(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 503 && error.queuedAhead !== undefined;
+}
+
+/**
+ * Query options for surfaces that read a scan lane: a busy lane is "still
+ * waiting", never "failed", so keep asking at the server's pace. Any other
+ * failure surfaces at once — these are charts the analyst is looking at, and
+ * a second of silent retry before the error is a second of spinner for
+ * nothing.
+ */
+export const busyRetry = {
+  retry: (_count: number, error: unknown): boolean => isScanBusy(error),
+  retryDelay: (_count: number, error: unknown): number =>
+    isScanBusy(error) ? (error.retryAfterMs ?? 5000) : 0,
+};
+
+/** What to show in place of a spinner while a busy lane is being retried. */
+export function busyMessage(error: unknown): string | null {
+  if (!isScanBusy(error)) return null;
+  const n = error.queuedAhead ?? 0;
+  return n > 0 ? `Waiting behind ${n} scan${n === 1 ? "" : "s"}…` : "Waiting for a scan slot…";
+}
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -60,7 +85,8 @@ export const queryClient = new QueryClient({
   }),
   queryCache: new QueryCache({
     onError: (error, query) => {
-      if (query.meta?.silentError || isUnauthorized(error)) return;
+      // A busy scan lane is retried, not failed — no toast.
+      if (query.meta?.silentError || isUnauthorized(error) || isScanBusy(error)) return;
       // Background refetch failures of data already on screen are surfaced
       // too — a stale panel silently pretending to be current is worse than
       // a toast. The store dedups identical messages, so one dead endpoint

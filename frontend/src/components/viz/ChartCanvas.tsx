@@ -12,6 +12,7 @@
  */
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { busyMessage, busyRetry } from "@/lib/queryClient";
 import type { ChartConfig } from "@/components/viz/lib/chartConfig";
 import { fetchChartData, type ChartResult } from "@/components/viz/chartFetch";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
@@ -83,7 +84,9 @@ export function ChartCanvas({
     queryKey: ["chart-canvas", caseId, timelineId, config, filters],
     queryFn: () => fetchChartData(caseId, timelineId, config, filters, opts),
     enabled: specComplete,
+    ...busyRetry,
   });
+  const waiting = busyMessage(chartQuery.failureReason);
 
   return (
     <div
@@ -94,8 +97,9 @@ export function ChartCanvas({
         <p className="py-2 text-[var(--color-fg-muted)]">{incompleteMessage}</p>
       )}
       {chartQuery.isLoading && (
-        <div className="flex items-center justify-center py-6">
+        <div className="flex items-center justify-center gap-2 py-6">
           <Spinner size={16} />
+          {waiting && <span className="text-xs text-[var(--color-fg-muted)]">{waiting}</span>}
         </div>
       )}
       {chartQuery.isError && (

@@ -75,6 +75,10 @@ export function ScanBudgetCard({ budget }: { budget: ScanBudget | undefined }) {
                 : "detection failed — fallback"}
           ), budget from {budget.source} detection.
         </p>
+        <p>
+          Charts have their own lane: {budget.foreground.concurrency} chart queries at{" "}
+          {gib(budget.foreground.per_query_bytes)} each, never queued behind a detector sweep.
+        </p>
         {budget.pending_concurrency !== null && (
           <p>
             Concurrent scans is set to {budget.pending_concurrency} but still running at{" "}

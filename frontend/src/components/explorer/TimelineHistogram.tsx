@@ -12,6 +12,7 @@
  */
 import { useState, useRef, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { Crosshair, Flag } from "lucide-react";
 import { eventsApi } from "@/api/events";
 import { Spinner } from "@/components/ui/Spinner";
@@ -134,13 +135,17 @@ export function TimelineHistogram({
   enabled = true,
 }: Props) {
   const currentPositionTs = useScrollPositionStore((s) => s.currentPositionTs);
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, failureReason } = useQuery({
     queryKey: ["histogram", caseId, timelineId, filters],
     queryFn: () => eventsApi.histogram(caseId, timelineId, filters),
     staleTime: 30_000,
     placeholderData: (prev) => prev,
     enabled,
+    ...busyRetry,
   });
+  // Set while a busy scan lane (#300) is being retried — `error` stays
+  // empty until retries stop, so this is the in-flight signal to read.
+  const waiting = busyMessage(failureReason);
 
   // Brush indices are kept in refs so handleMouseUp always reads the latest
   // values synchronously, even before React commits a re-render from mousedown.
@@ -284,8 +289,9 @@ export function TimelineHistogram({
 
   if (isLoading && !data) {
     return (
-      <div className="flex h-16 items-center justify-center border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]">
+      <div className="flex h-16 items-center justify-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-bg-surface)]">
         <Spinner size={14} />
+        {waiting && <span className="text-xs text-[var(--color-fg-muted)]">{waiting}</span>}
       </div>
     );
   }

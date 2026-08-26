@@ -1094,6 +1094,8 @@ export interface ScanBudget {
   max_threads: number;
   max_threads_source: "pinned" | "clickhouse_pinned" | "clickhouse" | "fallback";
   detected_cores: number | null;
+  /** The chart lane (#300): its own gate, fed by the slot the heavy divisor reserves. */
+  foreground: { concurrency: number; per_query_bytes: number };
 }
 
 /**
