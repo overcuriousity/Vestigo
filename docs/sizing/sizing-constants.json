@@ -7,6 +7,7 @@
   ],
   "default_concurrency": 2,
   "fallback_max_threads": 8,
+  "foreground_concurrency": 4,
   "memory_ratio": 0.8,
   "min_threads_per_scan": 2,
   "reference": {

@@ -38,6 +38,7 @@ def test_constants_carry_what_the_page_needs():
     assert data["memory_ratio"] > 0
     assert data["default_concurrency"] >= 1
     assert data["fallback_max_threads"] == 8
+    assert data["foreground_concurrency"] == 4
     assert set(data["shipped_caches"]) <= set(data["counted_caches"])
     assert data["reference"]["clickhouse_mem_limit_bytes"] > 0
     assert data["reference"]["clickhouse_ceiling_bytes"] > 0
@@ -65,3 +66,10 @@ def test_page_makes_no_external_requests():
     # Anything else that pulls a resource in at render time.
     for pattern in ("@import", "url(http", "url('http", 'url("http'):
         assert pattern not in html, f"{pattern} reaches the network"
+
+
+def test_page_divides_by_concurrency_plus_one():
+    """One heavy slot is the chart lane (#300); the page must not hand it out twice."""
+    html = (REPO / "docs" / "sizing" / "index.html").read_text()
+    assert "scanTotal / (concurrency + 1)" in html
+    assert "foreground per-chart cap" in html

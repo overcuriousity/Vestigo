@@ -85,7 +85,7 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   pin it with `VESTIGO_STAT_SCAN_MAX_THREADS`, and detection failure falls back to the
   former constant 8,
   spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
-  per-query cap), `max_memory_usage` = total budget / concurrency — the
+  per-query cap), `max_memory_usage` = total budget / (concurrency + 1) — the
   budget auto-sizes to `VESTIGO_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
   cgroup-aware; pin it with `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse
   is on a different host, ~70% of *that* host's RAM): large GROUP BY states
@@ -94,6 +94,21 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   the whole corpus must carry it. ClickHouse's own 90%-of-RAM server limit
   is no substitute — containerized servers misdetect total memory (observed
   503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
+- **Two admission classes (#300).** `HEAVY_SCAN_GATE` (N = `VESTIGO_STAT_SCAN_CONCURRENCY`)
+  admits detectors, Sigma, the value inventory and the enrichment rewrite;
+  `FOREGROUND_SCAN_GATE` (4 slots, a constant) admits the chart aggregations an analyst
+  is looking at — histogram, top terms, numeric stats, compare layers, punchcard, pivot,
+  scatter (`queries.py::_foreground_scan`). The heavy cap divides the budget by N + 1 and
+  the reserved slot is split four ways for charts (`foreground_scan_settings()`), so both
+  gates fully admitted still fit the total. A chart waits at most 30 s for a slot and then
+  answers 503 with `queued_ahead` and `Retry-After`, which the UI renders as "waiting
+  behind N scans" and retries; detectors queue indefinitely. Every request-driven scan
+  runs through `api/scan_exec.py::run_scan`, which binds a `ScanContext` so the query
+  carries `log_comment = 'vestigo-scan/<token>'`; when the request disconnects it sets
+  the scan's cancel flag (a parked `acquire_scan_slot` notices within a second) and
+  issues `KILL QUERY WHERE Settings['log_comment'] = …`, so a page reload releases its
+  slots and its ClickHouse processes instead of leaving orphaned sweeps ahead of the next
+  one. Background jobs, the CLI and the agent's tools bind no context and are unaffected.
 - **The budget comes from ClickHouse, not from the app's host.** At startup the
   app reads the ceiling ClickHouse runs under (`system.server_settings`, falling
   back to `system.asynchronous_metrics`) **and the cache maxima that live under

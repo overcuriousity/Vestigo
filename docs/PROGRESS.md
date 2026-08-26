@@ -1,6 +1,35 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-26 (session 189 — PR #304 review fixes).
+Last updated: 2026-08-26 (session 190 — scan admission classes, #300).
+
+## Session 190 — 2026-08-26: scan admission classes (#300)
+
+Production evidence on a 700M-event timeline: an analyst opening a per-value histogram
+during an Investigate sweep got a spinner that never resolved, and a reload turned every
+chart on the page into the same spinner. Three defects, none of them tuning:
+
+- **Charts shared the detector lane.** `queries.py` gated `histogram`, `field_terms` and
+  every other chart aggregation on the same `HEAVY_SCAN_GATE` as fourteen whole-corpus
+  detectors; a sweep is 4 cheap plus 9 heavy requests fired in parallel, and a histogram
+  joined the back of that queue. Now `FOREGROUND_SCAN_GATE` (4 slots) admits charts in
+  their own lane. The heavy cap divides the budget by N + 1 and the reserved slot is split
+  four ways, so both gates fully admitted still fit the total — the calculator and
+  `scan_budget` report follow.
+- **A queued request could never say so.** Every gate acquire was unbounded and blind. A
+  chart now waits at most 30 s and answers 503 with `queued_ahead` and `Retry-After`; the
+  histogram, per-value modal and chart canvas render "waiting behind N scans" and retry
+  at the server's pace instead of toasting a failure or spinning.
+- **A disconnect orphaned the work and the reload doubled it.** Nothing cancelled a
+  threadpool scan or its ClickHouse query when the client left. `api/scan_exec.py::run_scan`
+  binds a `ScanContext` (every scan's `SETTINGS` clause now carries
+  `log_comment = 'vestigo-scan/<token>'`), polls `request.is_disconnected()`, and on
+  disconnect sets the cancel flag — a parked `acquire_scan_slot` notices within a second —
+  and issues `KILL QUERY` by tag. Verified against the reference ClickHouse.
+
+The other half of the #300 report — the derived-range histogram scanning the corpus
+twice — had already shipped in `6c69855`; the roadmap entry claimed otherwise and is gone.
+Design round: `docs/superpowers/specs/2026-08-26-scan-admission-classes-design.md`; plan:
+`docs/superpowers/plans/2026-08-26-scan-admission-classes.md`.
 
 ## Session 189 — 2026-08-26: PR #304 review fixes (scan-budget accounting)
 

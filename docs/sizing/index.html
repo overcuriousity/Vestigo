@@ -286,7 +286,10 @@ function compute() {
   );
 
   const scanTotal = Math.floor((ceiling - caches) * K.memory_ratio);
-  const perQuery = Math.floor(scanTotal / concurrency);
+  // One heavy slot is reserved for the foreground class (charts), so the
+  // heavy cap divides by concurrency + 1 — see docs/ANOMALY_DETECTION.md.
+  const perQuery = Math.floor(scanTotal / (concurrency + 1));
+  const perChart = Math.floor(perQuery / K.foreground_concurrency);
   const headroom = ceiling - scanTotal - caches;
   // memory.xml must sit under (ratio × container limit), and the container
   // needs slack for allocator and thread stacks on top of what ClickHouse
@@ -325,9 +328,11 @@ function compute() {
   row(mem, "→ its caches", gib(caches),
     "mark, index-mark and primary-index caches live under that ceiling, so scans do not get them.");
   row(mem, "→ Vestigo scan budget (total)", gib(scanTotal),
-    `Auto: ${K.memory_ratio} × (ceiling − caches), shared across ${concurrency} concurrent scans.`);
+    `Auto: ${K.memory_ratio} × (ceiling − caches), shared across ${concurrency} concurrent scans plus a chart lane.`);
   row(mem, "→ per-query cap", gib(perQuery),
-    "budget ÷ concurrency, as max_memory_usage on every heavy scan. One query fails instead of the server.");
+    "budget ÷ (concurrency + 1), as max_memory_usage on every heavy scan. One query fails instead of the server.");
+  row(mem, "→ foreground per-chart cap", gib(perChart),
+    `${K.foreground_concurrency} chart queries share the reserved slot, in their own lane — a histogram never waits behind a detector sweep.`);
   row(mem, "→ merge headroom", gib(headroom),
     "What is left under the ceiling. Nothing else bounds background merges.");
   if (shape !== "split") {
@@ -342,7 +347,7 @@ function compute() {
   const set = document.getElementById("out-settings");
   set.textContent = "";
   row(set, "<code>VESTIGO_STAT_SCAN_CONCURRENCY</code>", String(concurrency),
-    "Heavy scans admitted at once; the rest queue. Also the divisor on the memory budget, so it needs a restart.");
+    "Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+1) on the memory budget, so it needs a restart.");
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)",
     `Auto resolves to ${threads} here — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",

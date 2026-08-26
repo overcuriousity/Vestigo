@@ -223,6 +223,16 @@ explains. It computes them with the same arithmetic `db/_scan.py` uses, from con
 out of the source — but it cannot see your host, so read `/api/health`'s `scan_budget` block
 (below) once the stack is up.
 
+Scans run in two lanes. `VESTIGO_STAT_SCAN_CONCURRENCY` (N) is the number of heavy scans —
+detectors, Sigma, inventory exports, the enrichment rewrite — admitted at once; interactive
+charts (histogram, top terms, numeric stats) have their own four-slot lane and never queue
+behind a sweep. The memory budget is divided by N + 1: N heavy caps plus one slot the four
+chart queries share, reported as `scan_budget.foreground` on `/api/health` and on the admin
+Settings page. Raising N widens the heavy lane and shrinks every cap; it does not change how
+charts are admitted. A chart that cannot get a slot within 30 s answers 503 with the queue
+depth and the UI keeps waiting visibly; a request that disconnects (a reload mid-sweep) frees
+its slot and kills its ClickHouse query within about a second.
+
 Both compose files ship **with memory limits set**, sized for a 32 GiB host and
 overridable per service (`VESTIGO_CLICKHOUSE_MEM_LIMIT`, `VESTIGO_POSTGRES_MEM_LIMIT`,
 `VESTIGO_QDRANT_MEM_LIMIT`, `VESTIGO_APP_MEM_LIMIT`). Raise them to fit your box.
