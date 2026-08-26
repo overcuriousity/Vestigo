@@ -66,14 +66,22 @@ whole-partition query and, before it was gated, it stacked on top of a full set
 of admitted detector scans and OOM-killed a 32 GiB host mid-apply.
 """
 
+import contextlib
+import logging
 import os
 import re
 import threading
-from collections.abc import Mapping
+import time
+import uuid
+from collections.abc import Iterator, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from vestigo.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # Used when detection is explicitly disabled nowhere but fails (exotic
 # platforms) — the pre-auto-detection default from the session-27 incident.
@@ -566,12 +574,149 @@ def scan_budget_report() -> dict[str, Any]:
     }
 
 
+# ── Scan context: tagging and cancellation ───────────────────────────────────
+
+
+@dataclass
+class ScanContext:
+    """One request-driven scan: the tag its queries carry and its cancel flag.
+
+    Bound by :func:`bind_scan_context` (the API's ``run_scan`` does this per
+    request) and read by the settings-clause builders and
+    :func:`acquire_scan_slot`. Background jobs and the CLI never bind one, so
+    their scans are untagged and uncancellable — exactly as before.
+    """
+
+    token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+_scan_context_var: ContextVar[ScanContext | None] = ContextVar("vestigo_scan_context", default=None)
+
+
+def scan_context() -> ScanContext | None:
+    return _scan_context_var.get()
+
+
+@contextlib.contextmanager
+def bind_scan_context() -> Iterator[ScanContext]:
+    """Bind a fresh :class:`ScanContext` for the duration of the block.
+
+    contextvars propagate into ``starlette.concurrency.run_in_threadpool``,
+    so a context bound in an endpoint is visible to the scan running in the
+    threadpool — which is what lets the clause builders tag the query.
+    """
+    ctx = ScanContext()
+    reset = _scan_context_var.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _scan_context_var.reset(reset)
+
+
+def scan_log_comment(token: str) -> str:
+    """The ``log_comment`` value a tagged scan carries; the key ``KILL QUERY`` uses."""
+    return f"vestigo-scan/{token}"
+
+
+class ScanBusy(RuntimeError):
+    """A bounded wait for a gate slot expired. ``ahead`` is the queue depth at entry."""
+
+    def __init__(self, *, ahead: int, wait: float) -> None:
+        self.ahead = ahead
+        self.wait = wait
+        super().__init__(f"scan lane busy: {ahead} waiting ahead after {wait:g}s — retry shortly")
+
+
+class ScanCancelled(RuntimeError):
+    """The request that started this scan went away while it waited or ran."""
+
+
+#: How often a parked acquire re-checks its cancel flag. Module-level so tests
+#: can shorten it; one second is invisible to a human and cheap for a thread.
+_ACQUIRE_POLL_SECONDS = 1.0
+
+_waiting_lock = threading.Lock()
+_waiting: dict[int, int] = {}
+
+
+def _waiting_count(gate: threading.BoundedSemaphore) -> int:
+    with _waiting_lock:
+        return _waiting.get(id(gate), 0)
+
+
+def _adjust_waiting(gate: threading.BoundedSemaphore, delta: int) -> None:
+    with _waiting_lock:
+        _waiting[id(gate)] = max(_waiting.get(id(gate), 0) + delta, 0)
+
+
+@contextlib.contextmanager
+def acquire_scan_slot(gate: threading.BoundedSemaphore, *, wait: float | None) -> Iterator[None]:
+    """Hold one slot of *gate* for the block, cancellably and optionally bounded.
+
+    Polls ``gate.acquire(timeout=_ACQUIRE_POLL_SECONDS)`` so a parked caller
+    notices the bound context's ``cancelled`` flag within a poll interval —
+    a plain ``acquire()`` would block until a slot came free, which on a busy
+    host is minutes after the client left. ``wait=None`` waits indefinitely
+    (heavy class); a float raises :class:`ScanBusy` once that many seconds
+    pass without a slot (foreground class). Without a bound context there is
+    nothing to cancel and the loop is just a slow-motion ``acquire()``.
+    """
+    ctx = scan_context()
+    ahead = _waiting_count(gate)
+    _adjust_waiting(gate, +1)
+    deadline = None if wait is None else time.monotonic() + wait
+    try:
+        while True:
+            if ctx is not None and ctx.cancelled.is_set():
+                raise ScanCancelled("cancelled while waiting for a scan slot")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise ScanBusy(ahead=ahead, wait=wait or 0.0)
+            timeout = (
+                _ACQUIRE_POLL_SECONDS
+                if remaining is None
+                else min(_ACQUIRE_POLL_SECONDS, remaining)
+            )
+            if gate.acquire(timeout=timeout):
+                break
+    finally:
+        _adjust_waiting(gate, -1)
+    try:
+        yield
+    finally:
+        gate.release()
+
+
+def kill_scan_queries(client: Any, token: str) -> None:
+    """Best-effort ``KILL QUERY`` for every ClickHouse query tagged with *token*.
+
+    ``ASYNC`` so the call returns at once; the running thread then fails with
+    ``QUERY_WAS_CANCELLED`` (code 394) and releases its slot. A failure here
+    is logged and swallowed: the scan simply finishes on its own, as it did
+    before cancellation existed.
+    """
+    try:
+        client.command(
+            "KILL QUERY WHERE Settings['log_comment'] = {tag:String} ASYNC",
+            parameters={"tag": scan_log_comment(token)},
+        )
+    except Exception:  # noqa: BLE001 — best effort by design
+        logger.warning(
+            "KILL QUERY for scan %s failed; it will finish on its own", token, exc_info=True
+        )
+
+
 def _scan_settings_clause(budget: int) -> str:
     s = get_settings()
     # Spill must engage well before the cap kills the query — a configured
     # threshold at or above the per-query cap would never fire.
     group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
     sort_spill = min(s.stat_scan_external_sort_bytes, budget // 2)
+    # A request-driven scan is tagged so a disconnect can KILL it by this
+    # value (see kill_scan_queries). The token is a uuid hex — nothing to quote.
+    ctx = scan_context()
+    tag = f", log_comment = '{scan_log_comment(ctx.token)}'" if ctx is not None else ""
     return (
         f"SETTINGS max_threads = {detect_scan_max_threads()}, "
         f"max_bytes_before_external_group_by = {group_by_spill}, "
@@ -579,7 +724,7 @@ def _scan_settings_clause(budget: int) -> str:
         # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those
         # scans structurally (per source / slim columns) instead.
         f"max_bytes_before_external_sort = {sort_spill}, "
-        f"max_memory_usage = {budget}"
+        f"max_memory_usage = {budget}{tag}"
     )
 
 
