@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi.concurrency import run_in_threadpool
 
+from vestigo.db._scan import unbounded_foreground_wait
 from vestigo.stories.schemas import canonical_json
 
 if TYPE_CHECKING:
@@ -474,7 +475,11 @@ async def resolve_story_snapshot(
                 f"did not parse as a chart spec: {exc}"
             ) from exc
         scope = await _scope_for(content["timeline_id"])
-        envelope = await run_chart(scope, spec)
+        # An export is a job: no spinner to answer to, no request to 503 and
+        # no retry. It queues for a foreground slot rather than failing a
+        # block because analysts happened to be rendering charts (#305).
+        with unbounded_foreground_wait():
+            envelope = await run_chart(scope, spec)
         data = {
             "name": chart.name,
             "config": chart.config or {},

@@ -1184,6 +1184,31 @@ async def test_chart_tool_reports_a_busy_lane_as_a_tool_error(store, monkeypatch
     assert "2 waiting ahead" in message
 
 
+async def test_aggregation_tools_report_a_busy_lane_as_a_tool_error(store, monkeypatch):
+    """Not only `propose_chart`: every tool that calls a gated aggregation.
+
+    The bounded foreground wait raises `ScanBusy`, a bare `RuntimeError`. Out
+    of a tool that is an unhandled crash — a 500 on the MCP surface — where
+    the model could have relayed "busy, retry" instead (#305).
+    """
+    from vestigo.db._scan import ScanBusy
+
+    fake = _patch_chart_service(monkeypatch)
+
+    def busy(*args, **kwargs):
+        raise ScanBusy(ahead=2, wait=30.0)
+
+    monkeypatch.setattr(fake, "field_terms", busy)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    with pytest.raises(ToolError) as excinfo:
+        await _call(server, "field_terms", {"field": "country"})
+    message = str(excinfo.value)
+    assert "2 waiting ahead" in message
+    # The guidance `run_gated_scan` appends — its absence means the bare
+    # RuntimeError escaped and only happened to carry a readable message.
+    assert "try again" in message
+
+
 async def test_missing_field_names_the_field_free_charts(store, monkeypatch):
     _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))

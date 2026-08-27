@@ -380,6 +380,20 @@ export function TimelineHistogram({
         </div>
       )}
 
+      {/* A busy scan lane (#300) while the previous buckets are still on
+          screen. `placeholderData` keeps `isLoading` false once anything has
+          loaded, so the spinner branch above never runs here — without this
+          badge the panel would read as merely slow for two minutes and then
+          fail. Gated on `isFetching`: a retry delay still counts as fetching,
+          so it clears the moment the answer (or the error) lands. */}
+      {waiting && isFetching && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+          <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+            {waiting}
+          </span>
+        </div>
+      )}
+
       {/* Bars — dimmed and non-interactive while a zoom refetch is in flight,
           so clicks can never land against stale placeholder bucket data. */}
       <div

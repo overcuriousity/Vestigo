@@ -129,6 +129,12 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
   computed with the same arithmetic <code>src/vestigo/db/_scan.py</code> uses at runtime —
   the constants are generated from the source, not transcribed.
 </p>
+<p class="lede">
+  Every value comes in two columns. <strong>Minimum</strong> is the smallest configuration that
+  still serves the workload you described. <strong>Max for your hardware</strong> spends the
+  machine you actually have: as many scan slots as its cores and RAM support without shrinking a
+  query below the size a whole-corpus <code>GROUP BY</code> needs.
+</p>
 
 <h2>What you expect</h2>
 <div class="panel controls">
@@ -165,6 +171,24 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
   </div>
 </div>
 
+<h2>What you have</h2>
+<div class="panel controls">
+  <div>
+    <label for="have-ram">Host RAM <span class="value" id="have-ram-v"></span></label>
+    <input type="range" id="have-ram" min="4" max="512" step="4" value="32">
+    <p class="hint">The RAM on the machine you actually have. On the split shape, the ClickHouse
+      host's RAM — the other services are elsewhere.</p>
+  </div>
+  <div>
+    <label for="have-cores">Host cores <span class="value" id="have-cores-v"></span></label>
+    <input type="range" id="have-cores" min="2" max="128" step="2" value="8">
+    <p class="hint">Cores ClickHouse can use. Every admitted scan wants at least
+      <code>2</code> of them, which is what bounds how many may run at once.</p>
+  </div>
+</div>
+
+<p class="note" id="verdict"></p>
+
 <h2>What to provision</h2>
 <div class="headline">
   <div class="stat">
@@ -181,7 +205,7 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
 
 <div class="scroll" style="margin-top:1rem">
   <table>
-    <thead><tr><th>Memory</th><th>Value</th><th>Why</th></tr></thead>
+    <thead><tr><th>Memory</th><th>Minimum</th><th>Max for your hardware</th><th>Why</th></tr></thead>
     <tbody id="out-memory"></tbody>
   </table>
 </div>
@@ -189,7 +213,7 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
 <h2>Settings to set</h2>
 <div class="scroll">
   <table>
-    <thead><tr><th>Key</th><th>Value</th><th>Why</th></tr></thead>
+    <thead><tr><th>Key</th><th>Minimum</th><th>Max for your hardware</th><th>Why</th></tr></thead>
     <tbody id="out-settings"></tbody>
   </table>
 </div>
@@ -239,18 +263,166 @@ const gib = (b) => (b / GIB).toFixed(b < 10 * GIB ? 1 : 0) + " GiB";
 /** Round up to something an operator would actually type into mem_limit. */
 const roundGib = (b) => Math.max(1, Math.ceil(b / GIB));
 
-function row(tbody, key, value, why) {
+function row(tbody, key, minValue, maxValue, why) {
   const tr = document.createElement("tr");
   const k = document.createElement("td");
   k.innerHTML = key;
   const v = document.createElement("td");
   v.className = "n";
-  v.textContent = value;
+  v.textContent = minValue;
+  const mx = document.createElement("td");
+  mx.className = "n";
+  mx.textContent = maxValue;
   const w = document.createElement("td");
   w.className = "why";
   w.textContent = why;
-  tr.append(k, v, w);
+  tr.append(k, v, mx, w);
   tbody.append(tr);
+}
+
+const cacheTotal = () => Object.values(K.shipped_caches).reduce((a, b) => a + b, 0);
+
+/** The scan budget a given ceiling and gate size resolve to — `db/_scan.py`.
+ *
+ * The heavy divisor is `concurrency + foreground_slots`: the chart lane holds
+ * that many heavy slots' worth of the budget, split `foreground_concurrency`
+ * ways, so both gates fully admitted still fit under the total. */
+function budgetFor(ceiling, concurrency) {
+  const caches = cacheTotal();
+  const scanTotal = Math.floor((ceiling - caches) * K.memory_ratio);
+  const perQuery = Math.floor(scanTotal / (concurrency + K.foreground_slots));
+  const perChart = Math.floor((perQuery * K.foreground_slots) / K.foreground_concurrency);
+  return { caches, scanTotal, perQuery, perChart, headroom: ceiling - scanTotal - caches };
+}
+
+/** RAM on this host that is not ClickHouse's to spend. */
+function otherServices(shape, embeddings) {
+  if (shape === "split") return 0;
+  return (
+    K.reference.postgres_mem_limit_bytes +
+    K.reference.app_mem_limit_bytes +
+    (embeddings ? K.reference.qdrant_mem_limit_bytes : 0)
+  );
+}
+
+/** Page cache is not spare RAM: ClickHouse reads compressed parts through it. */
+function pageCacheFor(events) {
+  return Math.max(4 * GIB, Math.min(16 * GIB, events * K.bytes_per_event_on_disk * 0.05));
+}
+
+/** The workload's requirement: the smallest deployment that still serves it. */
+function minimumPlan(input) {
+  const { events, analysts, shape, embeddings, enrichment } = input;
+  // The gate exists so several analysts' sweeps queue rather than stack. It
+  // grows well below linearly — more slots divide the same budget.
+  const concurrency = Math.min(6, Math.max(K.default_concurrency, Math.ceil(analysts / 2)));
+  const caches = cacheTotal();
+  const perScan = (events / 1e6) * K.scan_working_set_bytes_per_million_events;
+  // Floored at the reference stack — below that, sizing down stops buying
+  // anything and just makes every scan spill.
+  const wantedCeiling = Math.max(
+    K.reference.clickhouse_ceiling_bytes,
+    // `concurrency + foreground_slots`, matching budgetFor's divisor: sizing
+    // the ceiling for the heavy slots alone would hand each heavy scan
+    // `perScan × concurrency/(concurrency+slots)` — at the default
+    // concurrency, half the working set this deployment was just measured to
+    // need, so every detector scan spills on the hardware we recommended.
+    (perScan * (concurrency + K.foreground_slots)) / K.memory_ratio + caches
+  );
+  const ceiling = Math.max(
+    wantedCeiling,
+    (minPerQuery(enrichment) * (concurrency + K.foreground_slots)) / K.memory_ratio + caches
+  );
+  const chLimit = roundGib(ceiling / K.reference.ceiling_to_limit_ratio) * GIB;
+  const pageCache = pageCacheFor(events);
+  const onThisHost = chLimit + otherServices(shape, embeddings) + pageCache;
+  return {
+    concurrency,
+    ceiling,
+    chLimit,
+    pageCache,
+    ...budgetFor(ceiling, concurrency),
+    cores: Math.max(4, concurrency * 4),
+    threads: Math.max(K.min_threads_per_scan, Math.floor(Math.max(4, concurrency * 4) / concurrency)),
+    hostRam: roundGib(onThisHost * 1.1) * GIB,   // 10% for the OS itself
+  };
+}
+
+/** Enrichment rewrites a whole partition under one slot; a per-query cap of a
+ *  couple of GiB is where that starts failing on a large source. */
+function minPerQuery(enrichment) {
+  return enrichment ? 2 * GIB : 1.5 * GIB;
+}
+
+/** What the hardware in hand supports — `null` if it cannot host the stack.
+ *
+ * Maximum performance is more admitted scans, not a bigger cap on one: the
+ * gate is what several analysts queue on. So take every slot the cores can
+ * give two threads to, stopping before a query's share drops under what a
+ * whole-corpus GROUP BY needs. */
+function maximumPlan(input) {
+  const { events, shape, embeddings, enrichment, haveRam, haveCores } = input;
+  const pageCache = pageCacheFor(events);
+  const usable = haveRam / 1.1 - otherServices(shape, embeddings) - pageCache;
+  const chLimit = Math.floor(usable / GIB) * GIB;
+  const ceiling = Math.floor(chLimit * K.reference.ceiling_to_limit_ratio);
+  if (chLimit < 2 * GIB || ceiling <= cacheTotal()) return null;
+  const scanTotal = Math.floor((ceiling - cacheTotal()) * K.memory_ratio);
+  const byCores = Math.floor(haveCores / K.min_threads_per_scan);
+  const byMemory = Math.floor(scanTotal / minPerQuery(enrichment)) - K.foreground_slots;
+  // One slot always, even when the budget cannot give it the size a whole-corpus
+  // GROUP BY wants: the answer there is "it runs and spills", which is true, not
+  // "it does not run", which is not. `tight` is what says so out loud.
+  const concurrency = Math.max(1, Math.min(byCores, byMemory));
+  return {
+    concurrency,
+    tight: byMemory < 1,
+    ceiling,
+    chLimit,
+    pageCache,
+    ...budgetFor(ceiling, concurrency),
+    cores: haveCores,
+    threads: Math.max(K.min_threads_per_scan, Math.floor(haveCores / concurrency)),
+    hostRam: haveRam,
+  };
+}
+
+function renderVerdict(need, have, max) {
+  const el = document.getElementById("verdict");
+  const short = [];
+  if (have.haveRam < need.hostRam) short.push(`${gib(need.hostRam - have.haveRam)} of RAM`);
+  if (have.haveCores < need.cores) {
+    const n = need.cores - have.haveCores;
+    short.push(`${n} core${n === 1 ? "" : "s"}`);
+  }
+  if (!max) {
+    el.className = "note warn";
+    el.innerHTML =
+      "<strong>Not enough to run the stack.</strong> After the other services and the page " +
+      "cache there is nothing left for ClickHouse to scan with. Add RAM, or move ClickHouse to " +
+      "its own host.";
+    return;
+  }
+  const spend =
+    `it admits ${max.concurrency} concurrent scan${max.concurrency === 1 ? "" : "s"} of ` +
+    `${gib(max.perQuery)}, against the ${need.concurrency} of ${gib(need.perQuery)} the ` +
+    `minimum asks for`;
+  if (short.length === 0 && !max.tight) {
+    el.className = "note";
+    el.innerHTML =
+      `<strong>Sufficient.</strong> ${gib(have.haveRam)} and ${have.haveCores} cores cover this ` +
+      `workload, which needs ${gib(need.hostRam)} and ${need.cores} cores. At full spend ${spend}.`;
+    return;
+  }
+  el.className = "note warn";
+  const lead = short.length
+    ? `<strong>Short by ${short.join(" and ")}.</strong>`
+    : "<strong>Runs, but every scan spills.</strong>";
+  const tail = max.tight
+    ? ` A single scan gets less than the ${gib(minPerQuery(true))} a whole-corpus GROUP BY wants, ` +
+      "so aggregations fall back to disk rather than failing."
+    : " Expect sweeps to queue, and large scans to spill to disk.";
+  el.innerHTML = `${lead} This host still runs Vestigo — ${spend}.${tail}`;
 }
 
 function compute() {
@@ -259,114 +431,86 @@ function compute() {
   const shape = document.getElementById("shape").value;
   const embeddings = document.getElementById("embeddings").checked;
   const enrichment = document.getElementById("enrichment").checked;
+  const haveRam = +document.getElementById("have-ram").value * GIB;
+  const haveCores = +document.getElementById("have-cores").value;
 
   document.getElementById("events-v").textContent = fmtEvents(events);
   document.getElementById("analysts-v").textContent = analysts;
+  document.getElementById("have-ram-v").textContent = gib(haveRam);
+  document.getElementById("have-cores-v").textContent = haveCores;
 
-  // Concurrency: the gate exists so several analysts' sweeps queue rather than
-  // stack. It grows well below linearly — more slots divide the same budget.
-  const concurrency = Math.min(6, Math.max(K.default_concurrency, Math.ceil(analysts / 2)));
+  const input = { events, analysts, shape, embeddings, enrichment, haveRam, haveCores };
+  const need = minimumPlan(input);
+  const max = maximumPlan(input);
+  renderVerdict(need, { haveRam, haveCores }, max);
 
-  // ClickHouse's working set: the scan state a whole-corpus GROUP BY holds,
-  // times the slots that may be live at once, plus the caches, plus merge
-  // headroom. Floored at the reference stack — below that, sizing down stops
-  // buying anything and just makes every scan spill.
-  const perScan = (events / 1e6) * K.scan_working_set_bytes_per_million_events;
-  const caches = Object.values(K.shipped_caches).reduce((a, b) => a + b, 0);
-  const wantedCeiling = Math.max(
-    K.reference.clickhouse_ceiling_bytes,
-    (perScan * concurrency) / K.memory_ratio + caches
-  );
-  // Enrichment rewrites a whole partition under one slot; a per-query cap of a
-  // couple of GiB is where that starts failing on a large source.
-  const minPerQuery = enrichment ? 2 * GIB : 1.5 * GIB;
-  const ceiling = Math.max(
-    wantedCeiling,
-    (minPerQuery * concurrency) / K.memory_ratio + caches
-  );
+  // With hardware that cannot host the stack there is no second column to
+  // fill; say so in the cell rather than inventing a number.
+  const m = (fn) => (max ? fn(max) : "—");
 
-  const scanTotal = Math.floor((ceiling - caches) * K.memory_ratio);
-  // One heavy slot is reserved for the foreground class (charts), so the
-  // heavy cap divides by concurrency + 1 — see docs/ANOMALY_DETECTION.md.
-  const perQuery = Math.floor(scanTotal / (concurrency + 1));
-  const perChart = Math.floor(perQuery / K.foreground_concurrency);
-  const headroom = ceiling - scanTotal - caches;
-  // memory.xml must sit under (ratio × container limit), and the container
-  // needs slack for allocator and thread stacks on top of what ClickHouse
-  // accounts for.
-  const chLimit = roundGib(ceiling / K.reference.ceiling_to_limit_ratio) * GIB;
-
-  const pgLimit = K.reference.postgres_mem_limit_bytes;
-  const qdLimit = embeddings ? K.reference.qdrant_mem_limit_bytes : 0;
-  const appLimit = K.reference.app_mem_limit_bytes;
-
-  // Page cache is not spare RAM: ClickHouse reads compressed parts through it.
-  const pageCache = Math.max(4 * GIB, Math.min(16 * GIB, events * K.bytes_per_event_on_disk * 0.05));
-  const onThisHost = shape === "split" ? chLimit + pageCache : chLimit + pgLimit + qdLimit + appLimit + pageCache;
-  const hostRam = roundGib(onThisHost * 1.1) * GIB;   // 10% for the OS itself
-
-  // Threads: the gate admits `concurrency` scans, so an even share is the width
-  // at which a full gate saturates the box instead of oversubscribing it.
-  const cores = Math.max(4, concurrency * 4);
-  const threads = Math.max(K.min_threads_per_scan, Math.floor(cores / concurrency));
-
-  document.getElementById("out-ram").textContent = gib(hostRam);
+  document.getElementById("out-ram").textContent = gib(need.hostRam);
   document.getElementById("out-ram-why").textContent =
     shape === "split"
       ? "ClickHouse host only — the app, Postgres and Qdrant sit elsewhere."
       : "One host running the app and all three backing services.";
-  document.getElementById("out-cores").textContent = cores;
+  document.getElementById("out-cores").textContent = need.cores;
   document.getElementById("out-cores-why").textContent =
-    `${concurrency} concurrent scans × ${threads} threads each, so a full gate saturates the box rather than oversubscribing it.`;
+    `${need.concurrency} concurrent scans × ${need.threads} threads each, so a full gate saturates the box rather than oversubscribing it.`;
 
   const mem = document.getElementById("out-memory");
   mem.textContent = "";
-  row(mem, "ClickHouse container limit", gib(chLimit),
+  row(mem, "ClickHouse container limit", gib(need.chLimit), m((x) => gib(x.chLimit)),
     "mem_limit / VESTIGO_CLICKHOUSE_MEM_LIMIT. Decides who the kernel kills; it never makes anyone throttle first.");
-  row(mem, "ClickHouse <code>max_server_memory_usage</code>", gib(ceiling),
+  row(mem, "ClickHouse <code>max_server_memory_usage</code>", gib(need.ceiling), m((x) => gib(x.ceiling)),
     "memory.xml. The only ceiling that bounds background merges. Must sit under the container limit.");
-  row(mem, "→ its caches", gib(caches),
+  row(mem, "→ its caches", gib(need.caches), m((x) => gib(x.caches)),
     "mark, index-mark and primary-index caches live under that ceiling, so scans do not get them.");
-  row(mem, "→ Vestigo scan budget (total)", gib(scanTotal),
-    `Auto: ${K.memory_ratio} × (ceiling − caches), shared across ${concurrency} concurrent scans plus a chart lane.`);
-  row(mem, "→ per-query cap", gib(perQuery),
-    "budget ÷ (concurrency + 1), as max_memory_usage on every heavy scan. One query fails instead of the server.");
-  row(mem, "→ foreground per-chart cap", gib(perChart),
-    `${K.foreground_concurrency} chart queries share the reserved slot, in their own lane — a histogram never waits behind a detector sweep.`);
-  row(mem, "→ merge headroom", gib(headroom),
+  row(mem, "→ Vestigo scan budget (total)", gib(need.scanTotal), m((x) => gib(x.scanTotal)),
+    `Auto: ${K.memory_ratio} × (ceiling − caches), shared across the heavy slots plus the chart lane.`);
+  row(mem, "→ per-query cap", gib(need.perQuery), m((x) => gib(x.perQuery)),
+    `budget ÷ (concurrency + ${K.foreground_slots}), as max_memory_usage on every heavy scan. One query fails instead of the server.`);
+  row(mem, "→ foreground per-chart cap", gib(need.perChart), m((x) => gib(x.perChart)),
+    `${K.foreground_concurrency} chart queries share the ${K.foreground_slots} reserved slots, in their own lane — a histogram never waits behind a detector sweep.`);
+  row(mem, "→ merge headroom", gib(need.headroom), m((x) => gib(x.headroom)),
     "What is left under the ceiling. Nothing else bounds background merges.");
   if (shape !== "split") {
-    row(mem, "PostgreSQL", gib(pgLimit), "Metadata only — cases, sources, annotations, audit. Does not grow with event count.");
-    row(mem, "Qdrant", qdLimit ? gib(qdLimit) : "not needed",
+    const pgLimit = K.reference.postgres_mem_limit_bytes;
+    const qdLimit = embeddings ? K.reference.qdrant_mem_limit_bytes : 0;
+    row(mem, "PostgreSQL", gib(pgLimit), gib(pgLimit), "Metadata only — cases, sources, annotations, audit. Does not grow with event count.");
+    row(mem, "Qdrant", qdLimit ? gib(qdLimit) : "not needed", qdLimit ? gib(qdLimit) : "not needed",
       qdLimit ? "Vectors for embedding-based similarity." : "Embeddings are optional; without them Qdrant runs nothing.");
-    row(mem, "App", gib(appLimit), "Streams parses and drains query results; does not hold a corpus.");
+    row(mem, "App", gib(K.reference.app_mem_limit_bytes), gib(K.reference.app_mem_limit_bytes),
+      "Streams parses and drains query results; does not hold a corpus.");
   }
-  row(mem, "OS page cache (leave free)", gib(pageCache),
+  row(mem, "OS page cache (leave free)", gib(need.pageCache), m((x) => gib(x.pageCache)),
     "Not spare RAM. ClickHouse reads compressed parts through it — this is scanning from RAM versus from disk.");
 
   const set = document.getElementById("out-settings");
   set.textContent = "";
-  row(set, "<code>VESTIGO_STAT_SCAN_CONCURRENCY</code>", String(concurrency),
-    "Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+1) on the memory budget, so it needs a restart.");
-  row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)",
-    `Auto resolves to ${threads} here — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
+  row(set, "<code>VESTIGO_STAT_SCAN_CONCURRENCY</code>", String(need.concurrency), m((x) => String(x.concurrency)),
+    `Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+${K.foreground_slots}) on the memory budget, so it needs a restart.`);
+  row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)", "0 (auto)",
+    `Auto resolves to ${need.threads} at the minimum${max ? ` and ${max.threads} at full spend` : ""} — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",
-    shape === "split" ? String(scanTotal) : "0 (auto)",
+    shape === "split" ? String(need.scanTotal) : "0 (auto)",
+    shape === "split" ? m((x) => String(x.scanTotal)) : "0 (auto)",
     shape === "split"
       ? "ClickHouse is on another host, so the app cannot derive the budget — pin the total."
       : "Auto: derived from the ceiling ClickHouse reports, minus its caches. Leave it alone.");
-  row(set, "<code>VESTIGO_STAT_SCAN_MEMORY_RATIO</code>", String(K.memory_ratio),
+  row(set, "<code>VESTIGO_STAT_SCAN_MEMORY_RATIO</code>", String(K.memory_ratio), String(K.memory_ratio),
     "Fraction of (ceiling − caches) the scan budget takes; the rest is merge headroom.");
-  row(set, "<code>max_server_memory_usage</code>", String(ceiling),
+  row(set, "<code>max_server_memory_usage</code>", String(need.ceiling), m((x) => String(x.ceiling)),
     "In memory.xml. Keep it under (ratio × container limit) or ClickHouse silently clamps it.");
   row(set, "<code>max_server_memory_usage_to_ram_ratio</code>", String(K.reference.ceiling_to_limit_ratio),
+    String(K.reference.ceiling_to_limit_ratio),
     "Spelled out so clearing the absolute value cannot fall back to 0.9 of a possibly-misdetected total.");
   for (const [name, value] of Object.entries(K.shipped_caches)) {
-    row(set, `<code>${name}</code>`, String(value),
+    row(set, `<code>${name}</code>`, String(value), String(value),
       "In memory.xml. Left at its ClickHouse default this can be 5 GiB, spending the ceiling on cache instead of queries.");
   }
   if (shape === "docker") {
-    row(set, "<code>VESTIGO_CLICKHOUSE_MEM_LIMIT</code>", roundGib(chLimit) + "g",
+    row(set, "<code>VESTIGO_CLICKHOUSE_MEM_LIMIT</code>", roundGib(need.chLimit) + "g",
+      m((x) => roundGib(x.chLimit) + "g"),
       "Container limit. Recreate the container after changing it — a restart does not re-apply it.");
   }
 }
@@ -375,7 +519,7 @@ fetch("sizing-constants.json")
   .then((r) => r.json())
   .then((data) => {
     K = data;
-    for (const id of ["events", "analysts", "shape", "embeddings", "enrichment"]) {
+    for (const id of ["events", "analysts", "shape", "embeddings", "enrichment", "have-ram", "have-cores"]) {
       document.getElementById(id).addEventListener("input", compute);
     }
     compute();

@@ -1,6 +1,84 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-26 (session 190 — scan admission classes, #300).
+Last updated: 2026-08-27 (session 191 — PR #305 review fixes, #300).
+
+## Session 191 — 2026-08-27: PR #305 review fixes (scan admission classes)
+
+Six findings from the review of the session-190 branch, plus the sizing calculator rework
+that came out of the first one.
+
+- **The chart lane could not spill.** The foreground cap was one heavy slot split four
+  ways — with the default `stat_scan_concurrency=2`, `budget/12` against a detector's
+  `budget/2` on `main`. That would be fine if a chart query could always spill, but two
+  could not: `field_terms` carried `sum(count()) OVER ()` / `count() OVER ()` (a frameless
+  window materialises every group after the GROUP BY) and `field_numeric_grouped` counted
+  groups with `uniqExact` (a full in-memory hash set). Both died at `max_memory_usage` on
+  exactly the high-cardinality field a chart is for. Both are now spillable `GROUP BY`
+  aggregates — the trade `count_field_inventory` already documents — issued in parallel
+  under the slot the caller holds, and the lane now reserves **two** heavy slots
+  (divisor N + 2), so a chart is capped at half a detector's cap rather than a sixth.
+- **`_run_parallel` dropped the scan context.** A bare `ThreadPoolExecutor.submit` starts
+  with an empty context, so every fanned-out chart scan went out untagged and a disconnect
+  could not `KILL` it. It runs under `copy_context()` now — which is also what keeps the
+  two new parallel scans cancellable.
+- **A dead ClickHouse turned a 499 into a 500.** `_kill` built its store lazily *outside*
+  the best-effort `try`, so a connect failure on the first disconnect propagated out of
+  `run_scan` and left the scan task with nobody to retrieve its result.
+- **Nothing handled `run_scan`'s own cancellation.** On shutdown (or a failing `gather`
+  sibling) the threadpool scan ran on holding its gate slot and its ClickHouse process.
+  The `CancelledError` path now sets the flag and fires the `KILL` from a plain daemon
+  thread — no event loop required, since the loop is what is going away.
+- **The queue depth an analyst is shown.** `_waiting` was keyed by `id(gate)` and never
+  pruned, so a collected gate's count could resurface under a recycled id; it is a
+  `WeakKeyDictionary` now. And `ahead` was sampled at *entry* and reported up to 30 s
+  later — it is counted where the deadline expires instead.
+- **The frontend retried a busy lane forever.** No cap, no toast (`isScanBusy` was excluded
+  from the error handler) and, in `TimelineHistogram`, no waiting text either, because
+  `placeholderData` keeps `isLoading` false. A wedged lane therefore looked like a silently
+  stale panel — the symptom #300 set out to remove. Retries stop after `BUSY_RETRY_LIMIT`
+  (24 ≈ two minutes) and the 503 then surfaces as an error; the histogram shows "waiting
+  behind N scans" over its stale bars while it retries.
+
+The [sizing calculator](docs/sizing/index.html) now takes the hardware in hand — host RAM
+and cores — and answers whether it is enough, then gives every memory value and setting
+twice: the **minimum** that serves the described workload, and what the hardware supports
+at **full spend** (as many scan slots as its cores and RAM allow without shrinking a query
+below what a whole-corpus GROUP BY needs). A host that cannot host the stack at all, and
+one that runs but spills every scan, are different verdicts and say so.
+
+### Second review round
+
+Six more findings on the same branch, all of them the *edges* of the two-class model rather
+than its shape.
+
+- **A fan-out spent its slot's budget twice.** The per-query cap is sized per gate *slot*,
+  but `field_terms`' new totals wave, `field_numeric_grouped`, the violin's second wave and
+  the compare layers each put two queries in flight under one slot at the full cap — a
+  fully admitted foreground gate committing 2x what the heavy divisor reserved for it. The
+  over-commit factor is exactly the fan-out width, so no gate sizing absorbs it:
+  `_run_parallel` now declares its width to `scan_fanout` and the queries divide the slot's
+  share (nested waves multiply). The `_run_serial` the first round added for the pivot
+  stays, but as a latency/thread-count trade rather than the budget's only defence.
+- **The disconnect KILL queued behind the scans it was freeing.** It went out through
+  `run_in_threadpool`, and the situation a disconnect exists for is precisely the one where
+  every anyio thread token is held by a scan parked on a gate. It uses the same plain
+  daemon thread the `CancelledError` path already did.
+- **Agent and MCP tools had no `ScanBusy` guard.** `chart_exec` got one for `propose_chart`;
+  the thirteen other tool calls into gated aggregations did not, so a busy lane escaped as
+  an unhandled `RuntimeError` — a 500 on the MCP surface. `chart_exec._scan` is now the
+  shared `run_gated_scan` and every one of them goes through it.
+- **A story export could fail a chart block.** An export is a job: no spinner, no request to
+  answer 503 to, no retry. The bounded wait turned "the lane was busy for 30 s" into a
+  failed block in an attested report. `unbounded_foreground_wait()` lets such a caller queue
+  as it did before the gate existed.
+- **The sizing calculator recommended hardware its own numbers said was too small.**
+  `minimumPlan`'s working-set ceiling still divided by `concurrency` after `budgetFor` moved
+  to `concurrency + foreground_slots` — at the default concurrency, half the working set the
+  page had just computed the deployment needs.
+- **`detect_scan_memory_budget` hardcoded `+ 2`** where everything else keys off
+  `_FOREGROUND_SLOTS`, so changing that constant would have broken the "both gates fully
+  admitted still fit" identity silently — and `scan_budget_report` would have gone on
+  reporting the old total as fact.
 
 ## Session 190 — 2026-08-26: scan admission classes (#300)
 

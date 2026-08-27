@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -76,7 +77,73 @@ def _client() -> Any:
 
 
 def _kill(token: str) -> None:
-    kill_scan_queries(_client(), token)
+    """Best-effort KILL for *token*, including the connect that reaches it.
+
+    ``kill_scan_queries`` swallows its own failures, but the store behind
+    ``_client()`` is built lazily on the *first* disconnect — so a ClickHouse
+    that is restarting, rotated credentials or an exhausted socket pool used
+    to raise out of here instead. On the cancel path that turned a 499 into a
+    500 and left the scan task with nobody to retrieve its result. A scan we
+    could not kill simply finishes on its own, as it did before cancellation
+    existed.
+    """
+    try:
+        client = _client()
+    except Exception:  # noqa: BLE001 — best effort by design
+        logger.warning("cannot reach ClickHouse to kill scan %s; it will finish", token)
+        logger.debug("scan kill client failed", exc_info=True)
+        return
+    kill_scan_queries(client, token)
+
+
+def _discard(task: asyncio.Future) -> None:
+    """Retrieve the result of a scan nobody is waiting for any more.
+
+    Without this, a task abandoned on the cancellation path ends with
+    ``ScanCancelled`` and asyncio logs "Task exception was never retrieved"
+    on every disconnect.
+    """
+
+    def _done(finished: asyncio.Future) -> None:
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            logger.debug("scan ended after cancel", exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
+def _kill_detached(token: str) -> None:
+    """Send the KILL for *token* on a plain daemon thread.
+
+    Never ``run_in_threadpool``: the scenario a cancel exists for is a full
+    lane, and every scan parked in ``acquire_scan_slot`` is holding one of
+    anyio's limited threadpool tokens for the whole of its wait. Queueing the
+    KILL behind them is how it goes out minutes late or not at all — and
+    until it does, ``run_scan`` cannot finish cancelling, so the orphan this
+    path exists to kill survives. A raw thread needs neither a token nor a
+    running loop, which is also what makes it safe while one is being torn
+    down.
+    """
+    threading.Thread(
+        target=_kill, args=(token,), name=f"scan-kill-{token[:8]}", daemon=True
+    ).start()
+
+
+def _cancel_detached(ctx: Any, task: asyncio.Future) -> None:
+    """Cancel a scan without awaiting anything — safe while unwinding.
+
+    Used from the ``CancelledError`` path, where the event loop is being torn
+    down (shutdown, a failing ``gather`` sibling) and any further ``await``
+    may never resume. The scan thread then fails with ClickHouse's 394
+    (running) or notices the flag (parked) and releases its gate slot either
+    way. Without this, the scan outlives the request holding both — the
+    orphan the whole cancellation path exists to prevent.
+    """
+    ctx.cancelled.set()
+    _discard(task)
+    _kill_detached(ctx.token)
 
 
 async def run_scan(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
@@ -91,7 +158,7 @@ async def run_scan(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
                     break
                 if request is not None and await request.is_disconnected():
                     ctx.cancelled.set()
-                    await run_in_threadpool(_kill, ctx.token)
+                    _kill_detached(ctx.token)
                     # The thread ends with ScanCancelled (parked) or a 394 from
                     # ClickHouse (running); either way it releases its slot.
                     try:
@@ -100,6 +167,9 @@ async def run_scan(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
                         logger.debug("scan %s ended after cancel", ctx.token, exc_info=True)
                     raise ScanCancelledResponse()
             return task.result()
+        except asyncio.CancelledError:
+            _cancel_detached(ctx, task)
+            raise
         except ScanBusy as exc:
             raise ScanBusyResponse(exc) from exc
         except ScanCancelled:

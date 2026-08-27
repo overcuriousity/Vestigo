@@ -46,14 +46,25 @@ export function isScanBusy(error: unknown): error is ApiError {
 }
 
 /**
+ * How many times a busy lane is re-asked before the 503 is allowed to surface.
+ * At the server's 5s `Retry-After` that is about two minutes — long enough to
+ * outlast a detector sweep, short enough that a genuinely wedged lane ends in
+ * an error an analyst can act on. Retrying forever is the same silent stall
+ * #300 set out to remove: a busy lane raises no toast, and a panel still
+ * holding previous data never even reaches the spinner that names the queue.
+ */
+export const BUSY_RETRY_LIMIT = 24;
+
+/**
  * Query options for surfaces that read a scan lane: a busy lane is "still
- * waiting", never "failed", so keep asking at the server's pace. Any other
- * failure surfaces at once — these are charts the analyst is looking at, and
- * a second of silent retry before the error is a second of spinner for
- * nothing.
+ * waiting", never "failed", so keep asking at the server's pace — but only
+ * up to `BUSY_RETRY_LIMIT` times, after which it *is* a failure and says so.
+ * Any other failure surfaces at once — these are charts the analyst is
+ * looking at, and a second of silent retry before the error is a second of
+ * spinner for nothing.
  */
 export const busyRetry = {
-  retry: (_count: number, error: unknown): boolean => isScanBusy(error),
+  retry: (count: number, error: unknown): boolean => isScanBusy(error) && count < BUSY_RETRY_LIMIT,
   retryDelay: (_count: number, error: unknown): number =>
     isScanBusy(error) ? (error.retryAfterMs ?? 5000) : 0,
 };
@@ -85,8 +96,12 @@ export const queryClient = new QueryClient({
   }),
   queryCache: new QueryCache({
     onError: (error, query) => {
-      // A busy scan lane is retried, not failed — no toast.
-      if (query.meta?.silentError || isUnauthorized(error) || isScanBusy(error)) return;
+      // Reached only once retries are exhausted, so a busy scan lane landing
+      // here has stayed busy for the whole `BUSY_RETRY_LIMIT` window (#300):
+      // a failure the analyst should hear about, not a wait to keep hiding.
+      // While it is still being retried the query never enters the error
+      // state and this never runs.
+      if (query.meta?.silentError || isUnauthorized(error)) return;
       // Background refetch failures of data already on screen are surfaced
       // too — a stale panel silently pretending to be current is worse than
       // a toast. The store dedups identical messages, so one dead endpoint

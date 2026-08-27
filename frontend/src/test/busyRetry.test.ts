@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { ApiError } from "@/api/client";
-import { busyMessage, busyRetry, isScanBusy } from "@/lib/queryClient";
+import { BUSY_RETRY_LIMIT, busyMessage, busyRetry, isScanBusy } from "@/lib/queryClient";
 
 function busy(ahead: number): ApiError {
   const e = new ApiError(503, "scan lane busy");
@@ -27,5 +27,16 @@ describe("busyRetry", () => {
     expect(busyMessage(busy(1))).toBe("Waiting behind 1 scan…");
     expect(busyMessage(busy(0))).toBe("Waiting for a scan slot…");
     expect(busyMessage(new Error("x"))).toBeNull();
+  });
+});
+
+describe("busyRetry limits", () => {
+  it("gives up once the lane has stayed busy for the whole window", () => {
+    // Retrying forever is the stall #300 removes: a busy lane raises no toast
+    // and a panel holding previous data never shows the waiting text either.
+    expect(busyRetry.retry(BUSY_RETRY_LIMIT - 1, busy(2))).toBe(true);
+    expect(busyRetry.retry(BUSY_RETRY_LIMIT, busy(2))).toBe(false);
+    // ~5s apart, so the cap is about two minutes of waiting.
+    expect(BUSY_RETRY_LIMIT * 5).toBeGreaterThanOrEqual(100);
   });
 });

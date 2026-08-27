@@ -29,7 +29,7 @@ from fastapi.concurrency import run_in_threadpool
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from vestigo.agent.chart_exec import execute_chart_spec
+from vestigo.agent.chart_exec import execute_chart_spec, run_gated_scan
 from vestigo.agent.chart_meta import (
     LEGACY_KIND_MAP,
     PIE_COMFORTABLE_MAX,
@@ -1216,7 +1216,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         nonlocal field_vocabulary
         if field_vocabulary is None:
-            listed = await run_in_threadpool(
+            listed = await run_gated_scan(
                 service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
             )
             attrs = listed.get("attributes") or []
@@ -1335,7 +1335,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         attributes. Use `describe_field` before charting a field you have not
         charted yet — it reports the scale.
         """
-        listed = await run_in_threadpool(
+        listed = await run_gated_scan(
             service.list_fields, scope.case_id, scope.source_ids, scope.field_mappings
         )
         return {**listed, "time_fields": sorted(TIME_FIELD_SPECS)}
@@ -1400,8 +1400,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         spec = _validated(filters)
         query = await _build_query(scope, spec)
         terms, numeric = await asyncio.gather(
-            run_in_threadpool(service.field_terms, query, field, 5),
-            run_in_threadpool(service.field_numeric_stats, query, field),
+            run_gated_scan(service.field_terms, query, field, 5),
+            run_gated_scan(service.field_numeric_stats, query, field),
         )
         # `count == 0` is the documented categorical signal (see
         # EventQueryService.field_numeric_stats) — the same test the Visualize
@@ -1458,7 +1458,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(service.field_terms, query, field, max(1, min(limit, 100)))
+        result = await run_gated_scan(service.field_terms, query, field, max(1, min(limit, 100)))
         return _columnize(result, "values")
 
     @server.tool()
@@ -1466,7 +1466,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """Summary stats + fixed-width histogram for a numeric field. count==0 means non-numeric."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(service.field_numeric_stats, query, field)
+        result = await run_gated_scan(service.field_numeric_stats, query, field)
         return _columnize(result, "bins")
 
     @server.tool()
@@ -1497,7 +1497,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         query = await _build_query(scope, spec_f)
         for token in fields:
             await _check_chart_field(token, "fields")
-        return await run_in_threadpool(service.field_correlation, query, list(fields))
+        return await run_gated_scan(service.field_correlation, query, list(fields))
 
     @server.tool()
     async def field_numeric_grouped(
@@ -1514,7 +1514,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec_f = _validated(filters)
         query = await _build_query(scope, spec_f)
-        result = await run_in_threadpool(
+        result = await run_gated_scan(
             service.field_numeric_grouped,
             query,
             field,
@@ -1532,7 +1532,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """Time-bucketed event counts honoring optional filters — the timeline's shape."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(service.histogram, query, min(max(buckets, 4), 120))
+        result = await run_gated_scan(service.histogram, query, min(max(buckets, 4), 120))
         return _columnize(result, "buckets")
 
     @server.tool()
@@ -1551,7 +1551,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(
+        result = await run_gated_scan(
             service.field_value_timeseries,
             query,
             field,
@@ -1565,7 +1565,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """Event counts by (day-of-week x hour-of-day), UTC — surfaces weekly/daily rhythm."""
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(service.time_punchcard, query)
+        result = await run_gated_scan(service.time_punchcard, query)
         return _columnize(result, "cells")
 
     @server.tool()
@@ -1583,7 +1583,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        result = await run_in_threadpool(
+        result = await run_gated_scan(
             service.field_pivot,
             query,
             field_x,
@@ -1605,7 +1605,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         spec = _validated(filters)
         query = await _build_query(scope, spec)
-        return await run_in_threadpool(
+        return await run_gated_scan(
             service.field_scatter,
             query,
             field_x,
@@ -1643,7 +1643,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # Each kind returns its rows under a different key; all three are
         # dict-per-row and among the heaviest results the agent can ask for.
         if kind == "time":
-            result = await run_in_threadpool(
+            result = await run_gated_scan(
                 service.compare_time_histogram,
                 primary_query,
                 comparison_query,
@@ -1651,7 +1651,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             )
             return _columnize(result, "buckets")
         if kind == "terms":
-            result = await run_in_threadpool(
+            result = await run_gated_scan(
                 service.compare_field_terms,
                 primary_query,
                 comparison_query,
@@ -1659,7 +1659,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 max(1, min(limit, VIZ_MAX_TERMS)),
             )
             return _columnize(result, "values")
-        result = await run_in_threadpool(
+        result = await run_gated_scan(
             service.compare_field_numeric,
             primary_query,
             comparison_query,

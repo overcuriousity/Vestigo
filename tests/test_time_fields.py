@@ -159,7 +159,12 @@ def test_field_column_expr_ignores_offsets_for_ordinary_fields() -> None:
 def test_time_field_is_filterable_and_binds_the_offset_arrays() -> None:
     """ "Only hours 02-05" is a real forensic filter, and it comes free from
     resolving at ``_field_column_expr`` rather than per-aggregation."""
-    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[]))])
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[0, 0]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[])),
+        ]
+    )
     svc.field_terms(
         EventQuery(
             case_id="c1",
@@ -188,9 +193,10 @@ def test_pivot_with_a_bounded_time_axis_uses_the_full_ordered_domain() -> None:
         [
             # Only ONE terms scan runs: the country axis. The hour axis needs
             # no scan because its values are known in advance.
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[100, 12]])),
             (
                 "GROUP BY val",
-                FakeQueryResult(result_rows=[["NL", 90, 100, 12], ["US", 10, 100, 12]]),
+                FakeQueryResult(result_rows=[["NL", 90], ["US", 10]]),
             ),
             (
                 "GROUP BY xv, yv",
@@ -212,14 +218,16 @@ def test_pivot_with_a_bounded_time_axis_uses_the_full_ordered_domain() -> None:
     assert result["y_distinct"] == 24
     assert result["x_values"] == ["NL", "US"]
 
+    # One axis scanned, two scans for it: the top-N and its totals aggregate.
     terms_scans = [q for q, _ in svc.store.client.queries if "GROUP BY val" in q]  # type: ignore[union-attr]
-    assert len(terms_scans) == 1
+    assert len(terms_scans) == 2
 
 
 def test_pivot_with_a_bounded_time_axis_folds_nothing_to_other() -> None:
     svc = _viz_service(
         [
-            ("GROUP BY val", FakeQueryResult(result_rows=[["NL", 90, 100, 12]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[100, 12]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["NL", 90]])),
             ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["NL", "02", 40]])),
         ]
     )
@@ -244,12 +252,19 @@ def test_pivot_with_an_unbounded_time_axis_keeps_the_top_n_path(token: str) -> N
     # order can't be relied on.
     svc = _viz_service(
         [
+            # The matrix scan first: it groups by the same time expression the
+            # unbounded axis does, so a laxer marker would swallow it.
+            ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["NL", "2026-07-20", 40]])),
+            (
+                (_UNBOUNDED_SQL_MARKER[token], "n_groups"),
+                FakeQueryResult(result_rows=[[100, 30]]),
+            ),
             (
                 _UNBOUNDED_SQL_MARKER[token],
-                FakeQueryResult(result_rows=[["2026-07-20", 50, 100, 30]]),
+                FakeQueryResult(result_rows=[["2026-07-20", 50]]),
             ),
-            ("GROUP BY val", FakeQueryResult(result_rows=[["NL", 90, 100, 12]])),
-            ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["NL", "2026-07-20", 40]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[100, 12]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["NL", 90]])),
         ]
     )
     result = svc.field_pivot(
@@ -257,8 +272,9 @@ def test_pivot_with_an_unbounded_time_axis_keeps_the_top_n_path(token: str) -> N
     )
     assert result["y_values"] == ["2026-07-20"]
     assert result["y_distinct"] == 30
+    # Two axes scanned, two scans each: the top-N and its totals aggregate.
     terms_scans = [q for q, _ in svc.store.client.queries if "GROUP BY val" in q]  # type: ignore[union-attr]
-    assert len(terms_scans) == 2
+    assert len(terms_scans) == 4
 
 
 def test_pivot_of_two_bounded_time_axes_runs_no_terms_scan() -> None:

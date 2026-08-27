@@ -182,6 +182,43 @@ async def test_chart_block_freezes_execution_result(store):
     assert blk["data"]["warnings"] == ["clamped"]
 
 
+async def test_chart_block_queues_for_the_lane_rather_than_failing(store):
+    """An export has no spinner, no request to answer 503 to and no retry.
+
+    The bounded foreground wait exists for a chart an analyst is watching;
+    applied to a job it turns "the lane was busy for 30s" into a failed block
+    in an attested report (#305).
+    """
+    from vestigo.db._scan import foreground_wait_seconds
+
+    case, story, blocks = await _case_with_story(
+        store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
+    )
+    await store.create_saved_chart(
+        case.id,
+        "t1",
+        "ch1",
+        "Top ports",
+        {"v": 1, "chartType": "bar", "scale": "nominal", "field": "port", "options": {}},
+    )
+    seen: dict[str, object] = {}
+
+    async def fake_chart(scope, spec):
+        seen["wait"] = foreground_wait_seconds(30.0)
+        return {"ok": True, "resolved": {}, "warnings": [], "summary": {}, "result": {}}
+
+    await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_chart=fake_chart,
+        resolve_scope=lambda case_id, timeline_id: (["src1"], None, None),
+        now=lambda: FROZEN_NOW,
+    )
+    assert seen["wait"] is None, "the export queued instead of giving up"
+
+
 async def test_event_block_and_failing_block_isolation(store):
     case, story, blocks = await _case_with_story(
         store,

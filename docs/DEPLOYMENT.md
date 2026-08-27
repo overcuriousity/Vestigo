@@ -220,14 +220,18 @@ fails every Docker build. Keep the alias if you edit this.
 **Start here:** the [sizing calculator](https://overcuriousity.github.io/Vestigo/sizing/) turns
 an expected dataset size, analyst count and deployment shape into the numbers this section
 explains. It computes them with the same arithmetic `db/_scan.py` uses, from constants generated
-out of the source — but it cannot see your host, so read `/api/health`'s `scan_budget` block
-(below) once the stack is up.
+out of the source. Enter the RAM and cores you already have and it answers whether they are
+enough, and gives every value twice: the **minimum** that serves the workload, and what the
+**hardware supports at full spend**. It still cannot see your host, so read `/api/health`'s
+`scan_budget` block (below) once the stack is up.
 
 Scans run in two lanes. `VESTIGO_STAT_SCAN_CONCURRENCY` (N) is the number of heavy scans —
 detectors, Sigma, inventory exports, the enrichment rewrite — admitted at once; interactive
 charts (histogram, top terms, numeric stats) have their own four-slot lane and never queue
-behind a sweep. The memory budget is divided by N + 1: N heavy caps plus one slot the four
-chart queries share, reported as `scan_budget.foreground` on `/api/health` and on the admin
+behind a sweep. The memory budget is divided by N + 2: N heavy caps plus two slots the four
+chart queries share, so a chart is capped at half a detector's cap rather than a quarter of it
+— charts over high-cardinality fields are the ordinary workload, and they spill at that size
+rather than dying. Reported as `scan_budget.foreground` on `/api/health` and on the admin
 Settings page. Raising N widens the heavy lane and shrinks every cap; it does not change how
 charts are admitted. A chart that cannot get a slot within 30 s answers 503 with the queue
 depth and the UI keeps waiting visibly; a request that disconnects (a reload mid-sweep) frees
