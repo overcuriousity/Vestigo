@@ -182,9 +182,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- The open PR #182 review findings for case export/import are recorded in
-  `docs/archive/PR182_REVIEW_FINDINGS.md`, with an X1 residue entry on the roadmap pointing
-  into them.
+- The open PR #182 review findings for case export/import are recorded as the X1 residue
+  entry on the roadmap.
 
 ## [1.13.0] — 2026-08-18
 
@@ -1314,8 +1313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stories** — a per-case block document where the investigation's narrative
   and its evidence live together, so the report assembles itself while the work
   happens instead of being written afterwards (roadmap Phase 3 Step 3 / W7;
-  design in `docs/superpowers/specs/2026-07-26-w7-stories-design.md`, reference
-  in `docs/STORIES.md`). A story is an ordered list of blocks —
+  reference in `docs/STORIES.md`). A story is an ordered list of blocks —
   `markdown | view_ref | chart_ref | event_ref` — and embeds stay **live** while
   an analyst writes, so the document tracks the data as ingestion and detection
   progress. "Add to story" buttons on the Explorer filter rail, the saved-chart
@@ -1395,8 +1393,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Case export/import (`.vestigo` archive)** — any case leaves the instance as
   a single versioned zip and comes back intact, on the same or a different
-  instance (roadmap Milestone 9 / X1; design in
-  `docs/superpowers/specs/2026-07-24-case-export-import-design.md`). The archive
+  instance (roadmap Milestone 9 / X1). The archive
   carries every case-scoped Postgres entity (including audit rows), all
   ClickHouse events as per-source Arrow IPC, and — behind an explicit
   `include_blobs` flag — the original source-file blobs, with a SHA-256 per

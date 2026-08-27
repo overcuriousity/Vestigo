@@ -7,9 +7,7 @@ analyst can apply to the Explorer with one click. Update this document
 alongside any agent change, like `ANOMALY_DETECTION.md` for detectors.
 
 Code lives in `src/vestigo/agent/` (runtime, tools, config, context
-management) and `api/routers/agent.py` (HTTP/SSE layer). Design records:
-`docs/superpowers/specs/2026-07-19-agent-read-parity-mcp-http-design.md`,
-`docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md`.
+management) and `api/routers/agent.py` (HTTP/SSE layer).
 
 ## Design invariants
 
@@ -210,123 +208,92 @@ frontend renders an "Apply to Explorer" card (`run_id` maps onto
 
 ### Nested arguments a provider stringified
 
-Not every provider emits a nested object argument as an object; some hand it
-back as JSON *text*. pydantic-ai parses only the **top** level of a tool
-call's arguments (`ToolCallPart.args_as_dict`), and the MCP SDK's
-`pre_parse_json` likewise only covers top-level parameters — so a top-level
-argument always arrives parsed, and anything nested arrives exactly as the
-provider sent it. Rejecting that costs a retry the model has to guess its way
-out of, on tools it is otherwise using correctly (`FilterSpec` is a nested
-argument on 14 of them — every filtered query and aggregation in the toolset).
+Not every provider emits a nested object argument as an object; some hand it back
+as JSON *text*. pydantic-ai parses only the **top** level of a tool call's
+arguments, and the MCP SDK's `pre_parse_json` likewise — so a top-level argument
+always arrives parsed and anything nested arrives exactly as the provider sent it.
+Rejecting that costs a retry the model has to guess its way out of, on tools it is
+otherwise using correctly (`FilterSpec` is a nested argument on 14 of them).
 
-`ObjectArgModel` in `agent/tools.py` is the base for every nested-argument
-model and the single place this is handled. It coerces the model itself and
-every **field** whose annotation admits a JSON object — so `ChartSpec.options`
-(a model) and `FilterSpec.filters` (a plain `dict`) are covered by the same
-mechanism, no per-field opt-in. The rule is `_admits_json_object`: a field
-qualifies when some union member is a mapping or `BaseModel` and **no** member
-is `str`. That exclusion is the whole safety argument — `q: str | None` may
-legitimately hold `'{"a": 1}'` as a free-text search, and coercing it would
-rewrite the analyst's query. Coercion works on a copy: the same mapping is the
-call's `tool_args`, persisted verbatim, and a forensic record must not change
-shape between being stored and being validated.
+`ObjectArgModel` in `agent/tools.py` is the base for every nested-argument model
+and the single place this is handled. It coerces the model itself and every
+**field** whose annotation admits a JSON object, so `ChartSpec.options` (a model)
+and `FilterSpec.filters` (a plain `dict`) are covered by one mechanism with no
+per-field opt-in. The rule is `_admits_json_object`: a field qualifies when some
+union member is a mapping or `BaseModel` and **no** member is `str`. That
+exclusion is the whole safety argument — `q: str | None` may legitimately hold
+`'{"a": 1}'` as a free-text search, and coercing it would rewrite the analyst's
+query. Coercion works on a copy: the same mapping is the call's `tool_args`,
+persisted verbatim, and a forensic record must not change shape between being
+stored and being validated.
 
-Both halves of that are enforced rather than merely documented, because both
-fail *silently* — one provider retry-looping on a tool it is using correctly
-is not something a test suite notices on its own.
-`test_every_nested_argument_model_derives_from_object_arg_model` walks the
-built server's real signatures (and transitively through model fields, which
-is how `FilterSpec` inside `ChartSpec.compare` is reached) and fails if any
-model in a nested position is a bare `BaseModel`; the same walk feeds
-`test_spec_reference_covers_every_nested_argument_model`, so a new spec cannot
-have its `$defs` prose slimmed away without being added to `SHARED_SPEC_NAMES`.
-And `_admits_json_object` **raises** on an annotation it cannot decide (an
-unresolved forward reference) rather than answering "no": quietly dropping a
-field from coercion is the failure mode this whole path exists to make loud.
+Both halves are enforced rather than merely documented, because both fail
+*silently*. `test_every_nested_argument_model_derives_from_object_arg_model` walks
+the built server's real signatures (transitively through model fields) and fails
+if any model in a nested position is a bare `BaseModel`; the same walk feeds
+`test_spec_reference_covers_every_nested_argument_model`. And
+`_admits_json_object` **raises** on an annotation it cannot decide rather than
+answering "no" — quietly dropping a field from coercion is the failure mode this
+path exists to make loud.
 
-The frontend needs the mirror image, because `tool_args` is persisted exactly
-as emitted — a bad row is permanent and every re-render of that conversation
-reads it. `specToChartConfig` and `specToEventFilters` (`api/agent.ts`)
-normalize through `parseToolArgObject` at the translation boundary, so no
-caller has to remember to; `AgentPanel` additionally uses it as the render-or-
-don't decision, and an unusable spec produces no card rather than a throw.
-A stringified `compare` is the reason this is not optional: unparsed, it made
-`compare?.mode` undefined and silently drew one layer where the model proposed
-two.
+The frontend needs the mirror image, because `tool_args` is persisted exactly as
+emitted — a bad row is permanent and every re-render reads it. `specToChartConfig`
+and `specToEventFilters` (`api/agent.ts`) normalize through `parseToolArgObject`
+at the translation boundary, so no caller has to remember to; `AgentPanel` uses it
+as the render-or-don't decision, and an unusable spec produces no card rather than
+a throw.
 
 ### `propose_chart` — isomorphic with the analyst's `ChartConfig`
 
 `propose_chart(title, description, spec)` mirrors the Visualize page's
 `ChartConfig` field for field (`chart_type`, `scale`, `field`, `field_y`,
-`fields`, `metric`, `filters`, `compare{mode, filters}`, `options{…}`) — anything an analyst can build by hand the agent can propose.
-It replaced a flattened `kind` enum that could address only 7 chart types and
-silently rendered a requested pie as a bar.
+`fields`, `metric`, `filters`, `compare{mode, filters}`, `options{…}`) — anything
+an analyst can build by hand the agent can propose. It replaced a flattened `kind`
+enum that could address only 7 chart types and silently rendered a requested pie
+as a bar.
 
-The field slots are not interchangeable, and the table says which a mark
-takes: `field_y` is **required** by pivot/sankey/scatter (`requires_second
-_field`) and **optional** on box/violin (`accepts_second_field`), where it is
-a categorical grouping variable producing one distribution per group;
-`fields` is a 2–8 token list used only by the correlation matrix
-(`multi_field`).
+The field slots are not interchangeable: `field_y` is **required** by
+pivot/sankey/scatter and **optional** on box/violin, where it is a categorical
+grouping variable producing one distribution per group; `fields` is a 2–8 token
+list used only by the correlation matrix.
 
-- **Legality is enforced from one table.** `agent/chart_meta.py` is the
-  source of truth (which scales each mark admits, comparison support, second
-  field, options); `frontend/src/components/viz/lib/chartMeta.ts` is
-  **generated** from it by `scripts/gen_chart_meta.py` (committed;
-  `tests/test_chart_meta.py` asserts regeneration is a no-op). The analyst
-  gets the rules as UI affordances; the agent gets them as validation errors
-  that name the legal alternatives — the error *is* the dropdown.
-- Rejections fire before any query (illegal scale/type pair, missing or
-  superfluous fields, unsupported comparison, illegal metric, unknown field
-  token with `difflib` near-miss suggestions) and after it for the
-  silent-success cases (numeric chart over a non-numeric field, scatter with
-  no numeric pairs). Errors the model must recover from say what to do, not
-  only what is wrong — e.g. the field × field grid is `pivot`, not
-  `heatmap` (one field × time), and the rejection names that fix.
-- **Statistics are server-computed, never eyeballed.** ClickHouse natives
-  supply the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`,
-  `skewPop`, quantiles) over the **full** filtered data; `vestigo/stats.py`
-  (pure Python, no scipy) adds only what ClickHouse has no aggregate for —
-  p-values, Kendall's tau-b (Knight's O(n log n) method), Shapiro–Wilk — and
-  the response labels which numbers came from a sample. Correlations are
-  **pairwise-complete**: each pair reports the `n` it was computed over, so a
-  sparse field cannot silently shrink the other pairs. Where a statistic could
-  not be computed at all, the response says so rather than falling back
-  silently: `recommendation_basis` distinguishes a Shapiro–Wilk verdict from
-  the conservative default, and `bin_rule` distinguishes a Freedman–Diaconis
-  count from the fixed fallback used when the rule is undefined.
+- **Legality is enforced from one table.** `agent/chart_meta.py` is the source of
+  truth (admissible scales per mark, comparison support, second field, options);
+  `viz/lib/chartMeta.ts` is **generated** from it by `scripts/gen_chart_meta.py`
+  (committed; `tests/test_chart_meta.py` asserts regeneration is a no-op). The
+  analyst gets the rules as UI affordances; the agent gets them as validation
+  errors naming the legal alternatives — the error *is* the dropdown. Rejections
+  fire before any query (illegal scale/type pair, missing or superfluous fields,
+  unsupported comparison, illegal metric, unknown field token with `difflib`
+  near-miss suggestions) and after it for silent-success cases (numeric chart over
+  a non-numeric field, scatter with no numeric pairs).
+- **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
+  the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
+  quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
+  scipy) adds only what ClickHouse has no aggregate for — p-values, Kendall's
+  tau-b, Shapiro–Wilk — and the response labels which numbers came from a sample.
+  Correlations are **pairwise-complete**: each pair reports the `n` it was
+  computed over. Where a statistic could not be computed, the response says so
+  rather than falling back silently (`recommendation_basis`, `bin_rule`).
 - **Mark-choice cautions are warnings, not rejections.** A pie past
-  `PIE_COMFORTABLE_MAX` slices, or with two slices within 10% of each other,
-  still validates — with a warning naming bar/waffle. A grouped box/violin
-  whose grouping field has more than `VIZ_GROUP_CARDINALITY_CAUTION` distinct
-  values gets the same treatment (that is usually an identifier, not a
-  grouping variable), as does any grouped chart that omitted groups. Refusing
-  would be paternalistic; staying silent would let the model ship an
-  unreadable chart.
-- **Bad input is refused, not quietly narrowed.** `field_correlation` rejects
-  a field list that is too long or repeats a token rather than truncating it
-  to the cap — a silently truncated matrix answers a question the model never
-  asked and returns it as the answer to the one it did.
-- **The result echoes what will be drawn**: `{ok, resolved{…}, warnings,
-  summary}`. `AgentPanel.tsx` gates card creation on `ok`; the system prompt
-  requires the model to check `resolved`. Warnings carry ignored options and
-  clamped validation-query limits (those clamps bound the *tool result*,
-  never the analyst's card).
-- The chat renders a live chart card (`ChartProposalCard.tsx`) fetched fresh
-  through `vizApi` — not the tool-result echo — with **Open in Visualize**
-  and **Save** (the analyst's own click; the agent never writes a chart).
-  `specToChartConfig` maps the spec; `specToChartConfigLegacy` is a frozen
-  translation for persisted old-shape `tool_args`. Virtual `time:` fields are
-  analyst-facing too (`viz/lib/fieldDisplay.ts` labels tokens and values;
-  canonical values, not labels, round-trip into filters/URLs/saved charts).
-- **Save** stores `spec.filters` with the chart, `event_ids`/`run_id`/
-  `collapse_routine` included — a chart the agent scoped to one detector run
-  must not widen to the whole timeline on the analyst's click. **Open in
-  Visualize** on this card cannot carry those three: the chart is not saved
-  yet, so there is no id to name, and it falls back to describing the chart in
-  `c_*` params where they have no representation. Saving first is what makes
-  the chart addressable (`?c_chart=<id>`, `docs/STORIES.md`) and its link
-  exact.
+  `PIE_COMFORTABLE_MAX` slices, or a grouped box/violin whose grouping field
+  exceeds `VIZ_GROUP_CARDINALITY_CAUTION` distinct values, still validates with a
+  warning naming the better mark. Refusing would be paternalistic; staying silent
+  would let the model ship an unreadable chart.
+- **Bad input is refused, not quietly narrowed.** `field_correlation` rejects a
+  field list that is too long or repeats a token rather than truncating — a
+  silently truncated matrix answers a question the model never asked.
+- **The result echoes what will be drawn**: `{ok, resolved{…}, warnings, summary}`.
+  `AgentPanel.tsx` gates card creation on `ok`. Warnings carry ignored options and
+  clamped validation-query limits (those clamps bound the *tool result*, never the
+  analyst's card).
+- The chat renders a live chart card fetched fresh through `vizApi` — not the
+  tool-result echo — with **Open in Visualize** and **Save** (the analyst's own
+  click; the agent never writes a chart). **Save** stores `spec.filters` with the
+  chart, `event_ids`/`run_id`/`collapse_routine` included, so a chart the agent
+  scoped to one detector run cannot widen to the whole timeline. **Open in
+  Visualize** cannot carry those three — the chart is not saved yet, so there is
+  no id to name. Saving first is what makes it addressable (`?c_chart=<id>`).
 
 ### Per-tool enable/disable (three layers)
 
@@ -409,67 +376,49 @@ here is per-source. The tool-deny layers are not bypassed by this, because no
 tool is called.
 
 **Opt-in per analyst, per timeline — with the disclosure attached to the
-opting.** There is no instance-wide setting for this, deliberately: whether the
-model half is *available* is already answered by whether an agent endpoint is
-configured, and a second tri-state on top of it only made the disclosure
-incoherent (a dialog explaining egress that was not happening, offering an
-action most users could not take).
+opting.** There is no instance-wide setting, deliberately: whether the model half
+is *available* is already answered by whether an agent endpoint is configured, and
+a second tri-state on top of it only made the disclosure incoherent.
 
-The job takes `use_llm`, and it defaults to False. Every automatic trigger —
-post-ingest, timeline creation, the CLI, the demo build — leaves it there, so
-the scorer runs locally and **egress is never a side effect of uploading a
-file**. Exactly one caller sets it: `POST
-/api/cases/{id}/timelines/{id}/recommend-columns` with `{"use_ai": true}`,
-behind the disclosure
-(`frontend/src/components/explorer/ColumnAdvisorNotice.tsx`), which names
-exactly what would be sent, the endpoint URL and the model. Confirming records
-the answer for that timeline (`preferences.column_advisor_optin`, a
-`{timeline_id: bool}` map written through `PUT /api/auth/me/preferences`) and
-only then runs. Cancelling sends nothing and records `false` — a declined
-timeline has to be distinguishable from one nobody has been asked about, or the
-offer below returns on every visit and people learn to dismiss it unread. The
-next timeline asks again, because the sample values sent are that timeline's
-evidence.
+The job takes `use_llm`, defaulting to False. Every automatic trigger —
+post-ingest, timeline creation, the CLI, the demo build — leaves it there, so the
+scorer runs locally and **egress is never a side effect of uploading a file**.
+Exactly one caller sets it: `POST …/recommend-columns` with `{"use_ai": true}`,
+behind a disclosure (`ColumnAdvisorNotice.tsx`) naming exactly what would be sent,
+the endpoint URL and the model. Confirming records the answer for that timeline
+(`preferences.column_advisor_optin`) and only then runs. Cancelling sends nothing
+and records `false` — a declined timeline has to be distinguishable from one
+nobody has been asked about, or the offer returns on every visit and people learn
+to dismiss it unread. The next timeline asks again, because the sample values sent
+are that timeline's evidence.
 
-The disclosure refuses to close while its confirm is in flight — Escape, the
-overlay and the X included. A close is recorded as "no thanks", so a dismissal
-landing between the opt-in write and its response would race a `false` against
-the `true` the analyst just gave, and the stored consent could end up
-contradicting the request that was actually sent.
+The disclosure refuses to close while its confirm is in flight (Escape, overlay
+and X included): a close is recorded as "no thanks", so a dismissal landing
+between the opt-in write and its response would race a `false` against the `true`
+the analyst just gave.
 
-One derived run exists, and it is always local: when an ingest trigger is
-collapsed into an already-running job (`columns/jobs.py::_DIRTY`), that job
-re-runs itself once for the sources it read too early — with `use_llm` unset
-however the run that scheduled it was started, so a burst can never turn one
-opted-in "Suggest with AI" into repeated egress.
+One derived run exists and is always local: when an ingest trigger is collapsed
+into an already-running job (`columns/jobs.py::_DIRTY`), that job re-runs itself
+for the sources it read too early with `use_llm` unset, so a burst can never turn
+one opted-in "Suggest with AI" into repeated egress.
 
-Two surfaces open that disclosure, both through
-`frontend/src/hooks/useColumnRecommendation.ts` so neither can send anything the
-other would not:
-
-- **The "Suggest with AI" button** in the Columns picker, at any time.
-- **A one-time offer** the first time someone with contribute access opens a
-  timeline that holds a `method: "heuristic"` suggestion they have not answered
-  for. The button alone was not enough: the common path (create a timeline, open
-  it) landed on the local answer with nothing on screen saying a better one
-  existed, and a disclosure nobody finds is not a choice anybody made. The offer
-  merely appearing sends nothing — it is the same dialog, gated on the same
-  `capabilities.agent`, and it never fires for a read-only member, a timeline
-  with no local suggestion yet, or one already ranked by the model.
+Two surfaces open the disclosure, both through `useColumnRecommendation.ts` so
+neither can send anything the other would not: the **"Suggest with AI" button** in
+the Columns picker, and a **one-time offer** the first time someone with
+contribute access opens a timeline holding an unanswered `method: "heuristic"`
+suggestion. The offer merely appearing sends nothing — same dialog, same
+`capabilities.agent` gate — and it never fires for a read-only member, a timeline
+with no local suggestion, or one already ranked by the model.
 
 An explicit run from either surface also clears the requesting browser's stored
-column override. The per-user choice still outranks *automatic* recomputes (a
-colleague's ingest never moves anyone's columns), but pressing the button is
-asking for the new answer — leaving the override in place made the button look
-broken, since a single earlier checkbox click had already frozen the grid on the
-suggestion it was showing at the time.
+column override. The per-user choice still outranks *automatic* recomputes, but
+pressing the button is asking for the new answer.
 
 The contribute-access check on the endpoint is the authorization; the stored
 opt-in is the UI's memory of having shown the disclosure, not a second gate. The
-resulting suggestion is shared with everyone who can see the timeline — the
-opt-in governs who *causes* egress, not who may read the result afterwards, and
-the audit row names the analyst who triggered it. See
-`vestigo/columns/__init__.py` for the layering.
+suggestion is shared with everyone who can see the timeline — the opt-in governs
+who *causes* egress, not who may read the result, and the audit row names the
+analyst who triggered it.
 
 ### The converter generator
 
@@ -625,112 +574,89 @@ against a single pathological event, not the window.
 
 ### Sliding context window
 
-`agent/window.py` is the one overflow mechanism (1.5.0), replacing the
-earlier fidelity overflow-ladder and LLM history compaction (retired: the
-summarizer ran on the same possibly-small model and was nondeterministic).
+`agent/window.py` is the one overflow mechanism (1.5.0), replacing the earlier
+fidelity overflow-ladder and LLM history compaction (retired: the summarizer
+ran on the same possibly-small model and was nondeterministic).
 
 - **Mechanism.** A pydantic-ai `ProcessHistory` capability runs
   `apply_window(messages, budget)` before **every model request — mid-turn
-  included** (the failing case overflowed twice inside its first turn, where
-  compaction had nothing to fold). Three passes, cheapest first:
+  included**. Three passes, cheapest first:
   1. *Elide*: oldest-first, each `ToolReturnPart`'s content becomes
      `{"elided": true, "note": …}` until the estimate fits. Structure is
-     untouched, so tool pairing and role alternation survive on every
-     provider protocol.
-  2. *Drop turns*: the oldest user turns are replaced with one marker pair;
-     cuts land on user-turn boundaries only.
-  3. *Truncate the newest returns*: last resort, the only pass touching the
-     request the model is about to reason over — one tool result larger than
-     the whole budget is invisible to the first two passes. Content becomes
+     untouched, so tool pairing and role alternation survive on every provider
+     protocol.
+  2. *Drop turns*: the oldest user turns are replaced with one marker pair; cuts
+     land on user-turn boundaries only.
+  3. *Truncate the newest returns*: last resort, and the only pass touching the
+     request the model is about to reason over — one tool result larger than the
+     whole budget is invisible to the first two passes. Content becomes
      `{"truncated": true, "note": …, "head": …}` with a leading slice (never
      below `MIN_KEEP_CHARS`, 500) so the model can narrow the re-run itself.
 
-  Never elided: the first user request (case/timeline context), the most
-  recent request's tool returns (pass 3 may still truncate them), the last
-  user turn, and all assistant prose. The budget is `context_window × 0.8 −
-  est(system prompt) − est(tool schemas)` (`budget_for`). **All three things
-  that ship in a request are reserved** — history, the system prompt, *and*
-  the advertised tool schemas. Omitting the tool schemas is what let a 76k-token
-  request through a 49k budget on 2026-07-23: 14 of the 30 tools each carry
-  their own copy of the `FilterSpec` definition (~13k tokens total), invisible
-  to a window processor that only sees `messages`. `schema_chars_for_scope`
-  measures the actual advertised schemas for the conversation's tool set (it
-  varies with `disabled_tools`); the copies cannot be hoisted into one shared
-  `$defs` (the OpenAI function-calling wire gives every tool an independent
-  `parameters` schema — see `agent/schema_slim.py`), so the budget counts the
-  duplication honestly instead.
+  Never elided: the first user request (case/timeline context), the most recent
+  request's tool returns (pass 3 may still truncate them), the last user turn,
+  and all assistant prose.
+- **The budget reserves all three things that ship in a request** —
+  `context_window × 0.8 − est(system prompt) − est(tool schemas)` (`budget_for`).
+  The schema share is not optional: 14 of the 30 tools each carry their own copy
+  of the `FilterSpec` definition (~13k tokens), invisible to a window processor
+  that only sees `messages`. `schema_chars_for_scope` measures the actual
+  advertised schemas for the conversation's tool set (it varies with
+  `disabled_tools`); the copies cannot be hoisted into one shared `$defs` (the
+  OpenAI function-calling wire gives every tool an independent `parameters`
+  schema), so the budget counts the duplication honestly instead.
 - **Calibrated estimate, not a fixed divisor.** The default is
-  `CHARS_PER_TOKEN_DEFAULT = 3.0` — `chars/4` was measured against prose, but
+  `CHARS_PER_TOKEN_DEFAULT = 3.0` — `chars/4` was measured against prose, while
   real tool payloads (escaped JSON, base64 params, dotted-quad IPs, UUIDs)
-  measured **2.35** on the 2026-07-23 overflow, a 1.7× error `MARGIN` cannot
-  absorb. When a provider overflow body names the request's token count,
-  `calibrate_chars_per_token` derives the true ratio (`request_chars /
-  reported_tokens`, clamped to 1.5–5.0) and it is persisted under
-  `measured_chars_per_token`; the next turn reads it via
-  `get_last_chars_per_token`. Airgapped-safe — no tokenizer, pure Python.
+  measure closer to 2.35, a 1.7× error `MARGIN` cannot absorb. When a provider
+  overflow body names the request's token count, `calibrate_chars_per_token`
+  derives the true ratio (clamped 1.5–5.0) and persists it under
+  `measured_chars_per_token`. Airgapped-safe — no tokenizer, pure Python.
 - **Transparent to the model.** The stubs sit in the replayed history and the
   system prompt explains them, so the model re-runs narrower or fetches via
   `get_event` instead of reasoning over a silent gap.
-- **Deterministic, applied at send time.** `apply_window` is a pure function
-  of (messages, budget). The stored history blob stays complete — the window
+- **Deterministic, applied at send time.** `apply_window` is a pure function of
+  (messages, budget). The stored history blob stays complete — the window
   rewrites the outgoing request, never the record.
-- **Reactive backstop.** With `context_window` unset, a provider 400/413
-  matching `_is_context_overflow` (deliberately narrow phrasings) enables the
-  window and re-runs the turn **once**. The provider's ground truth wins:
-  when the error body names a window (`_overflow_window_hint`), the budget is
-  recomputed from it with the reserved shares and the calibrated ratio —
-  **whether or not** a budget already exists. Only with no hint does an
-  already-active window fall back to tightening (×0.6); blindly shrinking a
-  configured budget overshoots into turn-dropping, which made the agent re-run
-  its whole orientation sweep three times over in the 2026-07-23 export. A
-  second overflow surfaces `error{code="context_overflow"}`. Learned budget and
-  ratio persist per conversation (`get_last_window_budget`,
-  `get_last_chars_per_token`) so the next turn doesn't repeat the failed round
-  trip; configured `context_window` always wins.
-- **Per-request tool guard** (`agent/runtime.py` `_RequestGuardToolset`).
-  Wraps the MCP toolset and, scoped to one model request (`RunContext.run_step`),
+- **Reactive backstop.** With `context_window` unset, a provider 400/413 matching
+  `_is_context_overflow` (deliberately narrow phrasings) enables the window and
+  re-runs the turn **once**. The provider's ground truth wins: when the error
+  body names a window, the budget is recomputed from it, **whether or not** one
+  already exists — only with no hint does an active window fall back to
+  tightening (×0.6), because blindly shrinking a configured budget overshoots
+  into turn-dropping. A second overflow surfaces `error{code="context_overflow"}`.
+  Learned budget and ratio persist per conversation so the next turn does not
+  repeat the failed round trip; a configured `context_window` always wins.
+- **Per-request tool guard** (`agent/runtime.py::_RequestGuardToolset`). Wraps the
+  MCP toolset and, scoped to one model request (`RunContext.run_step`),
   (a) collapses an identical `(tool, canonical-args)` call to a
-  `{"duplicate_of": …}` back-reference — on 2026-07-23 one turn returned ~100k
-  chars of pure duplicate in three calls, which the window protects because
-  they are the *newest* returns (those three had *different* empty-filter keys
-  collapsing to the same query, the shape the FilterSpec empty-list rejection
-  defends; this guard defends the literal-repeat one) — and (b) caps one
-  request's total tool-return bytes at `budget × 0.5 × chars_per_token`,
-  returning later results reduced with a pointer to `get_event`/narrower
-  filters. The dedupe holds under pydantic-ai's parallel tool execution: the
-  first caller plants an in-flight marker before its first await, so a
-  concurrent identical call awaits the original's outcome instead of running a
-  second time. A `budget_for` floor clamp (budget 1, loudly warned about) also
-  collapses the byte ceiling to ~1 byte, so every non-first return is capped —
-  the misconfiguration shows in the transcript rather than passing silently.
-  Deterministic (keyed on canonical args, reset when `run_step` advances);
-  both actions are counted on the turn's `WindowStats`
-  (`duplicate_calls`, `results_capped`) and land on the same `role="window"`
-  row. This is reduction-for-fit, recorded in the export — distinct from
-  `fidelity.py`'s static per-conversation tier (which must never depend on call
-  order); see that module's docstring for the boundary.
+  `{"duplicate_of": …}` back-reference, and (b) caps one request's total
+  tool-return bytes at `budget × 0.5 × chars_per_token`, returning later results
+  reduced with a pointer to `get_event`/narrower filters. The dedupe holds under
+  pydantic-ai's parallel tool execution: the first caller plants an in-flight
+  marker before its first await, so a concurrent identical call awaits the
+  original's outcome. Deterministic (keyed on canonical args, reset when
+  `run_step` advances); both actions are counted on the turn's `WindowStats` and
+  land on the same `role="window"` row. This is reduction-for-fit, recorded in
+  the export — distinct from `fidelity.py`'s static per-conversation tier, which
+  must never depend on call order.
 - **Config guard-rail.** `fidelity_config_warning` flags an explicit
   `tool_fidelity=full` against a `context_window` below `AUTO_FULL_MIN_WINDOW`
-  (100k) — the exact `full` + 65536 shape that overflowed. Advisory only (the
-  operator keeps the override): logged at turn start, surfaced in the admin
-  agent-settings response `warnings` array, and rendered as a warning box on
-  the admin agent page.
+  (100k). Advisory only — logged at turn start, surfaced in the admin
+  agent-settings `warnings` array, and rendered on the admin agent page.
 - **Forensic trail.** A reduced turn persists one append-only `role="window"`
-  message row (reason, attempt, budget, counts, before/after estimates — the
-  turn's single largest reduction) plus an `agent.window` audit row, written
-  on *every* exit including stop and error. The chat renders them (SSE
-  `window` event), because the case file must answer "why is there less here
-  than there" from itself. Every appended message bumps the conversation's
-  `updated_at` (`add_agent_message`), so a conversation whose turns all failed
-  — history is rewritten only on the success path — no longer freezes at the
-  last successful turn and sorts wrong in the list. Historical transcripts may
-  still carry `compaction`/`fidelity` marker rows from the retired mechanisms;
-  the panel renders those read-only.
+  message row (reason, attempt, budget, counts, before/after estimates) plus an
+  `agent.window` audit row, written on *every* exit including stop and error. The
+  chat renders them (SSE `window` event), because the case file must answer "why
+  is there less here than there" from itself. Every appended message bumps the
+  conversation's `updated_at`, so a conversation whose turns all failed does not
+  freeze at the last successful turn. Historical transcripts may carry
+  `compaction`/`fidelity` rows from the retired mechanisms; the panel renders
+  those read-only.
 - **A retry re-runs the tools, and two of them write.** Re-executed
-  `run_anomaly_detector` runs are tagged (`params["agent_retry_attempt"]`)
-  so the Analysis page's superseded re-runs are distinguishable from an
-  analyst scanning twice; the `role="window"` overflow marker delimits the
-  attempts in the message log.
+  `run_anomaly_detector` runs are tagged (`params["agent_retry_attempt"]`) so the
+  Analysis page's superseded re-runs are distinguishable from an analyst scanning
+  twice; the `role="window"` marker delimits the attempts in the message log.
 
 ### How a turn can end early
 
@@ -755,91 +681,74 @@ marker.
 `AgentConversation.history` is the only thing a follow-up turn replays; the
 `AgentMessage` rows are the human-readable record and never feed the model. It
 used to be written only when a turn reached its result, so a stop, a provider
-error or a process restart discarded the whole turn — the 2026-07-26 export
-shows 125 persisted tool rows against an empty history blob, and the next turn
-re-ran the entire orientation sweep.
+error or a process restart discarded the whole turn.
 
-`stream_turn` now drives `agent.iter` and updates a caller-owned `TurnRecorder`
-after every tool result and at every node boundary, yielding a router-internal
+`stream_turn` drives `agent.iter` and updates a caller-owned `TurnRecorder` after
+every tool result and at every node boundary, yielding a router-internal
 `checkpoint` event. Each snapshot passes through
 `agent/resume.py::repair_partial`, and any checkpoint is replayable on its own.
 
-pydantic-ai already normalizes a history before every request
-(`_clean_message_history`: drop orphaned results, answer dangling calls, merge
-adjacent same-role messages), so `repair_partial` is not there to make the blob
-sendable — it is there to make it *faithful*, and to keep it that way if a
-future version normalizes differently:
+pydantic-ai already normalizes a history before every request, so
+`repair_partial` is not there to make the blob sendable — it is there to make it
+*faithful*, and to keep it that way if a future version normalizes differently:
 
 - **Unpaired calls are answered with the part the tool actually produced.** The
   library's own repair substitutes a generic stub; replaying the real
   `ToolReturnPart` — or `RetryPromptPart`, so a rejection is never replayed as a
-  success — keeps the resumed history in agreement with the run about what each
-  tool returned, including the content's type and its `outcome`. Only a call that
+  success — keeps the resumed history in agreement with the run. Only a call that
   genuinely never returned gets `INTERRUPTED_RESULT`, stamped
   `outcome="interrupted"` so a reader of an export can tell synthesized answers
-  from real ones without parsing prose. Answers are inserted in the request
-  immediately following the response that made the call, because the Anthropic
-  protocol requires that adjacency and nothing downstream reorders across a
-  response.
+  from real ones without parsing prose. Answers are inserted immediately
+  following the response that made the call, because the Anthropic protocol
+  requires that adjacency.
 - **A truncated trailing call is kept, not dropped.** A dead model stream can
   leave a `ToolCallPart` with half-written JSON arguments. Removing it would
   rewrite the shape of a `ModelResponse` whose thinking signature was computed
   over the turn that included the call, and this blob is the only place those
   signatures live. Malformed arguments are already sendable (`args_as_dict`
-  degrades them), so the call is replayed and answered like any other — the same
-  reasoning pydantic-ai gives for its own pass.
+  degrades them), so the call is replayed and answered like any other.
 - **The trailing request/response pair is closed** with a `RESUME_MARKER`
-  response. On 2.17.0 this is belt-and-braces: `_merge_consecutive_messages`
-  already folds a trailing tool-return request into the next turn's prompt
-  request, so the unmerged shape is not a protocol error. But that merge is
-  private API under a `>=` pin, and a checkpoint blob shaped exactly like a
-  completed turn's is one less case for the window and the exporter to reason
-  about. `tests/test_agent_resume.py::test_the_library_still_merges_adjacent_requests`
+  response. Belt-and-braces on 2.17.0, whose private `_merge_consecutive_messages`
+  already folds the unmerged shape — but that is private API under a `>=` pin, and
+  a checkpoint shaped like a completed turn is one less case for the window and
+  the exporter to reason about.
+  `tests/test_agent_resume.py::test_the_library_still_merges_adjacent_requests`
   fails loudly if a bump changes it.
 
 No checkpoint is taken before the model commits a response: there would be
 nothing to save, and closing the pair on a lone prompt would put a reply to the
 analyst in the model's mouth.
 
-Checkpointing is deliberately cheap. The node-boundary checkpoint is skipped
-when the node produced nothing mapped, and when its last mapped event was a
-`tool_result` (that checkpoint already captured the same state), so a
-125-tool-call turn takes ~125 snapshots rather than 250. Reaching the database is
-throttled separately, because each write is a full `dump_history` plus a
-whole-column JSON UPDATE of a monotonically growing blob on the event loop —
-writing every snapshot costs bytes quadratic in the turn's length.
-`_persist_partial` skips a write whose `recorder.revision` has not advanced, and
-skips a periodic one taken less than `_CHECKPOINT_MIN_INTERVAL` (3s) after the
-last. Every terminal exit forces the write regardless, so the floor bounds
-worst-case loss at a few seconds of tool work and never at an analyst's turn. The
-per-tool-result checkpoint stays — losing a tool batch to a `kill -9` is the
-thing this exists to prevent.
+Checkpointing is deliberately cheap. The node-boundary checkpoint is skipped when
+the node produced nothing mapped, and when its last mapped event was a
+`tool_result`, so a 125-tool-call turn takes ~125 snapshots rather than 250.
+Reaching the database is throttled separately, because each write is a full
+`dump_history` plus a whole-column JSON UPDATE of a growing blob on the event loop
+— writing every snapshot costs bytes quadratic in the turn's length.
+`_persist_partial` skips a write whose `recorder.revision` has not advanced, and a
+periodic one taken less than `_CHECKPOINT_MIN_INTERVAL` (3s) after the last. Every
+terminal exit forces the write regardless, so worst-case loss is a few seconds of
+tool work, never an analyst's turn.
 
 The router writes each checkpoint and stamps `history_partial_at`. Only a
-completed turn clears it; a stop is treated as an interruption like any other.
-While it is set, the next turn is run with `RESUME_NOTE` as pydantic-ai
-`instructions` — it tells the model the previous turn ended early and to build
-on the history rather than re-orient, without being folded into the prompt: the
-prompt is persisted verbatim as the analyst's `UserPromptPart`, so a note there
-would claim words the analyst never wrote and stack one stale copy per
-interruption. Instructions come from the current run only (verified against
-pydantic-ai 2.17.0), so a note left on an older `ModelRequest` is never resent.
-The recorder is reset per attempt, so the reactive overflow re-run replays from
-the same pre-turn base rather than concatenating the failed attempt's messages.
-If that re-run dies before its own first checkpoint, attempt 0's stamped
-snapshot stays on the record: it is a faithful account of work that really ran,
-and the window sizes it like any other history on the next turn.
+completed turn clears it; a stop is an interruption like any other. While it is
+set, the next turn runs with `RESUME_NOTE` as pydantic-ai `instructions` — telling
+the model the previous turn ended early and to build on the history rather than
+re-orient, without being folded into the prompt: the prompt is persisted verbatim
+as the analyst's `UserPromptPart`, so a note there would claim words the analyst
+never wrote and stack one stale copy per interruption. Instructions come from the
+current run only, so a note on an older `ModelRequest` is never resent. The
+recorder resets per attempt, so the reactive overflow re-run replays from the same
+pre-turn base rather than concatenating the failed attempt's messages.
 
-`history_partial_at` is on the conversation payload (`to_dict`), so it reaches
-the list and detail responses and the JSON export alongside `raw_history` — a
-reader can tell a replayable turn boundary from a mid-turn checkpoint without
-inspecting the blob. A partial write also bumps `updated_at`, which floats an
-actively streaming conversation to the top of the list; that is the intent.
+`history_partial_at` is on the conversation payload, so it reaches the list and
+detail responses and the JSON export alongside `raw_history` — a reader can tell a
+replayable turn boundary from a mid-turn checkpoint without inspecting the blob.
 
-No extra truncation logic: a resumed history is ordinary `message_history` and
-the sliding window (`agent/window.py`) still sizes every request. Because the
-learned budget and calibrated `chars_per_token` persist per conversation, a
-resumed turn starts with the budget the interrupted turn paid to learn.
+No extra truncation logic: a resumed history is ordinary `message_history` and the
+sliding window still sizes every request. Because the learned budget and
+calibrated `chars_per_token` persist per conversation, a resumed turn starts with
+the budget the interrupted turn paid to learn.
 
 ## Provider notes
 
@@ -881,27 +790,22 @@ route).
 
 ## Testing
 
-- `tests/test_agent_api.py` — availability gate, 503 gating, conversation
-  CRUD + per-user privacy, the full streamed loop over a stubbed MCP tool
-  server with pydantic-ai's `FunctionModel` (no real LLM), thinking-event
-  mapping + persisted rows, the Kimi replay shim, `effort_model_settings`,
-  the proposal lifecycle over HTTP (confirm writes + audits, idempotent
-  409 on redecide, owner-only), admin settings round-trips, `/api/agent/info`
-  shape + key-never-leaks, the JSON export, mid-turn elision end-to-end, and
-  the reactive overflow retry.
-- `tests/test_agent_window.py` — elision order, protected regions,
-  turn-dropping never orphans tool returns, purity and determinism.
-- `tests/test_agent_tools.py` — registry parity, read-parity tools, the
-  extended `FilterSpec`/detector-tuning surface, `propose_annotation`,
-  disabled tools absent from `list_tools` and erroring on call.
-- `tests/test_agent_schema.py` — schema slimming + the serialized-size
-  budget guard.
-- `tests/test_agent_tokens.py` / `tests/test_mcp_http.py` — token model +
-  management API (create/list/revoke, RBAC), token lifecycle over HTTP,
-  scope binding, an end-to-end tool call, off-by-default 404, admin deny
-  list on the external `tools/list`, `propose_annotation` and
-  `propose_story_block` absent from `/mcp`.
-- `tests/test_chart_meta.py` — chart-meta legality table + generated
-  frontend copy is regeneration-stable.
-- Frontend: `frontend/src/test/agent.test.ts` — FilterSpec → EventFilters
-  mapping.
+No test reaches a real LLM — the streamed loop runs over a stubbed MCP tool server
+with pydantic-ai's `FunctionModel`.
+
+- `tests/test_agent_api.py` — availability and 503 gating, conversation CRUD and
+  per-user privacy, the full streamed loop, thinking-event mapping, the Kimi
+  replay shim, `effort_model_settings`, the proposal lifecycle over HTTP (confirm
+  writes + audits, idempotent 409, owner-only), admin settings round-trips,
+  `/api/agent/info` shape and key-never-leaks, the JSON export, mid-turn elision
+  end-to-end, and the reactive overflow retry.
+- `tests/test_agent_window.py` / `test_agent_resume.py` — elision order, protected
+  regions, turn-dropping never orphaning tool returns, purity, checkpoint repair.
+- `tests/test_agent_tools.py` / `test_agent_schema.py` — registry parity, the
+  extended `FilterSpec`/detector surface, `propose_annotation`, disabled tools,
+  schema slimming and the serialized-size budget guard.
+- `tests/test_agent_tokens.py` / `test_mcp_http.py` — token model and management
+  API, scope binding, an end-to-end tool call, off-by-default 404, admin deny list
+  on the external `tools/list`, and the propose-* tools' absence from `/mcp`.
+- `tests/test_chart_meta.py` — chart-meta legality table and regeneration
+  stability. Frontend: `frontend/src/test/agent.test.ts`.

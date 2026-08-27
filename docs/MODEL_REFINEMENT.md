@@ -148,44 +148,29 @@ Artifact = what kind of log record each event is.
 
 ---
 
-## Storage placement audit (2026-07-05)
+## Storage placement
 
-Reviewed every field across Postgres (metadata), ClickHouse (events), and Qdrant (vectors)
-against the goal of minimal redundancy, each store doing what it's best at, and maximum
-performance. Qdrant is the one optional store of the three (single-user/airgapped deployments
-can skip it), so duplication *into* Qdrant is judged more leniently than duplication *between*
-Postgres and ClickHouse.
+Which store owns what, and where duplication is deliberate. Qdrant is the one optional
+store of the three (single-user/airgapped deployments skip it), so duplication *into*
+Qdrant is judged more leniently than duplication between Postgres and ClickHouse.
 
-### Verdict summary
+| Data | Stored in | Why |
+|---|---|---|
+| Case / Source / Timeline / View / Annotation / User / Team / Audit rows | Postgres only | Relational, low-volume, needs transactions, joins and RBAC. |
+| `content_hash`, `byte_offset`, `line_number` per event | ClickHouse only | Genuinely per-event — the forensic pointer back into the raw file. |
+| `file_hash`, `parser_name`, `parser_version` per event | ClickHouse, and on `Source` in Postgres | Deliberate denormalization: constant per source, but ClickHouse dictionary-encodes low-cardinality columns near-free, and it avoids a per-query join against Postgres on the hot event-scan path. |
+| `embedding_model`, `embedding_config_hash` | ClickHouse + `Timeline` (Postgres) + Qdrant payload | Lets a query resolve which Qdrant collection an event's vector lives in straight from the ClickHouse row, with no Postgres round-trip. |
+| Vector payload | Qdrant | Trimmed to what native vector-search filtering needs: `case_id`, `source_id`, `artifact`, `timestamp`. |
 
-| Data point | Stored in | Verdict | Why |
-|---|---|---|---|
-| Case/Source/Timeline/View/Annotation/User/Team/Audit rows | Postgres only | ✅ Correct | Relational, low-volume, needs transactions/joins/RBAC — exactly Postgres's job. |
-| `content_hash`, `byte_offset`, `line_number` per event | ClickHouse only | ✅ Correct | Genuinely per-event; forensic pointer back into the raw file. |
-| `file_hash`, `parser_name`, `parser_version` per event | ClickHouse (+ Source in Postgres) | ✅ Intentional, justified duplication | Constant per source, so this *is* denormalization — but ClickHouse dictionary-encodes low-cardinality columns near-free, and it avoids a per-query join against Postgres (which ClickHouse can't do natively without an external table engine) on the hot event-scan path. Keep. |
-| `embedding_model`, `embedding_config_hash` per event (ClickHouse) + on Timeline (Postgres) + in Qdrant payload | 3 stores | ✅ Justified duplication | Lets a query resolve "which Qdrant collection does this event's vector live in" straight from the ClickHouse row, with zero Postgres round-trip. Same rationale as above. |
-| `vector_id` column (ClickHouse) | ClickHouse | ❌ Pure redundancy — drop | `models/event.py` sets it unconditionally to `str(event_id)` in `__post_init__`; nothing anywhere ever assigns a different value. It's a second name for `event_id`, not an independent identity. Qdrant point IDs already come straight from `event.vector_id` (== `event_id`). Removing the column (using `event_id` as the Qdrant point ID directly) drops one column from every event row with zero behavior change. |
-| `Source.embedding_model` / `Source.embedding_config` (Postgres) | Postgres | ❌ Dead field — drop | Declared on the `sources` table but never written anywhere in the codebase (`create_source` doesn't accept them; grep finds zero writers). The real, live embedding config lives on `Timeline` (`set_timeline_embedding`, driven by `POST /timelines/{id}/embed`). The Source-level fields are vestigial from before embedding moved to timeline-scope and should be removed, not carried forward as decoration. |
-| Full row mirror in Qdrant payload (`message`, `display_name`, `source_file`, `byte_offset`, `line_number`, `content_hash`, `file_hash`, `parser_name`, `parser_version`, `timestamp_desc`, `artifact_long`, ...) | Qdrant + ClickHouse | ⚠️ Over-duplicated | Qdrant point ID == `event_id`, so any field not needed for **native Qdrant filtering** (payload-indexed `case_id`, `source_id`, `artifact`, `timestamp`, `tags`) can be dropped from the payload and fetched from ClickHouse in one batched `event_id IN (...)` lookup after the vector search returns candidate IDs — which callers already do downstream in practice. Trimming the payload to filter-relevant fields cuts Qdrant storage and index-rebuild cost substantially at 10M+ event scale, at the cost of one extra (cheap, PK-indexed) ClickHouse round trip per search. Worth doing since Qdrant is the store most sensitive to payload size on disk/RAM. |
-| `tags` in Qdrant payload | Qdrant | ⚠️ Can go stale | Annotation tags are written only to Postgres (`annotations` table); nothing re-syncs a Qdrant point's `tags` payload after embed time. A tag added post-embedding is invisible to Qdrant-side tag filters until a re-embed. Not a correctness bug in the "evidence" sense (ClickHouse/Postgres stay authoritative), but a silent staleness trap for anyone filtering similarity search by tag. Either drop `tags` from the Qdrant payload (fold into the trim above, re-resolve tags from Postgres/ClickHouse post-search) or accept and document the staleness explicitly. |
+**Qdrant is an index, not a mirror.** The point ID *is* the `event_id`, so full event
+detail resolves through one batched `event_id IN (...)` ClickHouse lookup after the vector
+search returns candidates. `tags` are deliberately not in the payload: annotation tags are
+written only to Postgres and nothing re-syncs a point after embed time, so a payload copy
+would go stale silently and similarity results filtered by it would be wrong. Tags resolve
+from the authoritative row instead.
 
-### Net recommendation
-
-- **ClickHouse stays the single source of truth for event-shaped data**, including the
-  source-constant columns it denormalizes from Postgres — that duplication is deliberate and
-  cheap, keep it.
-- **Qdrant should shrink to an index, not a mirror**: keep only the payload fields needed for
-  native vector-search filtering (`case_id`, `source_id`, `artifact`, `timestamp`, `tags` if kept),
-  drop the rest, and resolve full event detail via a ClickHouse lookup on the returned IDs. This
-  is safe to defer given Qdrant is optional, but becomes a real cost (RAM, reindex time) as
-  case size grows past the millions-of-events range this project targets.
-- **Two dead/redundant fields to actually delete**: `Event.vector_id` (use `event_id` as the
-  Qdrant point ID directly) and `Source.embedding_model`/`Source.embedding_config` in Postgres
-  (superseded by the Timeline-level fields; currently pure vestigial noise on every Source row).
-
-**Status (2026-07-05, M21):** all three cleanups are implemented. `Event.vector_id` is gone
-(the Qdrant point ID is `event_id` directly), the vestigial `Source.embedding_model`/
-`Source.embedding_config` columns are removed, and the Qdrant payload is trimmed to
-`case_id`/`source_id`/`artifact`/`timestamp`. `tags` was dropped from the payload entirely
-(the second option above) — nothing filtered on it natively, and dropping it removes the
-staleness trap; similarity results resolve tags from the authoritative ClickHouse row.
+Three cleanups from the 2026-07-05 placement review shipped in M21 and are recorded here
+as settled rather than pending: `Event.vector_id` is gone (it was only ever
+`str(event_id)`), the vestigial `Source.embedding_model`/`Source.embedding_config` columns
+are removed (the live config lives on `Timeline`), and the Qdrant payload is trimmed as
+above.

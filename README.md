@@ -25,8 +25,6 @@ detectors and Sigma rules — every method documented, and explained in the inte
 for peer review. Every mutating action is audit-trailed and the whole application can be
 pinned offline, so chain of custody survives the investigation.
 
-<!-- Screenshot grid (2x2) pending: Analysis tab with Method panel, Stories with a live
-     embed, Agent with an applied finding, plus a re-shot Explorer at matching size. -->
 <p align="center">
   <img width="2866" height="1589" alt="Vestigo Explorer" src="https://github.com/user-attachments/assets/d505af86-9ba2-4fe1-b448-10b18ae2d409">
 </p>
@@ -135,17 +133,24 @@ The full comparison, including what we hold narrower on purpose, is in
 
 ## Documentation
 
-- [Concept](docs/CONCEPT.md) — vision, target user, data model summary
-- [Deployment](docs/DEPLOYMENT.md) — compose stack, airgapped install, TLS, upgrades
+**Running it**
+
+- [Deployment](docs/DEPLOYMENT.md) — configuration, sizing, compose stack, airgapped install, TLS, upgrades
 - [Sizing calculator](https://overcuriousity.github.io/Vestigo/sizing/) — hardware and `VESTIGO_*` values from your expected dataset size
 - [Input Formats](docs/INPUT_FORMATS.md) — CSV/JSONL/Parquet field-level normalization spec
+
+**Using it**
+
 - [Anomaly Detection](docs/ANOMALY_DETECTION.md) — every detector explained, plain language
 - [Stories](docs/STORIES.md) — the living report: blocks, collaboration, hashed export
 - [AI Agent](docs/AGENT.md) — the optional investigation agent and the external MCP endpoint
-- [Tech Stack](docs/TECH_STACK.md) — why each backing service was chosen
+
+**Why it is built this way**
+
+- [Concept](docs/CONCEPT.md) — vision, target user, data model summary
 - [Model Refinement](docs/MODEL_REFINEMENT.md) — the Case / Source / Timeline / Event / Artifact model
-- [Roadmap](docs/ROADMAP.md) — the open backlog, prioritized
-- [Changelog](CHANGELOG.md)
+- [Tech Stack](docs/TECH_STACK.md) — why each backing service was chosen
+- [Roadmap](docs/ROADMAP.md) — the open backlog · [Changelog](CHANGELOG.md)
 
 ## License
 

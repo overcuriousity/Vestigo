@@ -3,8 +3,7 @@
 The design constraint under test is reproducibility (`CLAUDE.md`): the tier is
 a function of static configuration alone, never of what already ran in the
 turn, so replaying a conversation's tool calls under the same config returns
-byte-identical payloads. See
-`docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md`.
+byte-identical payloads. See `docs/AGENT.md` §"Tool-result fidelity".
 """
 
 from __future__ import annotations

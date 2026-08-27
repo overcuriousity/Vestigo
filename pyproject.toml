@@ -135,9 +135,8 @@ target-version = "py313"
 # Native converters (*2vestigo.py, timesketch2parquet.py) in the same directory ARE linted.
 #
 # `docs/`: ruff formats Python inside Markdown fences, so a bare `ruff format .`
-# silently rewrote the code blocks in `superpowers/plans/*.md` — which are
-# point-in-time records of a proposed shape, not live source (see CLAUDE.md).
-# Reformatting them produces a large diff that says nothing.
+# silently rewrites documentation code blocks — which illustrate a shape, and are
+# not live source. Reformatting them produces a large diff that says nothing.
 extend-exclude = [
     "src/vestigo/assets/converters/*2timesketch.py",
     "docs/**",

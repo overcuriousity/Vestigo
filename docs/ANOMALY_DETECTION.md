@@ -69,488 +69,380 @@ is checked.
 
 ### Query-cost discipline (all statistical detectors)
 
-Three cross-cutting rules keep detector scans survivable on 100M+-row cases
-(added 2026-07 after a 300M-row nginx case took a production box down):
+Cross-cutting rules that keep detector scans survivable on 100M+-row cases (added
+2026-07 after a 300M-row nginx case took a production box down). The operator-facing
+half — how to size the budget and read what resolved — is
+[`DEPLOYMENT.md` §Resource sizing](DEPLOYMENT.md#resource-sizing).
 
 - **Two-phase representative events.** Detector scans aggregate only
-  `argMin(event_id, timestamp)` per group — never `argMin(message, …)`, which
-  forces decompressing the fat `message` column for *every scanned row*
-  (~136 GiB per field on the 300M case). The ≤`limit` findings that survive
-  ranking are hydrated afterwards in one batched `get_events_by_ids` call
-  (`_hydrate_finding_events` / `_hydrate_freq_findings`); a finding whose
-  event vanished mid-flight keeps a minimal `_stub_event` shape.
-- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan** (`max_threads` auto-derived as
+  `argMin(event_id, timestamp)` per group — never `argMin(message, …)`, which forces
+  decompressing the fat `message` column for *every scanned row* (~136 GiB per field
+  on the 300M case). The ≤`limit` findings that survive ranking are hydrated
+  afterwards in one batched `get_events_by_ids` call; a finding whose event vanished
+  mid-flight keeps a minimal `_stub_event` shape.
+- **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan.** `max_threads` is derived as
   cores ÷ `VESTIGO_STAT_SCAN_CONCURRENCY` from the core count ClickHouse reports for
-  itself — `system.settings.max_threads`, which resolves `auto(N)` cgroup-quota-aware;
-  pin it with `VESTIGO_STAT_SCAN_MAX_THREADS`, and detection failure falls back to the
-  former constant 8,
-  spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
-  per-query cap), `max_memory_usage` = total budget / concurrency — the
-  budget auto-sizes to `VESTIGO_STAT_SCAN_MEMORY_RATIO` (0.8) of detected RAM,
-  cgroup-aware; pin it with `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` when ClickHouse
-  is on a different host, ~70% of *that* host's RAM): large GROUP BY states
-  and plain ORDER BY sorts spill to disk, and a runaway query fails alone
-  instead of taking the server with it. Any new detector query that touches
-  the whole corpus must carry it. ClickHouse's own 90%-of-RAM server limit
-  is no substitute — containerized servers misdetect total memory (observed
-  503 GiB on a 128 GiB VM), so this per-query cap is the real bound.
-- **The budget comes from ClickHouse, not from the app's host.** At startup the
-  app reads the ceiling ClickHouse runs under (`system.server_settings`, falling
-  back to `system.asynchronous_metrics`) **and the cache maxima that live under
-  that ceiling** (`mark_cache_size`, `index_mark_cache_size`,
-  `primary_index_cache_size` — the two `uncompressed` caches are excluded
-  because `use_uncompressed_cache` is off by default, so their maxima are never
-  allocated), subtracts the caches, and takes
-  `VESTIGO_STAT_SCAN_MEMORY_RATIO` of what remains — leaving the rest as headroom
-  for background merges, which no per-query cap reaches. Counting the caches is
-  not optional bookkeeping: at 26.6 defaults `index_mark_cache_size` and
-  `primary_index_cache_size` are 5 GiB *each*, so the reference stack's own
-  caches exceeded its whole 9.5 GiB ceiling while `/api/health` reported
-  `risk: "ok"`. Measuring the app's *own* container instead is how a full-docker stack
-  authorized 25.6 GiB per query against a ClickHouse that shared the box with
-  three other services (`docs/DEPLOYMENT.md` §"How this went unnoticed"). The
-  clause is therefore built per query by `heavy_scan_settings()`, not frozen at
-  import — import is the one moment the app cannot ask ClickHouse anything.
-  Two qualifications keep that derivation honest. A ceiling ClickHouse only
-  *derived* (no `max_server_memory_usage`, no container limit — 0.9 x a host it
-  does not own) is capped by the app's own local detection: two guesses, take
-  the lower. And an explicit `max_server_memory_usage` is clamped by
-  `max_server_memory_usage_to_ram_ratio` exactly as the server clamps it, so a
-  pinned value the server silently lowered cannot make the budget optimistic.
+  itself (cgroup-quota-aware; pin with `VESTIGO_STAT_SCAN_MAX_THREADS`, fallback 8);
+  spill thresholds for GROUP BY and plain ORDER BY sit at min(4 GB, half the
+  per-query cap); `max_memory_usage` is the total budget ÷ concurrency. Large GROUP
+  BY states and sorts spill to disk, and a runaway query fails alone instead of
+  taking the server with it. **Any new detector query touching the whole corpus must
+  carry it.** ClickHouse's own 90%-of-RAM server limit is no substitute —
+  containerized servers misdetect total memory (503 GiB observed on a 128 GiB VM).
+- **The budget comes from ClickHouse, not from the app's host.** At startup the app
+  reads the ceiling ClickHouse runs under **and the cache maxima under that ceiling**
+  (`mark_cache_size`, `index_mark_cache_size`, `primary_index_cache_size` — the two
+  `uncompressed` caches are excluded because `use_uncompressed_cache` is off by
+  default, so their maxima are never allocated), subtracts the caches, and takes
+  `VESTIGO_STAT_SCAN_MEMORY_RATIO` of the remainder, leaving headroom for background
+  merges that no per-query cap reaches. Counting the caches is not optional
+  bookkeeping: at 26.6 defaults two of them are 5 GiB *each*, so the reference stack's
+  caches exceeded its whole 9.5 GiB ceiling while `/api/health` reported `risk: "ok"`.
+  The clause is built per query by `heavy_scan_settings()`, not frozen at import —
+  import is the one moment the app cannot ask ClickHouse anything. Two qualifications
+  keep the derivation honest: a ceiling ClickHouse only *derived* is capped by the
+  app's own local detection (two guesses, take the lower), and an explicit
+  `max_server_memory_usage` is clamped by `max_server_memory_usage_to_ram_ratio`
+  exactly as the server clamps it, so a pinned value the server silently lowered
+  cannot make the budget optimistic.
 - **`HEAVY_SCAN_GATE` admission control on every `find_*` detector**: at most
-  `VESTIGO_STAT_SCAN_CONCURRENCY` (2) heavy scans run against ClickHouse at once;
-  surplus scans queue in the app. `max_memory_usage` is per *query* — without
-  the gate, N parallel detector requests (one anomaly-panel load fires
-  several) each carry a full cap and stack past the ClickHouse host's RAM;
-  a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this way.
-  The gate's size and the per-query divisor are the same frozen number
-  (`db/_scan.py::_GATE_CONCURRENCY`), read at import: the semaphore is imported
-  by value and cannot be resized live, so a divisor that followed the live
-  setting would let one console edit authorize twice the total budget the gate
-  admits. `/api/health` reports the value in force and any edit awaiting a
-  restart.
-  Nested helpers (`recommend_*`, `*_inventory`) are not gated — gated scans
-  call them while holding the slot.
-- **`EXPORT_SCAN_GATE` for the one scan that streams to a browser**: the value
-  inventory export (`EventQueryService.iter_field_inventory`) is a whole-corpus
-  `GROUP BY` whose results are drained at the client's pace, which makes it the
-  only heavy scan whose duration is not bounded by ClickHouse. It holds
-  `HEAVY_SCAN_GATE` for the aggregation and hands that slot back at the first
-  block — a sorted aggregate cannot emit a row until every group exists, so the
-  first block proves the scan is over — then holds `EXPORT_SCAN_GATE` (one
-  slot; the count is not configurable) for the drain. Without the handoff, one
-  backgrounded download starves every detector on the box for as long as it sits
-  there; with a second gate, two exports queue instead of stacking two live
-  result streams against the same memory budget. The *wait* for that slot is
-  bounded (`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS`, default 30) and taken by
-  the endpoint before a byte is sent, so a queued export is refused with 503
-  rather than parked on a shared worker thread for as long as someone leaves a
-  download backgrounded.
-  **The gate is not detector-only.** `ClickHouseStore.finalize_enrichment_apply`
-  takes a slot for the whole enrichment partition rewrite (scratch build,
-  `INSERT ... SELECT` over the source's partition, and the `REPLACE PARTITION`
-  swap — the swap included, because it queues merges on freshly written parts
-  and merge memory was never covered by the per-query cap; that wait is scoped
-  to the partition ids the apply staged, since an instance with concurrent
-  ingest always has *some* merge in flight and an unscoped poll would hold the
-  slot for the full timeout every time). Ungated, that
-  rewrite stacked on top of a full set of admitted detector scans and
-  OOM-killed clickhouse-server on a 32 GiB full-docker host mid-apply. Its
-  write side is bounded separately by `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES`,
-  since the scan settings bound a read and the rewrite also materializes a full
-  copy of the partition. That setting is ClickHouse's `min_insert_block_size_bytes`
-  — a squash *floor*, the size a block accumulates to before a part is written —
-  shipped below ClickHouse's own 256 MiB default so it bounds something out of the
-  box. `max_insert_threads` is deliberately left at the ClickHouse default (0, a
-  single-threaded `INSERT SELECT`): each insert thread carries its own squashing
-  buffer, so raising it adds write-side memory to the query being bounded.
-  Anything else that adds a whole-partition or whole-corpus query — read or
-  write — takes a slot too.
-- **Every `VESTIGO_STAT_SCAN_*` setting is restart-required.** The SETTINGS
-  clause is a module-level string built once at import, and the gate is
-  imported by value into each scan module, so an admin-console edit cannot
-  reach the running process. They are declared `restart_required` in the
-  settings registry rather than silently accepting an edit that does nothing.
-  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` is **not** in that group: it is
-  read via `get_settings()` and interpolated when the apply runs, so an
-  admin-console edit takes effect on the next enrichment apply.
-- **Window-function sorts cannot spill** (verified empirically on ClickHouse
-  26.6: the `MergeSortingTransform` feeding a window function runs into
-  `max_memory_usage` regardless of `max_bytes_before_external_sort`, code
-  241). Consequences for any `lagInFrame`-style scan: bound the sort — the
-  timestamp-order detector scans **per source** (one query per source, no
-  case-wide `PARTITION BY source_id`) — and keep the sorted rows slim
-  (fixed-width columns only; `message` is hydrated afterwards for just the
-  reported rows). The 300M-row case OOMed on both counts before this.
-- **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is
-  a non-Nullable sort-key column; events without a parseable timestamp carry
-  `2299-12-31 23:59:59.999 UTC` (`db/_dt.py NULL_TS_SENTINEL`) and are
-  presented as `null` by the API. Every aggregate/bucket over `timestamp`
-  must exclude them via `VESTIGO_NOT_SENTINEL_SQL` — exactly where the old
-  Nullable schema used `timestamp IS NOT NULL`.
-- **Per-source clock-skew offsets (W2) are honored.** When a source carries a
-  nonzero `time_offset_seconds`, every window predicate, bucket, representative
-  first-seen/last aggregate, and timeline-range query runs over the *effective*
-  (offset-corrected) timestamp via `effective_ts_sql` (`db/_offsets.py`), so
-  windows and cadences are judged on the corrected timeline. The applied offset
-  map is stamped into `DetectorRun.params` for reproducibility. The fast path
-  (no in-scope source has an offset) is byte-identical to pre-W2 SQL. The one
-  exception is **timestamp order**: its `lagInFrame` skew math stays on the raw
-  column (a uniform per-source shift cancels within a source), and only the
-  reported timestamps are shifted for display.
+  `VESTIGO_STAT_SCAN_CONCURRENCY` (2) heavy scans run at once; surplus queue in the
+  app. `max_memory_usage` is per *query* — without the gate, N parallel detector
+  requests (one Investigate load fires several) each carry a full cap and stack past
+  the host's RAM; a correctly-pinned 8 GiB cap OOM-killed a 12 GiB host exactly this
+  way. The gate's size and the per-query divisor are the same frozen number
+  (`db/_scan.py::_GATE_CONCURRENCY`), read at import: the semaphore is imported by
+  value and cannot be resized live, so a divisor following the live setting would let
+  one console edit authorize twice the total the gate admits. Nested helpers
+  (`recommend_*`, `*_inventory`) are not gated — gated scans call them while holding
+  the slot.
+- **`EXPORT_SCAN_GATE` for the one scan that streams to a browser.** The value
+  inventory export is a whole-corpus `GROUP BY` drained at the client's pace, which
+  makes it the only heavy scan whose duration ClickHouse does not bound. It holds
+  `HEAVY_SCAN_GATE` for the aggregation and hands that slot back at the first block —
+  a sorted aggregate cannot emit a row until every group exists, so the first block
+  proves the scan is over — then holds `EXPORT_SCAN_GATE` (one slot, not
+  configurable) for the drain. Without the handoff, one backgrounded download starves
+  every detector on the box. The wait for that slot is bounded
+  (`VESTIGO_EXPORT_SCAN_QUEUE_WAIT_SECONDS`, default 30) and taken before a byte is
+  sent, so a queued export is refused with 503 rather than parked on a worker thread.
+- **The gate is not detector-only.** `finalize_enrichment_apply` takes a slot for the
+  whole enrichment partition rewrite — scratch build, `INSERT … SELECT` over the
+  source's partition, and the `REPLACE PARTITION` swap included, because the swap
+  queues merges on freshly written parts and merge memory was never covered by the
+  per-query cap (that wait is scoped to the partition ids the apply staged, since an
+  instance with concurrent ingest always has *some* merge in flight). Ungated, that
+  rewrite stacked on a full set of admitted detector scans and OOM-killed
+  clickhouse-server on a 32 GiB host mid-apply. Its write side is bounded separately
+  by `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` (ClickHouse's
+  `min_insert_block_size_bytes` — a squash *floor*, shipped below ClickHouse's 256
+  MiB default so it bounds something out of the box). `max_insert_threads` stays at
+  the default 0: each insert thread carries its own squashing buffer. Anything else
+  adding a whole-partition or whole-corpus query — read or write — takes a slot too.
+- **Every `VESTIGO_STAT_SCAN_*` setting is restart-required.** The SETTINGS clause is
+  built once at import and the gate is imported by value, so an admin-console edit
+  cannot reach the running process; they are declared `restart_required` rather than
+  silently accepting an edit that does nothing.
+  `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` is **not** in that group — it is read
+  via `get_settings()` when the apply runs.
+- **Window-function sorts cannot spill** (verified on ClickHouse 26.6: the
+  `MergeSortingTransform` feeding a window function runs into `max_memory_usage`
+  regardless of `max_bytes_before_external_sort`, code 241). So any `lagInFrame`-style
+  scan must bound its sort — the timestamp-order detector scans **per source**, no
+  case-wide `PARTITION BY source_id` — and keep sorted rows slim (fixed-width columns
+  only; `message` is hydrated afterwards). The 300M-row case OOMed on both counts.
+- **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is a
+  non-Nullable sort-key column; events without a parseable timestamp carry
+  `2299-12-31 23:59:59.999 UTC` (`NULL_TS_SENTINEL`) and are presented as `null` by
+  the API. Every aggregate or bucket over `timestamp` must exclude them via
+  `VESTIGO_NOT_SENTINEL_SQL`.
+- **Per-source clock-skew offsets are honored.** With a nonzero
+  `time_offset_seconds`, every window predicate, bucket, representative aggregate and
+  range query runs over the *effective* timestamp (`effective_ts_sql`), so windows and
+  cadences are judged on the corrected timeline. The applied offset map is stamped
+  into `DetectorRun.params`. The fast path (no offsets in scope) is byte-identical to
+  the pre-offset SQL. One exception: **timestamp order** keeps its `lagInFrame` skew
+  math on the raw column (a uniform per-source shift cancels within a source), and
+  only the reported timestamps are shifted for display.
 
 ### The analysis gate: which methods are offered up front
 
-The Investigate rail does not run every method on open. `db/analysis_plan.py`
-answers, per method and without scanning a single event, whether that method
-*can* produce a finding on this data; `GET .../analysis/plan` serves the
-verdicts. Inputs are the per-source `field_stats` cache and one
-timestamp-range probe, both already paid for elsewhere. The probe reads the raw
-`timestamp` column — a sort-key prefix, so an index lookup rather than a scan —
-and widens the span it returns by the extremes of any declared per-source clock
-offsets. The span the gate sees is therefore an upper bound of the
-offset-corrected one, which can only make the gate offer a method it might have
-withheld; it never withholds one on that account.
+The Investigate rail does not run every method on open. `db/analysis_plan.py` answers,
+per method and without scanning a single event, whether that method *can* produce a
+finding on this data; `GET .../analysis/plan` serves the verdicts. Inputs are the
+per-source `field_stats` cache and one timestamp-range probe, both already paid for
+elsewhere. The probe reads the raw `timestamp` column — a sort-key prefix, so an index
+lookup rather than a scan — and widens the span by the extremes of any declared
+per-source clock offsets, so the span the gate sees is an upper bound of the corrected
+one: it can only make the gate offer a method it might have withheld, never withhold one.
 
-**A method is `not_applicable` if and only if it structurally cannot produce a
-finding here** — never because it looks unpromising. The distinction is the
-whole contract: a zero from a method that ran means "checked, nothing"; a
-method that was skipped was not checked, and the UI must never present the two
-the same way.
+**A method is `not_applicable` if and only if it structurally cannot produce a finding
+here** — never because it looks unpromising. That distinction is the whole contract: a
+zero from a method that ran means "checked, nothing"; a method that was skipped was not
+checked, and the UI must never present the two the same way.
 
 | Method | Precondition | Setting |
 |---|---|---|
-| `value_novelty`, `timestamp_order`, `log_template` | none — always offered | — |
+| `value_novelty`, `timestamp_order`, `log_template`, `entropy` | none — always offered | — |
 | `value_combo` | ≥2 categorical fields | — |
 | `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
-| `entropy` | none — always offered | — |
 | `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
 | `interval_periodicity` | a second window, then enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` (window: `needs_setup`) |
 | `sequence_novelty` | a second window, then a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` (window: `needs_setup`) |
-| `proportion_shift`, `value_distribution_drift` | a second window exists — i.e. the baseline frame with an active definition | — (reported as `needs_setup`) |
+| `proportion_shift`, `value_distribution_drift` | a second window exists | — (reported as `needs_setup`) |
 
-Three of those rows encode a distinction worth stating, because each was once
-drawn in the wrong place:
+Three rows encode a distinction worth stating, because each was once drawn wrong:
 
-- **`charset` is gated on enum-like fields; `entropy` is not.** Charset learns
-  each field's alphabet *from that field's own values*, so when every value is
-  one of a handful of literals the alphabet already contains every character
-  present and nothing can be novel — a structural impossibility. Entropy's band
-  is a comparison, and one of five enum literals can still sit far outside it (a
-  base64 blob among four short words). Gating entropy here marked a scoreable
-  method `not_applicable`.
-- **`sequence_novelty`'s floor is two distinct series values, not "enough to
-  look interesting".** One value yields a single repeated n-gram and nothing can
-  be novel against it; two already yield 2ⁿ distinct n-grams, and a rare one
-  among them scores normally. A timeline with exactly two artifact types is an
-  ordinary two-source case.
-- **`analysis_gate_min_frequency_buckets` is a count of *seconds*, not of
-  buckets**, despite its name. The detector always splits the span into
-  `stat_frequency_buckets` (60) of them; the gate asks only that the span be
-  wide enough for a bucket to exceed a second. Both numbers appear in the
-  verdict's `reason_facts` so the arithmetic on screen is checkable.
+- **`charset` is gated on enum-like fields; `entropy` is not.** Charset learns each
+  field's alphabet *from that field's own values*, so when every value is one of a
+  handful of literals the alphabet already contains every character present and nothing
+  can be novel — structurally impossible. Entropy's band is a comparison, and one of five
+  enum literals can still sit far outside it (a base64 blob among four short words).
+- **`sequence_novelty`'s floor is two distinct series values**, not "enough to look
+  interesting". One value yields a single repeated n-gram; two already yield 2ⁿ distinct
+  ones, and a rare one among them scores normally.
+- **`analysis_gate_min_frequency_buckets` counts *seconds*, not buckets**, despite its
+  name. The detector always splits the span into `stat_frequency_buckets` (60); the gate
+  asks only that the span be wide enough for a bucket to exceed a second. Both numbers
+  appear in `reason_facts` so the arithmetic on screen is checkable.
 
-All four temporal methods share the window precondition, and it is checked
-*before* their data-shape gates. `interval_periodicity` and `sequence_novelty`
-are temporal-only — both return `insufficient_data` the moment their window
-pair is missing, exactly as the two drift tests do — so gating them on shape
-alone counted them applicable in the self frame, ran them, and rendered a dash
-where the "Set a baseline" affordance belongs. When both a missing window and a
-shape problem apply, the window wins: it is the reason the analyst can act on.
+All four temporal methods share the window precondition, checked *before* their
+data-shape gates. `interval_periodicity` and `sequence_novelty` are temporal-only, so
+gating them on shape alone counted them applicable in the self frame and rendered a dash
+where the "Set a baseline" affordance belongs. When both a missing window and a shape
+problem apply, the window wins: it is the reason the analyst can act on. `needs_setup` is
+a third status, not a weaker skip — an analyst action makes the method applicable, so the
+UI offers that action rather than a "run anyway" that could only produce an empty scan.
 
-`needs_setup` is a third status, not a weaker skip: an analyst action makes the
-method applicable, so the UI offers that action rather than a "run anyway" that
-could only produce a guaranteed-empty scan.
-
-Two properties are load-bearing and are enforced by tests:
+Two properties are load-bearing and test-enforced:
 
 - **Nothing is ever locked.** A `not_applicable` method runs through
-  `GET .../analysis/findings` exactly as any other, returning what an
-  unconditional sweep would have returned.
-- **The gate never skips a method that works.** A wrong precondition fails
-  silently — a method that would have found something is simply not offered —
-  so `tests/test_demo_detector_coverage_clickhouse.py`, which already asserts
-  every analysis tool finds something in the demo case, also asserts the gate
-  offers every one of them there.
+  `GET .../analysis/findings` exactly as any other, returning what an unconditional sweep
+  would have returned.
+- **The gate never skips a method that works.** A wrong precondition fails silently, so
+  `tests/test_demo_detector_coverage_clickhouse.py` — which already asserts every
+  analysis tool finds something in the demo case — also asserts the gate offers every one
+  of them there.
 
-Every verdict carries `reason_facts`, the arithmetic behind it, so the UI can
-state "no field parses as numeric (0 of 19 sampled ≥ 90 %)" rather than a bare
-"not applicable". The numbers in it must come from the measurement they
-describe: `sampled` is the count of tokens the numeric scan actually tested
-(`NumericTokenScan.examined`), not the merged inventory's length, which counts a
-capped and differently-built population. The plan is also fail-open: if it errors, the client marks
-every method applicable and runs everything.
+Every verdict carries `reason_facts`, the arithmetic behind it, so the UI can state "no
+field parses as numeric (0 of 19 sampled ≥ 90 %)" rather than a bare "not applicable".
+The numbers must come from the measurement they describe: `sampled` is the count of
+tokens the numeric scan actually tested, not the merged inventory's length. The plan is
+fail-open — if it errors, the client marks every method applicable and runs everything.
 
 ### Muting a method
 
-Some defects belong to the evidence rather than to the behavior it records. A
-capture whose sources disagree about the clock makes `timestamp_order` fire on
-millions of rows: every finding true, none of them the investigation. Reading
-past that is not triage, so an analyst can take the method out of the sweep
-instead of dismissing its findings one at a time.
+Some defects belong to the evidence rather than the behavior it records. A capture whose
+sources disagree about the clock makes `timestamp_order` fire on millions of rows: every
+finding true, none of them the investigation. Reading past that is not triage, so an
+analyst can take the method out of the sweep instead of dismissing findings one at a time.
 
 The mute is a list of method ids on `Timeline.muted_methods`, written through
-`PATCH /api/cases/{case}/timelines/{timeline}/muted-methods` (contribute access,
-unknown ids rejected with a 422, every change audited as
-`timeline.update_muted_methods`). It is **shared, not per-browser**: "this
-source's clocks are a mess" is a conclusion about the data that the next analyst
-on the case should inherit rather than rediscover.
+`PATCH …/muted-methods` (contribute access, unknown ids 422, audited as
+`timeline.update_muted_methods`). It is **shared, not per-browser**: "this source's clocks
+are a mess" is a conclusion the next analyst should inherit rather than rediscover.
 
-A mute is a *reading* preference and is held to the same "advice, never a lock"
-contract as the gate itself:
+A mute is a *reading* preference, held to the same "advice, never a lock" contract as the
+gate:
 
-- **The plan does not consult it.** A muted method still reports its real
-  status, because a mute is not a claim that the method cannot produce a finding
-  here — that would be the gate's statement to make, and a false one. This is
-  pinned by `tests/test_timeline_muted_methods_api.py`.
-- **`GET .../analysis/findings` still runs it** when asked for by name, so the
-  Tools sheet's "Run anyway" works on a muted method exactly as it does on a
-  gated one. Running a muted method does not unmute it; they are different acts.
-- **The client is what skips it.** `useStreamingSweep` does not issue the query,
-  which is what removes the method from the findings feed, from the histogram
-  and grid markers derived from that feed, and from the sweep's progress
-  denominator, all from one decision rather than three that can drift.
+- **The plan does not consult it.** A muted method still reports its real status, because
+  a mute is not a claim that the method cannot produce a finding here — that would be the
+  gate's statement to make, and a false one.
+- **`GET .../analysis/findings` still runs it** when asked for by name, so "Run anyway"
+  works on a muted method exactly as on a gated one. Running a muted method does not
+  unmute it; they are different acts.
+- **The client is what skips it.** `useStreamingSweep` does not issue the query, which
+  removes the method from the findings feed, from the histogram and grid markers derived
+  from it, and from the sweep's progress denominator — one decision rather than three
+  that can drift.
 
-Because a mute makes the rail quieter, disclosure is not optional. The rail's
-top strip always names the count when anything is muted, the Tools accounting
-counts muted methods separately from both "ran" and "skipped" and shows no
-count for a muted row — its query never ran, so a `0` there would assert the
-"checked, clear" misread this whole surface exists to prevent — and every mute
-is reversible from either surface.
+Because a mute makes the rail quieter, disclosure is not optional. The rail's top strip
+always names the count when anything is muted; the Tools accounting counts muted methods
+separately from both "ran" and "skipped" and shows no count for a muted row — its query
+never ran, so a `0` there would assert the "checked, clear" misread this surface exists
+to prevent — and every mute is reversible from either surface.
 
 ### Declaring which fields a method reads
 
-A method that picks its own fields picks them from a recommender, and the
-recommenders type fields **syntactically** — they say so in their own
-docstrings. An HTTP status code parses as a number, so `numeric_range` offers
-it, learns a band over `{200, 301, 404, 500}` and reports the 500s as outliers
-forever. It is a categorical field wearing digits, and no amount of probing
-discovers that: only an analyst (or an agent reasoning about the field's
-meaning) knows what the field *is*. The Fields picker could correct it for one
-run, but the correction died with the component's state and the next analyst
-never learned it had been made.
+A method that picks its own fields picks them from a recommender, and the recommenders
+type fields **syntactically**. An HTTP status code parses as a number, so `numeric_range`
+offers it, learns a band over `{200, 301, 404, 500}` and reports the 500s as outliers
+forever. It is a categorical field wearing digits, and no amount of probing discovers
+that: only an analyst (or an agent reasoning about the field's meaning) knows what the
+field *is*. The Fields picker could correct it for one run, but the correction died with
+the component's state and the next analyst never learned it had been made.
 
-`Timeline.field_overrides` is where that correction becomes durable:
-`{method_id: {field_token: bool}}`, where `true` pins a field into a method's
-automatic selection and `false` takes it out. It is written through
-`PATCH /api/cases/{case}/timelines/{timeline}/field-overrides` (contribute
-access, every change audited as `timeline.update_field_overrides`) and, like the
-mute list, is
-**shared rather than per-browser** — "status codes are not a range field here"
-is a conclusion about the data the next analyst should inherit.
+`Timeline.field_overrides` makes that correction durable: `{method_id: {field_token:
+bool}}`, where `true` pins a field into a method's automatic selection and `false` takes
+it out. Written through `PATCH …/field-overrides` (contribute access, audited as
+`timeline.update_field_overrides`) and, like the mute list, **shared rather than
+per-browser**.
 
-It is **per method**, not per field, and that is the point: the same status code
-is meaningless to `numeric_range` and an excellent `value_novelty` field, so
-`numeric_range` drops it while `value_novelty` keeps it. A per-(method, field)
-blocklist of *findings* would record the symptom and have to be repeated for
-every numeric-ish detector added later; this records the decision at the one
-place both the unprompted sweep and the picker's auto default derive from.
+It is **per method**, not per field, and that is the point: the same status code is
+meaningless to `numeric_range` and an excellent `value_novelty` field. A per-(method,
+field) blocklist of *findings* would record the symptom and have to be repeated for every
+numeric-ish detector added later; this records the decision at the one place both the
+unprompted sweep and the picker's auto default derive from.
 
-A declaration that could never apply is rejected with a 422 rather than stored:
-an empty field token, an unknown method id, and a *known* method that selects no
-fields of its own — `frequency` and `sequence_novelty` take a single named
-`series_field`, `timestamp_order` reads no field, `log_template` clusters the
-message text (`FIELD_OVERRIDE_METHOD_IDS` in `db/analysis_plan.py`). Stored, any
-of those would be audited and rendered under "Declared fields" as an effective
-decision while the detector scanned exactly as before, without a warning to say
-so.
+A declaration that could never apply is rejected with 422 rather than stored: an empty
+field token, an unknown method id, and a *known* method that selects no fields of its own
+(`frequency` and `sequence_novelty` take a single named `series_field`, `timestamp_order`
+reads no field, `log_template` clusters the message text —
+`FIELD_OVERRIDE_METHOD_IDS`). Stored, any of those would be audited and rendered under
+"Declared fields" as an effective decision while the detector scanned exactly as before.
 
-The same "advice, never a lock" contract as the gate and the mute:
+Same "advice, never a lock" contract as the gate and the mute:
 
-- **It applies only to automatic selection.** `apply_field_overrides`
-  (`db/anomaly_stats.py`) sits between a recommender's answer and the detector's
-  scan list; an explicit `fields=[…]` never reaches it, so naming an excluded
-  field still scans it.
-- **The plan does not consult it.** A declaration is not a claim that the method
-  cannot produce a finding here.
-- **A held-back field is disclosed.** Every detector that dropped one names it
-  in `warnings`, because a silently narrower scan is indistinguishable from a
-  scan that found nothing — the exact "checked, clear" misread this surface
-  exists to prevent. A pin naming a field the timeline does not have is dropped
-  and disclosed the same way, rather than scanned as an always-empty column.
-  The count is what *this run* lost, always measured against the selection an
-  undeclared run would have scanned: excluding a field ranked far below a
-  detector's cap changes nothing, and claiming otherwise would both over-state
-  the narrowing and make the sentence's counts incomparable between detectors.
-- **Pins go first.** They are applied before each detector's `_MAX_AUTO_SCAN_FIELDS`
-  slice, since being ranked below the cut is precisely why a field gets pinned —
-  including a field the recommender *did* rank: a pin moves it ahead of the cut
-  rather than leaving it at its rank, or pinning the field an analyst is most
-  likely to pin would do nothing. The slice is re-applied afterwards, so a
-  declaration can reorder a scan but never enlarge it past its own cap.
-- **`value_distribution_drift` classifies a pin before placing it.** Its two
-  branches (KS over numeric fields, G-test over categorical ones) share one
-  declaration, so a pinned field neither recommender selected is put through the
-  same syntactic numeric probe the explicit-`fields` path uses and lands in the
-  branch that probe indicates. The "not present in this timeline" disclosure is
-  resolved once against both recommenders' candidates, so the run can never
-  scan a field in one branch and report it missing from the other. The two
-  branches split one cap, and the categorical half's budget never falls below
-  its own pins — otherwise a timeline wide enough to fill the cap with numeric
-  fields would drop a pinned categorical field silently.
-- **The declaration is part of a run's diary.** `DetectorRun.params` records the
-  method's slice as it stood at run time, next to the windows and the effective
-  thresholds: two runs whose `fields` both read `auto` can have scanned
-  different sets once the declaration is edited, and an applied pin — unlike an
-  exclusion, which reaches `warnings` — leaves no other trace. Recorded only
-  where it steered the run: a run with an explicit `fields` bypasses the
-  declaration, so citing it there would claim a decision shaped a scan it never
-  touched.
+- **It applies only to automatic selection.** `apply_field_overrides` sits between a
+  recommender's answer and the detector's scan list; an explicit `fields=[…]` never
+  reaches it, so naming an excluded field still scans it.
+- **The plan does not consult it.** A declaration is not a claim that the method cannot
+  produce a finding here.
+- **A held-back field is disclosed.** Every detector that dropped one names it in
+  `warnings`, because a silently narrower scan is indistinguishable from a scan that
+  found nothing. A pin naming a field the timeline does not have is dropped and disclosed
+  the same way, rather than scanned as an always-empty column. The count is what *this
+  run* lost, measured against the selection an undeclared run would have scanned:
+  excluding a field ranked far below a detector's cap changes nothing, and claiming
+  otherwise would over-state the narrowing and make the counts incomparable.
+- **Pins go first**, applied before each detector's `_MAX_AUTO_SCAN_FIELDS` slice — being
+  ranked below the cut is precisely why a field gets pinned, including one the
+  recommender *did* rank. The slice is re-applied afterwards, so a declaration can
+  reorder a scan but never enlarge it past its own cap.
+- **`value_distribution_drift` classifies a pin before placing it.** Its two branches (KS
+  over numeric fields, G-test over categorical) share one declaration, so a pinned field
+  neither recommender selected goes through the same syntactic numeric probe the
+  explicit-`fields` path uses and lands in the branch it indicates. The "not present in
+  this timeline" disclosure is resolved once against both recommenders' candidates, so a
+  run can never scan a field in one branch and report it missing from the other. The
+  branches split one cap, and the categorical half's budget never falls below its own
+  pins.
+- **The declaration is part of a run's diary.** `DetectorRun.params` records the method's
+  slice as it stood at run time, next to the windows and effective thresholds: two runs
+  whose `fields` both read `auto` can have scanned different sets once the declaration is
+  edited, and an applied pin — unlike an exclusion, which reaches `warnings` — leaves no
+  other trace. Recorded only where it steered the run: a run with an explicit `fields`
+  bypasses the declaration, so citing it there would claim a decision shaped a scan it
+  never touched.
 
 Detectors that select their own fields all route through it: `value_novelty`,
 `value_combo`, `numeric_range`, `charset`, `entropy`, `proportion_shift`,
-`interval_periodicity` and `value_distribution_drift`. In the UI the control is
-the small pin/exclude button beside each chip in the Fields picker (the checkbox
-still scopes the single run — two different questions, two different controls),
-the picker's auto preview applies the declaration exactly as the backend does,
-and the Tools sheet's Methods tab summarizes and resets what a timeline
-declares. Pinned by `tests/test_field_overrides.py` and
-`tests/test_timeline_field_overrides_api.py`.
+`interval_periodicity`, `value_distribution_drift`. In the UI the control is the small
+pin/exclude button beside each chip in the Fields picker (the checkbox still scopes the
+single run — two questions, two controls); the picker's auto preview applies the
+declaration exactly as the backend does, and the Tools sheet's Methods tab summarizes and
+resets what a timeline declares.
 
 ### The analysis cache
 
-`GET .../analysis/findings` is memoized in `analysis_cache` (`db/analysis_cache.py`),
-keyed on a SHA-256 of everything that can change an answer: the timeline, the
-sorted set of source content hashes, the enrichment generation, the frame and
-baseline, the method, its canonical params, the row `limit`, and
-`dispositions_hash`.
+`GET .../analysis/findings` is memoized in `analysis_cache`, keyed on a SHA-256 of
+everything that can change an answer: the timeline, the sorted set of source content
+hashes, the enrichment generation, the frame and baseline, the method, its canonical
+params, the row `limit`, and `dispositions_hash`.
 
-Five of those inputs are not request parameters, and each closes a way of
-being served a wrong answer as proof:
+Five of those inputs are not request parameters, and each closes a way of being served a
+wrong answer as proof:
 
-- **the baseline definition's content hash**, not just its id. `PUT
-  .../baselines/{id}` replaces the windows in place, so an edited definition
-  keeps its id — keying on the id alone would serve the pre-edit findings under
-  the new name.
-- **the timeline's `field_mappings`**, which every detector resolves canonical
-  field aliases through. Remapping a field changes what was scanned.
-- **the per-source `time_offset_seconds`**, the declared clock-skew correction
-  the temporal detectors bucket against.
-- **this method's slice of `field_overrides`**, which decides what the detector
-  scans when it picks its own fields. An answer computed before a field was
+- **the baseline definition's content hash**, not just its id — `PUT .../baselines/{id}`
+  replaces windows in place, so an edited definition keeps its id.
+- **the timeline's `field_mappings`**, which every detector resolves canonical aliases
+  through. Remapping a field changes what was scanned.
+- **the per-source `time_offset_seconds`**, the declared clock-skew correction the
+  temporal detectors bucket against.
+- **this method's slice of `field_overrides`** — an answer computed before a field was
   declared off is an answer to a different question.
-- **the runtime-editable `stat_*` settings**, the thresholds every runner falls
-  back to when a knob is omitted. An admin lowering `stat_z_threshold` in the
-  console changes every default-parameter answer in the system. Taken as a
-  prefix sweep so a newly added threshold cannot be forgotten; `stat_scan_*` is
-  excluded, since those tune ClickHouse's resource budget rather than the
-  conclusion.
+- **the runtime-editable `stat_*` settings**, the thresholds every runner falls back to
+  when a knob is omitted. Taken as a prefix sweep so a newly added threshold cannot be
+  forgotten; `stat_scan_*` is excluded, since those tune ClickHouse's resource budget
+  rather than the conclusion.
 
-`frame` and `baseline_id` are cross-validated rather than trusted
-independently: the runners key off the id while the response — and therefore
-every verdict's recorded provenance — is stamped with the frame, so a request
-where the two disagree is a 422 rather than a comparison labelled as its
-opposite.
+`frame` and `baseline_id` are cross-validated rather than trusted independently: the
+runners key off the id while the response — and every verdict's recorded provenance — is
+stamped with the frame, so a request where the two disagree is a 422 rather than a
+comparison labelled as its opposite. `limit` is in the key because every runner truncates
+to it: a payload computed at fifty rows is not the answer to a request for five hundred.
 
-`limit` is in the key because every runner truncates to it: a payload computed
-at fifty rows is not the answer to a request for five hundred, and serving it
-as a hit would assert a completeness it does not have.
+Params enter the key **after** validation, not as the client sent them. Each method
+declares its knobs as a Pydantic model (`METHOD_MODELS`) with `extra="forbid"` and the
+same bounds `GET /anomalies` declares. That model is the single declaration of a method's
+parameters — `METHOD_PARAMS`, which the frontend's method-registry test checks against,
+is derived from it. So a typo'd knob 422s rather than computing the default answer under
+a key claiming the typo, and `2` and `2.0` are one question with one key.
 
-Params enter the key **after** validation, not as the client sent them. Each
-method declares its knobs as a Pydantic model in `api/routers/analysis.py`
-(`METHOD_MODELS`), with `extra="forbid"` and the same bounds `GET /anomalies`
-declares as query constraints. That model is the single declaration of a
-method's parameters — `METHOD_PARAMS`, which the frontend's method-registry
-test checks its knobs against, is derived from it. Two consequences: a typo'd
-knob 422s rather than computing the default answer under a key claiming the
-typo, and `2` and `2.0` are one question with one key.
+Dismissals and confirmations are applied to the **response**, after the cache, never
+before it. The key covers `normal` verdicts only, since those are what change a
+computation; a cached payload that had already been dismissal-filtered would keep a later
+dismissal invisible until something unrelated invalidated it. `include_dismissed` is
+therefore presentation-only in the full sense.
 
-Dismissals and confirmations are applied to the **response**, after the cache,
-never before it. The key covers `normal` verdicts only, since those are what
-change a computation; a cached payload that had already been
-dismissal-filtered would keep a later dismissal invisible until something
-unrelated invalidated it. `include_dismissed` is therefore presentation-only in
-the full sense — it changes what is shown and never what is computed or
-stored.
+Sources are immutable after ingestion (enrichment applies excepted, and those move the
+generation), so identical inputs cannot describe different data: **a hit is proof the
+answer still holds**, not a judgement that it is recent enough. There is deliberately no
+TTL — adding one would reintroduce exactly the staleness guesswork the key removes.
 
-Sources are immutable after ingestion (enrichment applies excepted, and those
-move the generation), so identical inputs cannot describe different data: **a
-hit is proof the answer still holds**, not a judgement that it is recent
-enough. There is deliberately no TTL — "is this recent?" is not the question,
-and adding one would reintroduce exactly the staleness guesswork the key
-removes.
+`dispositions_hash` is in the key because `normal` verdicts are detection-affecting. That
+hash is timeline-wide rather than per-method, which over-invalidates slightly — the safe
+direction, costing a rescan rather than a wrong answer.
 
-`dispositions_hash` is in the key because `normal` verdicts are
-detection-affecting: marking a value normal must invalidate cached findings
-that would otherwise keep showing it. That hash is timeline-wide rather than
-per-method, which over-invalidates slightly — the safe direction, costing a
-rescan rather than a wrong answer.
-
-Every row is derived data. Eviction is per case
-(`analysis_cache_max_rows_per_case`) and costs a rescan and nothing else, which
-is why it needs no audit trail. It is least-recently-**computed**, not
-least-recently-used, and the distinction is deliberate: a cache *hit* writes
-nothing, because `GET .../analysis/findings` is a `require_case_read` endpoint
-whose one write exception is the miss path, and restamping on every hit would
-trade the entire value of the hit path for a better eviction order. A recompute
-does restamp `computed_at`. The worst case is that a hot entry computed long ago
-is evicted ahead of a cold one computed recently — one rescan, never a wrong
-answer. Eviction runs only on an insert that actually exceeds the cap; a replace
-cannot grow the table. `DetectorRun` is unchanged and keeps its separate role:
-the accumulating forensic diary of what an analyst ran.
+Every row is derived data. Eviction is per case (`analysis_cache_max_rows_per_case`) and
+costs a rescan and nothing else, which is why it needs no audit trail. It is
+least-recently-**computed**, not least-recently-used: a cache *hit* writes nothing,
+because `GET .../analysis/findings` is a `require_case_read` endpoint whose one write
+exception is the miss path, and restamping on every hit would trade the entire value of
+the hit path for a better eviction order. The worst case is a hot entry computed long ago
+evicted ahead of a cold recent one — one rescan, never a wrong answer. Eviction runs only
+on an insert that exceeds the cap; a replace cannot grow the table. `DetectorRun` keeps
+its separate role: the accumulating forensic diary of what an analyst ran.
 
 ### Scope provenance
 
-A finding is meaningless without the comparison that produced it, so both
-sides now record it:
+A finding is meaningless without the comparison that produced it, so both sides record it:
+every plan and findings response carries a `scope` object (frame, baseline id and name,
+dispositions hash), and `finding_dispositions.analysis_scope` records the comparison a
+verdict was reached under. That column is nullable — rows written before it existed read
+as "scope not recorded", which is honest where a backfill would be invention. It is the
+one JSON column in the model that is *compared* rather than only stored, hence `JSONB` on
+PostgreSQL (migration `0027`): `json` has no equality operator there. Writes and
+comparisons both go through the canonical key-sorted form (`postgres.canonical_scope`).
 
-- Every plan and findings response carries a `scope` object (frame, baseline id
-  and name, dispositions hash).
-- `finding_dispositions.analysis_scope` records the comparison a verdict was
-  reached under. Nullable — rows written before this existed read as "scope not
-  recorded", which is honest where a backfill would be invention. Named
-  `analysis_scope` because that model already uses "scope" for the
-  value-vs-event distinction. It is the one JSON column in the model that is
-  *compared* rather than only stored, hence `JSONB` on PostgreSQL (migration
-  `0027`): `json` has no equality operator there. SQLite keeps the plain-JSON
-  text encoding, so both dialects only agree because writes and comparisons go
-  through the canonical key-sorted form (`postgres.canonical_scope`).
+`analysis_scope` is deliberately **not** part of `dispositions_hash`: that hashes
+detection-affecting facts, and scope-at-verdict-time is provenance. Extending it would
+invalidate the reproducibility record of every existing `DetectorRun` for no detection
+benefit.
 
-`analysis_scope` is deliberately **not** part of `dispositions_hash`: that
-hashes detection-affecting facts, and scope-at-verdict-time is provenance.
-Extending it would invalidate the reproducibility record of every existing
-`DetectorRun` for no detection benefit.
+It *does* join the dedupe identity for `confirmed` only. That verdict asserts something
+about a comparison — escalating a finding against the February baseline and again against
+the March one are two separate claims, and collapsing them would lose one. `normal`,
+`dismissed` and `routine` are standing declarations about a value under every frame;
+duplicating those per scope would inflate the dispositions hash and the triage burndown
+without expressing anything new. A consequence worth stating: a case can hold two
+`confirmed` verdicts on one finding, so coverage counters must count distinct findings
+rather than disposition rows.
 
-It *does* join the dedupe identity for `confirmed` only. That verdict asserts
-something about a comparison — escalating a finding against the February
-baseline and again against the March one are two separate claims, and
-collapsing them would lose one. `normal`, `dismissed` and `routine` are
-standing declarations about a value under every frame; duplicating those per
-scope would inflate the dispositions hash and the triage burndown without
-expressing anything new. A consequence worth stating: a case can hold two
-`confirmed` verdicts on one finding, so coverage counters must count distinct
-findings rather than disposition rows.
+An unstamped row is never adopted into a stamped one. A `confirmed` verdict carrying no
+scope answers only for "scope not recorded"; re-confirming that finding under a real
+scope writes its own row rather than backfilling the old one, because stamping a frame
+onto a verdict that was not reached under it is the same invention the nullable column
+exists to avoid.
 
-An unstamped row is never adopted into a stamped one. A `confirmed` verdict
-carrying no scope answers only for "scope not recorded"; re-confirming that
-finding under a real scope writes its own row rather than backfilling the old
-one, because stamping a frame onto a verdict that was not reached under it is
-the same invention the nullable column exists to avoid. The cost is one extra
-row per legacy finding that gets re-confirmed, which is a counting artifact
-rather than a false claim.
-
-Every write path stamps it, including `POST
-.../anomalies/persist` — the endpoint behind the UI's Confirm button, and the
-only one it reaches. That is not incidental: `confirmed` is the sole kind whose
+Every write path stamps it, including `POST .../anomalies/persist` — the endpoint behind
+the UI's Confirm button, and the only one it reaches. `confirmed` is the sole kind whose
 identity includes the scope, so a persist path that dropped it would leave every
-confirmed row in a real deployment carrying `NULL`, and the column, its
-migration and the per-scope dedupe would all be unreachable code.
+confirmed row in a real deployment carrying `NULL`.
 
-Reading follows the same rule. `_apply_confirmations` badges a finding
-`confirmed` only when the covering verdict was reached under the comparison the
-request ran under; a verdict from a *different* one sets
-`confirmed_other_scope`, which the rail renders as a muted "confirmed
-elsewhere" marker with Confirm still live. Without that split the February
-verdict would badge the row under March and disable Confirm, making the second
-claim unreachable from the UI. A row with no recorded scope badges under every
-comparison — demoting it would silently unbadge existing evidence.
+Reading follows the same rule. `_apply_confirmations` badges a finding `confirmed` only
+when the covering verdict was reached under the comparison the request ran under; a
+verdict from a *different* one sets `confirmed_other_scope`, which the rail renders as a
+muted "confirmed elsewhere" marker with Confirm still live. Without that split the
+February verdict would badge the row under March and disable Confirm, making the second
+claim unreachable from the UI. A row with no recorded scope badges under every comparison
+— demoting it would silently unbadge existing evidence.
 
-Changing scope re-runs every method and reframes every verdict already
-recorded, so the UI gates it behind a confirm that names both counts. Existing
-verdicts are never discarded or rewritten — they are kept and stay tagged with
-the scope they were reached under, and findings covered only by an
-out-of-scope verdict are marked so they can be re-examined.
+Changing scope re-runs every method and reframes every verdict already recorded, so the
+UI gates it behind a confirm that names both counts. Existing verdicts are never
+discarded or rewritten — they stay tagged with the scope they were reached under, and
+findings covered only by an out-of-scope verdict are marked for re-examination.
 
 ### Baseline definitions, suspect windows, and the normality model
 
@@ -1158,88 +1050,65 @@ invisible characters are visible in the report.
 
 ### Caveats
 
-- **Per-identifier scoping is opt-in via `group_field`.** AMiner's
-  `CharsetDetector` always learns a separate charset per `id_path_list` value;
-  Vestigo learns one alphabet per field across the scope by default, and
-  `group_field` (e.g. `attr:host`) learns one alphabet per value of that field
-  instead — a field that is legitimately Cyrillic for one host and ASCII for
-  the rest no longer merges into a reference alphabet that flags neither. Both
-  modes honor it, the skip guards below apply per group, and suppressions stay
-  keyed on `(field, value)`, applying across groups. Findings name their group
-  in `details.group_field`/`details.group_value`, which reference scored them
-  in `details.group_basis`, and how much evidence the group itself contributed
-  in `details.group_baseline_distinct_values`.
-- **The two skip guards mean opposite things, so a group failing one is not
-  treated like a group failing the other.** A reference alphabet over 5,000
-  characters (CJK prose, base64 blobs mixing full alphabets) means *the
-  question does not apply* — "novel character" carries no signal there however
-  much data you have — so that group is **dropped** and named in `warnings`.
-  Fewer than 20 distinct values means *not enough evidence to learn this
-  group's own alphabet*, which does not exonerate it, so that group is scored
-  against a **fallback** reference instead. Note that "absent from the baseline
+- **Per-identifier scoping is opt-in via `group_field`.** AMiner's `CharsetDetector`
+  always learns a separate charset per identifier; Vestigo learns one alphabet per
+  field across the scope by default, and `group_field` (e.g. `attr:host`) learns one
+  per value of that field instead — so a field that is legitimately Cyrillic for one
+  host and ASCII for the rest no longer merges into a reference alphabet that flags
+  neither. Both modes honor it, the skip guards apply per group, and suppressions
+  stay keyed on `(field, value)`, applying across groups. Findings name their group
+  (`details.group_field`/`group_value`), which reference scored them
+  (`details.group_basis`) and how much evidence the group contributed
+  (`details.group_baseline_distinct_values`).
+- **The two skip guards mean opposite things.** A reference alphabet over 5,000
+  characters (CJK prose, base64 blobs) means *the question does not apply* — "novel
+  character" carries no signal there however much data you have — so that group is
+  **dropped** and named in `warnings`. Fewer than 20 distinct values means *not
+  enough evidence to learn this group's own alphabet*, which does not exonerate it,
+  so that group is scored against a **fallback** reference. "Absent from the baseline
   window" is just the `n_vals = 0` case of the same condition: routing 0 to a
-  fallback but 3 to a blind spot would mean less evidence bought better
-  treatment, right where a freshly provisioned host would sit. Ungrouped, both
-  guards skip the whole field as before; if every scanned field skips, the
-  status is `insufficient_data`.
-- **The fallback reference is mode-specific**, learned with the rare-chars
-  recipe, and named on every finding it scores:
-  - temporal → `details.group_basis = "outside-suspect-windows"`, learned from
-    events *outside* the suspect windows. Learning it over the whole scope
-    would let the suspect values into their own reference and mask themselves.
-  - self-baseline → `details.group_basis = "scope-merged"`, the merged
-    whole-scope alphabet — which is exactly what the field was scored against
-    before `group_field` existed, so enabling grouping never narrows coverage.
-
-  Groups scored this way are named in `warnings`, with "had no baseline-window
-  values" and "had fewer than 20 distinct values of their own" reported
-  separately. If no fallback can be learned either, those groups go unevaluated
-  and the run says which ones and which guard the fallback itself tripped.
-  Every one of these warnings names the *field* alongside the groups: the same
-  group can be thin for one field and absent from the baseline window for
-  another, and a merged sentence would leave no way to tell which is which.
+  fallback but 3 to a blind spot would mean less evidence bought better treatment,
+  right where a freshly provisioned host would sit. Ungrouped, both guards skip the
+  whole field; if every scanned field skips, the status is `insufficient_data`.
+- **The fallback reference is mode-specific**, learned with the rare-chars recipe and
+  named on every finding it scores: temporal → `outside-suspect-windows` (learning it
+  over the whole scope would let the suspect values mask themselves); self-baseline →
+  `scope-merged`, the merged whole-scope alphabet, which is what the field was scored
+  against before `group_field` existed, so grouping never narrows coverage. Groups
+  scored this way are named in `warnings`, with "no baseline-window values" and
+  "fewer than 20 distinct values" reported separately, each alongside its *field* —
+  the same group can be thin for one field and absent for another.
 - **What grouping costs.** At most one extra *learn* query per field, never one
-  violation scan per group: the per-group reference alphabets travel into the
-  single scan as parallel `{grps, sets}` array parameters, each row picking its
-  own reference by `indexOf`, and `LIMIT <per_field_limit> BY grp` preserves the
-  per-group finding budget. Group cardinality therefore costs rows, not
-  queries. A pathological group count is bounded at 5,000 returned rows per
-  field — and because that ceiling sits *under* the per-group budget, ordering
-  by novelty length across all groups, hitting it drops whole low-novelty
-  groups rather than trimming each group evenly. A run that hits it says so in
-  `warnings` and names the fields; a truncated grouped scan must never read as
-  "these are the groups with novel characters". The fallback learn is a
-  whole-scope scan, so it only runs when some group actually needs one — in
-  temporal mode a bounded `SELECT DISTINCT` probe
-  over the suspect windows (1,000 rows, and a truncated result counts as "yes")
-  answers that far more cheaply than the scan it guards.
-- **Events missing the grouping field form their own group** (empty group
-  value, rendered `(no value)`): excluding them would quietly drop them from
-  the run.
-- **`group_field` must be a string field.** A non-string column (only
-  `timestamp` today) is refused with 422 rather than reaching ClickHouse as a
-  type error.
-- **Characters are extracted with re2 (`extractAll(val, '(?s).')`) in UTF-8
-  mode.** Codepoints — including NUL — are handled; byte sequences that are not
-  valid UTF-8 may be skipped by the regex engine rather than surfaced as
-  findings. (A byte-level fallback exists as a documented option if this bites
-  in practice.)
-- **Auto field selection differs from value novelty:** identifier-kind fields
-  (URLs, filenames, user agents — near-unique values) are *included*, since
-  that's exactly where injected metacharacters live. Constant and sparse
-  fields stay excluded. Within the 15-field auto cap, up to 5 slots are
-  reserved for identifier fields so a source with many categorical columns
-  can't crowd them out (categoricals otherwise sort first); the Fields picker's
-  "auto" preview mirrors this selection.
+  violation scan per group: per-group reference alphabets travel into the single scan
+  as parallel `{grps, sets}` array parameters, each row picking its own by `indexOf`,
+  and `LIMIT <per_field_limit> BY grp` preserves the per-group budget. Group
+  cardinality costs rows, not queries. A pathological group count is bounded at 5,000
+  returned rows per field — and because that ceiling sits *under* the per-group
+  budget, ordering by novelty length across all groups, hitting it drops whole
+  low-novelty groups rather than trimming each evenly. A run that hits it says so and
+  names the fields; a truncated grouped scan must never read as "these are the groups
+  with novel characters". In temporal mode a bounded `SELECT DISTINCT` probe over the
+  suspect windows (1,000 rows; a truncated result counts as "yes") decides whether
+  the whole-scope fallback learn is needed at all.
+- **Events missing the grouping field form their own group** (rendered `(no value)`);
+  excluding them would quietly drop them from the run. **`group_field` must be a
+  string field** — a non-string column is refused with 422 rather than reaching
+  ClickHouse as a type error.
+- **Characters are extracted with re2 (`extractAll(val, '(?s).')`) in UTF-8 mode.**
+  Codepoints — including NUL — are handled; byte sequences that are not valid UTF-8
+  may be skipped by the regex engine rather than surfaced. (A byte-level fallback is
+  a documented option if this bites in practice.)
+- **Auto field selection differs from value novelty:** identifier-kind fields (URLs,
+  filenames, user agents) are *included*, since that is exactly where injected
+  metacharacters live. Constant and sparse fields stay excluded. Within the 15-field
+  auto cap, up to 5 slots are reserved for identifier fields so a source with many
+  categorical columns cannot crowd them out.
 - **Tuning:** the rare-character floor is its own setting,
-  `stat_charset_rarity_floor` (`VESTIGO_STAT_CHARSET_RARITY_FLOOR`, default 3),
-  separate from value novelty's `stat_rarity_floor` so the two detectors can be
-  tuned independently — they count different things (distinct-values-per-char
-  vs. value occurrences).
-- Rare ≠ malicious, as everywhere: a legitimately imported UTF-8 name and a
-  homoglyph attack look identical to this detector. It ranks for triage.
-
----
+  `stat_charset_rarity_floor` (default 3), separate from value novelty's
+  `stat_rarity_floor` — they count different things (distinct-values-per-char vs.
+  value occurrences).
+- Rare ≠ malicious: a legitimately imported UTF-8 name and a homoglyph attack look
+  identical to this detector. It ranks for triage.
 
 ## 6. Entropy outliers (random-looking values)
 
@@ -2065,157 +1934,120 @@ Three further consequences worth knowing:
 
 ## 14. Log templates (structural line clustering)
 
-**What it answers:** "What are the *shapes* of the lines in this log, and
-how many of each?" Not a scored detector — a browser. Many logs are 90%+ one
-or two routine shapes (heartbeats, routine auth, health checks) with the
-interesting rest buried inside; grouping by shape turns "scroll 50M rows" into
-"mute the routine shape, see what's left."
+**What it answers:** "What are the *shapes* of the lines in this log, and how many of
+each?" Not a scored detector — a browser. Many logs are 90%+ one or two routine shapes
+(heartbeats, routine auth, health checks) with the interesting rest buried inside;
+grouping by shape turns "scroll 50M rows" into "mute the routine shape, see what's left."
 
-**How it works.** Every event's templated field (`message` by default) is
-run through an ordered chain of `replaceRegexpAll` substitutions that mask
-variable substrings, then hashed (`cityHash64`) to a `template_hash`. Events
-sharing a hash share a shape. The chain, in order (each pattern must run
-before a broader one downstream would otherwise consume part of it):
+**How it works.** Every event's templated field (`message` by default) is run through an
+ordered chain of `replaceRegexpAll` substitutions that mask variable substrings, then
+hashed (`cityHash64`) to a `template_hash`. Events sharing a hash share a shape. Order
+matters — each pattern runs before a broader one downstream would consume part of it:
 
 | # | Pattern | Placeholder |
 |---|---|---|
-| 1 | ISO-ish timestamp (`2026-07-20T10:00:01.123Z`, `... 10:00:00+02:00`) | `<TS>` |
+| 1 | ISO-ish timestamp (`2026-07-20T10:00:01.123Z`, `… 10:00:00+02:00`) | `<TS>` |
 | 2 | UUID | `<UUID>` |
 | 3 | MAC address | `<MAC>` |
 | 4 | IPv6 (2–7 colon-separated hex groups) | `<IP6>` |
 | 5 | IPv4 | `<IP>` |
-| 6 | Hex run, 8+ chars, optional `0x`/`0X` prefix | `<HEX>` |
+| 6 | Hex run, 8+ chars, optional `0x` prefix | `<HEX>` |
 | 7 | Any remaining digit run | `<NUM>` |
 
-All patterns are RE2-compatible (ClickHouse's regex engine — no
-backreferences, no lookaround). Digit masking is unconditional: "HTTP 404"
-and "HTTP 500" collapse to one template (`HTTP <NUM>`) — a deliberate
-coarseness call (confirmed 2026-07-20); status/error codes stay visible via
-each template's `example` row, just not split into separate templates. If
-this proves too coarse for a given corpus, Drain3 (offline, pure Python) is
-the evaluated fallback — not implemented, since the regex pass hasn't yet
-proven insufficient.
+All patterns are RE2-compatible (ClickHouse's engine — no backreferences, no
+lookaround). Digit masking is unconditional: "HTTP 404" and "HTTP 500" collapse to one
+template — a deliberate coarseness call; status codes stay visible via each template's
+`example` row, just not split into separate templates. If that proves too coarse for a
+corpus, Drain3 (offline, pure Python) is the evaluated fallback, not implemented since
+the regex pass has not yet proven insufficient.
 
-**Storage.** `template_hash UInt64` is a `MATERIALIZED` column on `events`
-(`db/clickhouse.py`, alongside `search_blob`'s identical pattern) — computed
-server-side, correct immediately even on parts written before the column
-existed (MATERIALIZED columns compute on read), with a bloom-filter skip
-index backfilled asynchronously (`MATERIALIZE COLUMN`/`INDEX`, non-blocking
-at startup). No normalized-text column is stored: a template's representative
-text is reconstructed on demand by applying the same expression to
-`any(message)` per group, avoiding a second message-sized column.
+**Storage.** `template_hash UInt64` is a `MATERIALIZED` column on `events` — computed
+server-side, correct immediately even on parts written before the column existed
+(MATERIALIZED columns compute on read), with a bloom-filter skip index backfilled
+asynchronously. No normalized-text column is stored: a template's representative text is
+reconstructed on demand from `any(message)` per group, avoiding a second message-sized
+column. The skip index only earns its keep on collapsed-count queries, and only written
+as `template_hash IN {…}` — ClickHouse applies a `bloom_filter` index for
+`equals`/`in`/`notIn`, while its `has` support is for `has(array_column, value)`, so the
+`has({ths}, col)` form used elsewhere would read every granule. It cannot help the
+grid's `template_hash NOT IN (...)` collapse at all: a bloom filter answers "definitely
+absent", which no negation can prune on.
 
-The skip index only earns its keep on the collapsed-count queries, and only
-if they are written `template_hash IN {…}`. ClickHouse applies a
-`bloom_filter` index for `equals`/`in`/`notIn` on the indexed column; its
-`has` support is for `has(array_column, value)`, so the `has({ths}, col)`
-form used elsewhere in `clickhouse.py` would read every granule. It cannot
-help the grid's own `template_hash NOT IN (...)` collapse at all — a bloom
-filter answers "definitely absent", which no negation can prune on.
+**Field-agnostic, like every other detector.** The materialized column is fixed to
+`message` (the one field required non-null on every `Event`), but `list_log_templates`
+accepts any field token `_col_expr` resolves — for a non-`message` field the hash is
+computed inline per query. That is an explicit cost tradeoff: no skip-index pruning, a
+live regex pass over the scanned rows. Browsing `message` is the fast indexed path;
+browsing anything else works, just unaccelerated.
 
-**Field-agnostic, like every other detector.** The materialized column is
-fixed to `message` (the one field required non-null on every `Event`), but
-`list_log_templates` accepts any field token `_col_expr` resolves — for a
-non-`message` field, the hash is computed inline per-query (unindexed, an
-explicit cost tradeoff: no skip-index pruning, a live regex pass over the
-scanned rows). Browsing a `message`-templated corpus is the fast, indexed
-path; browsing any other field works, just isn't accelerated.
+**Versioned, append-only identity.** Like `ParserConfig`/`EmbeddingConfig`, the regex
+chain is versioned (`TEMPLATE_NORMALIZE_VERSION = 1`) and never modified in place — a
+stored part's materialized hash would go stale silently, splitting one template's
+identity across old and new parts, which is a forensic-reproducibility violation. A
+future coarseness change ships as a new column (`template_hash_v2`), not an
+`ALTER MODIFY`.
 
-**Versioned, append-only identity.** Like `ParserConfig`/`EmbeddingConfig`,
-the regex chain is versioned (`TEMPLATE_NORMALIZE_VERSION = 1`,
-`src/vestigo/db/_template.py`) and never modified in place — a stored part's
-materialized hash would go stale silently, splitting one template's identity
-across old and new parts, a forensic-reproducibility violation. A future
-coarseness change ships as a new column (`template_hash_v2`), not an
-`ALTER MODIFY` of this expression.
+**Browsing.** `GET /{case}/timelines/{tl}/log-templates` (`field`, `order`, `limit`,
+optional `baseline_id` + `only_new`) returns each template's id (a decimal *string* —
+`cityHash64` is a UInt64 and JS loses precision past 53 bits), reconstructed text,
+count, distinct source count, first/last seen, and one representative raw example.
+`only_new` keeps templates whose earliest occurrence across the full scope is at or
+after the baseline split — expressed as `HAVING first_seen >= baseline_end` on the
+grouped subquery rather than an anti-join, cheaper and equivalent for one split point.
+`total_templates` rides in on a `count() OVER ()` window over the same subquery, so the
+whole listing is one scan. Empty values are excluded for every field including
+`message`: non-null by contract, but an empty string is not a shape worth ranking. No
+BH-FDR, no Finding dataclass, no allowlist — a browser, not a scored run. The UI is a
+**Templates** sub-tab under the Investigate panel's Patterns tab.
 
-**Browsing.** `GET /{case}/timelines/{tl}/log-templates` (`field`, `order` —
-count/first_seen/last_seen, `limit`, optional `baseline_id` + `only_new`)
-returns each template's id (a decimal string — `cityHash64` is a UInt64,
-stringified to avoid JS 53-bit float precision loss), reconstructed text,
-count, distinct source count, first/last seen, and one representative raw
-example. `only_new` (paired with a baseline definition's `baseline_end`)
-keeps only templates whose earliest occurrence across the full scope is
-at/after the split — "never seen in the baseline" — expressed as a single
-`HAVING first_seen >= baseline_end` on the grouped subquery rather than an
-anti-join: cheaper and equivalent for one split point. `total_templates` (the
-pre-`limit` count behind the UI's "showing top N") rides in on a
-`count() OVER ()` window over the same grouped subquery, so the whole listing
-is one scan — counting it separately would re-run the regex chain and the
-GROUP BY over the events table, doubling the cost of the most expensive call
-on the tab. Empty values are excluded for every field including `message`:
-non-null by contract, but an empty string is not a shape worth ranking. No
-BH-FDR, no Finding dataclass, no allowlist — a browser, not a scored run. Templates UI lives as
-a **Templates** sub-tab under the Investigate panel's Patterns tab (grouped
-with sequence-motif mining as the other "recurring shape" discovery tool).
+**Facet.** `template_id` resolves through the same `resolve_column_token` allowlist every
+other field token uses (`toString(template_hash)`), so the grid can filter to one
+template's events like any other field. It is also reserved as a canonical
+field-mapping name: mappings resolve *before* column tokens, so a timeline defining
+`template_id` as a mapping would otherwise shadow the column and silently redirect the
+facet onto an unrelated attribute.
 
-**Facet.** `template_id` resolves through the same `resolve_column_token`
-allowlist every other field token uses (`toString(template_hash)`), so the
-grid can filter to one template's events exactly like any other field. It is
-also reserved as a canonical field-mapping name: mappings resolve *before*
-column tokens, so a timeline defining `template_id` as a mapping would
-otherwise shadow the column and silently redirect this facet onto an
-unrelated attribute.
-
-**Mute disposition & grid collapse.** *Mute* writes a `kind="routine"`
-disposition (`detector="log_template"`, value = the decimal template id,
-`details` snapshots `{template, template_version, field, example,
-count_at_mute}` as the audit record). Unlike sequence_motif, **no occurrence
-materialization job runs** — template membership is a direct predicate on
-the materialized `template_hash` column (`template_hash IN (...)`), so there
-is no aux table to populate and no 500k-row cap to hit; muting takes effect
-immediately. Collapse is **derived from the disposition set, not opted into**:
-a mute is a filter, so the grid applies it the moment it exists (`#147` — it
-used to sit behind a default-off toggle, so muting appeared to do nothing).
-The top-bar control is a *reveal* override that un-hides routine events
-temporarily; it is stamped with the disposition-set signature it was made
-against and expires when that set changes, so a reveal cannot silently defeat
-every later mute (`frontend/src/lib/routineCollapse.ts`). Collapse excludes
-muted templates' events via `template_hash NOT IN (...)` alongside the existing
-`motif_occurrences` anti-join, and `routine_collapsed_count` reports the
-*union* of both mechanisms' covered events (not a naive sum — an event
-covered by both a routine motif and a muted template must not be
-double-counted; computed via one `UNION ALL ... uniqExact` query,
-`ClickHouseStore.count_routine_collapsed`). As with motifs, muting is
-presentation-only and never enters `dispositions_hash`; deleting the
+**Mute disposition & grid collapse.** *Mute* writes a `kind="routine"` disposition
+(`detector="log_template"`, value = the decimal template id; `details` snapshots
+`{template, template_version, field, example, count_at_mute}` as the audit record).
+Unlike `sequence_motif`, **no occurrence materialization job runs** — template
+membership is a direct predicate on the materialized column, so there is no aux table
+and no row cap, and muting takes effect immediately. Collapse is **derived from the
+disposition set, not opted into**: a mute is a filter, so the grid applies it the moment
+it exists. The top-bar control is a *reveal* override stamped with the disposition-set
+signature it was made against, expiring when that set changes, so a reveal cannot
+silently defeat every later mute. Collapse excludes muted templates alongside the
+existing `motif_occurrences` anti-join, and `routine_collapsed_count` reports the
+*union* of both mechanisms' covered events — not a naive sum, since an event covered by
+both a routine motif and a muted template must not be double-counted. As with motifs,
+muting is presentation-only and never enters `dispositions_hash`; deleting the
 disposition restores the events immediately.
 
 **Every filter-driven endpoint must resolve the same scope.** `list_events`,
-`get_histogram`, `export_events`, `bulk_annotate_by_filter`, the agent's
-event-query tool *and* all seven viz aggregations (`viz.py`, via
-`_resolve_event_query` and `CompareFilters`) call `_resolve_routine_collapse`
-and pass its scope into their `EventQuery`. The bulk-annotate path is the
-load-bearing one: it writes durable annotations, so a missing
-`collapse_routine` there stamps forensic records onto events the analyst
-never saw while the confirm dialog's count comes from the collapsed query
-(`#147`). The viz gap was the same silent drop one layer over — the frontend
-always sent the flag, FastAPI ignored the unknown param, and every chart
-aggregated the uncollapsed superset the grid was hiding (`viz.py`'s
-`_is_unfiltered` cache check treats the scope as a filter for the same
-reason). A new filter-driven endpoint that skips this resolution is a bug of
-that shape, not a missing feature. Frontend-side, both pages derive collapse
-from the disposition set itself (`frontend/src/lib/routineCollapse.ts`):
-the Explorer *and* the Visualize page (which cannot inherit the flag from the
-URL — it is deliberately never URL-serialized) each query dispositions, gate
-their data queries on that load, and show what is hidden.
+`get_histogram`, `export_events`, `bulk_annotate_by_filter`, the agent's event-query tool
+*and* all seven viz aggregations call `_resolve_routine_collapse` and pass its scope into
+their `EventQuery`. The bulk-annotate path is load-bearing: it writes durable
+annotations, so a missing `collapse_routine` there stamps forensic records onto events
+the analyst never saw while the confirm dialog's count comes from the collapsed query.
+The viz gap was the same silent drop one layer over — the frontend always sent the flag,
+FastAPI ignored the unknown param, and every chart aggregated the uncollapsed superset
+the grid was hiding. A new filter-driven endpoint that skips this resolution is a bug of
+that shape, not a missing feature. Frontend-side, both the Explorer and the Visualize
+page derive collapse from the disposition set itself (`lib/routineCollapse.ts`) —
+Visualize cannot inherit the flag from the URL, which is deliberately never serialized.
 
-**Asymmetry, v1.** Muting only supports `field == "message"` (the indexed
-column the mute predicate binds to) — browsing is field-agnostic, muting
-isn't yet. Revisit if an analyst wants to mute on a non-`message` field.
+**Asymmetry, v1.** Muting only supports `field == "message"` (the indexed column the
+predicate binds to) — browsing is field-agnostic, muting is not yet. Enforced at both
+layers deliberately: the Templates tab replaces Mute with a disabled, explained control
+for any other field, and `_validate_scope` rejects a `log_template` disposition whose
+`details.field` is anything else. Without that check a mute minted from an `attr:*`
+listing would carry a hash from a different domain into `template_hash NOT IN (...)` and
+collapse events the row does not describe — a collapse that hides something other than
+what it announces, which is the one failure mode this mechanism exists to avoid.
 
-Enforced at both layers, deliberately: the Templates tab replaces Mute with a
-disabled, explained control for any non-`message` field, and
-`_validate_scope` rejects a `log_template` disposition whose `details.field`
-is anything else. Without that check a mute minted from an `attr:*` listing
-would carry a hash from a different domain into `template_hash NOT IN (...)`
-and collapse events the row does not describe — a collapse that hides
-something other than what it announces, which is the one failure mode this
-whole mechanism exists to avoid.
-
-**Novelty.** No standalone detector — `only_new` on the browser covers "what
-templates are new since the baseline" without a Finding/BH-FDR apparatus.
-Revisit as a full detector-registry entry if that need grows past a browser
-flag.
+**Novelty.** No standalone detector — `only_new` covers "what templates are new since
+the baseline" without a Finding/BH-FDR apparatus. Revisit as a full detector-registry
+entry if that need grows past a browser flag.
 
 ---
 

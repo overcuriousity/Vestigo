@@ -600,7 +600,7 @@ async def _message_stream_inner(
     # reactive otherwise — a provider overflow derives a budget from the
     # failed request's size and the turn is re-run exactly once. It replaced
     # the fidelity overflow ladder and LLM compaction (see
-    # docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md).
+    # docs/AGENT.md "Sliding context window").
     #
     # With no configured window, an earlier turn of this conversation may
     # already have learned one the hard way — reuse it, or every turn repeats
