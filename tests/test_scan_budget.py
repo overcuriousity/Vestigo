@@ -890,12 +890,47 @@ def test_foreground_gate_has_four_slots():
             _scan.FOREGROUND_SCAN_GATE.release()
 
 
+def test_foreground_threads_are_the_same_two_reserved_slots(monkeypatch):
+    """The reservation covers CPU too, not memory alone (PR #306 review).
+
+    The heavy width is sized so a *full* heavy gate exactly saturates the box
+    (issue #301). A foreground lane running at that same width added its own
+    multiple on top — four charts, each fanning out two queries, put 8x a
+    heavy scan's threads on a box already fully committed. The chart lane gets
+    the two slots the heavy divisor holds back, split across the gate, exactly
+    as its memory cap does.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    monkeypatch.setattr(_scan, "_clickhouse_pinned_max_threads", None)
+    heavy = _scan.detect_scan_max_threads()
+    foreground = _scan.detect_foreground_max_threads()
+    assert foreground == max(2, heavy * _scan._FOREGROUND_SLOTS // _scan._FOREGROUND_CONCURRENCY)
+    # A full chart lane costs the reserved slots' worth of threads, no more.
+    assert (
+        _scan._FOREGROUND_CONCURRENCY * foreground <= _scan._FOREGROUND_SLOTS * heavy
+        # ...unless the floor binds, which only happens on a box too small for
+        # the arithmetic to matter.
+        or foreground == 2
+    )
+
+
+def test_foreground_clause_carries_the_narrower_width(monkeypatch):
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    monkeypatch.setattr(_scan, "_clickhouse_pinned_max_threads", None)
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    assert f"max_threads = {_scan.detect_foreground_max_threads()}" in (
+        _scan.foreground_scan_settings()
+    )
+    assert f"max_threads = {_scan.detect_scan_max_threads()}" in _scan.heavy_scan_settings()
+
+
 def test_report_discloses_the_foreground_class(monkeypatch):
     monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
     report = _scan.scan_budget_report()
     assert report["foreground"] == {
         "concurrency": 4,
         "per_query_bytes": _scan.detect_foreground_memory_budget(),
+        "max_threads": _scan.detect_foreground_max_threads(),
     }
     # `total_bytes` is what both classes may hold at once, not just the heavy gate.
     assert report["total_bytes"] == report["per_query_bytes"] * (

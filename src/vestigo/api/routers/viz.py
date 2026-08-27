@@ -214,6 +214,14 @@ async def get_field_terms(
     timeline_id: str,
     field: str = Query(..., description="Field token, e.g. 'artifact' or 'attr:status_code'"),
     limit: int = Query(default=50, ge=1, le=500),
+    totals: bool = Query(
+        default=True,
+        description=(
+            "Also scan for the field's whole distribution, so total/distinct/other_count "
+            "cover the tail beyond the top-N. Pass false from a caller that reads only the "
+            "values (e.g. autocomplete) to halve the scan."
+        ),
+    ),
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -284,6 +292,7 @@ async def get_field_terms(
         query,
         field,
         limit,
+        totals=totals,
     )
 
 

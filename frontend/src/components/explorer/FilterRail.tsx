@@ -17,6 +17,7 @@ import { Dialog, DialogContent, DialogClose } from "@/components/ui/Dialog";
 import { toast } from "@/stores/toasts";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/cn";
+import { busyRetry } from "@/lib/queryClient";
 import type { EventFilters, FieldMatchMode, View } from "@/api/types";
 import { fmtRelative } from "@/lib/time";
 import { viewPayloadColumns, viewPayloadToFilters } from "@/lib/queryParams";
@@ -24,7 +25,16 @@ import { viewPayloadColumns, viewPayloadToFilters } from "@/lib/queryParams";
 /** Debounced top-N distinct values of `fieldKey`, for value autocomplete.
  * Deliberately unfiltered (empty EventFilters): suggestions describe the
  * whole timeline, not the currently narrowed view, and don't refetch on
- * every filter change. */
+ * every filter change — which also means it is usually answered from the
+ * per-source field_stats cache without touching a scan lane at all.
+ *
+ * When it does fall through to a live scan (a mapped field, or a cache gap)
+ * it takes the foreground gate like any chart, so it can answer 503 "busy"
+ * (#300): `busyRetry` keeps asking at the server's pace, and `silentError`
+ * keeps the eventual failure quiet. Nobody asked for these suggestions
+ * explicitly — a toast over a background autocomplete is noise, and the
+ * field still works untyped-ahead. `totals: false` skips the totals scan;
+ * only `value` is read below. */
 function useFieldValueSuggestions(
   caseId: string,
   timelineId: string,
@@ -33,9 +43,12 @@ function useFieldValueSuggestions(
   const debouncedKey = useDebouncedValue(fieldKey.trim(), 300);
   const { data } = useQuery({
     queryKey: ["field-value-suggest", caseId, timelineId, debouncedKey],
-    queryFn: () => vizApi.fieldTerms(caseId, timelineId, debouncedKey, {}, 50),
+    queryFn: () =>
+      vizApi.fieldTerms(caseId, timelineId, debouncedKey, {}, 50, { totals: false }),
     enabled: !!(caseId && timelineId && debouncedKey),
     staleTime: 60_000,
+    meta: { silentError: true },
+    ...busyRetry,
   });
   return useMemo(() => (data?.values ?? []).map((v) => v.value).filter(Boolean), [data]);
 }

@@ -68,12 +68,20 @@ def install(app: FastAPI) -> None:
 
 _store: ClickHouseStore | None = None
 
+#: Guards the lazy build of :data:`_store`. ``_kill`` runs on a bare daemon
+#: thread (see ``_kill_detached``), and the case this path exists for — a full
+#: lane — is exactly the one that produces simultaneous disconnects. Without
+#: the lock each of them builds its own store and all but one is leaked, on
+#: the very path that is meant to be cheap.
+_store_lock = threading.Lock()
+
 
 def _client() -> Any:
     global _store
-    if _store is None:
-        _store = ClickHouseStore()
-    return _store.client
+    with _store_lock:
+        if _store is None:
+            _store = ClickHouseStore()
+        return _store.client
 
 
 def _kill(token: str) -> None:

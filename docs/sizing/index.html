@@ -348,6 +348,13 @@ function minimumPlan(input) {
   };
 }
 
+/** Threads one chart query runs at — `detect_foreground_max_threads` in
+ *  src/vestigo/db/_scan.py. The same reservation as the per-chart memory cap:
+ *  the two slots the heavy divisor holds back, split across the chart lane. */
+function chartThreadsFor(threads) {
+  return Math.max(K.min_threads_per_scan, Math.floor((threads * K.foreground_slots) / K.foreground_concurrency));
+}
+
 /** Enrichment rewrites a whole partition under one slot; a per-query cap of a
  *  couple of GiB is where that starts failing on a large source. */
 function minPerQuery(enrichment) {
@@ -455,7 +462,8 @@ function compute() {
       : "One host running the app and all three backing services.";
   document.getElementById("out-cores").textContent = need.cores;
   document.getElementById("out-cores-why").textContent =
-    `${need.concurrency} concurrent scans × ${need.threads} threads each, so a full gate saturates the box rather than oversubscribing it.`;
+    `${need.concurrency} concurrent scans × ${need.threads} threads each, so a full heavy gate saturates the box rather than oversubscribing it. ` +
+    `The chart lane runs narrower — ${K.foreground_concurrency} × ${chartThreadsFor(need.threads)} threads, the ${K.foreground_slots} reserved slots' share — so charts rendering during a sweep cost about two slots on top, briefly, rather than multiplying the box.`;
 
   const mem = document.getElementById("out-memory");
   mem.textContent = "";
@@ -491,6 +499,8 @@ function compute() {
     `Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+${K.foreground_slots}) on the memory budget, so it needs a restart.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)", "0 (auto)",
     `Auto resolves to ${need.threads} at the minimum${max ? ` and ${max.threads} at full spend` : ""} — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
+  row(set, "→ chart-lane width (derived)", String(chartThreadsFor(need.threads)), m((x) => String(chartThreadsFor(x.threads))),
+    `Not a setting: ${K.foreground_slots} reserved slots ÷ ${K.foreground_concurrency} chart queries, applied to the width above. A chart is latency-bound and short, so it runs narrow rather than taking a detector's full width.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",
     shape === "split" ? String(need.scanTotal) : "0 (auto)",
     shape === "split" ? m((x) => String(x.scanTotal)) : "0 (auto)",

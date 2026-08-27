@@ -233,9 +233,26 @@ chart queries share, so a chart is capped at half a detector's cap rather than a
 — charts over high-cardinality fields are the ordinary workload, and they spill at that size
 rather than dying. Reported as `scan_budget.foreground` on `/api/health` and on the admin
 Settings page. Raising N widens the heavy lane and shrinks every cap; it does not change how
-charts are admitted. A chart that cannot get a slot within 30 s answers 503 with the queue
-depth and the UI keeps waiting visibly; a request that disconnects (a reload mid-sweep) frees
-its slot and kills its ClickHouse query within about a second.
+charts are admitted. A chart that cannot get a slot within 5 s answers 503 with the queue
+depth and the UI keeps waiting visibly, re-asking at the server's pace for about four minutes
+before it calls the lane wedged; a request that disconnects (a reload mid-sweep) frees its slot
+and kills its ClickHouse query within about a second.
+
+The same reservation covers threads: a chart runs at `max_threads × 2 ÷ 4` (floor 2), not the
+heavy width, so a full chart lane costs the two reserved slots' worth of CPU rather than four
+times a detector's. Reported as `scan_budget.foreground.max_threads`. Charts are short and
+latency-bound; the width they lose costs them little, and the sweep they would otherwise have
+slowed down is usually the thing the analyst is actually waiting for.
+
+> **Upgrading across the chart-lane change (#300):** the heavy per-query cap changed divisor from
+> N to N + 2, so at the default `VESTIGO_STAT_SCAN_CONCURRENCY=2` **every detector query's
+> `max_memory_usage` halved** — and the spill thresholds with it. The reservation is permanent,
+> not demand-driven: an install that never opens the Visualize tab still pays it. On a corpus
+> where a whole-corpus `value_combo` or `distribution_drift` sweep was already close to its cap,
+> that is the difference between spilling and `MEMORY_LIMIT_EXCEEDED`. If a sweep that used to
+> complete now fails, check `scan_budget.per_query_bytes` on `/api/health` against the sizing
+> calculator and raise `max_server_memory_usage` (and the container limit with it) rather than
+> lowering N — N is what bounds how many sweeps stack.
 
 Both compose files ship **with memory limits set**, sized for a 32 GiB host and
 overridable per service (`VESTIGO_CLICKHOUSE_MEM_LIMIT`, `VESTIGO_POSTGRES_MEM_LIMIT`,
@@ -354,8 +371,9 @@ services are resident. The app now says so, loudly, at startup and in
   one — which is what `budget_ceiling_bytes` reports when it differs from
   `clickhouse_ceiling_bytes`.
 
-`max_threads` is per-scan thread width. At `VESTIGO_STAT_SCAN_MAX_THREADS=0` (the
-default) it is `detected_cores ÷ concurrency`, floor 2, where `detected_cores` is what
+`max_threads` is per-*heavy*-scan thread width; the chart lane derives its own from it
+(above, and `foreground.max_threads` in the same block). At `VESTIGO_STAT_SCAN_MAX_THREADS=0`
+(the default) it is `detected_cores ÷ concurrency`, floor 2, where `detected_cores` is what
 ClickHouse resolves for itself — cgroup-CPU-quota aware, so a `--cpus=2` container
 reports 2. `max_threads_source` is `pinned` (`VESTIGO_STAT_SCAN_MAX_THREADS`),
 `clickhouse_pinned` (an operator pinned `max_threads` in a ClickHouse profile — that

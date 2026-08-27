@@ -1768,6 +1768,28 @@ def test_field_terms_returns_top_values_and_other_count() -> None:
     assert result["other_count"] == 10
 
 
+def test_field_terms_totals_false_runs_one_scan() -> None:
+    """A caller that reads only the values pays for one grouping, not two.
+
+    The totals scan exists so the tail beyond the top-N can be reported
+    truthfully and *spillably* — but the filter rail's autocomplete maps the
+    values and throws total/distinct/other_count away, so for it the second
+    whole-corpus grouping is pure cost (PR #306 review).
+    """
+    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]]))])
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", totals=False)
+    queries = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert len(queries) == 1
+    assert "n_groups" not in queries[0]
+    assert result["values"] == [{"value": "GET", "count": 60}, {"value": "POST", "count": 30}]
+    # Describes the rows in hand and says so: no tail was measured, so none is
+    # claimed. `other_count` is 0 rather than a subtraction against a total
+    # nobody scanned for.
+    assert result["total"] == 90
+    assert result["distinct"] == 2
+    assert result["other_count"] == 0
+
+
 def test_field_terms_on_timestamp_column_casts_to_string() -> None:
     """`timestamp` is a `DateTime64` top-level column, not `String` — the
     generated SQL must cast it before comparing/grouping, or ClickHouse

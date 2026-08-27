@@ -1,6 +1,53 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-27 (session 191 — PR #305 review fixes, #300).
+Last updated: 2026-08-27 (session 192 — PR #306 review fixes, #300).
+
+## Session 192 — 2026-08-27: PR #306 review fixes (the chart lane's other half)
+
+Seven findings from the review of the session-191 branch. The cancellation plumbing came
+through clean; every real problem was in the *sizing* half of the change — the reservation
+had been re-derived for memory and not for anything else.
+
+- **The chart lane's threads were unaccounted.** `foreground_scan_settings()` reused the
+  heavy `max_threads`, which is auto-sized as `cores ÷ N` precisely so a *full* heavy gate
+  saturates the box (#301). Four chart slots at that width, each able to fan out two
+  queries, put 8× a detector's threads on top of a box already fully committed — 100
+  threads on 20 cores at the default concurrency. So four charts rendering during a sweep
+  made every query slower, including the sweep, which is the opposite of what #300 is for.
+  `detect_foreground_max_threads()` applies the same reservation the memory cap uses: the
+  two slots the heavy divisor holds back, split across the gate. Not divided again by the
+  fan-out width — two waves at half the heavy width is one heavy slot's threads, which is
+  what the reservation already allows.
+- **The busy retry window was seven times what it claimed.** `BUSY_RETRY_LIMIT` was sized
+  against the 5 s `Retry-After` alone, but each attempt *also* parks for
+  `FOREGROUND_WAIT_SECONDS` server-side before the 503 exists — so "about two minutes" was
+  really about fourteen, and a wedged lane spent a quarter of an hour looking like a slow
+  one. The wait is 5 s now rather than 30, which also fixes the second half of it: a parked
+  caller holds one of anyio's threadpool tokens for the whole wait, so several panels
+  retrying against a full lane could occupy the pool with *waiters* — including the poll
+  `run_scan` uses to notice a disconnect, the very path `_kill_detached` avoids the pool for.
+  Answering "busy" quickly frees the token and lets the (cheap) retry do the waiting.
+- **The filter rail's autocomplete could raise a toast.** `vizApi.fieldTerms` became
+  foreground-gated, so it can answer 503 — and that one query had neither `busyRetry` nor
+  `silentError`, so typing in a filter field during a busy lane popped "scan lane busy" from
+  a background suggestion nobody asked for. It usually never reaches a scan at all (an
+  unfiltered call is served from the `field_stats` cache); this is the cache-gap path.
+- **…and it paid for a scan it discarded.** The totals wave exists so the tail beyond the
+  top-N can be reported *spillably*, but the autocomplete maps `values[].value` and throws
+  `total`/`distinct`/`other_count` away. `field_terms(..., totals=False)` runs the top-N
+  alone and reports the rows in hand; `other_count` is 0 rather than a subtraction against a
+  total nobody measured, so nothing that renders an "Other" slice may use it.
+- **`scan_exec._client()` built its store unlocked** from the bare daemon threads `_kill`
+  runs on — and simultaneous disconnects are exactly the scenario that path exists for, so
+  two of them each built a store and all but one leaked. One `threading.Lock`.
+- **The halved heavy cap is documented, not reverted.** Moving the divisor to N + 2 cut
+  every detector query's `max_memory_usage` in half at the default concurrency, permanently
+  and whether or not anyone opens Visualize. That is the deliberate price of a lane that
+  never queues behind a sweep, but it can turn a whole-corpus sweep that used to spill into
+  one that hits `MEMORY_LIMIT_EXCEEDED` — so `docs/DEPLOYMENT.md` now carries an upgrade
+  note saying so and pointing at the ceiling rather than at N.
+- Sizing calculator: the chart lane's derived thread width is shown alongside its cap, and
+  the cores line no longer implies a full box covers both lanes at once.
 
 ## Session 191 — 2026-08-27: PR #305 review fixes (scan admission classes)
 

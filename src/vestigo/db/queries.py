@@ -1128,7 +1128,18 @@ class _ParameterizedQueryBuilder:
 
 #: How long a chart waits for a foreground slot before the API answers 503
 #: "busy" instead of leaving a spinner. Module-level so tests can shorten it.
-FOREGROUND_WAIT_SECONDS = 30.0
+#:
+#: Short on purpose, and it bounds two things rather than one. It is half of
+#: the client's retry period — the browser waits this *plus* the ``Retry-After``
+#: it is handed — so ``BUSY_RETRY_LIMIT`` attempts have to be read against
+#: ``wait + retry_after``, not ``retry_after`` alone; at 30s the documented
+#: "about two minutes" was really about fourteen. It is also how long a parked
+#: caller holds one of anyio's threadpool tokens: the wait happens inside
+#: ``run_in_threadpool``, so several panels retrying against a full lane could
+#: occupy the pool with *waiters* — including the poll ``run_scan`` uses to
+#: notice a disconnect. Answering "busy" quickly frees the token and lets the
+#: retry, which costs one cheap round-trip, do the waiting instead.
+FOREGROUND_WAIT_SECONDS = 5.0
 
 
 def _foreground_scan(fn):
@@ -2148,7 +2159,9 @@ class EventQueryService:
         }
 
     @_foreground_scan
-    def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
+    def field_terms(
+        self, query: EventQuery, field_token: str, limit: int = 50, *, totals: bool = True
+    ) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
         Honors all query filters (same ``_build_where`` as every other
@@ -2159,17 +2172,36 @@ class EventQueryService:
         ``other_count`` is the count of non-empty values that fall outside
         the top *limit* — present so a bar/pie chart can render a truthful
         "Other" slice instead of silently dropping the tail.
+
+        ``totals=False`` is for a caller that reads only the values: it drops
+        the second scan (see :py:meth:`_field_terms_impl`) and reports
+        ``total``/``distinct`` from the returned rows, which is exact when
+        the field has no tail and an undercount when it does. Nothing that
+        renders an "Other" slice may use it.
         """
-        return self._field_terms_impl(query, field_token, limit=limit)
+        return self._field_terms_impl(query, field_token, limit=limit, totals=totals)
 
     def _field_terms_impl(
-        self, query: EventQuery, field_token: str, limit: int = 50, *, parallel: bool = True
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        parallel: bool = True,
+        totals: bool = True,
     ) -> dict[str, Any]:
         """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate.
 
         ``parallel=False`` runs the two scans one after the other, for a
         caller that is *itself* fanning out (the pivot's two axes) — see
         :py:meth:`_run_serial`.
+
+        ``totals=False`` runs the top-N scan alone. The grouping below is
+        deliberately run twice so the totals can spill, but a caller that
+        never reads ``total``, ``distinct`` or ``other_count`` pays that price
+        for nothing — the filter rail's value autocomplete maps the values and
+        throws the rest away. Such a caller gets one scan and no fan-out, so
+        its slot's whole memory share goes to the query it actually issues.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
@@ -2197,9 +2229,8 @@ class EventQueryService:
         # the same construction — as `count_field_inventory`. The price is
         # that the grouping runs twice; the two waves overlap, so the cost is
         # ClickHouse-side, not latency an analyst sees.
-        run = self._run_parallel if parallel else self._run_serial
-        result, totals_result = run(
-            lambda: self._select(
+        def top_n() -> Any:
+            return self._select(
                 f"""
                 SELECT {col_expr} AS val, count() AS c
                 FROM {database}.events
@@ -2210,8 +2241,10 @@ class EventQueryService:
                 {foreground_scan_settings()}
                 """,
                 parameters=parameters,
-            ),
-            lambda: self._select(
+            )
+
+        def all_groups() -> Any:
+            return self._select(
                 f"""
                 SELECT sum(c) AS total, count() AS n_groups FROM (
                     SELECT {col_expr} AS val, count() AS c
@@ -2222,8 +2255,25 @@ class EventQueryService:
                 {foreground_scan_settings()}
                 """,
                 parameters=parameters,
-            ),
-        )
+            )
+
+        if not totals:
+            # One scan, no fan-out: `total` and `distinct` describe the rows
+            # in hand. Exact when the field's whole distribution fit in the
+            # top-N, an undercount otherwise — which is why `other_count` is
+            # 0 rather than a subtraction against a total nobody measured.
+            rows = top_n().result_rows
+            values = [{"value": row[0], "count": row[1]} for row in rows]
+            return {
+                "field": field_token,
+                "total": sum(v["count"] for v in values),
+                "distinct": len(values),
+                "values": values,
+                "other_count": 0,
+            }
+
+        run = self._run_parallel if parallel else self._run_serial
+        result, totals_result = run(top_n, all_groups)
         rows = result.result_rows
         if not rows:
             return {

@@ -47,13 +47,25 @@ export function isScanBusy(error: unknown): error is ApiError {
 
 /**
  * How many times a busy lane is re-asked before the 503 is allowed to surface.
- * At the server's 5s `Retry-After` that is about two minutes — long enough to
- * outlast a detector sweep, short enough that a genuinely wedged lane ends in
- * an error an analyst can act on. Retrying forever is the same silent stall
- * #300 set out to remove: a busy lane raises no toast, and a panel still
- * holding previous data never even reaches the spinner that names the queue.
+ *
+ * One attempt costs the server's `FOREGROUND_WAIT_SECONDS` (5s — it waits for
+ * a slot before answering "busy") *plus* the 5s `Retry-After` it hands back,
+ * so 24 attempts is about four minutes, not the two the count alone suggests.
+ * Both halves have to be counted: sizing this against `Retry-After` alone once
+ * put the real window at fourteen minutes while the comment claimed two.
+ *
+ * Long enough to outlast a detector sweep, short enough that a genuinely
+ * wedged lane ends in an error an analyst can act on. Retrying forever is the
+ * same silent stall #300 set out to remove: a busy lane raises no toast, and a
+ * panel still holding previous data never even reaches the spinner that names
+ * the queue.
  */
 export const BUSY_RETRY_LIMIT = 24;
+
+/** What one busy attempt costs end to end, in seconds: the server's bounded
+ * wait for a slot plus the `Retry-After` it answers with. Exported so the
+ * window `BUSY_RETRY_LIMIT` describes is checkable rather than asserted. */
+export const BUSY_ATTEMPT_SECONDS = 10;
 
 /**
  * Query options for surfaces that read a scan lane: a busy lane is "still

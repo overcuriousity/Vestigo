@@ -84,6 +84,8 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   itself — `system.settings.max_threads`, which resolves `auto(N)` cgroup-quota-aware;
   pin it with `VESTIGO_STAT_SCAN_MAX_THREADS`, and detection failure falls back to the
   former constant 8,
+  and is the *heavy* width — the chart lane derives a narrower one from it, see the
+  foreground class below —
   spill thresholds for GROUP BY and plain ORDER BY at min(4 GB, half the
   per-query cap), `max_memory_usage` = total budget / (concurrency + 2) — the
   two extra slots are the chart lane's share, see the foreground class below — the
@@ -108,10 +110,21 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   over-commit is exactly the fan-out width, and no gate sizing can absorb it. Two slots rather than one because charts over high-cardinality fields are the
   ordinary case: a chart query must be able to *spill* at that cap, and the two that could
   not — `field_terms`' `sum(count()) OVER ()` and `field_numeric_grouped`'s `uniqExact` —
-  were rewritten as spillable `GROUP BY` aggregates for exactly that reason. A chart waits
-  at most 30 s for a slot and then answers 503 with `queued_ahead` and `Retry-After`, which
-  the UI renders as "waiting behind N scans" and retries for about two minutes before
-  surfacing the 503 as an error; detectors queue indefinitely. The bound is for a chart
+  were rewritten as spillable `GROUP BY` aggregates for exactly that reason. The totals wave
+  is skippable: `field_terms(..., totals=False)` runs the top-N alone and reports
+  `total`/`distinct` from the rows in hand, for a caller that reads only the values (the
+  filter rail's value autocomplete) and would otherwise pay a second whole-corpus grouping
+  for numbers it discards. The reservation covers threads as well as memory —
+  `detect_foreground_max_threads()` gives a chart `max_threads × 2 ÷ 4` (floor 2), so a full
+  chart lane costs the two reserved slots' worth of CPU rather than four times a detector's;
+  a lane running at the heavy width would have undone the sizing that makes a *full* heavy
+  gate exactly saturate the box (#301). A chart waits at most 5 s for a slot and then answers
+  503 with `queued_ahead` and `Retry-After`, which the UI renders as "waiting behind N scans"
+  and retries for about four minutes before surfacing the 503 as an error — the client's
+  window is `BUSY_RETRY_LIMIT × (that wait + Retry-After)`, both halves, since a parked
+  request is waiting server-side too. The wait is short for a second reason: it happens
+  inside the threadpool, so a long one lets retrying panels fill the pool with *waiters* —
+  including the poll that notices a disconnect. Detectors queue indefinitely. The bound is for a chart
   someone is *watching*: a background job wraps its work in `unbounded_foreground_wait()`
   and queues instead (the Stories export renders its chart blocks that way — a job has no
   spinner, no request to answer 503 to and no retry). An agent or MCP tool calling a gated

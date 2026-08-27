@@ -4,7 +4,13 @@
  */
 import { describe, it, expect } from "vitest";
 import { ApiError } from "@/api/client";
-import { BUSY_RETRY_LIMIT, busyMessage, busyRetry, isScanBusy } from "@/lib/queryClient";
+import {
+  BUSY_ATTEMPT_SECONDS,
+  BUSY_RETRY_LIMIT,
+  busyMessage,
+  busyRetry,
+  isScanBusy,
+} from "@/lib/queryClient";
 
 function busy(ahead: number): ApiError {
   const e = new ApiError(503, "scan lane busy");
@@ -36,7 +42,11 @@ describe("busyRetry limits", () => {
     // and a panel holding previous data never shows the waiting text either.
     expect(busyRetry.retry(BUSY_RETRY_LIMIT - 1, busy(2))).toBe(true);
     expect(busyRetry.retry(BUSY_RETRY_LIMIT, busy(2))).toBe(false);
-    // ~5s apart, so the cap is about two minutes of waiting.
-    expect(BUSY_RETRY_LIMIT * 5).toBeGreaterThanOrEqual(100);
+    // Each attempt costs the server's bounded wait *and* the Retry-After it
+    // answers with, so the window is BUSY_RETRY_LIMIT x both halves — a few
+    // minutes. Counting Retry-After alone once understated it by ~7x.
+    const windowSeconds = BUSY_RETRY_LIMIT * BUSY_ATTEMPT_SECONDS;
+    expect(windowSeconds).toBeGreaterThanOrEqual(120);
+    expect(windowSeconds).toBeLessThanOrEqual(600);
   });
 });
