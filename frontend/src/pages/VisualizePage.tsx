@@ -85,7 +85,7 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, SCALES } from "@/components/viz/lib/chartMeta";
+import { CHART_META, SCALES, chartTypesFor } from "@/components/viz/lib/chartMeta";
 import {
   resolveChartOptions,
   defaultChartTypeForScale,
@@ -142,6 +142,11 @@ const CLEAR_GROUP = "__viz_no_group__";
  * analyst more about why than an empty parenthetical would. Ordinary fields
  * guard on null anyway, so an absent count renders nothing rather than
  * "(null distinct)". */
+/** "a ratio scale", but "an interval scale" — the scale names are data. */
+function articleFor(word: string): string {
+  return /^[aeiou]/i.test(word) ? "an" : "a";
+}
+
 function fieldComboOption(f: VizFieldInfo): FieldComboOption {
   return {
     value: f.token,
@@ -449,6 +454,10 @@ export function VisualizePage() {
 
   const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
     updateConfig(preset.config);
+    // A preset is an explicit pick of type, scale and field at once, so any
+    // standing "we moved this for you" note is now about a chart the analyst
+    // no longer has — and would read as an excuse for the one they just chose.
+    setAutoNotice(null);
     setPresetsOpen(false);
   };
 
@@ -585,9 +594,14 @@ export function VisualizePage() {
       const next = defaultChartTypeForScale(s, field);
       updateConfig({ scale: s, chartType: next });
       // The re-pick is correct and used to be silent: two controls where the
-      // analyst touched one. Say which moved and why (#298).
+      // analyst touched one. Say which moved and why (#298) — and say which of
+      // the two reasons it was, since blaming the scale for a clamp the *field*
+      // forced is a false statement about the chart the analyst is looking at.
+      const legalForScale = chartTypesFor(s).includes(chartType);
       setAutoNotice(
-        `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available on a ${s} scale.`,
+        legalForScale && field
+          ? `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} can't plot ${fieldTokenLabel(field)}.`
+          : `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available on ${articleFor(s)} ${s} scale.`,
       );
     } else {
       updateConfig({ scale: s });
@@ -1035,8 +1049,17 @@ export function VisualizePage() {
               options={(fieldsQuery.data?.fields ?? []).map(fieldComboOption)}
               value={field ?? ""}
               onChange={(v) => {
-                updateConfig({ field: v });
-                setAutoNotice(null);
+                // X and Y must differ, and the Y list drops whatever X holds —
+                // so setting X to the token Y already had left an unreachable
+                // value sitting there under "not in this timeline's reported
+                // fields", which is a claim about the wrong problem entirely.
+                const takesOverY = !!v && v === fieldY;
+                updateConfig(takesOverY ? { field: v, fieldY: null } : { field: v });
+                setAutoNotice(
+                  takesOverY
+                    ? `${acceptsSecondField ? "Group by" : "Field (Y)"} cleared — ${fieldTokenLabel(v)} is now the X field.`
+                    : null,
+                );
               }}
             />
           )}
@@ -1090,7 +1113,12 @@ export function VisualizePage() {
               aria-label="Add a field to correlate"
               placeholder="Add a field…"
               // The box stays empty: this picker adds to the chip list above
-              // rather than holding a selection of its own.
+              // rather than holding a selection of its own — which also means
+              // its `value` can never carry the unknown-token disclosure. So
+              // close the set instead: the matrix charts fields the inventory
+              // reported, and a typo appended as a chip returns an empty
+              // matrix with nothing naming the cause.
+              allowFreeText={false}
               value=""
               options={(fieldsQuery.data?.fields ?? [])
                 .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))

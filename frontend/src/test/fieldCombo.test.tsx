@@ -169,4 +169,106 @@ describe("FieldCombo", () => {
 
     expect(screen.queryByText(/not in this timeline/i)).not.toBeInTheDocument();
   });
+
+  it("stays quiet while the field list is still loading", () => {
+    // Every caller feeds this from a query, so `options` is empty for as long
+    // as the fetch takes. A field named in the URL is not suspect because a
+    // request has not landed — and the note claimed exactly that on every
+    // Visualize load carrying `c_field`.
+    render(<FieldCombo options={[]} value="src_ip" onChange={() => {}} />);
+
+    expect(screen.queryByText(/not in this timeline/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps Escape to itself instead of closing the surface around it", () => {
+    // The sheet and the export dialog both close on Escape — the sheet from a
+    // `window` listener, the dialog from a capture-phase `document` one. A
+    // combo that let the key through reverted its draft *and* threw away every
+    // knob value beside it.
+    const onChange = vi.fn();
+    const outer = vi.fn();
+    window.addEventListener("keydown", outer);
+    try {
+      render(<FieldCombo options={OPTIONS} value="src_ip" onChange={onChange} />);
+      const input = screen.getByRole("combobox") as HTMLInputElement;
+      fireEvent.change(input, { target: { value: "half-typed" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+
+      expect(input.value).toBe("src_ip");
+      expect(outer).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", outer);
+    }
+  });
+
+  it("lets Escape past when the box is not the one holding it", () => {
+    const outer = vi.fn();
+    window.addEventListener("keydown", outer);
+    try {
+      render(<FieldCombo options={OPTIONS} value="src_ip" onChange={() => {}} />);
+      fireEvent.focus(screen.getByRole("combobox"));
+      fireEvent.keyDown(document.body, { key: "Escape" });
+
+      expect(outer).toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", outer);
+    }
+  });
+
+  it("does not commit an empty field to a caller that has no empty option", () => {
+    // `logTemplates(..., { field: "" })` is a request no list here can express
+    // and no caller guards — a state the `<select>`s this replaced could not
+    // reach at all.
+    const onChange = vi.fn();
+    render(<FieldCombo options={OPTIONS} value="src_ip" onChange={onChange} />);
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("commits the empty field where the caller offers it", () => {
+    // The method knobs do: `""` is the method's own default there, named after
+    // what it then does.
+    const onChange = vi.fn();
+    render(
+      <FieldCombo
+        options={[{ value: "", label: "the whole scope" }, ...OPTIONS]}
+        value="src_ip"
+        onChange={onChange}
+      />,
+    );
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onChange).toHaveBeenCalledWith("");
+  });
+
+  it("names the highlighted row for a screen reader", () => {
+    render(<FieldCombo options={OPTIONS} value="" onChange={() => {}} />);
+
+    const input = screen.getByRole("combobox");
+    fireEvent.focus(input);
+    expect(input).not.toHaveAttribute("aria-activedescendant");
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+
+    const active = input.getAttribute("aria-activedescendant");
+    expect(active).toBeTruthy();
+    expect(document.getElementById(active!)).toHaveTextContent("Source IP");
+  });
+
+  it("keeps the portaled list clickable inside a modal dialog", () => {
+    // A modal Radix layer sets `body { pointer-events: none }` and re-enables
+    // it on its own node only, so a list portaled to `document.body` was
+    // mouse-dead in the export dialog: every row click swallowed.
+    render(<FieldCombo options={OPTIONS} value="" onChange={() => {}} />);
+    fireEvent.focus(screen.getByRole("combobox"));
+
+    expect(screen.getByRole("listbox").className).toContain("pointer-events-auto");
+  });
 });

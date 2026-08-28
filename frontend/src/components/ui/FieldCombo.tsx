@@ -14,7 +14,7 @@
  * the token is what you would type and what every caller stores; the pretty
  * label and its hint live in the list rows.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -67,8 +67,21 @@ export function FieldCombo({
   const [draft, setDraft] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [highlightIdx, setHighlightIdx] = useState(-1);
+  // The blur close is deferred so a row's click lands first, which means it can
+  // still be in flight when the analyst comes back — refocusing and typing
+  // inside that window used to have the stale timer wipe the fresh draft.
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const listId = useId();
 
   const text = draft ?? value;
+
+  const cancelBlurClose = useCallback(() => {
+    if (blurTimer.current !== null) {
+      clearTimeout(blurTimer.current);
+      blurTimer.current = null;
+    }
+  }, []);
+  useEffect(() => cancelBlurClose, [cancelBlurClose]);
 
   const filtered = useMemo(() => {
     const q = (draft ?? "").trim().toLowerCase();
@@ -83,12 +96,59 @@ export function FieldCombo({
     itemCount: filtered.length,
   });
 
-  function commit(next: string) {
-    onChange(next);
+  const close = useCallback(() => {
+    cancelBlurClose();
     setDraft(null);
     setOpen(false);
     setHighlightIdx(-1);
+  }, [cancelBlurClose]);
+
+  function commit(next: string) {
+    onChange(next);
+    close();
   }
+
+  // Escape reverts the draft and must not reach anything else. Both surfaces
+  // this lives in also close on Escape — `InvestigateSheet` from a `window`
+  // listener, a Radix dialog from a *capture*-phase `document` one that runs
+  // before any React handler — so an `onKeyDown` here loses the race: reverting
+  // a half-typed token threw away every knob value in the sheet, or shut the
+  // export dialog outright. A capture listener on `window` is the one position
+  // ahead of both.
+  const escapeArmed = open || draft !== null;
+  useEffect(() => {
+    if (!escapeArmed) return;
+    const container = containerRef.current;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      // Only the key the analyst pressed *in this box*: an open list whose
+      // input has already lost focus must not swallow the sheet's own Escape.
+      const target = e.target;
+      if (!(target instanceof Node) || !container?.contains(target)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      close();
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [escapeArmed, close, containerRef]);
+
+  // The list is `max-h-48` and these run to hundreds of tokens, which is the
+  // reason this control exists — an arrow key that moves an off-screen
+  // highlight would have Enter commit something the analyst cannot see.
+  useEffect(() => {
+    if (!open || highlightIdx < 0) return;
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-idx="${highlightIdx}"]`);
+    // jsdom has no layout, so it ships no `scrollIntoView`.
+    row?.scrollIntoView?.({ block: "nearest" });
+  }, [open, highlightIdx, listRef]);
+
+  // `""` is a real choice only where the caller offers one — it is the method's
+  // own default in `MethodFieldSelect`. Everywhere else the list cannot express
+  // it and the query cannot use it, so an emptied box keeps its draft rather
+  // than issuing a fieldless request that comes back wrong with nothing saying
+  // why.
+  const hasEmptyOption = useMemo(() => options.some((o) => o.value === ""), [options]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "ArrowDown") {
@@ -110,13 +170,8 @@ export function FieldCombo({
         const exact = options.find((o) => o.value.toLowerCase() === typed.toLowerCase());
         if (exact) commit(exact.value);
         else if (typed && allowFreeText) commit(typed);
-        else if (!typed) commit("");
+        else if (!typed && hasEmptyOption) commit("");
       }
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      setDraft(null);
-      setOpen(false);
-      setHighlightIdx(-1);
     }
   }
 
@@ -124,7 +179,10 @@ export function FieldCombo({
   // token and the chart or detector then comes back empty with nothing naming
   // the cause. Say it on the spot; never block on it — the inventory can lag a
   // source that was ingested a minute ago, and that field is still valid.
-  const unknown = value !== "" && !options.some((o) => o.value === value);
+  // An empty list is not evidence of anything: until the inventory query lands
+  // every value is "unknown", and a field named in the URL is not suspect
+  // because a fetch is still in flight.
+  const unknown = options.length > 0 && value !== "" && !options.some((o) => o.value === value);
 
   // Rows carry their group header inline rather than nesting lists, so the
   // flat index the keyboard walks stays the index of the row itself.
@@ -137,12 +195,21 @@ export function FieldCombo({
     [filtered],
   );
 
+  const listOpen = open && filtered.length > 0;
+
   return (
     <div ref={containerRef} className={cn("relative", className)}>
       <div className="relative">
         <input
           role="combobox"
           aria-expanded={open}
+          aria-autocomplete="list"
+          aria-controls={listOpen ? listId : undefined}
+          // Without this a screen reader hears nothing as ↓/↑ walk the list —
+          // the Radix `Select` this replaces announced its active item.
+          aria-activedescendant={
+            listOpen && highlightIdx >= 0 ? `${listId}-opt-${highlightIdx}` : undefined
+          }
           aria-label={ariaLabel}
           data-testid={testId}
           disabled={disabled}
@@ -154,11 +221,16 @@ export function FieldCombo({
             setHighlightIdx(-1);
           }}
           onKeyDown={handleKeyDown}
-          onFocus={() => setOpen(true)}
+          onFocus={() => {
+            cancelBlurClose();
+            setOpen(true);
+          }}
           onBlur={() => {
             // Delay so a row's click lands first; a draft left unconfirmed is
             // dropped rather than committed, which is what clicking away means.
-            setTimeout(() => {
+            cancelBlurClose();
+            blurTimer.current = setTimeout(() => {
+              blurTimer.current = null;
               setDraft(null);
               setOpen(false);
               setHighlightIdx(-1);
@@ -191,15 +263,20 @@ export function FieldCombo({
           <ChevronDown size={14} />
         </button>
       </div>
-      {open &&
-        filtered.length > 0 &&
+      {listOpen &&
         createPortal(
           <ul
             ref={listRef}
+            id={listId}
             role="listbox"
             style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, width: pos?.width ?? undefined }}
+            // `pointer-events-auto` and the z-index above a dialog's `z-50` are
+            // both for `ExportDialog`: a modal Radix layer sets
+            // `body { pointer-events: none }` and re-enables it on its own node
+            // only, so a list portaled to `document.body` was mouse-dead —
+            // every row click swallowed, keyboard the sole way through.
             className={cn(
-              "fixed z-50 max-h-48 min-w-[10rem] overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] text-xs shadow-lg",
+              "pointer-events-auto fixed z-[60] max-h-48 min-w-[10rem] overflow-y-auto rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] text-xs shadow-lg",
               pos ? "" : "invisible",
             )}
           >
@@ -212,6 +289,8 @@ export function FieldCombo({
                     </div>
                   )}
                   <div
+                    id={`${listId}-opt-${i}`}
+                    data-idx={i}
                     role="option"
                     aria-selected={o.value === value}
                     onMouseDown={(e) => {

@@ -46,6 +46,7 @@ vi.mock("@/api/viz", async () => {
 const FIELDS: VizFieldsResponse = {
   fields: [
     { token: "artifact", distinct: 12, coverage: 0.98 },
+    { token: "data_type", distinct: 8, coverage: 0.9 },
     // Virtual entries carry null stats and a label — the shape viz.py emits.
     {
       token: "time:hour_of_day",
@@ -68,7 +69,7 @@ function LocationSpy() {
   return null;
 }
 
-function renderPage() {
+function renderPage(entry: string = START) {
   lastSearch = "";
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
@@ -76,7 +77,7 @@ function renderPage() {
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={[START]}>
+        <MemoryRouter initialEntries={[entry]}>
           <LocationSpy />
           <Routes>
             <Route
@@ -189,5 +190,37 @@ describe("VisualizePage time-field auto-probe bypass", () => {
     // ...and the chart type from defaultChartTypeForScale. The naive
     // chartTypesFor("ordinal")[0] would be "time" — a field-free chart.
     expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar");
+  });
+});
+
+/**
+ * What the rail changed on the analyst's behalf, and whether it says the true
+ * reason (#298). Both cases below used to render a claim about the wrong
+ * thing entirely, which is worse than the silence the notice replaced.
+ */
+describe("VisualizePage auto-change notices", () => {
+  it("clears a second field the primary just took over, and names what moved", async () => {
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=pivot&c_scale=nominal&c_field=artifact&c_field_y=data_type",
+    );
+
+    fireEvent.focus(await screen.findByRole("combobox", { name: "Field (X)" }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+
+    // X and Y must differ and the Y list drops whatever X holds, so leaving
+    // `data_type` in Y left it unreachable — and disclosed as "not in this
+    // timeline's reported fields", a claim about a field that plainly is.
+    await waitFor(() => expect(lastSearch).not.toContain("c_field_y"));
+    expect(await screen.findByText(/Field \(Y\) cleared/)).toBeInTheDocument();
+    expect(screen.queryByText(/not in this timeline/i)).toBeNull();
+  });
+
+  it("names the scale in the article the scale actually takes", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByRole("radio", { name: /Interval/ }));
+
+    // Bar is nominal/ordinal only, so the switch is a genuine scale clamp —
+    // and "on a interval scale" is not English.
+    expect(await screen.findByText(/on an interval scale/)).toBeInTheDocument();
   });
 });

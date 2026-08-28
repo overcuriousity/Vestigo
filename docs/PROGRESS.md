@@ -4,7 +4,48 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 196 — the Visualize rail reads in dependency order).
+Last updated: 2026-08-28 (session 197 — PR #308 review fixes).
+
+## Session 197 — 2026-08-28: PR #308 review fixes (the one field picker, and what it says)
+
+Eleven findings from the review of the session-195/196 branch. Nine are in `FieldCombo` itself,
+which is now on five surfaces at once — so each of them was one bug in five places.
+
+- **The list was mouse-dead inside the export dialog.** A modal Radix layer sets
+  `body { pointer-events: none }` and re-enables it on its own node only, so a list portaled to
+  `document.body` swallowed every row click and hover; the keyboard was the sole way through.
+  `pointer-events-auto`, and a z-index above the dialog's.
+- **Escape closed the surface around the combo.** `preventDefault()` without `stopPropagation`
+  let the key reach `InvestigateSheet`'s `window` listener — reverting a half-typed token threw
+  away every knob value beside it — and Radix's capture-phase `document` handler shut the export
+  dialog before the combo saw the key at all. The documented "Escape reverts a draft" contract
+  was unreachable on both surfaces. It now listens on `window` in the capture phase, the one
+  position ahead of both, and only for the key pressed inside its own container.
+- **Two disclosures that named the wrong problem.** The unknown-field note fired while the
+  options query was still in flight (every Visualize load carrying `c_field`), and again on the
+  Y picker whenever X was set to the token Y already held — a field that plainly *is* in the
+  timeline, reported as not. The first is gated on the list being loaded; for the second, taking
+  Y's token into X now clears Y and says so, which is the same disclosure the rest of #298 makes.
+- **Enter on an emptied box committed `""`** to callers with no empty option — `logTemplates`
+  and the sequence-motif query both issued a fieldless request, a state the `<select>`s this
+  replaced could not reach. The empty commit now needs an empty option to commit *to*; the
+  method knobs, which offer one as the method's own default, are unchanged.
+- **The keyboard walked an invisible highlight.** These lists run to hundreds of tokens — the
+  reason the control exists — inside a `max-h-48` box, so arrowing past the sixth row moved a
+  highlight off-screen and Enter committed something the analyst could not see. Also
+  `aria-activedescendant`/`aria-controls`, absent since the Radix `Select` was replaced.
+- **A 150 ms blur timer with no owner** could wipe a draft typed after a refocus. Tracked and
+  cleared, on focus and on unmount.
+- **Two more notices that were not true.** The scale radio blamed the scale for a clamp the
+  *field* forced (`time:date` excludes the numeric marks at any scale), and wrote "on a interval
+  scale"; and a preset — an explicit pick of type, scale and field at once — left the previous
+  auto-notice standing under the chart type the analyst had just chosen, which is the one thing
+  that notice must never do.
+- **The correlate picker accepted free text with no way to disclose it.** Its `value` is
+  permanently empty, so the unknown-token note could never fire, and a typo became a matrix chip
+  that came back empty. The set there is closed, so it is now closed.
+
+Nine new tests; the suite is 1004 green.
 
 ## Session 196 — 2026-08-28: the Visualize rail reads in dependency order (#298)
 
