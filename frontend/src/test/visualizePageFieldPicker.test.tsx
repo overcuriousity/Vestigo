@@ -112,10 +112,11 @@ beforeEach(() => {
   });
 });
 
-/** Open the primary field combo — `FieldCombo` opens its list on focus. */
+/** Open the primary field combo — `FieldCombo` opens its list on focus.
+ * By name, not by index: the rail reads scale → chart type → field now (#298),
+ * so index 0 is the chart-type Select. */
 const openFieldPicker = async () => {
-  const combo = (await screen.findAllByRole("combobox"))[0];
-  fireEvent.focus(combo);
+  fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
   await screen.findByRole("listbox");
 };
 
@@ -162,9 +163,9 @@ describe("VisualizePage time-field auto-probe bypass", () => {
     // The box holds the raw token once committed — the friendly label lives on
     // the list row, and the token is what `c_field` carries.
     await waitFor(() =>
-      expect((screen.getAllByRole("combobox")[0] as HTMLInputElement).value).toBe(
-        "time:hour_of_day",
-      ),
+      expect(
+        (screen.getByRole("combobox", { name: /^Field/ }) as HTMLInputElement).value,
+      ).toBe("time:hour_of_day"),
     );
     // The assertion that matters: no field_numeric_stats scan was issued for
     // the time field. Any earlier call was for the default `artifact` pick.
