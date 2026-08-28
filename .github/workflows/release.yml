@@ -23,6 +23,10 @@ jobs:
           POSTGRES_USER: vestigo
           POSTGRES_PASSWORD: vestigo
           POSTGRES_DB: vestigo
+          # See ci.yml's comment: throwaway service container, dropping SCRAM's
+          # pure-Python PBKDF2 takes a connection from ~27 ms to ~6 ms and the
+          # suite opens them per operation.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -34,6 +38,12 @@ jobs:
         # glibc tag, not -alpine — see ci.yml's comment (musl startup path
         # trips the Actions seccomp profile and never boots).
         image: docker.io/clickhouse/clickhouse-server:26.6.1.1193
+        env:
+          # `default` is restricted to localhost by the image's users.d drop-in
+          # and the job connects across the docker bridge, so every query is
+          # refused with 194 while /ping still answers Ok — see ci.yml's
+          # comment. Test-only: nothing here is a deployment.
+          CLICKHOUSE_SKIP_USER_SETUP: 1
         ports:
           - 8123:8123
           - 9000:9000
