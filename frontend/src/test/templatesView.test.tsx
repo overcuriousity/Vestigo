@@ -172,7 +172,11 @@ describe("TemplatesView", () => {
     await screen.findByText(/Allow TCP/);
     expect(screen.getAllByTitle(/^Mute:/).length).toBe(2);
 
-    fireEvent.change(screen.getByDisplayValue("Message"), { target: { value: "attr:raw_line" } });
+    // The field picker is a combobox showing the raw token, and typing is a
+    // draft until Enter commits it.
+    const fieldCombo = screen.getByRole("combobox", { name: "Field" });
+    fireEvent.change(fieldCombo, { target: { value: "attr:raw_line" } });
+    fireEvent.keyDown(fieldCombo, { key: "Enter" });
     await waitFor(() =>
       expect(screen.getAllByTitle(/only available for Message templates/).length).toBe(2),
     );

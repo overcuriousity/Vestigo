@@ -16,6 +16,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EyeOff, Filter, Info, Undo2 } from "lucide-react";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import { anomaliesApi } from "@/api/anomalies";
 import { dispositionsApi } from "@/api/dispositions";
 import { useDisposition } from "@/hooks/useDisposition";
@@ -138,17 +139,14 @@ export function TemplatesView({ caseId, timelineId, onDrillField }: Props) {
         <span className="shrink-0 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
           Template over
         </span>
-        <select
+        <FieldCombo
+          size="sm"
+          aria-label="Field"
+          className="min-w-0 flex-1"
+          options={fieldOptions.map((o) => ({ value: o.value, label: o.label }))}
           value={field}
-          onChange={(e) => setField(e.target.value)}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
-        >
-          {fieldOptions.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
+          onChange={setField}
+        />
         <select
           value={order}
           onChange={(e) => setOrder(e.target.value as typeof order)}

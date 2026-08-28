@@ -112,13 +112,17 @@ beforeEach(() => {
   });
 });
 
-/** Open the primary field Select — Radix opens on pointerdown, not click. */
+/** Open the primary field combo — `FieldCombo` opens its list on focus. */
 const openFieldPicker = async () => {
-  const triggers = await screen.findAllByRole("combobox");
-  triggers[0].focus();
-  fireEvent.keyDown(triggers[0], { key: "ArrowDown" });
+  const combo = (await screen.findAllByRole("combobox"))[0];
+  fireEvent.focus(combo);
   await screen.findByRole("listbox");
 };
+
+/** Commit a row — the list commits on mousedown, so focus never leaves the
+ * input and the blur handler cannot drop the pick first. */
+const pickField = async (label: string) =>
+  fireEvent.mouseDown(await screen.findByRole("option", { name: new RegExp(label) }));
 
 describe("VisualizePage field picker", () => {
   it("names a virtual field by its label and marks it as a time field", async () => {
@@ -153,12 +157,15 @@ describe("VisualizePage time-field auto-probe bypass", () => {
   it("never probes numeric-ness for a virtual time field", async () => {
     renderPage();
     await openFieldPicker();
-    const option = await screen.findByText("Hour of day (UTC)");
-    fireEvent.click(option);
+    await pickField("Hour of day \\(UTC\\)");
 
-    await waitFor(() => {
-      expect(screen.getAllByText(/Hour of day \(UTC\)/).length).toBeGreaterThan(0);
-    });
+    // The box holds the raw token once committed — the friendly label lives on
+    // the list row, and the token is what `c_field` carries.
+    await waitFor(() =>
+      expect((screen.getAllByRole("combobox")[0] as HTMLInputElement).value).toBe(
+        "time:hour_of_day",
+      ),
+    );
     // The assertion that matters: no field_numeric_stats scan was issued for
     // the time field. Any earlier call was for the default `artifact` pick.
     const timeFieldProbes = fieldNumericMock.mock.calls.filter((c) =>
@@ -170,7 +177,7 @@ describe("VisualizePage time-field auto-probe bypass", () => {
   it("takes an ordinal time field's scale statically and charts it as a bar", async () => {
     renderPage();
     await openFieldPicker();
-    fireEvent.click(await screen.findByText("Hour of day (UTC)"));
+    await pickField("Hour of day \\(UTC\\)");
     await waitFor(() => {
       expect(new URLSearchParams(lastSearch).get("c_field")).toBe("time:hour_of_day");
     });

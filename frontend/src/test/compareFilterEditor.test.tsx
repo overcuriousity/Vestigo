@@ -25,6 +25,14 @@ function setup(filters: EventFilters = {}) {
   return onChange;
 }
 
+/** Pick a field in the shared `FieldCombo` — index 0 among the comboboxes.
+ * Its rows are portaled and commit on mousedown, not click. */
+const pickField = async (label: string) => {
+  const combo = (await screen.findAllByRole("combobox"))[0];
+  fireEvent.focus(combo);
+  fireEvent.mouseDown(await screen.findByRole("option", { name: label }));
+};
+
 /** Open a Radix Select by index among the rendered comboboxes. */
 const openSelect = async (index: number) => {
   const triggers = await screen.findAllByRole("combobox");
@@ -36,8 +44,7 @@ const openSelect = async (index: number) => {
 describe("CompareFilterEditor with a bounded time field", () => {
   it("offers the domain as labelled choices instead of a free-text box", async () => {
     setup();
-    await openSelect(0);
-    fireEvent.click(screen.getByText("Day of week (UTC)"));
+    await pickField("Day of week (UTC)");
 
     // The value control is now a Select, not an Input.
     expect(screen.queryByPlaceholderText("value")).toBeNull();
@@ -48,8 +55,7 @@ describe("CompareFilterEditor with a bounded time field", () => {
 
   it("stores the canonical value behind the label", async () => {
     const onChange = setup();
-    await openSelect(0);
-    fireEvent.click(screen.getByText("Day of week (UTC)"));
+    await pickField("Day of week (UTC)");
     await openSelect(1);
     fireEvent.click(screen.getByText("Mon"));
     fireEvent.click(screen.getByLabelText("Add field filter"));
@@ -61,8 +67,7 @@ describe("CompareFilterEditor with a bounded time field", () => {
 
   it("keeps the free-text box for an ordinary field", async () => {
     const onChange = setup();
-    await openSelect(0);
-    fireEvent.click(screen.getByText("artifact"));
+    await pickField("artifact");
 
     const input = screen.getByPlaceholderText("value");
     fireEvent.change(input, { target: { value: "FILE" } });
@@ -74,13 +79,11 @@ describe("CompareFilterEditor with a bounded time field", () => {
     // "1" means Monday for day-of-week and nothing for artifact; carrying it
     // across a field change would build a filter from the wrong vocabulary.
     setup();
-    await openSelect(0);
-    fireEvent.click(screen.getByText("Day of week (UTC)"));
+    await pickField("Day of week (UTC)");
     await openSelect(1);
     fireEvent.click(screen.getByText("Mon"));
 
-    await openSelect(0);
-    fireEvent.click(screen.getByText("artifact"));
+    await pickField("artifact");
     expect(screen.getByPlaceholderText("value")).toHaveValue("");
   });
 

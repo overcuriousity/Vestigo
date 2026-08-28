@@ -6,7 +6,7 @@
  * and "hung" — and a way out matters more than anywhere else.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { ExportDialog } from "@/components/explorer/ExportDialog";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { installRadixJsdomStubs } from "./helpers/radix";
@@ -68,8 +68,18 @@ async function openInventory() {
   renderDialog();
   fireEvent.click(screen.getByRole("button", { name: "Value inventory" }));
   const picker = await screen.findByRole("combobox", { name: "Field" });
-  await waitFor(() => expect(picker.querySelectorAll("option").length).toBe(3));
+  // The picker is a combobox: its rows are portaled and only exist while it is
+  // open, and typing is a draft until Enter commits it.
+  fireEvent.focus(picker);
+  // Scoped to the combo's own list — the dialog's other selects contribute
+  // `option`s of their own.
+  await waitFor(() =>
+    // Two — the fixture's two fields. The third row the old select had was its
+    // placeholder option, which is now placeholder text on the input.
+    expect(within(screen.getByRole("listbox")).getAllByRole("option").length).toBe(2),
+  );
   fireEvent.change(picker, { target: { value: "attr:src_ip" } });
+  fireEvent.keyDown(picker, { key: "Enter" });
 }
 
 describe("ExportDialog", () => {
