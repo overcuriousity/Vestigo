@@ -166,7 +166,11 @@ docker compose up -d   # or: podman compose up -d
 
 It publishes all three services on `127.0.0.1` only — they run with default or no
 credentials, so they are deliberately unreachable from the LAN. The app's defaults
-(`.env.example`) connect via these localhost ports.
+(`.env.example`) connect via these localhost ports. PostgreSQL is initialized with
+`trust` authentication for the same reason ClickHouse and Qdrant carry no auth here;
+set `VESTIGO_POSTGRES_HOST_AUTH=scram-sha-256` before the first `up` to keep password
+auth. It applies at initdb only, so on a stack that has already run, changing it means
+recreating the volume (`docker compose down -v`, which destroys the local data).
 
 **This compose file is a reference/evaluation deployment, not a production hardening
 guide.** It ships with fixed, well-known defaults so it works out of the box:
