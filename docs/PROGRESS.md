@@ -1,6 +1,61 @@
 # Vestigo Implementation Progress
 
-Last updated: 2026-08-27 (session 192 — PR #306 review fixes, #300).
+Last updated: 2026-08-28 (session 193 — PR #305 review fixes; CI's ClickHouse refused every query).
+
+## Session 193 — 2026-08-28: PR #305 review fixes (the chart lane's last unwired surface)
+
+Three findings from the review of the session-192 branch.
+
+- **The Visualize page never opted into `busyRetry`.** Its eleven gated aggregations — more
+  than the rest of the app together — fell back to the global `retry: 1`, so a busy lane
+  (a story export holding foreground slots, or three other panels) turned a 5-second wait
+  into an error toast where the old unbounded queue had always produced an answer. Every
+  *smaller* surface had been wired up; the biggest one was missed, which is the shape of
+  gap a per-call-site opt-in with no type behind it produces. `busyRetryCoverage.test.ts`
+  now fails any component that issues a `_foreground_scan` call through `useQuery` without
+  it.
+- **The busy badge only rendered under `isLoading`.** False the moment a key has data, so a
+  filter change on a chart that was already drawn retried silently for four minutes behind
+  stale marks and then failed. `TimelineHistogram` had added a `waiting && isFetching`
+  overlay for exactly this; `ChartCanvas`, `FieldHistogramModal` and the Visualize canvas
+  had not. Also names the Visualize page's active query once — the spinner, the badge and
+  the grouped box/violin case (which had no spinner at all, since `numericQuery` is
+  disabled while `groupedOn`) now read the same one.
+- **The chart lane's thread reservation is a bound, not a reservation.**
+  `detect_scan_memory_budget` divides by `N + 2` so the lane's memory comes out of the
+  detectors' share; `detect_scan_max_threads` still divides by `N` alone, so the lane's
+  threads are *added* to a box a full heavy gate already saturates — `2 x 10 + 4 x 5 = 40`
+  on 20 cores. Kept as is (closing it means halving every sweep on a box where no chart is
+  open, and it is a quarter of the 8x it replaced) and the prose corrected instead:
+  `_scan.py`'s two docstrings, `ANOMALY_DETECTION.md`, `DEPLOYMENT.md` and the sizing
+  calculator now state the additive bound and point at
+  `VESTIGO_STAT_SCAN_MAX_THREADS = cores / (N + 2)` for operators who want the strict
+  version.
+
+## Session 193 — 2026-08-28: CI's ClickHouse answered `/ping` and refused every query
+
+The backend job had been red since 2026-08-26 and burned the runner's 6-hour default
+timeout on every run, on `main` and on PR #305 alike. Not a regression in the branch under
+review: `bcc3683` (PR #304) moved CI from `clickhouse-server:24` to `26.6.1.1193` to match
+the tag `docker-compose.yml` pins, and images from ~25.x on ship a
+`users.d/default-user.xml` that restricts the `default` user to `::1`/`127.0.0.1`. The job
+reaches the service container through a published port, so its packets arrive from the
+docker bridge and every query came back `401` / exception code 194 (REQUIRED_PASSWORD).
+`docker-compose.yml` has mounted `deploy/clickhouse/allow-default-network.xml` against
+exactly this since the image bumped; a service container starts before `actions/checkout`,
+so there is no repo file to mount and CI never got the equivalent.
+
+- **`CLICKHOUSE_SKIP_USER_SETUP: 1`** on both jobs' ClickHouse service. The entrypoint
+  drops the drop-in entirely, which is the mount's effect without a file. Test-only —
+  nothing in `.github/` is a deployment.
+- **The reachability probe asks a question the failure could answer.** `/ping` is served
+  before any user is resolved, so it said `Ok.` to a server that would refuse every
+  statement — and `tests/conftest.py::pytest_configure` exists precisely so a run that
+  cannot pass stops in a second instead of ending in a wall of red. It now runs `SELECT 1`
+  as the configured user and reports ClickHouse's own diagnosis on failure.
+- **`timeout-minutes: 60` on the backend job.** The suite runs in ~25 minutes; a hung test
+  should not hold a runner for six hours to teach nobody anything.
+
 
 ## Session 192 — 2026-08-27: PR #306 review fixes (the chart lane's other half)
 

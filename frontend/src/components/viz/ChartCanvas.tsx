@@ -111,12 +111,26 @@ export function ChartCanvas({
         </p>
       )}
       {chartQuery.data && (
-        <ChartMarks
-          config={config}
-          data={chartQuery.data}
-          opts={opts}
-          compareOn={compareOn}
-        />
+        <div className="relative">
+          {/* A busy lane (#300) while marks are already drawn. `isLoading` is
+              false once the key has data, so the spinner branch above never
+              runs for a refetch — without this the chart would sit stale and
+              silent for the whole retry window and only then fail. Gated on
+              `isFetching`, which stays true across the retry delay. */}
+          {waiting && chartQuery.isFetching && (
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+              <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+                {waiting}
+              </span>
+            </div>
+          )}
+          <ChartMarks
+            config={config}
+            data={chartQuery.data}
+            opts={opts}
+            compareOn={compareOn}
+          />
+        </div>
       )}
     </div>
   );

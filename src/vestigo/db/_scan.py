@@ -497,24 +497,35 @@ def detect_foreground_memory_budget() -> int:
 def detect_foreground_max_threads() -> int:
     """``max_threads`` for a foreground (chart) scan.
 
-    The same reservation as :func:`detect_foreground_memory_budget`, applied
-    to the other resource a gate slot commits: two heavy slots' worth of
-    threads, divided across the foreground gate. Without it the reservation
-    covered memory only and the lane's CPU was unaccounted — a full gate of
-    four charts, each fanning out two queries at the *heavy* width, put 8x
-    that width on a box the heavy divisor had already sized so that a full
-    heavy gate exactly saturates it (issue #301). On a 20-core host at the
-    default concurrency of 2 that was 100 threads on 20 cores, and the
-    detector sweep the analyst was waiting on got slower for it.
+    Two heavy slots' worth of threads, divided across the foreground gate —
+    the same arithmetic :func:`detect_foreground_memory_budget` uses, but
+    **not** the same guarantee, and the difference is deliberate. The memory
+    path is a true reservation: :func:`detect_scan_memory_budget` divides the
+    total by ``_GATE_CONCURRENCY + _FOREGROUND_SLOTS``, so the chart lane's
+    share comes out of the detectors' own and the two lanes together never
+    exceed the budget. :func:`detect_scan_max_threads` divides the cores by
+    ``_GATE_CONCURRENCY`` alone, so the heavy width is unchanged by this lane
+    existing and these threads are *added* to a box a full heavy gate already
+    saturates. Every slot busy at once is therefore up to 2x the core count:
+    on a 20-core host at the default concurrency, ``2 x 10 + 4 x 5 = 40``.
+
+    That bound is accepted rather than closed. It is a quarter of the 8x this
+    replaced — a full gate of four charts, each fanning out two queries at the
+    *heavy* width, was 100 threads on 20 cores (issue #301) — it needs all six
+    slots occupied to appear at all, and closing it would mean dividing the
+    heavy width by ``N + 2`` as well, halving every detector sweep on a box
+    where nobody has opened a chart. An operator who does run charts
+    continuously alongside sweeps can pin ``VESTIGO_STAT_SCAN_MAX_THREADS`` to
+    ``cores // (N + 2)`` and get the strict version.
 
     Floored at 2 for the same reason :func:`detect_scan_max_threads` is: a
     single-threaded GROUP BY is not a fallback to land on silently. A gate
-    wider than twice the heavy width therefore *can* exceed the reservation
-    on a very small box, where the floor matters more than the arithmetic.
+    wider than twice the heavy width therefore *can* exceed even that bound on
+    a very small box, where the floor matters more than the arithmetic.
 
     Not divided by the fan-out width the way the memory cap is
     (:func:`scan_fanout`): a fan-out of two at half the heavy width is one
-    heavy slot's threads, which is what the reservation already allows, and
+    heavy slot's threads, which is inside the two-slot allowance already, and
     dividing again would put the ordinary two-wave chart at the floor.
     """
     return max(2, detect_scan_max_threads() * _FOREGROUND_SLOTS // _FOREGROUND_CONCURRENCY)
@@ -592,8 +603,10 @@ def scan_budget_report() -> dict[str, Any]:
         # the heavy divisor reserves. Disclosed so "why is my chart capped at
         # X" has an answer on the same page as the heavy cap.
         # `max_threads` is disclosed here too, and not only for the heavy
-        # class: the reservation covers both resources, and an operator
-        # asking "why is my chart capped at X" is as likely to mean CPU.
+        # class: an operator asking "why is my chart capped at X" is as
+        # likely to mean CPU — and this is the one number that shows the
+        # chart lane's threads are a bound on top of the heavy width rather
+        # than a slice out of it (see `detect_foreground_max_threads`).
         "foreground": {
             "concurrency": _FOREGROUND_CONCURRENCY,
             "per_query_bytes": foreground,
@@ -862,10 +875,11 @@ def foreground_scan_settings() -> str:
     """The SETTINGS clause for an interactive chart aggregation.
 
     Same shape as :func:`heavy_scan_settings` with the foreground cap *and*
-    the foreground thread width. Both are the same reservation — two heavy
-    slots split across the gate — applied to the two resources a slot
-    commits; see :func:`detect_foreground_max_threads` for why the width
-    cannot simply be the heavy one.
+    the foreground thread width — both two heavy slots split across the gate,
+    applied to the two resources a slot commits. The memory half is a true
+    reservation, taken out of the heavy class's share; the thread half is a
+    bound on top of it. See :func:`detect_foreground_max_threads` for why the
+    width cannot simply be the heavy one, and why the asymmetry stands.
     """
     return _scan_settings_clause(detect_foreground_memory_budget(), detect_foreground_max_threads())
 

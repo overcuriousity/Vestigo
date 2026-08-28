@@ -238,11 +238,21 @@ depth and the UI keeps waiting visibly, re-asking at the server's pace for about
 before it calls the lane wedged; a request that disconnects (a reload mid-sweep) frees its slot
 and kills its ClickHouse query within about a second.
 
-The same reservation covers threads: a chart runs at `max_threads × 2 ÷ 4` (floor 2), not the
-heavy width, so a full chart lane costs the two reserved slots' worth of CPU rather than four
-times a detector's. Reported as `scan_budget.foreground.max_threads`. Charts are short and
-latency-bound; the width they lose costs them little, and the sweep they would otherwise have
-slowed down is usually the thing the analyst is actually waiting for.
+Threads are bounded but **not** reserved the way memory is. A chart runs at `max_threads × 2 ÷ 4`
+(floor 2), not the heavy width, so a full chart lane costs about two heavy slots' worth of CPU
+rather than four times a detector's. Reported as `scan_budget.foreground.max_threads`. Charts are
+short and latency-bound; the width they lose costs them little, and the sweep they would otherwise
+have slowed down is usually the thing the analyst is actually waiting for.
+
+The heavy width still divides the cores by N alone, though, so those two slots are *added* to a
+box the heavy divisor has already sized to be exactly saturated by a full heavy gate — unlike
+`per_query_bytes`, which divides by N + 2 and therefore takes the chart lane's share out of the
+detectors' own. Every slot busy at once is up to twice the core count in threads: on a 20-core
+host at the default N, `2 × 10 + 4 × 5 = 40`. That is the deliberate trade — it is a quarter of
+the 8× oversubscription it replaced, it needs all six slots full to appear at all, and closing it
+would mean halving every detector sweep's width on a box where nobody has opened a chart. Size for
+it if you run the Visualize tab continuously alongside sweeps: pin `VESTIGO_STAT_SCAN_MAX_THREADS`
+to `cores ÷ (N + 2)` and both lanes fit inside the core count.
 
 > **Upgrading across the chart-lane change (#300):** the heavy per-query cap changed divisor from
 > N to N + 2, so at the default `VESTIGO_STAT_SCAN_CONCURRENCY=2` **every detector query's

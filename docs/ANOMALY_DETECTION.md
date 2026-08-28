@@ -114,11 +114,15 @@ Three cross-cutting rules keep detector scans survivable on 100M+-row cases
   is skippable: `field_terms(..., totals=False)` runs the top-N alone and reports
   `total`/`distinct` from the rows in hand, for a caller that reads only the values (the
   filter rail's value autocomplete) and would otherwise pay a second whole-corpus grouping
-  for numbers it discards. The reservation covers threads as well as memory —
-  `detect_foreground_max_threads()` gives a chart `max_threads × 2 ÷ 4` (floor 2), so a full
-  chart lane costs the two reserved slots' worth of CPU rather than four times a detector's;
-  a lane running at the heavy width would have undone the sizing that makes a *full* heavy
-  gate exactly saturate the box (#301). A chart waits at most 5 s for a slot and then answers
+  for numbers it discards. Threads are bounded as well as memory, though not reserved the same
+  way — `detect_foreground_max_threads()` gives a chart `max_threads × 2 ÷ 4` (floor 2), so a
+  full chart lane costs about two heavy slots' worth of CPU rather than four times a
+  detector's; a lane running at the heavy width would have undone the sizing that makes a
+  *full* heavy gate exactly saturate the box (#301). The memory cap divides by `N + 2` and so
+  comes out of the detectors' share; the heavy thread width still divides by `N` alone, so
+  those two slots are added on top and every slot busy at once is up to twice the core count.
+  Deliberate: closing it means halving every sweep on a box where no chart is open. Pin
+  `VESTIGO_STAT_SCAN_MAX_THREADS` to `cores ÷ (N + 2)` for the strict version. A chart waits at most 5 s for a slot and then answers
   503 with `queued_ahead` and `Retry-After`, which the UI renders as "waiting behind N scans"
   and retries for about four minutes before surfacing the 503 as an error — the client's
   window is `BUSY_RETRY_LIMIT × (that wait + Retry-After)`, both halves, since a parked

@@ -349,8 +349,10 @@ function minimumPlan(input) {
 }
 
 /** Threads one chart query runs at — `detect_foreground_max_threads` in
- *  src/vestigo/db/_scan.py. The same reservation as the per-chart memory cap:
- *  the two slots the heavy divisor holds back, split across the chart lane. */
+ *  src/vestigo/db/_scan.py. Two heavy slots' worth split across the chart
+ *  lane, the same arithmetic as the per-chart memory cap — but the memory
+ *  divisor holds those slots back and the thread divisor does not, so these
+ *  threads sit on top of a saturated box rather than inside it. */
 function chartThreadsFor(threads) {
   return Math.max(K.min_threads_per_scan, Math.floor((threads * K.foreground_slots) / K.foreground_concurrency));
 }
@@ -463,7 +465,7 @@ function compute() {
   document.getElementById("out-cores").textContent = need.cores;
   document.getElementById("out-cores-why").textContent =
     `${need.concurrency} concurrent scans × ${need.threads} threads each, so a full heavy gate saturates the box rather than oversubscribing it. ` +
-    `The chart lane runs narrower — ${K.foreground_concurrency} × ${chartThreadsFor(need.threads)} threads, the ${K.foreground_slots} reserved slots' share — so charts rendering during a sweep cost about two slots on top, briefly, rather than multiplying the box.`;
+    `The chart lane runs narrower — ${K.foreground_concurrency} × ${chartThreadsFor(need.threads)} threads, ${K.foreground_slots} heavy slots' worth — so charts rendering during a sweep cost about two slots on top, briefly, rather than multiplying the box. Unlike the per-chart memory cap that is added to the core count above rather than carved out of it; pin VESTIGO_STAT_SCAN_MAX_THREADS to cores / (N + ${K.foreground_slots}) if charts and sweeps run together continuously.`;
 
   const mem = document.getElementById("out-memory");
   mem.textContent = "";
@@ -500,7 +502,7 @@ function compute() {
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)", "0 (auto)",
     `Auto resolves to ${need.threads} at the minimum${max ? ` and ${max.threads} at full spend` : ""} — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
   row(set, "→ chart-lane width (derived)", String(chartThreadsFor(need.threads)), m((x) => String(chartThreadsFor(x.threads))),
-    `Not a setting: ${K.foreground_slots} reserved slots ÷ ${K.foreground_concurrency} chart queries, applied to the width above. A chart is latency-bound and short, so it runs narrow rather than taking a detector's full width.`);
+    `Not a setting: ${K.foreground_slots} heavy slots' worth ÷ ${K.foreground_concurrency} chart queries, applied to the width above. A chart is latency-bound and short, so it runs narrow rather than taking a detector's full width — but this width is added to the core count, not taken out of it, unlike the memory cap.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",
     shape === "split" ? String(need.scanTotal) : "0 (auto)",
     shape === "split" ? m((x) => String(x.scanTotal)) : "0 (auto)",
