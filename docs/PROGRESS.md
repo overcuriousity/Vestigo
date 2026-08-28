@@ -4,7 +4,142 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 193 — PR #305 review fixes; CI's ClickHouse refused every query).
+Last updated: 2026-08-28 (session 198 — PR #308 review, second pass).
+
+## Session 198 — 2026-08-28: PR #308 review, second pass (four more true-statement bugs)
+
+A second review of the same branch. One in `FieldCombo`, three in the Visualize rail — and all
+four are the branch's own theme: a control that moved without saying so, or said something that
+was not true of the chart on screen.
+
+- **Enter committed a label as a token.** The list filters on the label *and* the token, but
+  Enter's exact-match checked only the token — so typing what a row displays narrowed the list
+  to that one row and then committed the display text as free entry: `series_field = "Display
+  name"`, `user_agent` where the option is `attr:user_agent`, the literal `No grouping` where
+  the row means "clear this". A unique label match now selects its row; an ambiguous one still
+  falls through to free text rather than guessing which row was meant.
+- **The Y picker claimed the wrong problem, in the other direction.** Session 197 fixed X→Y by
+  clearing Y and saying so. Y→X had no guard: the Y list drops whatever X holds, but the box
+  takes free text, so typing X's token into Y committed it and disclosed it as "not in this
+  timeline's reported fields" — about a field that plainly is. There is no mirror of the
+  takeover to make here (X is the axis the chart is built on, and clearing it would only have
+  the defaulting effect refill it with a field nobody picked), so the pick is refused and the
+  reason is said at the picker that refused it.
+- **The auto-notice outlived the chart it was about.** The invariant "never shown under
+  `chartRefLive`" was in the docstring but not in the render. The page does not remount when a
+  saved chart is opened — `c_chart` is a param on the same route — so a notice from the chart
+  the analyst was building survived onto a stored chart the rail re-picked nothing for.
+- **The non-numeric probe moved two controls in silence and wiped a standing notice.** Its
+  branch set the notice to `null`: a ratio Box plot became a nominal Bar with no word about it,
+  and the "Group by cleared" line the analyst's own edit had put there a few hundred
+  milliseconds earlier went with it. It now names exactly which of the two controls moved, and
+  returns early when neither did — landing on the scale and type the chart already has is not a
+  change and must not claim to be one.
+
+Six new tests; the suite is 1010 green. The Visualize page tests now mock `dispositionsApi`:
+every chart query waits on `scopeReady`, so without it the numeric probe never fired and the
+existing "never probes a time field" assertion was passing on a page that probed nothing at all.
+
+## Session 197 — 2026-08-28: PR #308 review fixes (the one field picker, and what it says)
+
+Eleven findings from the review of the session-195/196 branch. Nine are in `FieldCombo` itself,
+which is now on five surfaces at once — so each of them was one bug in five places.
+
+- **The list was mouse-dead inside the export dialog.** A modal Radix layer sets
+  `body { pointer-events: none }` and re-enables it on its own node only, so a list portaled to
+  `document.body` swallowed every row click and hover; the keyboard was the sole way through.
+  `pointer-events-auto`, and a z-index above the dialog's.
+- **Escape closed the surface around the combo.** `preventDefault()` without `stopPropagation`
+  let the key reach `InvestigateSheet`'s `window` listener — reverting a half-typed token threw
+  away every knob value beside it — and Radix's capture-phase `document` handler shut the export
+  dialog before the combo saw the key at all. The documented "Escape reverts a draft" contract
+  was unreachable on both surfaces. It now listens on `window` in the capture phase, the one
+  position ahead of both, and only for the key pressed inside its own container.
+- **Two disclosures that named the wrong problem.** The unknown-field note fired while the
+  options query was still in flight (every Visualize load carrying `c_field`), and again on the
+  Y picker whenever X was set to the token Y already held — a field that plainly *is* in the
+  timeline, reported as not. The first is gated on the list being loaded; for the second, taking
+  Y's token into X now clears Y and says so, which is the same disclosure the rest of #298 makes.
+- **Enter on an emptied box committed `""`** to callers with no empty option — `logTemplates`
+  and the sequence-motif query both issued a fieldless request, a state the `<select>`s this
+  replaced could not reach. The empty commit now needs an empty option to commit *to*; the
+  method knobs, which offer one as the method's own default, are unchanged.
+- **The keyboard walked an invisible highlight.** These lists run to hundreds of tokens — the
+  reason the control exists — inside a `max-h-48` box, so arrowing past the sixth row moved a
+  highlight off-screen and Enter committed something the analyst could not see. Also
+  `aria-activedescendant`/`aria-controls`, absent since the Radix `Select` was replaced.
+- **A 150 ms blur timer with no owner** could wipe a draft typed after a refocus. Tracked and
+  cleared, on focus and on unmount.
+- **Two more notices that were not true.** The scale radio blamed the scale for a clamp the
+  *field* forced (`time:date` excludes the numeric marks at any scale), and wrote "on a interval
+  scale"; and a preset — an explicit pick of type, scale and field at once — left the previous
+  auto-notice standing under the chart type the analyst had just chosen, which is the one thing
+  that notice must never do.
+- **The correlate picker accepted free text with no way to disclose it.** Its `value` is
+  permanently empty, so the unknown-token note could never fire, and a typo became a matrix chip
+  that came back empty. The set there is closed, so it is now closed.
+
+Nine new tests; the suite is 1004 green.
+
+## Session 196 — 2026-08-28: the Visualize rail reads in dependency order (#298)
+
+The rail read Field → Scale → Chart type while the dependency ran the other way. Landing on
+the default Time histogram — which charts no field — left the *topmost* control inert, and the
+only way to discover why was to change a dropdown below it. Two more controls moved on their
+own with no explanation.
+
+- **Reordered:** scale of measurement → chart type → field → second field → Compare → metric →
+  options. Scale gates which chart types are legal; the chart type decides whether a field
+  means anything. Top-down, that is now a sentence. The page header comment, which promised
+  the old field-first model, was rewritten in the same commit rather than left stating the
+  opposite of the code.
+- **The inert field state explains itself.** Instead of a bare greyed `— event count —`, it
+  says the time histogram counts every event so it charts no field, and offers a one-click
+  "Chart a field instead (Bar)". This is the contract Compare already kept — always rendered,
+  disabled with the reason — now applied to the control that needed it most.
+  `firstFieldChartingType` picks the target: `defaultChartTypeForScale` alone would not do,
+  because its preference list ends in `time`, which is itself field-free.
+- **Every automatic re-pick names itself.** One `autoNotice` under Chart type, set by the scale
+  radio when it clamps an illegal chart type and by both field probes when they choose a scale
+  ("`attr:src_port` looks numeric — scale set to ratio, chart set to Histogram"). Cleared by
+  the analyst's next explicit chart-type or field pick, since their own choice needs no excuse;
+  never shown under `chartRefLive`, where the config is the analyst's, not a probe's.
+
+Six new tests; the suite is 987 green. `components/viz/ChartRail.tsx` is still worth
+extracting from this 1,500-line page — deliberately not folded in here, since it would bury a
+UX fix inside a large-diff refactor.
+
+## Session 195 — 2026-08-28: one field picker everywhere
+
+Six surfaces asked "which field?" six different ways, and none of them let an analyst type.
+Two native `<select>`s in Investigate (log templates, sequence patterns), one in the export
+dialog, two Radix `Select`s in Visualize and the compare-filter editor, and a bare inline
+`<select>` for the method knobs. On a timeline carrying a few hundred `attr:*` tokens, a
+dropdown is the wrong control — and none of the six could reach a field the cardinality
+inventory had not caught up with yet.
+
+- **`components/ui/FieldCombo.tsx`** — the one control. A text input that opens its full list
+  on focus (browse, exactly as the dropdowns did), filters as you type against both the token
+  and the label, walks with ↓/↑, and commits whatever you type when nothing matches. The box
+  shows the raw token because that is what every caller stores and what an analyst would type;
+  the pretty label and its hint (cardinality, `(time field)`, distinct counts) live on the
+  rows. Escape reverts a draft without the caller ever seeing it.
+- **Free entry, disclosed.** A committed token that is not in `options` renders a muted "not
+  in this timeline's reported fields" note. It never blocks — the inventory legitimately lags
+  a source ingested a minute ago — but a typo used to commit silently and come back as an
+  empty chart or a scan that found nothing, with nothing naming the cause.
+- **`lib/useAnchoredDropdown.ts`** — the portaled fixed-position anchoring (flip above when
+  there is no room below, re-place on scroll/resize) extracted verbatim from `TagInput`, which
+  had the only copy. `TagInput` now calls the hook, so there is one implementation rather than
+  two to keep in step.
+- **Six call sites converted.** `PatternsView`'s `<optgroup>` Standard/Dynamic split survives
+  as the combo's section headers; `MethodFieldSelect` uses the borderless `inline` variant so
+  it still reads as part of the knob's sentence; `ExportDialog`'s placeholder still names which
+  of its three states the list is in. `CompareFilterEditor`'s *value* control stays a `Select`
+  on a bounded `time:` field — its domain is complete and its canonical values are opaque
+  ("1" is Monday), which is the one place free text builds a filter matching nothing.
+
+Thirteen new tests pin the contract; the suite is 981 green.
 
 ## Session 193 — 2026-08-28: PR #305 review fixes, and a CI job that could not pass
 

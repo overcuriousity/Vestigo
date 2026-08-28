@@ -6,10 +6,18 @@
  * matches whatever the analyst was just looking at in the grid. That
  * inheritance is stated on the canvas by `viz/InheritedFiltersBar` — the
  * scope of an exported figure has to be legible before the chart is read,
- * not only in the caption underneath it. The analyst
- * picks a field, declares its scale of measurement, and gets the chart
- * types appropriate to that scale — each backed by one of the `vizApi`
- * aggregations.
+ * not only in the caption underneath it.
+ *
+ * The rail reads in dependency order: scale of measurement, then the chart
+ * types that scale allows, then the field that chart charts — each backed by
+ * one of the `vizApi` aggregations. It used to read field-first, which stated
+ * the dependency backwards: the default time histogram charts no field, so the
+ * topmost control was inert until the analyst changed a dropdown *below* it
+ * (#298). Nothing in the rail goes quietly dead now — a control that cannot
+ * apply says why and offers the way out, the contract Compare already kept —
+ * and every re-pick the rail makes on the analyst's behalf (the scale radio
+ * clamping an illegal chart type, the field probes choosing a scale) names
+ * itself in `autoNotice` rather than moving a control nobody touched.
  *
  * All chart state (type, field, scale, metric, comparison layer, options)
  * lives in the URL as a serialized `ChartConfig` (`c_*` params, see
@@ -33,6 +41,7 @@ import {
   type RoutineOverride,
 } from "@/lib/routineCollapse";
 import { applyFieldEntries, removeFilterEntry } from "@/lib/fieldFilters";
+import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -76,12 +85,13 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, SCALES } from "@/components/viz/lib/chartMeta";
+import { CHART_META, SCALES, chartTypesFor } from "@/components/viz/lib/chartMeta";
 import {
   resolveChartOptions,
   defaultChartTypeForScale,
   chartTypesForField,
 } from "@/components/viz/lib/chartOptions";
+import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
@@ -132,19 +142,43 @@ const CLEAR_GROUP = "__viz_no_group__";
  * analyst more about why than an empty parenthetical would. Ordinary fields
  * guard on null anyway, so an absent count renders nothing rather than
  * "(null distinct)". */
-function fieldOptionText(f: VizFieldInfo) {
-  return (
-    <>
-      {fieldTokenLabel(f.token)}{" "}
-      <span className="text-[var(--color-fg-muted)]">
-        {isTimeField(f.token)
-          ? "(time field)"
-          : f.distinct != null
-            ? `(${f.distinct} distinct)`
-            : null}
-      </span>
-    </>
+/** "a ratio scale", but "an interval scale" — the scale names are data. */
+function articleFor(word: string): string {
+  return /^[aeiou]/i.test(word) ? "an" : "a";
+}
+
+function fieldComboOption(f: VizFieldInfo): FieldComboOption {
+  return {
+    value: f.token,
+    label: fieldTokenLabel(f.token),
+    hint: isTimeField(f.token)
+      ? "(time field)"
+      : f.distinct != null
+        ? `(${f.distinct} distinct)`
+        : undefined,
+  };
+}
+
+/** The chart type to switch to when the analyst wants to chart a field and the
+ * current one charts none. `defaultChartTypeForScale` is not enough on its own:
+ * its preference list ends in `time`, which is itself field-free, so on a scale
+ * whose only other legal marks are field-free it would hand back the state we
+ * are trying to leave. */
+function firstFieldChartingType(scale: Scale, field: string | null): ChartType | null {
+  const legal = chartTypesForField(scale, field).filter(
+    (c) => CHART_META[c].dataKind !== "time" && CHART_META[c].dataKind !== "punchcard",
   );
+  if (legal.length === 0) return null;
+  const preferred = defaultChartTypeForScale(scale, field);
+  return legal.includes(preferred) ? preferred : legal[0];
+}
+
+/** Why the field picker is inert — shown instead of a bare greyed box, the same
+ * way Compare states its own reason rather than disappearing (#298). */
+function fieldFreeReason(chartType: ChartType): string {
+  return chartType === "punchcard"
+    ? "The punchcard counts events by weekday and hour, so it charts no field of its own."
+    : "The time histogram counts every event in each bucket, so it charts no field of its own.";
 }
 
 /** Why Compare is disabled for a chart type — shown instead of hiding the
@@ -409,10 +443,33 @@ export function VisualizePage() {
   // the same response — both coefficients always ship, so switching never
   // refetches (same reasoning as pivot↔sankey).
   const [corrMethod, setCorrMethod] = useState<CorrMethod>("pearson");
+  /** What the rail changed on the analyst's behalf, and why (#298).
+   *
+   * The scale radio re-picks the chart type, and the field probes reassign both
+   * — correct in every case, and until now wordless: controls the analyst never
+   * touched moved while they watched. This holds the last such change and is
+   * cleared by the next explicit pick, since their own choice needs no excuse. */
+  const [autoNotice, setAutoNotice] = useState<string | null>(null);
+  /** A token typed into the second-field picker that X already holds (#308).
+   *
+   * The X and Y pickers must not name the same field, so the Y list drops
+   * whatever X holds — but the box takes free text, so the token can still be
+   * typed in. Committing it would show the combo's unknown-field disclosure,
+   * which is a claim about the wrong problem entirely: the field *is* in this
+   * timeline's inventory, it is just spoken for. The X→Y direction resolves
+   * the collision by clearing Y and saying so; Y→X cannot mirror that, since X
+   * is the axis the chart is built on and emptying it would only have the
+   * defaulting effect refill it with a field nobody picked. So refuse, and say
+   * why at the picker that refused. */
+  const [fieldYTaken, setFieldYTaken] = useState<string | null>(null);
   const [presetsOpen, setPresetsOpen] = useState(() => !searchParams.has("c_type"));
 
   const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
     updateConfig(preset.config);
+    // A preset is an explicit pick of type, scale and field at once, so any
+    // standing "we moved this for you" note is now about a chart the analyst
+    // no longer has — and would read as an excuse for the one they just chose.
+    setAutoNotice(null);
     setPresetsOpen(false);
   };
 
@@ -501,7 +558,11 @@ export function VisualizePage() {
     autoProbedField.current = field;
     if (fieldFree || requiresSecondField || multiField) return;
     const scale = TIME_FIELDS[field].scale;
-    updateConfig({ scale, chartType: defaultChartTypeForScale(scale, field) });
+    const nextType = defaultChartTypeForScale(scale, field);
+    updateConfig({ scale, chartType: nextType });
+    setAutoNotice(
+      `${fieldTokenLabel(field)} is a time field — scale set to ${scale}, chart set to ${CHART_META[nextType].label}.`,
+    );
   }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig, chartRefLive]);
 
   useEffect(() => {
@@ -516,10 +577,23 @@ export function VisualizePage() {
     // punchcard) or a deliberately-picked two-field chart.
     if (fieldFree || requiresSecondField || multiField) return;
     const isNumeric = numericQuery.data.count > 0;
-    updateConfig({
-      scale: isNumeric ? "ratio" : "nominal",
-      chartType: isNumeric ? "histogram" : "bar",
-    });
+    const nextScale: Scale = isNumeric ? "ratio" : "nominal";
+    const nextType: ChartType = isNumeric ? "histogram" : "bar";
+    // Say exactly which of the two controls moved, and say nothing when
+    // neither did. The non-numeric branch used to re-pick *both* silently —
+    // a Histogram on a ratio scale became a Bar on a nominal one with no word
+    // about it — and then set the notice to `null`, which also wiped the
+    // "Group by cleared" line the analyst's own edit had just put there a few
+    // hundred milliseconds earlier. Landing on the scale and type the chart
+    // already has is not a change and must not claim to be one.
+    const moved: string[] = [];
+    if (nextScale !== scale) moved.push(`scale set to ${nextScale}`);
+    if (nextType !== chartType) moved.push(`chart set to ${CHART_META[nextType].label}`);
+    if (moved.length === 0) return;
+    updateConfig({ scale: nextScale, chartType: nextType });
+    setAutoNotice(
+      `${fieldTokenLabel(field)} ${isNumeric ? "looks numeric" : "has no numeric values"} — ${moved.join(", ")}.`,
+    );
   }, [
     field,
     fieldIsTime,
@@ -527,6 +601,8 @@ export function VisualizePage() {
     fieldFree,
     requiresSecondField,
     multiField,
+    scale,
+    chartType,
     updateConfig,
     chartRefLive,
   ]);
@@ -538,9 +614,21 @@ export function VisualizePage() {
     // Also re-picks when the type is legal for the new scale but not for the
     // field — a `time:` field cannot feed a numeric mark at any scale.
     if (!chartTypesForField(s, field).includes(chartType)) {
-      updateConfig({ scale: s, chartType: defaultChartTypeForScale(s, field) });
+      const next = defaultChartTypeForScale(s, field);
+      updateConfig({ scale: s, chartType: next });
+      // The re-pick is correct and used to be silent: two controls where the
+      // analyst touched one. Say which moved and why (#298) — and say which of
+      // the two reasons it was, since blaming the scale for a clamp the *field*
+      // forced is a false statement about the chart the analyst is looking at.
+      const legalForScale = chartTypesFor(s).includes(chartType);
+      setAutoNotice(
+        legalForScale && field
+          ? `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} can't plot ${fieldTokenLabel(field)}.`
+          : `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available on ${articleFor(s)} ${s} scale.`,
+      );
     } else {
       updateConfig({ scale: s });
+      setAutoNotice(null);
     }
   };
 
@@ -687,6 +775,10 @@ export function VisualizePage() {
   });
 
   const availableChartTypes = chartTypesForField(scale, field);
+  /** The chart type the "chart a field instead" button switches to — null when
+   * this scale offers no field-charting mark at all, in which case the button
+   * would be a dead end and is not rendered. */
+  const fieldChartingType = firstFieldChartingType(scale, field);
 
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
@@ -881,6 +973,72 @@ export function VisualizePage() {
           </p>
         )}
 
+        {/* Scale of measurement */}
+        <div>
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Scale of measurement
+          </label>
+          <div className="space-y-1">
+            {SCALES.map((s) => (
+              <label
+                key={s}
+                className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
+                  scale === s ? "bg-[var(--color-accent-dim)]" : "hover:bg-[var(--color-bg-hover)]"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="scale"
+                  checked={scale === s}
+                  onChange={() => handleScaleChange(s)}
+                  className="accent-[var(--color-accent)]"
+                />
+                {SCALE_INFO[s].label}
+                <Tooltip content={SCALE_INFO[s].hint} side="right">
+                  <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
+                </Tooltip>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Chart type */}
+        <div>
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Chart type
+          </label>
+          <Select
+            value={chartType}
+            onValueChange={(v) => {
+              updateConfig({ chartType: v as ChartType });
+              setAutoNotice(null);
+            }}
+          >
+            <SelectTrigger className="text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {availableChartTypes.map((c) => (
+                <SelectItem key={c} value={c}>
+                  {CHART_META[c].label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {/* Never under a live chart reference: the page does not remount when
+              a saved chart is opened (`chartRefLive` is derived from `c_chart`
+              on the same route), so a notice about the chart the analyst was
+              building would otherwise survive onto a stored chart the rail
+              re-picked nothing for — a "we moved this for you" line about a
+              move that never happened here. */}
+          {!chartRefLive && autoNotice && (
+            <p className="mt-1 text-xs text-[var(--color-info)]">{autoNotice}</p>
+          )}
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            {CHART_HOW_TO_READ[chartType]}
+          </p>
+        </div>
+
         {/* Field picker — hidden for the correlation matrix, which charts a
             list of fields instead (its own picker is below). */}
         <div className={multiField ? "hidden" : undefined}>
@@ -888,22 +1046,51 @@ export function VisualizePage() {
             {requiresSecondField ? "Field (X)" : "Field"}
           </label>
           {fieldFree ? (
-            <div className="rounded border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg-muted)]">
-              — event count —
-            </div>
+            /* Rendered and inert with the reason shown, never silently dead —
+               the same contract Compare keeps a few blocks down. Greying a
+               control the analyst cannot see the cause of is what made this
+               read as a glitch (#298). */
+            <>
+              <div className="rounded border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg-muted)]">
+                — event count —
+              </div>
+              <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+                {fieldFreeReason(chartType)}
+              </p>
+              {fieldChartingType && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-1.5 w-full"
+                  onClick={() => {
+                    updateConfig({ chartType: fieldChartingType });
+                    setAutoNotice(null);
+                  }}
+                >
+                  Chart a field instead ({CHART_META[fieldChartingType].label})
+                </Button>
+              )}
+            </>
           ) : (
-            <Select value={field ?? undefined} onValueChange={(v) => updateConfig({ field: v })}>
-              <SelectTrigger className="text-sm">
-                <SelectValue placeholder="Choose a field…" />
-              </SelectTrigger>
-              <SelectContent>
-                {(fieldsQuery.data?.fields ?? []).map((f) => (
-                  <SelectItem key={f.token} value={f.token}>
-                    {fieldOptionText(f)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <FieldCombo
+              aria-label={requiresSecondField ? "Field (X)" : "Field"}
+              placeholder="Choose a field…"
+              options={(fieldsQuery.data?.fields ?? []).map(fieldComboOption)}
+              value={field ?? ""}
+              onChange={(v) => {
+                // X and Y must differ, and the Y list drops whatever X holds —
+                // so setting X to the token Y already had left an unreachable
+                // value sitting there under "not in this timeline's reported
+                // fields", which is a claim about the wrong problem entirely.
+                const takesOverY = !!v && v === fieldY;
+                updateConfig(takesOverY ? { field: v, fieldY: null } : { field: v });
+                setAutoNotice(
+                  takesOverY
+                    ? `${acceptsSecondField ? "Group by" : "Field (Y)"} cleared — ${fieldTokenLabel(v)} is now the X field.`
+                    : null,
+                );
+              }}
+            />
           )}
         </div>
 
@@ -951,25 +1138,24 @@ export function VisualizePage() {
               ))}
               <ExplainerPopover id={corrMethod === "pearson" ? "pearson" : "spearman"} />
             </div>
-            <Select
-              value={undefined}
-              onValueChange={(v) =>
-                updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
+            <FieldCombo
+              aria-label="Add a field to correlate"
+              placeholder="Add a field…"
+              // The box stays empty: this picker adds to the chip list above
+              // rather than holding a selection of its own — which also means
+              // its `value` can never carry the unknown-token disclosure. So
+              // close the set instead: the matrix charts fields the inventory
+              // reported, and a typo appended as a chip returns an empty
+              // matrix with nothing naming the cause.
+              allowFreeText={false}
+              value=""
+              options={(fieldsQuery.data?.fields ?? [])
+                .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
+                .map(fieldComboOption)}
+              onChange={(v) =>
+                v && updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
               }
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue placeholder="Add a field…" />
-              </SelectTrigger>
-              <SelectContent>
-                {(fieldsQuery.data?.fields ?? [])
-                  .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
-                  .map((f) => (
-                    <SelectItem key={f.token} value={f.token}>
-                      {fieldOptionText(f)}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+            />
           </div>
         )}
 
@@ -980,86 +1166,38 @@ export function VisualizePage() {
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               {acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
             </label>
-            <Select
-              value={fieldY ?? undefined}
-              onValueChange={(v) => updateConfig({ fieldY: v === CLEAR_GROUP ? null : v })}
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue
-                  placeholder={
-                    acceptsSecondField ? "No grouping" : "Choose a second field…"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {acceptsSecondField && (
-                  <SelectItem value={CLEAR_GROUP}>No grouping</SelectItem>
-                )}
-                {(fieldsQuery.data?.fields ?? [])
+            <FieldCombo
+              aria-label={acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
+              placeholder={acceptsSecondField ? "No grouping" : "Choose a second field…"}
+              options={[
+                ...(acceptsSecondField
+                  ? [{ value: CLEAR_GROUP, label: "No grouping" }]
+                  : []),
+                ...(fieldsQuery.data?.fields ?? [])
                   .filter((f) => f.token !== field)
-                  .map((f) => (
-                    <SelectItem key={f.token} value={f.token}>
-                      {fieldOptionText(f)}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+                  .map(fieldComboOption),
+              ]}
+              value={fieldY ?? ""}
+              onChange={(v) => {
+                const next = v === CLEAR_GROUP || !v ? null : v;
+                if (next && next === field) {
+                  setFieldYTaken(next);
+                  return;
+                }
+                setFieldYTaken(null);
+                updateConfig({ fieldY: next });
+              }}
+            />
+            {/* Compared against the *current* X, so the line clears itself the
+                moment X moves off the token it was about. */}
+            {fieldYTaken === field && field && (
+              <p className="mt-1 text-xs text-[var(--color-info)]">
+                {fieldTokenLabel(field)} is already the{" "}
+                {requiresSecondField ? "X field" : "charted field"} — pick a different one.
+              </p>
+            )}
           </div>
         )}
-
-        {/* Scale of measurement */}
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Scale of measurement
-          </label>
-          <div className="space-y-1">
-            {SCALES.map((s) => (
-              <label
-                key={s}
-                className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                  scale === s ? "bg-[var(--color-accent-dim)]" : "hover:bg-[var(--color-bg-hover)]"
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="scale"
-                  checked={scale === s}
-                  onChange={() => handleScaleChange(s)}
-                  className="accent-[var(--color-accent)]"
-                />
-                {SCALE_INFO[s].label}
-                <Tooltip content={SCALE_INFO[s].hint} side="right">
-                  <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
-                </Tooltip>
-              </label>
-            ))}
-          </div>
-        </div>
-
-        {/* Chart type */}
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Chart type
-          </label>
-          <Select
-            value={chartType}
-            onValueChange={(v) => updateConfig({ chartType: v as ChartType })}
-          >
-            <SelectTrigger className="text-sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {availableChartTypes.map((c) => (
-                <SelectItem key={c} value={c}>
-                  {CHART_META[c].label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            {CHART_HOW_TO_READ[chartType]}
-          </p>
-        </div>
 
         {/* Compare — time histogram, bar (grouped), numeric histogram (overlay).
             Always rendered; disabled (with the reason) for chart types without

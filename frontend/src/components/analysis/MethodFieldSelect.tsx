@@ -15,10 +15,15 @@
  * The static options come from the knob (each method's are different); the
  * dynamic half is every `attr:*` token the cardinality inventory reports, which
  * is exactly how the deleted views built their dropdowns.
+ *
+ * It renders the shared `FieldCombo`, so this reads and behaves exactly like
+ * every other "which field?" control in the app — and, unlike the select it
+ * replaced, it can reach a token the inventory has not caught up with yet.
  */
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { anomaliesApi } from "@/api/anomalies";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import { anomalyFieldLabel } from "@/lib/format";
 import type { MethodKnob } from "./method-registry";
 
@@ -51,24 +56,20 @@ export function MethodFieldSelect({
   // Only the control: the caller wraps it in the same labelled chrome as the
   // text and number knobs, and the size comes from there by inheritance. A
   // second copy of that chrome here would be a second place to keep in step,
-  // and would need its own arbitrary font size to match.
+  // and would need its own arbitrary font size to match — which is also why
+  // this is the combo's `inline` variant rather than the bordered default.
   return (
-    <select
+    <FieldCombo
+      variant="inline"
       aria-label={knob.label}
       data-testid={`method-knob-${knob.param}`}
+      // The empty choice is the method's own default, so it is named after what
+      // the method then does rather than left blank — "(none)" beside a knob
+      // that silently means "the whole scope" reads as a missing value.
+      options={[{ value: "", label: knob.noneLabel ?? knob.placeholder ?? "" }, ...options]}
+      placeholder={knob.noneLabel ?? knob.placeholder}
       value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="bg-transparent text-[var(--color-fg-primary)] outline-none"
-    >
-      {/* The empty choice is the method's own default, so it is named after what
-          the method then does rather than left blank — "(none)" beside a knob
-          that silently means "the whole scope" reads as a missing value. */}
-      <option value="">{knob.noneLabel ?? knob.placeholder}</option>
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label}
-        </option>
-      ))}
-    </select>
+      onChange={onChange}
+    />
   );
 }

@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { downloadExport, downloadFieldInventory } from "@/api/export";
 import { vizApi } from "@/api/viz";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import { Dialog, DialogContent, DialogTrigger, DialogClose } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
@@ -175,34 +176,34 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                 <label className="mb-2 block text-xs text-[var(--color-fg-muted)]">
                   Field
                 </label>
-                {/* Native select rather than the Radix one: this list runs to
-                    hundreds of fields in a real timeline, and typing a prefix
-                    to jump is worth more here than styling. */}
-                <select
+                {/* One `FieldCombo`, as everywhere else that asks which
+                    field: this list runs to hundreds of tokens in a real
+                    timeline, so typing a prefix to narrow it is the whole
+                    point — and the placeholder still states which of the three
+                    states the list is in. Without it a failed or in-flight
+                    `viz/fields` renders as an empty picker with the Download
+                    button permanently disabled and nothing saying why. */}
+                <FieldCombo
                   aria-label="Field"
-                  className={SELECT_CLASS}
                   disabled={download.active || fieldsQuery.isPending || fieldsQuery.isError}
-                  value={field ?? ""}
-                  onChange={(e) => setField(e.target.value || null)}
-                >
-                  {/* The placeholder states which of the three the list is in.
-                      Without it a failed or in-flight `viz/fields` renders as
-                      an empty picker with the Download button permanently
-                      disabled and nothing saying why. */}
-                  <option value="">
-                    {fieldsQuery.isPending
+                  placeholder={
+                    fieldsQuery.isPending
                       ? "Loading fields…"
                       : fieldsQuery.isError
                         ? "Could not load fields"
-                        : "Choose a field…"}
-                  </option>
-                  {(fieldsQuery.data?.fields ?? []).map((f) => (
-                    <option key={f.token} value={f.token}>
-                      {f.token}
-                      {f.distinct != null ? ` (${f.distinct.toLocaleString()} distinct)` : ""}
-                    </option>
-                  ))}
-                </select>
+                        : "Choose a field…"
+                  }
+                  options={(fieldsQuery.data?.fields ?? []).map((f) => ({
+                    value: f.token,
+                    label: f.token,
+                    hint:
+                      f.distinct != null
+                        ? `${f.distinct.toLocaleString()} distinct`
+                        : undefined,
+                  }))}
+                  value={field ?? ""}
+                  onChange={(v) => setField(v || null)}
+                />
                 {fieldsQuery.isError ? (
                   <div className="mt-1.5 flex items-center gap-2">
                     <p className="text-xs text-[var(--color-danger)]">

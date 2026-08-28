@@ -13,6 +13,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, EyeOff, Info, Repeat, Undo2 } from "lucide-react";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import { anomaliesApi } from "@/api/anomalies";
 import { dispositionsApi } from "@/api/dispositions";
 import { jobsApi } from "@/api/jobs";
@@ -374,32 +375,20 @@ export function PatternsView({ caseId, timelineId, onSelectEvent, onJumpToTime }
         <span className="shrink-0 text-xs font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
           Sequence of
         </span>
-        <select
+        <FieldCombo
+          size="sm"
+          aria-label="Sequence of"
+          className="min-w-0 flex-1"
+          // The `<optgroup>` split survives as the combo's section headers, so
+          // an analyst still sees which tokens are this timeline's own.
+          options={seriesFieldOptions.map((o) => ({
+            value: o.value,
+            label: o.label,
+            group: o.group === "dynamic" ? "Dynamic fields" : "Standard",
+          }))}
           value={seriesField}
-          onChange={(e) => setSeriesField(e.target.value)}
-          className="min-w-0 flex-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
-        >
-          <optgroup label="Standard">
-            {seriesFieldOptions
-              .filter((o) => o.group === "standard")
-              .map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-          </optgroup>
-          {seriesFieldOptions.some((o) => o.group === "dynamic") && (
-            <optgroup label="Dynamic fields">
-              {seriesFieldOptions
-                .filter((o) => o.group === "dynamic")
-                .map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-            </optgroup>
-          )}
-        </select>
+          onChange={setSeriesField}
+        />
         <span className="flex shrink-0 items-center gap-1 text-xs text-[var(--color-fg-muted)]">
           n =
           <select

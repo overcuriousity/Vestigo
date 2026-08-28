@@ -6,6 +6,7 @@ import { fieldTokenLabel, fieldValueLabel } from "@/components/viz/lib/fieldDisp
 import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { FilterChips } from "@/components/explorer/FilterChips";
 import { removeFilterEntry } from "@/lib/fieldFilters";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import {
@@ -70,25 +71,19 @@ export function CompareFilterEditor({ filters, onChange, fields }: Props) {
         className="h-7 text-xs"
       />
       <div className="flex items-center gap-1">
-        <Select
-          value={fieldKey || undefined}
-          onValueChange={(v) => {
+        <FieldCombo
+          size="sm"
+          aria-label="Field"
+          placeholder="Field…"
+          className="min-w-0 flex-1"
+          options={fields.map((f) => ({ value: f.token, label: fieldTokenLabel(f.token) }))}
+          value={fieldKey}
+          onChange={(v) => {
             setFieldKey(v);
             // The pending value belongs to the old field's vocabulary.
             setFieldValue("");
           }}
-        >
-          <SelectTrigger className="h-7 flex-1 text-xs">
-            <SelectValue placeholder="Field…" />
-          </SelectTrigger>
-          <SelectContent>
-            {fields.map((f) => (
-              <SelectItem key={f.token} value={f.token}>
-                {fieldTokenLabel(f.token)}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        />
         {timeDomain ? (
           <Select value={fieldValue || undefined} onValueChange={setFieldValue}>
             <SelectTrigger className="h-7 flex-1 text-xs">
