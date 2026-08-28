@@ -24,7 +24,6 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
 
 - **#297** — loosen the Top-values cap on the Visualize page (slider + free numeric input).
 - **#296** — make "+ N more in other values" clickable to load the next page of values.
-- **#298** — Visualize rail: control dependencies run backwards relative to reading order.
 
 ## Milestone 2 — visualization gaps
 

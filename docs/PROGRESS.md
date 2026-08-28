@@ -4,7 +4,35 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 195 — one field picker everywhere).
+Last updated: 2026-08-28 (session 196 — the Visualize rail reads in dependency order).
+
+## Session 196 — 2026-08-28: the Visualize rail reads in dependency order (#298)
+
+The rail read Field → Scale → Chart type while the dependency ran the other way. Landing on
+the default Time histogram — which charts no field — left the *topmost* control inert, and the
+only way to discover why was to change a dropdown below it. Two more controls moved on their
+own with no explanation.
+
+- **Reordered:** scale of measurement → chart type → field → second field → Compare → metric →
+  options. Scale gates which chart types are legal; the chart type decides whether a field
+  means anything. Top-down, that is now a sentence. The page header comment, which promised
+  the old field-first model, was rewritten in the same commit rather than left stating the
+  opposite of the code.
+- **The inert field state explains itself.** Instead of a bare greyed `— event count —`, it
+  says the time histogram counts every event so it charts no field, and offers a one-click
+  "Chart a field instead (Bar)". This is the contract Compare already kept — always rendered,
+  disabled with the reason — now applied to the control that needed it most.
+  `firstFieldChartingType` picks the target: `defaultChartTypeForScale` alone would not do,
+  because its preference list ends in `time`, which is itself field-free.
+- **Every automatic re-pick names itself.** One `autoNotice` under Chart type, set by the scale
+  radio when it clamps an illegal chart type and by both field probes when they choose a scale
+  ("`attr:src_port` looks numeric — scale set to ratio, chart set to Histogram"). Cleared by
+  the analyst's next explicit chart-type or field pick, since their own choice needs no excuse;
+  never shown under `chartRefLive`, where the config is the analyst's, not a probe's.
+
+Six new tests; the suite is 987 green. `components/viz/ChartRail.tsx` is still worth
+extracting from this 1,500-line page — deliberately not folded in here, since it would bury a
+UX fix inside a large-diff refactor.
 
 ## Session 195 — 2026-08-28: one field picker everywhere
 
