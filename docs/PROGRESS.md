@@ -4,7 +4,47 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 198 — PR #308 review, second pass).
+Last updated: 2026-08-28 (session 199 — release CI, dependency bumps).
+
+## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
+
+CI on `main` has been green since 1.15.2, but the **Release** workflow has failed on every tag
+since v1.13.0 — so no tag has published an image or a GitHub release in four versions. The
+backend job died at `pytest` in ~50s with `ClickHouse — HTTP 401 ... Code: 194 ...
+Authentication failed`.
+
+`ci.yml` sets `CLICKHOUSE_SKIP_USER_SETUP: 1` on its ClickHouse service: the image's `users.d`
+drop-in restricts `default` to localhost, the job connects across the docker bridge, and every
+query is refused with 194 while `/ping` — which takes no user — still answers Ok, so the
+container looks healthy right up to the first query. `release.yml` gates on "the same checks as
+CI" but never got that env var when ci.yml did. Added it, plus `POSTGRES_HOST_AUTH_METHOD:
+trust` for the connection-cost reason ci.yml documents. Both are throwaway service-container
+settings; neither is a deployment.
+
+Remaining drift, deliberately left: release.yml has no `ruff format --check` step and no
+`if: !cancelled()` gating, so a tag can pass checks CI would fail on.
+
+Also adopted nine of the ten open dependabot bumps — frontend `@tanstack/react-query`,
+`vite`, `@vitejs/plugin-react`, `oxlint`, three `@types/*`; backend `clickhouse-connect` and
+`ruff` (to 0.16.5, two patches past the PR).
+
+The tenth, `mcp` 1.28.1 → 2.1.1, cannot land, and not because of our code. mcp 2.x renames
+`FastMCP` to `mcp.server.mcpserver.MCPServer`; that migration is small here — the internals
+`agent/tools.py` reaches for (`_tool_manager.list_tools()`, `Tool.parameters`,
+`Tool.fn_metadata`, `remove_tool`) are unchanged, and `server.settings.{stateless_http,
+streamable_http_path,transport_security}` simply became `streamable_http_app()` kwargs. But
+the chain is `pydantic-ai-slim[mcp]` → `fastmcp-slim[client]` → `mcp`, and the `<2.0` cap is
+**fastmcp-slim 3.x's**, one hop further down than uv's error message attributes it —
+pydantic-ai itself already allows `fastmcp-slim<5`. So the resolver refuses no matter what we
+rewrite. Pinned `mcp<2` and told dependabot to skip 2.x rather than have it reopen an
+unmergeable PR weekly.
+
+Because an ignore rule is a thing you stop seeing, the trigger is recorded twice: a standing
+decision in `ROADMAP.md`, and `tests/test_dependency_guards.py`, which asserts the installed
+fastmcp-slim *still* caps `mcp<2` and fails with the migration steps the day it does not.
+fastmcp-slim 4.0.0b5 already requires `mcp>=2.0`, so 4.0 going stable is what fires it — and
+it forces the move rather than merely allowing it, since our own pin would make that bump
+unresolvable.
 
 ## Session 198 — 2026-08-28: PR #308 review, second pass (four more true-statement bugs)
 
