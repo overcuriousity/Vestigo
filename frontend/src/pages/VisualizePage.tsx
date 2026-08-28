@@ -82,6 +82,7 @@ import {
   defaultChartTypeForScale,
   chartTypesForField,
 } from "@/components/viz/lib/chartOptions";
+import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
@@ -132,19 +133,16 @@ const CLEAR_GROUP = "__viz_no_group__";
  * analyst more about why than an empty parenthetical would. Ordinary fields
  * guard on null anyway, so an absent count renders nothing rather than
  * "(null distinct)". */
-function fieldOptionText(f: VizFieldInfo) {
-  return (
-    <>
-      {fieldTokenLabel(f.token)}{" "}
-      <span className="text-[var(--color-fg-muted)]">
-        {isTimeField(f.token)
-          ? "(time field)"
-          : f.distinct != null
-            ? `(${f.distinct} distinct)`
-            : null}
-      </span>
-    </>
-  );
+function fieldComboOption(f: VizFieldInfo): FieldComboOption {
+  return {
+    value: f.token,
+    label: fieldTokenLabel(f.token),
+    hint: isTimeField(f.token)
+      ? "(time field)"
+      : f.distinct != null
+        ? `(${f.distinct} distinct)`
+        : undefined,
+  };
 }
 
 /** Why Compare is disabled for a chart type — shown instead of hiding the
@@ -892,18 +890,13 @@ export function VisualizePage() {
               — event count —
             </div>
           ) : (
-            <Select value={field ?? undefined} onValueChange={(v) => updateConfig({ field: v })}>
-              <SelectTrigger className="text-sm">
-                <SelectValue placeholder="Choose a field…" />
-              </SelectTrigger>
-              <SelectContent>
-                {(fieldsQuery.data?.fields ?? []).map((f) => (
-                  <SelectItem key={f.token} value={f.token}>
-                    {fieldOptionText(f)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <FieldCombo
+              aria-label={requiresSecondField ? "Field (X)" : "Field"}
+              placeholder="Choose a field…"
+              options={(fieldsQuery.data?.fields ?? []).map(fieldComboOption)}
+              value={field ?? ""}
+              onChange={(v) => updateConfig({ field: v })}
+            />
           )}
         </div>
 
@@ -951,25 +944,19 @@ export function VisualizePage() {
               ))}
               <ExplainerPopover id={corrMethod === "pearson" ? "pearson" : "spearman"} />
             </div>
-            <Select
-              value={undefined}
-              onValueChange={(v) =>
-                updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
+            <FieldCombo
+              aria-label="Add a field to correlate"
+              placeholder="Add a field…"
+              // The box stays empty: this picker adds to the chip list above
+              // rather than holding a selection of its own.
+              value=""
+              options={(fieldsQuery.data?.fields ?? [])
+                .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
+                .map(fieldComboOption)}
+              onChange={(v) =>
+                v && updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
               }
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue placeholder="Add a field…" />
-              </SelectTrigger>
-              <SelectContent>
-                {(fieldsQuery.data?.fields ?? [])
-                  .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
-                  .map((f) => (
-                    <SelectItem key={f.token} value={f.token}>
-                      {fieldOptionText(f)}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+            />
           </div>
         )}
 
@@ -980,30 +967,20 @@ export function VisualizePage() {
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               {acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
             </label>
-            <Select
-              value={fieldY ?? undefined}
-              onValueChange={(v) => updateConfig({ fieldY: v === CLEAR_GROUP ? null : v })}
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue
-                  placeholder={
-                    acceptsSecondField ? "No grouping" : "Choose a second field…"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {acceptsSecondField && (
-                  <SelectItem value={CLEAR_GROUP}>No grouping</SelectItem>
-                )}
-                {(fieldsQuery.data?.fields ?? [])
+            <FieldCombo
+              aria-label={acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
+              placeholder={acceptsSecondField ? "No grouping" : "Choose a second field…"}
+              options={[
+                ...(acceptsSecondField
+                  ? [{ value: CLEAR_GROUP, label: "No grouping" }]
+                  : []),
+                ...(fieldsQuery.data?.fields ?? [])
                   .filter((f) => f.token !== field)
-                  .map((f) => (
-                    <SelectItem key={f.token} value={f.token}>
-                      {fieldOptionText(f)}
-                    </SelectItem>
-                  ))}
-              </SelectContent>
-            </Select>
+                  .map(fieldComboOption),
+              ]}
+              value={fieldY ?? ""}
+              onChange={(v) => updateConfig({ fieldY: v === CLEAR_GROUP || !v ? null : v })}
+            />
           </div>
         )}
 

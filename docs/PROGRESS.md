@@ -4,7 +4,39 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 193 — PR #305 review fixes; CI's ClickHouse refused every query).
+Last updated: 2026-08-28 (session 195 — one field picker everywhere).
+
+## Session 195 — 2026-08-28: one field picker everywhere
+
+Six surfaces asked "which field?" six different ways, and none of them let an analyst type.
+Two native `<select>`s in Investigate (log templates, sequence patterns), one in the export
+dialog, two Radix `Select`s in Visualize and the compare-filter editor, and a bare inline
+`<select>` for the method knobs. On a timeline carrying a few hundred `attr:*` tokens, a
+dropdown is the wrong control — and none of the six could reach a field the cardinality
+inventory had not caught up with yet.
+
+- **`components/ui/FieldCombo.tsx`** — the one control. A text input that opens its full list
+  on focus (browse, exactly as the dropdowns did), filters as you type against both the token
+  and the label, walks with ↓/↑, and commits whatever you type when nothing matches. The box
+  shows the raw token because that is what every caller stores and what an analyst would type;
+  the pretty label and its hint (cardinality, `(time field)`, distinct counts) live on the
+  rows. Escape reverts a draft without the caller ever seeing it.
+- **Free entry, disclosed.** A committed token that is not in `options` renders a muted "not
+  in this timeline's reported fields" note. It never blocks — the inventory legitimately lags
+  a source ingested a minute ago — but a typo used to commit silently and come back as an
+  empty chart or a scan that found nothing, with nothing naming the cause.
+- **`lib/useAnchoredDropdown.ts`** — the portaled fixed-position anchoring (flip above when
+  there is no room below, re-place on scroll/resize) extracted verbatim from `TagInput`, which
+  had the only copy. `TagInput` now calls the hook, so there is one implementation rather than
+  two to keep in step.
+- **Six call sites converted.** `PatternsView`'s `<optgroup>` Standard/Dynamic split survives
+  as the combo's section headers; `MethodFieldSelect` uses the borderless `inline` variant so
+  it still reads as part of the knob's sentence; `ExportDialog`'s placeholder still names which
+  of its three states the list is in. `CompareFilterEditor`'s *value* control stays a `Select`
+  on a bounded `time:` field — its domain is complete and its canonical values are opaque
+  ("1" is Monday), which is the one place free text builds a filter matching nothing.
+
+Thirteen new tests pin the contract; the suite is 981 green.
 
 ## Session 193 — 2026-08-28: PR #305 review fixes, and a CI job that could not pass
 

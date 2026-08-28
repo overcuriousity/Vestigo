@@ -174,9 +174,11 @@ describe("InvestigateSheet", () => {
   it("sends group_field when the analyst types one", () => {
     const onRun = vi.fn();
     renderSheet({ mode: "method", methodId: "charset", onRun, query: idleQuery() });
-    fireEvent.change(screen.getByTestId("method-knob-group_field"), {
-      target: { value: "display_name" },
-    });
+    // The field knob is a combobox now: typing is a draft until Enter (or a
+    // row) commits it, so a half-typed token can never reach a run.
+    const groupField = screen.getByTestId("method-knob-group_field");
+    fireEvent.change(groupField, { target: { value: "display_name" } });
+    fireEvent.keyDown(groupField, { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
     expect(onRun).toHaveBeenCalledWith({ group_field: "display_name" });
   });
@@ -211,12 +213,19 @@ describe("InvestigateSheet", () => {
 
   it("offers a single-field knob as this timeline's own fields", async () => {
     renderSheet({ mode: "method", methodId: "sequence_novelty", onRun: () => {}, query: idleQuery() });
-    const select = screen.getByTestId("method-knob-series_field");
-    expect(select.tagName).toBe("SELECT");
+    const combo = screen.getByTestId("method-knob-series_field");
+    // A combobox, so the analyst can type `attr:` tokens as well as browse —
+    // the list still opens on focus, which is all the old select could do.
+    expect(combo).toHaveAttribute("role", "combobox");
+    fireEvent.focus(combo);
     // Standard columns immediately; the timeline's attribute keys once the
     // inventory arrives.
+    // Exact names: the knob's own default row reads "Artifact type (default)",
+    // so a substring match would find two.
     expect(screen.getByRole("option", { name: "Artifact type" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("option", { name: "src_ip" })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole("option", { name: "src_ip" })).toBeInTheDocument(),
+    );
   });
 
   it("holds value_combo's picker to the two-to-four fields it can combine", async () => {
