@@ -32,6 +32,18 @@ services:
       POSTGRES_USER: vestigo
       POSTGRES_PASSWORD: vestigo
       POSTGRES_DB: vestigo
+      # `trust` by default, matching what ClickHouse and Qdrant already do in
+      # this file: it is published on 127.0.0.1 only and ships well-known
+      # credentials by design (see DEPLOYMENT.md "Reference compose stack").
+      # It is also worth real time — asyncpg computes SCRAM's PBKDF2 in pure
+      # Python, ~20 ms per connection, and the test suite's API tests open a
+      # connection per database operation. Set VESTIGO_POSTGRES_HOST_AUTH to
+      # scram-sha-256 to keep password auth.
+      #
+      # Applies at initdb only: an existing `postgres_data` volume keeps the
+      # method it was created with, so this changes nothing until the volume is
+      # recreated (`podman compose down -v` — destroys local dev data).
+      POSTGRES_HOST_AUTH_METHOD: ${VESTIGO_POSTGRES_HOST_AUTH:-trust}
     ports:
       - "127.0.0.1:5432:5432"
     # Metadata only — never holds events.

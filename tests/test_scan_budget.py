@@ -77,7 +77,7 @@ def test_cgroup_limit_bounds_detection(monkeypatch):
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 128 << 30)
     settings = _scan.get_settings()
-    expected = int((8 << 30) * 0.8) // settings.stat_scan_concurrency
+    expected = int((8 << 30) * 0.8) // (settings.stat_scan_concurrency + 2)
     assert _scan.detect_scan_memory_budget() == expected
 
 
@@ -86,7 +86,7 @@ def test_unlimited_cgroup_uses_physical_memory(monkeypatch):
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: None)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 64 << 30)
     settings = _scan.get_settings()
-    expected = int((64 << 30) * 0.8) // settings.stat_scan_concurrency
+    expected = int((64 << 30) * 0.8) // (settings.stat_scan_concurrency + 2)
     assert _scan.detect_scan_memory_budget() == expected
 
 
@@ -97,7 +97,7 @@ def test_meminfo_beats_ballooned_sysinfo(monkeypatch):
     monkeypatch.setattr(_scan, "_meminfo_total", lambda: 128 << 30)
     monkeypatch.setattr(_scan, "_physical_memory_total", lambda: 503 << 30)
     settings = _scan.get_settings()
-    expected = int((128 << 30) * 0.8) // settings.stat_scan_concurrency
+    expected = int((128 << 30) * 0.8) // (settings.stat_scan_concurrency + 2)
     assert _scan.detect_scan_memory_budget() == expected
 
 
@@ -157,13 +157,13 @@ def test_enrichment_partition_rewrite_takes_a_gate_slot():
     seen: list[str] = []
 
     class _Gate:
-        def __enter__(self):
+        # The shape acquire_scan_slot drives: a semaphore, not a context manager.
+        def acquire(self, timeout=None):
             seen.append("acquired")
-            return self
+            return True
 
-        def __exit__(self, *exc):
+        def release(self):
             seen.append("released")
-            return False
 
     class _Client:
         def command(self, sql):
@@ -328,8 +328,9 @@ def _report_with(monkeypatch, ceiling, bounded, per_query=None):
 
 def test_report_flags_a_budget_over_the_server_ceiling(monkeypatch):
     """Scans alone authorized more than ClickHouse may use in total."""
-    concurrency = _scan.get_settings().stat_scan_concurrency
-    report = _report_with(monkeypatch, 8 << 30, True, per_query=(16 << 30) // concurrency)
+    # 16 GiB of scans in total: the heavy slots plus the foreground share.
+    slots = _scan.get_settings().stat_scan_concurrency + _scan._FOREGROUND_SLOTS
+    report = _report_with(monkeypatch, 8 << 30, True, per_query=(16 << 30) // slots)
 
     assert report["risk"] == "over_budget"
     assert report["total_bytes"] > report["clickhouse_ceiling_bytes"]
@@ -341,8 +342,8 @@ def test_report_flags_an_unbounded_server(monkeypatch):
 
 
 def test_report_is_ok_when_the_budget_fits(monkeypatch):
-    concurrency = _scan.get_settings().stat_scan_concurrency
-    report = _report_with(monkeypatch, 28 << 30, True, per_query=(16 << 30) // concurrency)
+    slots = _scan.get_settings().stat_scan_concurrency + _scan._FOREGROUND_SLOTS
+    report = _report_with(monkeypatch, 28 << 30, True, per_query=(16 << 30) // slots)
 
     assert report["risk"] == "ok"
     assert report["clickhouse_ceiling_is_explicit"] is True
@@ -367,7 +368,9 @@ def test_clause_follows_the_configured_ceiling(monkeypatch):
         _scan.configure_scan_budget(None, bounded=False)
 
     settings = _scan.get_settings()
-    expected = int((8 << 30) * settings.stat_scan_memory_ratio) // settings.stat_scan_concurrency
+    expected = int((8 << 30) * settings.stat_scan_memory_ratio) // (
+        settings.stat_scan_concurrency + 2
+    )
     assert before != after
     assert f"max_memory_usage = {expected}" in after
 
@@ -544,7 +547,7 @@ def test_budget_divides_by_the_gate_size_not_the_live_setting():
 
     assert report["concurrency"] == _scan._GATE_CONCURRENCY
     assert report["pending_concurrency"] == pending, "the waiting value is disclosed"
-    assert report["total_bytes"] == before * _scan._GATE_CONCURRENCY
+    assert report["total_bytes"] == before * (_scan._GATE_CONCURRENCY + _scan._FOREGROUND_SLOTS)
 
 
 def test_merge_wait_is_skipped_when_the_apply_wrote_no_parts():
@@ -694,7 +697,8 @@ def test_clickhouse_caches_are_not_subtracted_from_the_apps_own_memory(monkeypat
     monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 1)
     _settings_with(monkeypatch, stat_scan_max_memory_bytes=0, stat_scan_memory_ratio=0.8)
 
-    assert _scan.detect_scan_memory_budget() == int((4 << 30) * 0.8)
+    # One heavy slot plus the two foreground slots share the budget (#300).
+    assert _scan.detect_scan_memory_budget() == int((4 << 30) * 0.8) // 3
 
 
 def test_clickhouse_caches_are_subtracted_from_clickhouses_own_ceiling(monkeypatch):
@@ -707,7 +711,8 @@ def test_clickhouse_caches_are_subtracted_from_clickhouses_own_ceiling(monkeypat
     monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 1)
     _settings_with(monkeypatch, stat_scan_max_memory_bytes=0, stat_scan_memory_ratio=0.8)
 
-    assert _scan.detect_scan_memory_budget() == int((8 << 30) * 0.8)
+    # One heavy slot plus the two foreground slots share the budget (#300).
+    assert _scan.detect_scan_memory_budget() == int((8 << 30) * 0.8) // 3
 
 
 def test_report_counts_caches_against_the_ceiling(monkeypatch):
@@ -717,10 +722,13 @@ def test_report_counts_caches_against_the_ceiling(monkeypatch):
     monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
     monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 5 << 30)
     monkeypatch.setattr(_scan, "_clickhouse_cache_breakdown", {"mark_cache_size": 5 << 30})
-    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (6 << 30) // 2)
+    # Two heavy slots plus the two foreground slots: 6 GiB of scans in total.
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 2)
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (6 << 30) // 4)
 
     report = _scan.scan_budget_report()
 
+    assert report["total_bytes"] == 6 << 30
     assert report["total_bytes"] < report["clickhouse_ceiling_bytes"], "scans alone fit"
     assert report["risk"] == "over_budget", "scans plus caches do not"
     assert report["cache_bytes"] == 5 << 30
@@ -733,12 +741,13 @@ def test_report_is_ok_when_scans_and_caches_both_fit(monkeypatch):
     monkeypatch.setattr(_scan, "_clickhouse_bounded", True)
     monkeypatch.setattr(_scan, "_clickhouse_cache_bytes", 4 << 30)
     monkeypatch.setattr(_scan, "_clickhouse_cache_breakdown", {"mark_cache_size": 4 << 30})
-    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (8 << 30) // 2)
+    monkeypatch.setattr(_scan, "_GATE_CONCURRENCY", 2)
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: (8 << 30) // 4)
 
     report = _scan.scan_budget_report()
 
     assert report["risk"] == "ok"
-    assert report["headroom_bytes"] == (16 << 30) - (8 << 30) - (4 << 30)
+    assert report["headroom_bytes"] == (16 << 30) - report["total_bytes"] - (4 << 30)
 
 
 # ── Thread width follows the cores ClickHouse actually has ──────────────────
@@ -827,3 +836,176 @@ def test_our_own_pin_still_beats_a_server_side_one(monkeypatch):
 
     assert _scan.detect_scan_max_threads() == 6
     assert _scan.scan_budget_report()["max_threads_source"] == "pinned"
+
+
+# ── Admission classes (#300) ─────────────────────────────────────────────────
+
+
+def test_heavy_cap_reserves_two_slots_for_the_foreground_class(monkeypatch):
+    """The divisor is N + 2: two heavy slots' worth are the foreground share."""
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    settings = _scan.get_settings()
+    total = int((64 << 30) * settings.stat_scan_memory_ratio)
+    assert _scan._FOREGROUND_SLOTS == 2
+    assert _scan.detect_scan_memory_budget() == total // (_scan._GATE_CONCURRENCY + 2)
+
+
+def test_foreground_cap_is_half_a_heavy_slot(monkeypatch):
+    """Two reserved slots split four ways: a chart spills at half a detector's
+    cap, not a sixth of it. Charts over high-cardinality fields are the ordinary
+    workload, and a quarter-slot cap made the ordinary case spill on every
+    render (PR #305 review)."""
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    heavy = _scan.detect_scan_memory_budget()
+    assert _scan._FOREGROUND_CONCURRENCY == 4
+    assert _scan.detect_foreground_memory_budget() == heavy // 2
+    # The invariant the module exists for: both classes fully admitted fit the budget.
+    settings = _scan.get_settings()
+    total = int((64 << 30) * settings.stat_scan_memory_ratio)
+    assert (
+        _scan._GATE_CONCURRENCY * heavy
+        + _scan._FOREGROUND_CONCURRENCY * _scan.detect_foreground_memory_budget()
+        <= total
+    )
+
+
+def test_foreground_clause_carries_the_smaller_cap(monkeypatch):
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    clause = _scan.foreground_scan_settings()
+    cap = _scan.detect_foreground_memory_budget()
+    spill = min(_scan.get_settings().stat_scan_external_group_by_bytes, cap // 2)
+    assert clause.startswith("SETTINGS max_threads = ")
+    assert f"max_memory_usage = {cap}" in clause
+    assert f"max_bytes_before_external_group_by = {spill}" in clause
+
+
+def test_foreground_gate_has_four_slots():
+    taken = 0
+    try:
+        while _scan.FOREGROUND_SCAN_GATE.acquire(blocking=False):
+            taken += 1
+        assert taken == 4
+    finally:
+        for _ in range(taken):
+            _scan.FOREGROUND_SCAN_GATE.release()
+
+
+def test_foreground_threads_are_the_same_two_reserved_slots(monkeypatch):
+    """The reservation covers CPU too, not memory alone (PR #306 review).
+
+    The heavy width is sized so a *full* heavy gate exactly saturates the box
+    (issue #301). A foreground lane running at that same width added its own
+    multiple on top — four charts, each fanning out two queries, put 8x a
+    heavy scan's threads on a box already fully committed. The chart lane gets
+    the two slots the heavy divisor holds back, split across the gate, exactly
+    as its memory cap does.
+    """
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    monkeypatch.setattr(_scan, "_clickhouse_pinned_max_threads", None)
+    heavy = _scan.detect_scan_max_threads()
+    foreground = _scan.detect_foreground_max_threads()
+    assert foreground == max(2, heavy * _scan._FOREGROUND_SLOTS // _scan._FOREGROUND_CONCURRENCY)
+    # A full chart lane costs the reserved slots' worth of threads, no more.
+    assert (
+        _scan._FOREGROUND_CONCURRENCY * foreground <= _scan._FOREGROUND_SLOTS * heavy
+        # ...unless the floor binds, which only happens on a box too small for
+        # the arithmetic to matter.
+        or foreground == 2
+    )
+
+
+def test_foreground_clause_carries_the_narrower_width(monkeypatch):
+    monkeypatch.setattr(_scan, "_clickhouse_cores", 20)
+    monkeypatch.setattr(_scan, "_clickhouse_pinned_max_threads", None)
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    assert f"max_threads = {_scan.detect_foreground_max_threads()}" in (
+        _scan.foreground_scan_settings()
+    )
+    assert f"max_threads = {_scan.detect_scan_max_threads()}" in _scan.heavy_scan_settings()
+
+
+def test_report_discloses_the_foreground_class(monkeypatch):
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    report = _scan.scan_budget_report()
+    assert report["foreground"] == {
+        "concurrency": 4,
+        "per_query_bytes": _scan.detect_foreground_memory_budget(),
+        "max_threads": _scan.detect_foreground_max_threads(),
+    }
+    # `total_bytes` is what both classes may hold at once, not just the heavy gate.
+    assert report["total_bytes"] == report["per_query_bytes"] * (
+        _scan._GATE_CONCURRENCY + _scan._FOREGROUND_SLOTS
+    )
+
+
+def test_chart_aggregations_take_the_foreground_gate(monkeypatch):
+    """A histogram must never wait for a detector slot (#300)."""
+    from vestigo.db import queries
+
+    class _Gate:
+        def __init__(self):
+            self.entered = 0
+
+        def acquire(self, timeout=None):
+            self.entered += 1
+            return True
+
+        def release(self):
+            pass
+
+    heavy, fg = _Gate(), _Gate()
+    monkeypatch.setattr(queries, "HEAVY_SCAN_GATE", heavy)
+    monkeypatch.setattr(queries, "FOREGROUND_SCAN_GATE", fg)
+
+    @queries._foreground_scan
+    def probe(self):
+        return "ok"
+
+    assert probe(object()) == "ok"
+    assert (fg.entered, heavy.entered) == (1, 0)
+
+
+def test_every_chart_aggregation_is_foreground():
+    from vestigo.db.queries import EventQueryService
+
+    charts = [
+        "histogram",
+        "field_terms",
+        "field_numeric_stats",
+        "field_correlation",
+        "field_numeric_grouped",
+        "field_value_timeseries",
+        "compare_time_histogram",
+        "compare_field_terms",
+        "compare_field_numeric",
+        "time_punchcard",
+        "field_pivot",
+        "field_scatter",
+    ]
+    for name in charts:
+        fn = getattr(EventQueryService, name)
+        assert getattr(fn, "_scan_class", None) == "foreground", f"{name} is not foreground"
+    inventory = getattr(EventQueryService.count_field_inventory, "_scan_class", None)
+    assert inventory != "foreground"
+
+
+def test_foreground_wait_is_bounded(monkeypatch):
+    from vestigo.db import queries
+
+    class _Full:
+        def acquire(self, timeout=None):
+            return False
+
+        def release(self):
+            raise AssertionError("never acquired")
+
+    monkeypatch.setattr(queries, "FOREGROUND_SCAN_GATE", _Full())
+    monkeypatch.setattr(queries, "FOREGROUND_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(_scan, "_ACQUIRE_POLL_SECONDS", 0.01)
+
+    @queries._foreground_scan
+    def probe(self):
+        raise AssertionError("must not run")
+
+    with pytest.raises(_scan.ScanBusy):
+        probe(object())

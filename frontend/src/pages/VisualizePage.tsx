@@ -25,6 +25,7 @@ import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
 import { dispositionsApi } from "@/api/dispositions";
 import { FILTER_PARAM_KEYS, filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { InheritedFiltersBar } from "@/components/viz/InheritedFiltersBar";
 import {
   resolveCollapseRoutine,
@@ -476,6 +477,7 @@ export function VisualizePage() {
           !fieldFree &&
           !requiresSecondField &&
           field !== autoProbedField.current)),
+    ...busyRetry,
   });
 
   // A named chart's field arrives *after* mount, so it is never the field the
@@ -564,6 +566,7 @@ export function VisualizePage() {
     queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
     queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
     enabled: scopeReady && !!field && dataKind === "terms" && !compareTermsOn,
+    ...busyRetry,
   });
 
   const compareTermsQuery = useQuery({
@@ -577,6 +580,7 @@ export function VisualizePage() {
         limit: topN,
       })) as CompareTermsResponse,
     enabled: scopeReady && !!field && compareTermsOn,
+    ...busyRetry,
   });
 
   const compareNumericOn = compareOn && chartType === "histogram" && compareApiSpec != null;
@@ -593,6 +597,7 @@ export function VisualizePage() {
         bins: bins ?? 30,
       })) as CompareNumericResponse,
     enabled: scopeReady && !!field && compareNumericOn,
+    ...busyRetry,
   });
 
   // Grouped box/violin: one distribution per top-N value of the grouping
@@ -622,18 +627,21 @@ export function VisualizePage() {
         showPoints,
       ),
     enabled: scopeReady && !!field && !!fieldY && groupedOn,
+    ...busyRetry,
   });
 
   const correlationQuery = useQuery({
     queryKey: ["viz-field-correlation", caseId, timelineId, selectedFields, filters],
     queryFn: () => vizApi.fieldCorrelation(caseId!, timelineId!, selectedFields, filters),
     enabled: scopeReady && multiField && selectedFields.length >= 2,
+    ...busyRetry,
   });
 
   const timeseriesQuery = useQuery({
     queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, buckets, topN],
     queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, buckets, topN),
     enabled: scopeReady && !!field && dataKind === "timeseries",
+    ...busyRetry,
   });
 
   // Events-over-time: one shared-grid compare call when a comparison layer
@@ -652,12 +660,14 @@ export function VisualizePage() {
       return histogramToCompare(await eventsApi.histogram(caseId!, timelineId!, filters, buckets));
     },
     enabled: scopeReady && dataKind === "time",
+    ...busyRetry,
   });
 
   const punchcardQuery = useQuery({
     queryKey: ["viz-punchcard", caseId, timelineId, filters],
     queryFn: () => vizApi.punchcard(caseId!, timelineId!, filters),
     enabled: scopeReady && dataKind === "punchcard",
+    ...busyRetry,
   });
 
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
@@ -666,12 +676,14 @@ export function VisualizePage() {
     queryKey: ["viz-field-pivot", caseId, timelineId, field, fieldY, filters, limitX, limitY],
     queryFn: () => vizApi.fieldPivot(caseId!, timelineId!, field!, fieldY!, filters, limitX, limitY),
     enabled: scopeReady && !!(field && fieldY) && dataKind === "pivot",
+    ...busyRetry,
   });
 
   const scatterQuery = useQuery({
     queryKey: ["viz-field-scatter", caseId, timelineId, field, fieldY, filters, sampleLimit],
     queryFn: () => vizApi.fieldScatter(caseId!, timelineId!, field!, fieldY!, filters, sampleLimit),
     enabled: scopeReady && !!(field && fieldY) && dataKind === "scatter",
+    ...busyRetry,
   });
 
   const availableChartTypes = chartTypesForField(scale, field);
@@ -779,16 +791,43 @@ export function VisualizePage() {
     facts,
   });
 
-  const loading =
-    (dataKind === "time" && timeQuery.isLoading) ||
-    (dataKind === "terms" && (compareTermsOn ? compareTermsQuery.isLoading : termsQuery.isLoading)) ||
-    (dataKind === "numeric" &&
-      (compareNumericOn ? compareNumericQuery.isLoading : numericQuery.isLoading)) ||
-    (dataKind === "timeseries" && timeseriesQuery.isLoading) ||
-    (dataKind === "punchcard" && punchcardQuery.isLoading) ||
-    (dataKind === "pivot" && pivotQuery.isLoading) ||
-    (dataKind === "scatter" && scatterQuery.isLoading) ||
-    (dataKind === "corr" && correlationQuery.isLoading);
+  // The one query behind the chart on screen. Named once rather than
+  // re-derived per state, so the spinner, the busy-lane badge and any future
+  // read of it can never disagree about which query the canvas is showing.
+  // `groupedOn` is a modifier on the numeric kind — box/violin per group have
+  // their own endpoint, and numericQuery is disabled while it is on.
+  const activeQuery =
+    dataKind === "time"
+      ? timeQuery
+      : dataKind === "terms"
+        ? compareTermsOn
+          ? compareTermsQuery
+          : termsQuery
+        : dataKind === "numeric"
+          ? groupedOn
+            ? groupedQuery
+            : compareNumericOn
+              ? compareNumericQuery
+              : numericQuery
+          : dataKind === "timeseries"
+            ? timeseriesQuery
+            : dataKind === "punchcard"
+              ? punchcardQuery
+              : dataKind === "pivot"
+                ? pivotQuery
+                : dataKind === "scatter"
+                  ? scatterQuery
+                  : dataKind === "corr"
+                    ? correlationQuery
+                    : null;
+
+  const loading = activeQuery?.isLoading ?? false;
+
+  // A busy scan lane (#300) being retried. `error` stays empty until the
+  // retries stop, so `failureReason` is the only in-flight signal — without
+  // it every chart on this page reads as merely slow for up to four minutes
+  // and then fails, which is what the lane was built to avoid.
+  const waiting = busyMessage(activeQuery?.failureReason);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1598,11 +1637,24 @@ export function VisualizePage() {
             chart type — bar, pie or heatmap.
           </div>
         ) : loading ? (
-          <div className="flex h-full items-center justify-center">
+          <div className="flex h-full flex-col items-center justify-center gap-2">
             <Spinner size={24} />
+            {waiting && <span className="text-xs text-[var(--color-fg-muted)]">{waiting}</span>}
           </div>
         ) : (
-          <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4">
+          <div className="relative rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4">
+            {/* A busy lane while a chart is already on screen. `isLoading` is
+                false the moment the key has data, so a filter change on a
+                drawn chart would otherwise retry silently behind stale marks.
+                Gated on `isFetching`: a retry delay still counts as fetching,
+                so it clears when the answer (or the error) lands. */}
+            {waiting && activeQuery?.isFetching && (
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+                <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+                  {waiting}
+                </span>
+              </div>
+            )}
             {chartType === "time" && timeQuery.data && (
               <CompareHistogram
                 data={timeQuery.data}

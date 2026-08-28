@@ -33,18 +33,25 @@ export const vizApi = {
   fields: (caseId: string, timelineId: string): Promise<VizFieldsResponse> =>
     get<VizFieldsResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/fields`),
 
-  /** Top-N value/count terms aggregation for a field. */
+  /** Top-N value/count terms aggregation for a field.
+   *
+   * `totals: false` drops the server's second scan over the field's whole
+   * distribution. `total`/`distinct` then describe the returned rows only and
+   * `other_count` is 0, so it is for callers that read `values` and nothing
+   * else — never for a chart that renders an "Other" slice. */
   fieldTerms: (
     caseId: string,
     timelineId: string,
     field: string,
     filters: EventFilters = {},
     limit = 50,
+    opts: { totals?: boolean } = {},
   ): Promise<FieldTermsResponse> =>
     get<FieldTermsResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-terms`, {
       ...serializeEventFilterParams(filters),
       field,
       limit,
+      ...(opts.totals === false ? { totals: false } : {}),
     }),
 
   /** Summary statistics + fixed-width histogram for a numeric field. */

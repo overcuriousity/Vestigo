@@ -214,7 +214,7 @@ from vestigo.db._dt import (
     to_clickhouse_utc,
 )
 from vestigo.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
-from vestigo.db._scan import HEAVY_SCAN_GATE, heavy_scan_settings
+from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
 from vestigo.db._template import template_normalize_expr
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import mapping_coalesce_expr, resolve_mapping
@@ -1586,9 +1586,12 @@ def _gated_scan(fn):
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with HEAVY_SCAN_GATE:
+        # Cancellable (#300): a request that disconnects while parked here is
+        # noticed within a second instead of taking a slot nobody wants.
+        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
             return fn(*args, **kwargs)
 
+    wrapper._scan_class = "heavy"  # type: ignore[attr-defined]
     return wrapper
 
 

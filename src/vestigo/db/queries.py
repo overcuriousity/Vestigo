@@ -10,6 +10,7 @@ import math
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -44,7 +45,16 @@ from vestigo.db._offsets import (
     effective_ts_sql,
     offset_raw_bounds,
 )
-from vestigo.db._scan import EXPORT_SCAN_GATE, HEAVY_SCAN_GATE, heavy_scan_settings
+from vestigo.db._scan import (
+    EXPORT_SCAN_GATE,
+    FOREGROUND_SCAN_GATE,
+    HEAVY_SCAN_GATE,
+    acquire_scan_slot,
+    foreground_scan_settings,
+    foreground_wait_seconds,
+    heavy_scan_settings,
+    scan_fanout,
+)
 from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_mappings import (
@@ -1116,24 +1126,45 @@ class _ParameterizedQueryBuilder:
         return " AND ".join(self.conditions)
 
 
-def _gated_scan(fn):
-    """Admit at most VESTIGO_STAT_SCAN_CONCURRENCY heavy scans to ClickHouse at once.
+#: How long a chart waits for a foreground slot before the API answers 503
+#: "busy" instead of leaving a spinner. Module-level so tests can shorten it.
+#:
+#: Short on purpose, and it bounds two things rather than one. It is half of
+#: the client's retry period — the browser waits this *plus* the ``Retry-After``
+#: it is handed — so ``BUSY_RETRY_LIMIT`` attempts have to be read against
+#: ``wait + retry_after``, not ``retry_after`` alone; at 30s the documented
+#: "about two minutes" was really about fourteen. It is also how long a parked
+#: caller holds one of anyio's threadpool tokens: the wait happens inside
+#: ``run_in_threadpool``, so several panels retrying against a full lane could
+#: occupy the pool with *waiters* — including the poll ``run_scan`` uses to
+#: notice a disconnect. Answering "busy" quickly frees the token and lets the
+#: retry, which costs one cheap round-trip, do the waiting instead.
+FOREGROUND_WAIT_SECONDS = 5.0
 
-    Same admission control as ``anomaly_stats._gated_scan``: each viz
-    aggregation's per-query ``max_memory_usage`` cap is budget/concurrency,
-    so the gate is what makes the total budget actually hold when several
-    charts render concurrently (see ``db/_scan.py``). Applied to the public
-    aggregation entry points only — internal helpers (``_field_terms_impl``,
-    the ``_compare`` layer scans) run while the caller holds the slot, and
-    gating them too would deadlock. Callers run in FastAPI's threadpool, so
-    blocking on the semaphore is safe.
+
+def _foreground_scan(fn):
+    """Admit at most ``_FOREGROUND_CONCURRENCY`` chart aggregations at once.
+
+    The foreground class (#300): its own gate so a histogram never queues
+    behind a detector sweep, its own (smaller) per-query cap so the total
+    budget still holds, and a *bounded* wait — a chart the analyst is looking
+    at must say "busy" rather than spin — unless the caller is a background
+    job with no spinner to answer to, which declares itself with
+    :func:`~vestigo.db._scan.unbounded_foreground_wait` and queues instead.
+    Applied to the public aggregation entry points only; internal helpers
+    (``_field_terms_impl``, the ``_compare`` layer scans) run while the
+    caller holds the slot, and gating them too would deadlock. Callers run in FastAPI's threadpool, so blocking
+    on the semaphore is safe. The gate is looked up at call time so tests can
+    substitute it.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with HEAVY_SCAN_GATE:
+        wait = foreground_wait_seconds(FOREGROUND_WAIT_SECONDS)
+        with acquire_scan_slot(FOREGROUND_SCAN_GATE, wait=wait):
             return fn(*args, **kwargs)
 
+    wrapper._scan_class = "foreground"  # type: ignore[attr-defined]
     return wrapper
 
 
@@ -1149,10 +1180,33 @@ class EventQueryService:
         Used for Compare-mode queries, where the primary/comparison layers
         are separate scans with no data dependency between them — running
         them in threads halves wall-clock latency over doing them serially.
+
+        Each thread runs under a *copy of the calling context*, because a bare
+        ``submit`` starts with an empty one: the scan context bound per request
+        would not reach these queries, they would go out untagged, and a
+        disconnect could not ``KILL`` them (#300). A chart that fans out is
+        exactly the chart worth cancelling.
+
+        The fan-out width is declared to :func:`~vestigo.db._scan.scan_fanout`
+        for the duration, so the queries split the memory cap the caller's one
+        gate slot authorizes rather than each taking it whole — see that
+        function for why no gate sizing can absorb the difference.
         """
-        with ThreadPoolExecutor(max_workers=len(fns)) as pool:
-            futures = [pool.submit(fn) for fn in fns]
+        with scan_fanout(len(fns)), ThreadPoolExecutor(max_workers=len(fns)) as pool:
+            futures = [pool.submit(copy_context().run, fn) for fn in fns]
             return [f.result() for f in futures]
+
+    def _run_serial(self, *fns: Callable[[], Any]) -> list[Any]:
+        """Same shape as :py:meth:`_run_parallel`, one at a time.
+
+        For a caller that is already fanning out. The budget is safe either
+        way — :func:`~vestigo.db._scan.scan_fanout` multiplies, so a nested
+        fan-out divides the slot's share by the product — but a two-by-two
+        nest leaves each of four queries a quarter share and four threads to
+        run them in, and the pivot's axis scans are cheap enough that serial
+        at the full share is the better trade.
+        """
+        return [fn() for fn in fns]
 
     def _select(self, sql: str, parameters: Mapping[str, Any] | None = None, **kwargs: Any) -> Any:
         """Run *sql*, forwarding any external-data tables its parameters carry.
@@ -2015,7 +2069,7 @@ class EventQueryService:
             },
         }
 
-    @_gated_scan
+    @_foreground_scan
     def histogram(self, query: EventQuery, buckets: int = 60) -> dict[str, Any]:
         """Return a bucketed event-count histogram honoring all query filters.
 
@@ -2044,7 +2098,7 @@ class EventQueryService:
                 WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
                 GROUP BY bucket
                 ORDER BY bucket
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2087,7 +2141,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2104,8 +2158,10 @@ class EventQueryService:
             "buckets": [{"start": ensure_utc_iso(row[0]), "count": row[1]} for row in rows],
         }
 
-    @_gated_scan
-    def field_terms(self, query: EventQuery, field_token: str, limit: int = 50) -> dict[str, Any]:
+    @_foreground_scan
+    def field_terms(
+        self, query: EventQuery, field_token: str, limit: int = 50, *, totals: bool = True
+    ) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
         Honors all query filters (same ``_build_where`` as every other
@@ -2116,13 +2172,37 @@ class EventQueryService:
         ``other_count`` is the count of non-empty values that fall outside
         the top *limit* — present so a bar/pie chart can render a truthful
         "Other" slice instead of silently dropping the tail.
+
+        ``totals=False`` is for a caller that reads only the values: it drops
+        the second scan (see :py:meth:`_field_terms_impl`) and reports
+        ``total``/``distinct`` from the returned rows, which is exact when
+        the field has no tail and an undercount when it does. Nothing that
+        renders an "Other" slice may use it.
         """
-        return self._field_terms_impl(query, field_token, limit=limit)
+        return self._field_terms_impl(query, field_token, limit=limit, totals=totals)
 
     def _field_terms_impl(
-        self, query: EventQuery, field_token: str, limit: int = 50
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        parallel: bool = True,
+        totals: bool = True,
     ) -> dict[str, Any]:
-        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate."""
+        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate.
+
+        ``parallel=False`` runs the two scans one after the other, for a
+        caller that is *itself* fanning out (the pivot's two axes) — see
+        :py:meth:`_run_serial`.
+
+        ``totals=False`` runs the top-N scan alone. The grouping below is
+        deliberately run twice so the totals can spill, but a caller that
+        never reads ``total``, ``distinct`` or ``other_count`` pays that price
+        for nothing — the filter rail's value autocomplete maps the values and
+        throws the rest away. Such a caller gets one scan and no fan-out, so
+        its slot's whole memory share goes to the query it actually issues.
+        """
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
@@ -2134,25 +2214,66 @@ class EventQueryService:
             source_offsets=query.source_offsets,
         )
 
-        # Single scan: the window aggregates run after GROUP BY but before
-        # ORDER BY/LIMIT, so every surviving row carries the pre-LIMIT event
-        # total and group count (= distinct non-empty values, since the
-        # grouping key is the value itself).
-        result = self._select(
-            f"""
-            SELECT {col_expr} AS val,
-                   count() AS c,
-                   sum(count()) OVER () AS total,
-                   count() OVER () AS n_groups
-            FROM {database}.events
-            WHERE {where} AND {col_expr} != ''
-            GROUP BY val
-            ORDER BY c DESC, val ASC
-            LIMIT {int(limit)}
-            {heavy_scan_settings()}
-            """,
-            parameters=parameters,
-        )
+        scope = f"WHERE {where} AND {col_expr} != ''"
+
+        # Two scans, run in parallel under the one slot the caller holds —
+        # splitting its memory share between them rather than doubling it
+        # (`_run_parallel` -> `scan_fanout`) —
+        # rather than one scan carrying `sum(count()) OVER ()` /
+        # `count() OVER ()`. The windows were free in wall-clock terms but
+        # **cannot spill**: a frameless `OVER ()` materialises every group in
+        # memory after the (spillable) GROUP BY, so a top-N over a field like
+        # `filename` or `url` died at `max_memory_usage` on exactly the
+        # high-cardinality data this chart is for. The totals scan aggregates
+        # through the spillable path instead, for the same reason — and by
+        # the same construction — as `count_field_inventory`. The price is
+        # that the grouping runs twice; the two waves overlap, so the cost is
+        # ClickHouse-side, not latency an analyst sees.
+        def top_n() -> Any:
+            return self._select(
+                f"""
+                SELECT {col_expr} AS val, count() AS c
+                FROM {database}.events
+                {scope}
+                GROUP BY val
+                ORDER BY c DESC, val ASC
+                LIMIT {int(limit)}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        def all_groups() -> Any:
+            return self._select(
+                f"""
+                SELECT sum(c) AS total, count() AS n_groups FROM (
+                    SELECT {col_expr} AS val, count() AS c
+                    FROM {database}.events
+                    {scope}
+                    GROUP BY val
+                ) AS t
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        if not totals:
+            # One scan, no fan-out: `total` and `distinct` describe the rows
+            # in hand. Exact when the field's whole distribution fit in the
+            # top-N, an undercount otherwise — which is why `other_count` is
+            # 0 rather than a subtraction against a total nobody measured.
+            rows = top_n().result_rows
+            values = [{"value": row[0], "count": row[1]} for row in rows]
+            return {
+                "field": field_token,
+                "total": sum(v["count"] for v in values),
+                "distinct": len(values),
+                "values": values,
+                "other_count": 0,
+            }
+
+        run = self._run_parallel if parallel else self._run_serial
+        result, totals_result = run(top_n, all_groups)
         rows = result.result_rows
         if not rows:
             return {
@@ -2163,7 +2284,8 @@ class EventQueryService:
                 "other_count": 0,
             }
 
-        total, distinct = rows[0][2], rows[0][3]
+        totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        total, distinct = int(totals_row[0] or 0), int(totals_row[1] or 0)
         values = [{"value": row[0], "count": row[1]} for row in rows]
         other_count = total - sum(v["count"] for v in values)
         return {
@@ -2233,7 +2355,7 @@ class EventQueryService:
         to turn "the export refuses on the fields it was built for" into "the
         export works".
         """
-        with HEAVY_SCAN_GATE:
+        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
             where, parameters, col_expr = self._inventory_scope(query, field_token)
             result = self._select(
                 f"SELECT count() FROM ("
@@ -2263,10 +2385,11 @@ class EventQueryService:
 
         Three deliberate details:
 
-        - **No window functions.** ``field_terms`` can afford ``sum() OVER ()``
-          because it takes a top-N; this scan is unbounded in group count and
-          window sorts cannot spill to disk (see ``db/_scan.py``). Plain
-          ``GROUP BY``/``ORDER BY`` under ``heavy_scan_settings()`` does.
+        - **No window functions.** They cannot spill to disk (see
+          ``db/_scan.py``), and a frameless ``OVER ()`` materialises every
+          group besides — which is why ``field_terms`` no longer carries one
+          either. Plain ``GROUP BY``/``ORDER BY`` under
+          ``heavy_scan_settings()`` spills.
         - **Sentinel-safe times.** The no-timestamp storage sentinel is nulled
           out *inside* the aggregate rather than filtered out of the scan, so a
           value seen only on undated events still gets a row carrying its true
@@ -2316,12 +2439,15 @@ class EventQueryService:
         )
 
         with EXPORT_SCAN_GATE if hold_export_slot else contextlib.nullcontext():
-            HEAVY_SCAN_GATE.acquire()
+            # Cancellable admission (#300), driven by hand because the release
+            # point is inside the generator loop, not at block exit.
+            slot = acquire_scan_slot(HEAVY_SCAN_GATE, wait=None)
+            slot.__enter__()
             scanning = True
             try:
                 for block in self._select_row_blocks(sql, parameters=parameters):
                     if scanning:
-                        HEAVY_SCAN_GATE.release()
+                        slot.__exit__(None, None, None)
                         scanning = False
                     for value, count, first_seen, last_seen in block:
                         yield {
@@ -2336,7 +2462,7 @@ class EventQueryService:
                         }
             finally:
                 if scanning:
-                    HEAVY_SCAN_GATE.release()
+                    slot.__exit__(None, None, None)
 
     # Quantiles reported for every numeric field — chosen to cover both the
     # box-plot five-number summary (0.25/0.5/0.75, whiskers approximated from
@@ -2353,7 +2479,7 @@ class EventQueryService:
     #: Reported as ``bin_rule: "fd_fallback"``, never as ``"fd"``.
     _FD_FALLBACK_BINS = 30
 
-    @_gated_scan
+    @_foreground_scan
     def field_numeric_stats(
         self,
         query: EventQuery,
@@ -2417,7 +2543,7 @@ class EventQueryService:
                    stddevPop(v) AS sd, skewPop(v) AS skew, {quantile_exprs}
             FROM (SELECT {cast_expr} AS v FROM {database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2474,7 +2600,7 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
@@ -2500,7 +2626,7 @@ class EventQueryService:
                 WHERE v IS NOT NULL
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -2528,7 +2654,7 @@ class EventQueryService:
     #: past that stops being readable anyway.
     CORRELATION_MAX_FIELDS = 8
 
-    @_gated_scan
+    @_foreground_scan
     def field_correlation(self, query: EventQuery, field_tokens: list[str]) -> dict[str, Any]:
         """Pairwise correlation matrix over several numeric fields.
 
@@ -2589,7 +2715,7 @@ class EventQueryService:
             f"""
             SELECT {", ".join(selects)}
             FROM ({values_subquery}) AS t
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -2633,7 +2759,7 @@ class EventQueryService:
             "dropped_fields": dropped,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_numeric_grouped(
         self,
         query: EventQuery,
@@ -2699,13 +2825,27 @@ class EventQueryService:
 
         # Wave 1 — the extent scan and the per-group aggregate scan have no
         # data dependency on each other.
+        #
+        # The extent scan aggregates *over the groups* rather than over the
+        # rows, which is what lets one query carry the distinct-group count
+        # too. The obvious `uniqExact(g)` builds the full distinct set in a
+        # hash table and **cannot spill**, so on a high-cardinality grouping
+        # field it died at `max_memory_usage` — the trap
+        # `count_field_inventory` documents. `GROUP BY g` spills; summing its
+        # counts and taking min/max of its extremes is the same answer, and
+        # still one scan, so a chart never fans out wider than the single
+        # foreground slot it holds is budgeted for.
         global_result, groups_result = self._run_parallel(
             lambda: self._select(
                 f"""
-                SELECT count(v), min(v), max(v), uniqExact(g)
-                FROM ({pairs_subquery}) AS t
-                WHERE {member_where}
-                {heavy_scan_settings()}
+                SELECT sum(c), min(mn), max(mx), count()
+                FROM (
+                    SELECT g, count(v) AS c, min(v) AS mn, max(v) AS mx
+                    FROM ({pairs_subquery}) AS t
+                    WHERE {member_where}
+                    GROUP BY g
+                ) AS d
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2718,7 +2858,7 @@ class EventQueryService:
                 GROUP BY g
                 ORDER BY c DESC, g ASC
                 LIMIT {int(groups)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             ),
@@ -2757,7 +2897,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 GROUP BY g, bin_idx
                 ORDER BY g, bin_idx
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=_with_params(parameters, mn=mn, bw=bin_width, kept=kept_values),
             )
@@ -2777,7 +2917,7 @@ class EventQueryService:
                 WHERE {member_where} AND g IN {{kept:Array(String)}}
                 ORDER BY ord
                 LIMIT {int(points_limit)}
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=_with_params(parameters, kept=kept_values),
             )
@@ -2836,7 +2976,7 @@ class EventQueryService:
             "points": points_block,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_value_timeseries(
         self,
         query: EventQuery,
@@ -2859,7 +2999,7 @@ class EventQueryService:
         keeps sentinel buckets out of the plotted series, matching the old
         bucket scan's ``VESTIGO_NOT_SENTINEL_SQL`` predicate. No window functions:
         those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
-        BY/LIMIT stay within ``heavy_scan_settings()``' memory budget.
+        BY/LIMIT stay within ``foreground_scan_settings()``' memory budget.
 
         The timestamp-range scan (when no explicit window is set) stays a
         separate query on purpose: the bucket grid must cover *all* filtered
@@ -2887,7 +3027,7 @@ class EventQueryService:
                 where,
                 parameters,
                 ts_expr=eff,
-                settings=heavy_scan_settings(),
+                settings=foreground_scan_settings(),
             )
 
         empty: dict[str, Any] = {
@@ -2926,7 +3066,7 @@ class EventQueryService:
             GROUP BY val
             ORDER BY total DESC, val ASC
             LIMIT {int(series_limit)}
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3019,7 +3159,7 @@ class EventQueryService:
             where,
             parameters,
             ts_expr=effective_ts_sql(query.source_offsets),
-            settings=heavy_scan_settings(),
+            settings=foreground_scan_settings(),
         )
 
     def _bucketed_counts(self, query: EventQuery, interval: int) -> dict[str, int]:
@@ -3034,13 +3174,13 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY bucket
             ORDER BY bucket
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
         return {ensure_utc_iso(row[0]): row[1] for row in result.result_rows}
 
-    @_gated_scan
+    @_foreground_scan
     def compare_time_histogram(
         self,
         primary: EventQuery,
@@ -3133,7 +3273,7 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_expr} != ''
             GROUP BY val
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3145,7 +3285,7 @@ class EventQueryService:
                 counts[val] = count
         return counts, total
 
-    @_gated_scan
+    @_foreground_scan
     def compare_field_terms(
         self,
         primary: EventQuery,
@@ -3219,7 +3359,7 @@ class EventQueryService:
             SELECT count(v), min(v), max(v)
             FROM (SELECT {cast_expr} AS v FROM {self.store.database}.events WHERE {where}) AS t
             WHERE v IS NOT NULL
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3248,13 +3388,13 @@ class EventQueryService:
             WHERE v IS NOT NULL
             GROUP BY bin_idx
             ORDER BY bin_idx
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=_with_params(parameters, mn=mn, bw=bin_width),
         )
         return {row[0]: row[1] for row in result.result_rows}
 
-    @_gated_scan
+    @_foreground_scan
     def compare_field_numeric(
         self,
         primary: EventQuery,
@@ -3340,7 +3480,7 @@ class EventQueryService:
             "comparison_total": c_count,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def time_punchcard(self, query: EventQuery) -> dict[str, Any]:
         """Return event counts grouped by (day-of-week × hour-of-day), UTC.
 
@@ -3364,7 +3504,7 @@ class EventQueryService:
             WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
             GROUP BY dow, hod
             ORDER BY dow, hod
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
@@ -3379,7 +3519,7 @@ class EventQueryService:
             "cells": cells,
         }
 
-    @_gated_scan
+    @_foreground_scan
     def field_pivot(
         self,
         query: EventQuery,
@@ -3424,7 +3564,8 @@ class EventQueryService:
             """One axis's ``(values, distinct, bounded)`` — domain, or top-N by count."""
             if spec is not None and spec.domain is not None:
                 return list(spec.domain), len(spec.domain), True
-            terms = self._field_terms_impl(query, field_token, limit=limit)
+            # Serial: this helper is one arm of a two-way fan-out already.
+            terms = self._field_terms_impl(query, field_token, limit=limit, parallel=False)
             return [v["value"] for v in terms["values"]], terms["distinct"], False
 
         (x_values, x_distinct, x_bounded), (y_values, y_distinct, y_bounded) = self._run_parallel(
@@ -3470,14 +3611,14 @@ class EventQueryService:
             FROM {self.store.database}.events
             WHERE {where} AND {col_x} != '' AND {col_y} != ''
             GROUP BY xv, yv
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )
         cells = [{"x": row[0], "y": row[1], "count": int(row[2])} for row in result.result_rows]
         return {**base, "cells": cells, "total": sum(c["count"] for c in cells)}
 
-    @_gated_scan
+    @_foreground_scan
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:
@@ -3556,7 +3697,7 @@ class EventQueryService:
                        simpleLinearRegression(assumeNotNull(vx), assumeNotNull(vy))
                 FROM ({pairs_subquery}) AS t
                 WHERE vx IS NOT NULL AND vy IS NOT NULL
-                {heavy_scan_settings()}
+                {foreground_scan_settings()}
                 """,
                 parameters=parameters,
             )
@@ -3612,7 +3753,7 @@ class EventQueryService:
             WHERE vx IS NOT NULL AND vy IS NOT NULL
             ORDER BY ord
             LIMIT {int(limit)}
-            {heavy_scan_settings()}
+            {foreground_scan_settings()}
             """,
             parameters=parameters,
         )

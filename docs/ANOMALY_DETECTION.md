@@ -82,13 +82,59 @@ half — how to size the budget and read what resolved — is
   mid-flight keeps a minimal `_stub_event` shape.
 - **`HEAVY_SCAN_SETTINGS` on every whole-corpus scan.** `max_threads` is derived as
   cores ÷ `VESTIGO_STAT_SCAN_CONCURRENCY` from the core count ClickHouse reports for
-  itself (cgroup-quota-aware; pin with `VESTIGO_STAT_SCAN_MAX_THREADS`, fallback 8);
-  spill thresholds for GROUP BY and plain ORDER BY sit at min(4 GB, half the
-  per-query cap); `max_memory_usage` is the total budget ÷ concurrency. Large GROUP
+  itself (cgroup-quota-aware; pin with `VESTIGO_STAT_SCAN_MAX_THREADS`, fallback 8), and is
+  the *heavy* width — the chart lane derives a narrower one from it, see the foreground class
+  below; spill thresholds for GROUP BY and plain ORDER BY sit at min(4 GB, half the per-query
+  cap); `max_memory_usage` is the total budget ÷ (concurrency + 2), the two extra slots being
+  the chart lane's share. Large GROUP
   BY states and sorts spill to disk, and a runaway query fails alone instead of
   taking the server with it. **Any new detector query touching the whole corpus must
   carry it.** ClickHouse's own 90%-of-RAM server limit is no substitute —
   containerized servers misdetect total memory (503 GiB observed on a 128 GiB VM).
+- **Two admission classes (#300).** `HEAVY_SCAN_GATE` (N = `VESTIGO_STAT_SCAN_CONCURRENCY`)
+  admits detectors, Sigma, the value inventory and the enrichment rewrite;
+  `FOREGROUND_SCAN_GATE` (4 slots, a constant) admits the chart aggregations an analyst
+  is looking at — histogram, top terms, numeric stats, compare layers, punchcard, pivot,
+  scatter (`queries.py::_foreground_scan`). The heavy cap divides the budget by N + 2 and
+  the two reserved slots are split four ways for charts (`foreground_scan_settings()`), so
+  both gates fully admitted still fit the total and a chart is capped at half a detector's
+  cap. A cap is per *slot*, not per query: a chart that fans out (`_run_parallel` — the
+  compare layers, `field_terms`' totals wave, the violin's two waves) declares its width to
+  `scan_fanout` and its queries divide the slot's share between them. Without that the
+  over-commit is exactly the fan-out width, and no gate sizing can absorb it. Two slots rather than one because charts over high-cardinality fields are the
+  ordinary case: a chart query must be able to *spill* at that cap, and the two that could
+  not — `field_terms`' `sum(count()) OVER ()` and `field_numeric_grouped`'s `uniqExact` —
+  were rewritten as spillable `GROUP BY` aggregates for exactly that reason. The totals wave
+  is skippable: `field_terms(..., totals=False)` runs the top-N alone and reports
+  `total`/`distinct` from the rows in hand, for a caller that reads only the values (the
+  filter rail's value autocomplete) and would otherwise pay a second whole-corpus grouping
+  for numbers it discards. Threads are bounded as well as memory, though not reserved the same
+  way — `detect_foreground_max_threads()` gives a chart `max_threads × 2 ÷ 4` (floor 2), so a
+  full chart lane costs about two heavy slots' worth of CPU rather than four times a
+  detector's; a lane running at the heavy width would have undone the sizing that makes a
+  *full* heavy gate exactly saturate the box (#301). The memory cap divides by `N + 2` and so
+  comes out of the detectors' share; the heavy thread width still divides by `N` alone, so
+  those two slots are added on top and every slot busy at once is up to twice the core count.
+  Deliberate: closing it means halving every sweep on a box where no chart is open. Pin
+  `VESTIGO_STAT_SCAN_MAX_THREADS` to `cores ÷ (N + 2)` for the strict version. A chart waits at most 5 s for a slot and then answers
+  503 with `queued_ahead` and `Retry-After`, which the UI renders as "waiting behind N scans"
+  and retries for about four minutes before surfacing the 503 as an error — the client's
+  window is `BUSY_RETRY_LIMIT × (that wait + Retry-After)`, both halves, since a parked
+  request is waiting server-side too. The wait is short for a second reason: it happens
+  inside the threadpool, so a long one lets retrying panels fill the pool with *waiters* —
+  including the poll that notices a disconnect. Detectors queue indefinitely. The bound is for a chart
+  someone is *watching*: a background job wraps its work in `unbounded_foreground_wait()`
+  and queues instead (the Stories export renders its chart blocks that way — a job has no
+  spinner, no request to answer 503 to and no retry). An agent or MCP tool calling a gated
+  aggregation goes through `chart_exec.run_gated_scan`, which turns the busy lane into a
+  tool error the model can relay rather than an unhandled `RuntimeError`. Every request-driven scan
+  runs through `api/scan_exec.py::run_scan`, which binds a `ScanContext` so the query
+  carries `log_comment = 'vestigo-scan/<token>'`; when the request disconnects it sets
+  the scan's cancel flag (a parked `acquire_scan_slot` notices within a second) and
+  issues `KILL QUERY WHERE Settings['log_comment'] = …` on a plain daemon thread — never
+  through the threadpool, whose tokens are held by the very scans the KILL is meant to
+  free — so a page reload releases its slots and its ClickHouse processes instead of
+  leaving orphaned sweeps ahead of the next one. Background jobs, the CLI and the agent's tools bind no context and are unaffected.
 - **The budget comes from ClickHouse, not from the app's host.** At startup the app
   reads the ceiling ClickHouse runs under **and the cache maxima under that ceiling**
   (`mark_cache_size`, `index_mark_cache_size`, `primary_index_cache_size` — the two

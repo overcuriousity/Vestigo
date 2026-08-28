@@ -12,6 +12,10 @@ export const BASE = (import.meta.env.VITE_API_BASE ?? "") + "/api";
 
 export class ApiError extends Error {
   status: number;
+  /** Set on a 503 from a full scan lane: callers parked ahead of this request. */
+  queuedAhead?: number;
+  /** `Retry-After` in milliseconds, when the server sent one. */
+  retryAfterMs?: number;
   constructor(status: number, message: string) {
     super(message);
     this.name = "ApiError";
@@ -67,17 +71,29 @@ export function apiErrorFromBody(
   statusText: string,
   bodyText: string,
   path: string,
+  headers?: Record<string, string> | Headers,
 ): ApiError {
   if (status === 401 && path !== "/auth/login") {
     onUnauthorized?.();
   }
   let detail = statusText;
+  let queuedAhead: number | undefined;
   try {
-    detail = extractErrorDetail(JSON.parse(bodyText), detail);
+    const json: unknown = JSON.parse(bodyText);
+    detail = extractErrorDetail(json, detail);
+    // A full scan lane (#300) answers 503 with the queue depth beside `detail`;
+    // that is what lets the UI say "waiting" instead of "failed".
+    const ahead = (json as { queued_ahead?: unknown } | null)?.queued_ahead;
+    if (typeof ahead === "number") queuedAhead = ahead;
   } catch {
     // Non-JSON body (proxy error page, empty 502): keep the status text.
   }
-  return new ApiError(status, detail);
+  const err = new ApiError(status, detail);
+  if (queuedAhead !== undefined) err.queuedAhead = queuedAhead;
+  const retryAfter =
+    headers instanceof Headers ? headers.get("retry-after") : headers?.["retry-after"];
+  if (retryAfter && /^\d+$/.test(retryAfter)) err.retryAfterMs = Number(retryAfter) * 1000;
+  return err;
 }
 
 /** Shared 401-handling + error-surfacing for every fetch helper below. */
@@ -85,7 +101,7 @@ async function checkResponse(res: Response, path: string): Promise<void> {
   if (!res.ok) {
     // A 401 always implies `!res.ok`, so the `onUnauthorized` call inside
     // `apiErrorFromBody` still fires for every unauthorized response.
-    throw apiErrorFromBody(res.status, res.statusText, await res.text(), path);
+    throw apiErrorFromBody(res.status, res.statusText, await res.text(), path, res.headers);
   }
 }
 
@@ -272,7 +288,11 @@ function xhrRequest<T>(opts: XhrOptions): Promise<T> {
       }
       // Error bodies are JSON even when the success path is a blob.
       const rejectWith = (text: string) =>
-        reject(apiErrorFromBody(xhr.status, xhr.statusText, text, opts.path));
+        reject(
+          apiErrorFromBody(xhr.status, xhr.statusText, text, opts.path, {
+            "retry-after": xhr.getResponseHeader("retry-after") ?? "",
+          }),
+        );
       if (opts.responseType === "blob") {
         // `responseText` *throws* InvalidStateError unless responseType is ""
         // or "text", and this is an event listener — the throw would escape

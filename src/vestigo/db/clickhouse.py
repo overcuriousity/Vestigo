@@ -36,7 +36,7 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
-from vestigo.db._scan import HEAVY_SCAN_GATE, heavy_scan_settings
+from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
 from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
@@ -893,7 +893,7 @@ class ClickHouseStore:
         # by the caller so no future call site can forget it — the enrichment
         # job already runs this in a worker thread (asyncio.to_thread), so
         # blocking on the semaphore is correct.
-        with HEAVY_SCAN_GATE:
+        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
             self.client.command(f"DROP TABLE IF EXISTS {events_table}")
             # AS clones the full DDL (engine, ORDER BY, PARTITION BY, skip
             # indexes, settings) — required for REPLACE PARTITION. The MATERIALIZED

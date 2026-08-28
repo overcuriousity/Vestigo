@@ -100,6 +100,20 @@ slower. The `store` fixture also does *not* dispose its engine — those connect
 to the client's loop, and disposing across that boundary fails a passing test in teardown;
 `pg_database` drops the database `WITH (FORCE)` immediately after, which closes them.
 
+That connect-per-operation is what the suite's runtime is mostly made of, so two things keep
+it affordable and both belong to the *test* stack only. `docker-compose.yml` initializes
+PostgreSQL with `trust` auth and CI's service container sets `POSTGRES_HOST_AUTH_METHOD:
+trust`: asyncpg computes SCRAM's PBKDF2 in pure Python (4100 `hmac.new` calls, ~20 ms), which
+is most of a ~27 ms connection, and an average `client` test opens 85 of them. And
+`_cheap_password_hashing` swaps argon2's work factors down for the session — same library,
+same verifier, production parameters restored after. Don't reach for either in application
+code: the cost of both is the point outside tests.
+
+The session template is named per run (`vestigo_tpl_<uuid>`) and the orphan sweep skips
+templates while any test database has a connection. Two suites against one PostgreSQL used to
+share a fixed template name, and the second one's teardown dropped it under the first — every
+remaining test failing with "template database does not exist", which names neither cause.
+
 Postgres schema is managed by **Alembic** (`src/vestigo/db/migrations`; `env.py` resolves
 the DSN from `get_settings()`). `PostgresStore.init_schema` upgrades to head on startup and
 auto-adopts a pre-Alembic database (stamps it at revision `0001`), so deploys need no manual

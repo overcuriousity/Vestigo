@@ -21,6 +21,7 @@ from collections.abc import Iterator
 
 import pytest
 import pytest_asyncio
+from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -28,6 +29,7 @@ from sqlalchemy.pool import NullPool
 
 from vestigo.api import deps
 from vestigo.api.main import create_app
+from vestigo.core import security
 from vestigo.core.config import get_settings
 from vestigo.core.login_backoff import reset_login_backoff
 from vestigo.db.postgres import PostgresStore, User
@@ -43,24 +45,46 @@ _PROBE_TIMEOUT_SECONDS = 1.5
 
 
 def _probe_clickhouse(url: str) -> str | None:
-    """Return None if ClickHouse answers ``/ping``, else a one-line reason.
+    """Return None if ClickHouse answers a real query, else a one-line reason.
 
     Uses ``urllib`` rather than ``clickhouse_connect`` on purpose. The driver
     retries, and its failure surfaces as a paragraph of connection-pool
     traceback — which is exactly how a stopped container used to read as a
     mysterious test failure minutes into a run.
+
+    It is a ``SELECT 1`` as the configured user and not ``/ping``, because
+    ``/ping`` is answered before any user is resolved. A server whose ``default``
+    user is restricted to localhost — what the stock ``users.d/default-user.xml``
+    in images >= ~25.x does, so every ClickHouse reached across a container
+    bridge — answers ``Ok.`` to the ping and refuses every query with
+    REQUIRED_PASSWORD/194. That configuration cost a CI run six hours of red
+    that this probe existed to prevent.
     """
-    ping = urllib.parse.urljoin(url.rstrip("/") + "/", "ping")
+    settings = get_settings()
+    query = urllib.parse.urljoin(url.rstrip("/") + "/", "?query=SELECT+1")
+    request = urllib.request.Request(
+        query,
+        headers={
+            "X-ClickHouse-User": settings.clickhouse_username,
+            "X-ClickHouse-Key": settings.clickhouse_password,
+        },
+    )
     try:
-        with urllib.request.urlopen(ping, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(request, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
             if resp.status != 200:
-                return f"HTTP {resp.status} from {ping}"
+                return f"HTTP {resp.status} from {query}"
+            body = resp.read(64).decode("utf-8", "replace").strip()
+        if body != "1":
+            return f"unexpected answer to SELECT 1 from {query}: {body!r}"
         return None
     except urllib.error.HTTPError as exc:
-        return f"HTTP {exc.code} from {ping}"
+        # ClickHouse puts its own diagnosis in the body — "not allowed from
+        # network" names a fix, a bare 403 does not.
+        detail = exc.read(200).decode("utf-8", "replace").strip().replace("\n", " ")
+        return f"HTTP {exc.code} from {query}: {detail}"
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
-        return f"{reason} ({ping})"
+        return f"{reason} ({query})"
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -125,10 +149,19 @@ def pytest_configure(config: pytest.Config) -> None:
 # template database replays the migrations once per session and every test
 # clones it (~55ms vs ~101ms replaying them into a fresh SQLite file).
 
-#: Migrated once per session; every test's database is a clone of it.
-_TEMPLATE_DB = "vestigo_test_template"
 #: Prefix for per-test clones, and what the orphan sweep matches on.
 _TEST_DB_PREFIX = "vestigo_test_"
+#: Prefix for session templates, kept distinct from the clone prefix so the
+#: clone sweep cannot reach one.
+_TEMPLATE_DB_PREFIX = "vestigo_tpl_"
+#: Migrated once per session; every test's database is a clone of it.
+#:
+#: Unique per run, because the name used to be a constant and two suites
+#: against one PostgreSQL then shared it: the second run's `CREATE DATABASE`
+#: collided, and its teardown dropped the template out from under the first,
+#: which failed every remaining test with "template database does not exist" —
+#: a message that names neither the cause nor the other run.
+_TEMPLATE_DB = f"{_TEMPLATE_DB_PREFIX}{uuid.uuid4().hex[:12]}"
 
 
 def _admin_url() -> URL:
@@ -183,6 +216,29 @@ def _probe_postgres() -> str | None:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _cheap_password_hashing() -> Iterator[None]:
+    """Argon2 at test cost, not production cost.
+
+    The default `PasswordHasher()` is tuned to be slow on purpose — ~50 ms to
+    hash and ~45 ms to verify on this hardware. That is the right number in
+    production and pure overhead here: a single API test file spent two of its
+    seventeen seconds inside argon2, and the suite logs in thousands of times.
+
+    Same library and same API, so every hash produced is still a real argon2
+    hash and `verify_password` still exercises the real verifier — only the
+    work factors change. Nothing asserts on the parameters, and the production
+    ones are the module default this replaces, so a test cannot pass because
+    of this and then fail in production.
+    """
+    cheap = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1, hash_len=16, salt_len=8)
+    original, security._hasher = security._hasher, cheap
+    try:
+        yield
+    finally:
+        security._hasher = original
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _pg_template():
     """Build the template database once, and clean up after killed runs.
 
@@ -190,15 +246,32 @@ def _pg_template():
     behind, and without this they accumulate silently until someone wonders why
     the dev server has four hundred databases.
     """
-    pattern = _TEST_DB_PREFIX.replace("_", r"\_") + "%"
+    clones = _TEST_DB_PREFIX.replace("_", r"\_") + "%"
+    templates = _TEMPLATE_DB_PREFIX.replace("_", r"\_") + "%"
     # Only databases nobody is connected to. A second suite running right now
     # holds connections to its own clones, and dropping those out from under it
     # would fail that run with something it has no way to explain.
+    #
+    # An idle template is the case that check cannot see: a live run's template
+    # carries no connection between clones, so it looks exactly like an orphan.
+    # So templates are swept only when nothing at all is connected to a test
+    # database — i.e. when no other suite is running. Ours is created after,
+    # and named per run, so a concurrent suite can never take it.
     stale = _admin_sql(
         "SELECT d.datname FROM pg_database d "
-        f"WHERE d.datname LIKE '{pattern}' "
+        f"WHERE d.datname LIKE '{clones}' "
         "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
     )
+    busy = _admin_sql(
+        "SELECT 1 FROM pg_stat_activity a JOIN pg_database d ON d.datname = a.datname "
+        f"WHERE d.datname LIKE '{clones}' OR d.datname LIKE '{templates}' LIMIT 1"
+    )
+    if not busy:
+        stale += _admin_sql(
+            "SELECT d.datname FROM pg_database d "
+            f"WHERE d.datname LIKE '{templates}' "
+            "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
+        )
     for name in stale:
         _admin_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
     _admin_sql(f'CREATE DATABASE "{_TEMPLATE_DB}"')

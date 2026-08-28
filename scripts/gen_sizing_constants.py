@@ -20,7 +20,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 from vestigo.core.config import Settings  # noqa: E402
-from vestigo.db._scan import _COUNTED_CACHES, _FALLBACK_MAX_THREADS  # noqa: E402
+from vestigo.db._scan import (  # noqa: E402
+    _COUNTED_CACHES,
+    _FALLBACK_MAX_THREADS,
+    _FOREGROUND_CONCURRENCY,
+    _FOREGROUND_SLOTS,
+)
 
 MEMORY_XML = REPO / "deploy" / "clickhouse" / "memory.xml"
 
@@ -37,6 +42,10 @@ def build() -> dict[str, object]:
     return {
         "memory_ratio": fields["stat_scan_memory_ratio"].default,
         "default_concurrency": fields["stat_scan_concurrency"].default,
+        # The chart lane (#300): two heavy slots' worth of the budget, split
+        # this many ways. The heavy cap therefore divides by concurrency + 2.
+        "foreground_concurrency": _FOREGROUND_CONCURRENCY,
+        "foreground_slots": _FOREGROUND_SLOTS,
         "fallback_max_threads": _FALLBACK_MAX_THREADS,
         "min_threads_per_scan": 2,
         "counted_caches": list(_COUNTED_CACHES),

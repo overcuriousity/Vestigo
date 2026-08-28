@@ -15,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from vestigo import __version__
+from vestigo.api import scan_exec
 from vestigo.api.deps import get_store, resolve_user_optional
+from vestigo.api.request_context import RequestContextMiddleware
 from vestigo.api.routers import (
     admin,
     agent,
@@ -461,7 +463,7 @@ async def _probe_scan_budget() -> None:
         )
     elif report["risk"] == "over_budget":
         logger.error(
-            "Heavy-scan budget (%.1f GiB across %d slot(s)) plus ClickHouse's own caches "
+            "Scan budget (%.1f GiB across %d heavy slot(s) plus the chart lane) plus ClickHouse's own caches "
             "(%.1f GiB) exceeds what ClickHouse is allowed to use in total (%.1f GiB). "
             "Admitting a full set of scans can only end in a memory error or an OOM kill. "
             "Lower VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES, shrink the caches in "
@@ -473,11 +475,14 @@ async def _probe_scan_budget() -> None:
         )
     else:
         logger.info(
-            "Heavy-scan budget: %.1f GiB total (%.1f GiB per query x %d) under ClickHouse's "
-            "%.1f GiB ceiling, with %.1f GiB of server caches counted; %d threads per scan (%s).",
+            "Scan budget: %.1f GiB total (%.1f GiB per heavy query x %d, plus %d chart queries "
+            "at %.1f GiB) under ClickHouse's %.1f GiB ceiling, with %.1f GiB of server caches "
+            "counted; %d threads per scan (%s).",
             report["total_bytes"] / (1 << 30),
             report["per_query_bytes"] / (1 << 30),
             report["concurrency"],
+            report["foreground"]["concurrency"],
+            report["foreground"]["per_query_bytes"] / (1 << 30),
             report["clickhouse_ceiling_bytes"] / (1 << 30),
             report["cache_bytes"] / (1 << 30),
             report["max_threads"],
@@ -710,6 +715,11 @@ def create_app() -> FastAPI:
     # and 401 responses, instead of AuthAuditMiddleware short-circuiting
     # them first with a bare, header-less 401.
     app.add_middleware(AuthAuditMiddleware)
+    # Binds the Request into a contextvar for every HTTP request so
+    # scan_exec.run_scan can watch it for a disconnect. Order relative to the
+    # auth gate is immaterial — it sets a variable and passes through.
+    app.add_middleware(RequestContextMiddleware)
+    scan_exec.install(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://localhost:8080"],

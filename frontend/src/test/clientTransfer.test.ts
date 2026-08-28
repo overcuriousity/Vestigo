@@ -25,6 +25,10 @@ class FakeXHR {
   withCredentials = false;
   responseType = "";
   status = 0;
+  /** No headers are staged by these tests; `apiErrorFromBody` must cope with null. */
+  getResponseHeader(_name: string): string | null {
+    return null;
+  }
   statusText = "";
   response: unknown = null;
   sentBody: unknown = null;

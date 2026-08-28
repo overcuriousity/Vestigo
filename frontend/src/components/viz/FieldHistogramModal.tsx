@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
 import { Spinner } from "@/components/ui/Spinner";
@@ -67,6 +68,7 @@ export function FieldHistogramModal({
     queryKey: ["field-histogram-total", caseId, timelineId, filters, buckets],
     queryFn: () => eventsApi.histogram(caseId, timelineId, filters, buckets),
     enabled: open,
+    ...busyRetry,
   });
 
   // The scoped (blue) and total (grey) histograms must share an identical
@@ -97,13 +99,20 @@ export function FieldHistogramModal({
     // otherwise the first paint would briefly show a self-ranged (and thus
     // misaligned) scoped histogram before this refetches.
     enabled: open && rangeStart != null && rangeEnd != null,
+    ...busyRetry,
   });
 
   const termsQuery = useQuery({
     queryKey: ["field-terms", caseId, timelineId, fieldKey, filters],
     queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, 50),
     enabled: open,
+    ...busyRetry,
   });
+  // In-flight busy-lane signals (#300): shown beside the spinner while retrying.
+  const histogramWaiting = busyMessage(
+    histogramQuery.failureReason ?? totalHistogramQuery.failureReason,
+  );
+  const termsWaiting = busyMessage(termsQuery.failureReason);
 
   const maxTermCount = Math.max(1, ...(termsQuery.data?.values.map((v) => v.count) ?? [1]));
   const captionLines = buildCaptionLines({
@@ -165,17 +174,35 @@ export function FieldHistogramModal({
         <div className="grid grid-cols-[1fr_280px] gap-4">
           <div>
             {histogramQuery.isLoading || totalHistogramQuery.isLoading ? (
-              <div className="flex h-[320px] items-center justify-center">
+              <div className="flex h-[320px] flex-col items-center justify-center gap-2">
                 <Spinner size={20} />
+                {histogramWaiting && (
+                  <span className="text-xs text-[var(--color-fg-muted)]">{histogramWaiting}</span>
+                )}
               </div>
             ) : (
               <>
-                <TimeHistogram
-                  svgRef={svgRef}
-                  height={320}
-                  buckets={histogramQuery.data?.buckets ?? []}
-                  contextBuckets={totalHistogramQuery.data?.buckets}
-                />
+                <div className="relative">
+                  {/* A busy lane (#300) on a refetch — a bucket-count change
+                      keeps `isLoading` false because the key already has data,
+                      so without this the histogram sits stale and silent for
+                      the whole retry window. `isFetching` covers the delay
+                      between attempts too. */}
+                  {histogramWaiting &&
+                    (histogramQuery.isFetching || totalHistogramQuery.isFetching) && (
+                      <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+                        <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+                          {histogramWaiting}
+                        </span>
+                      </div>
+                    )}
+                  <TimeHistogram
+                    svgRef={svgRef}
+                    height={320}
+                    buckets={histogramQuery.data?.buckets ?? []}
+                    contextBuckets={totalHistogramQuery.data?.buckets}
+                  />
+                </div>
                 <div className="mt-1.5 flex items-center gap-4 text-xs text-[var(--color-fg-muted)]">
                   <span className="flex items-center gap-1.5">
                     <span className="inline-block h-2.5 w-2.5 rounded-sm bg-[var(--color-accent)]" />
@@ -201,11 +228,23 @@ export function FieldHistogramModal({
             </p>
             <div className="max-h-[360px] flex-1 overflow-y-auto pr-1">
               {termsQuery.isLoading ? (
-                <div className="flex justify-center py-4">
+                <div className="flex flex-col items-center gap-2 py-4">
                   <Spinner size={16} />
+                  {termsWaiting && (
+                    <span className="text-xs text-[var(--color-fg-muted)]">{termsWaiting}</span>
+                  )}
                 </div>
               ) : (
-                <ul className="space-y-0.5">
+                <ul className="relative space-y-0.5">
+                  {/* Same refetch case as the histogram: the list stays on
+                      screen, so the spinner branch above does not run. */}
+                  {termsWaiting && termsQuery.isFetching && (
+                    <li className="pointer-events-none absolute inset-0 z-10 flex items-start justify-center pt-4">
+                      <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+                        {termsWaiting}
+                      </span>
+                    </li>
+                  )}
                   {(termsQuery.data?.values ?? []).map((v) => (
                     <li
                       key={v.value}

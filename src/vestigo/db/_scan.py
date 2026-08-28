@@ -14,8 +14,9 @@ The memory budget is a **total across concurrent scans**, resolved from
 ``VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`` when nonzero, else auto-sized to
 ``VESTIGO_STAT_SCAN_MEMORY_RATIO`` (0.8) of the detected memory — the cgroup limit
 when the process runs in a memory-limited container, the machine's physical
-RAM otherwise. Each query's ``max_memory_usage`` is budget /
-``VESTIGO_STAT_SCAN_CONCURRENCY``, and :data:`HEAVY_SCAN_GATE` (acquired by every
+RAM otherwise. Each heavy query's ``max_memory_usage`` is budget /
+(``VESTIGO_STAT_SCAN_CONCURRENCY`` + 2) — the two extra slots are the foreground
+class's share, see :data:`FOREGROUND_SCAN_GATE` — and :data:`HEAVY_SCAN_GATE` (acquired by every
 detector entry point in ``db/anomaly_stats.py``) holds surplus scans so no
 more than that many run at once — ``max_memory_usage`` alone is per *query*,
 and N parallel detector requests stacking N full-budget queries is exactly
@@ -65,14 +66,23 @@ whole-partition query and, before it was gated, it stacked on top of a full set
 of admitted detector scans and OOM-killed a 32 GiB host mid-apply.
 """
 
+import contextlib
+import logging
 import os
 import re
 import threading
-from collections.abc import Mapping
+import time
+import uuid
+import weakref
+from collections.abc import Iterator, Mapping, MutableMapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from vestigo.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # Used when detection is explicitly disabled nowhere but fails (exotic
 # platforms) — the pre-auto-detection default from the session-27 incident.
@@ -444,18 +454,81 @@ def detect_scan_memory_budget() -> int:
         s.stat_scan_max_memory_bytes,
         s.stat_scan_memory_ratio,
         ceiling,
-        # Deliberately the gate's own size, not the live setting. The divisor
-        # and the semaphore describe one budget from two sides, and this is the
-        # only value both can agree on: :data:`HEAVY_SCAN_GATE` is sized at
-        # import and imported by value, while an admin-console edit to
-        # `stat_scan_concurrency` lands on the next `get_settings()`. Reading
-        # the live value here would let a 4 -> 2 edit double every query's cap
-        # while the gate still admitted four — 2x the total budget, which is
-        # precisely the OOM the pair exists to prevent. `restart_required=True`
-        # on the spec is what makes the frozen value honest, not enforcement.
-        _GATE_CONCURRENCY,
+        # Deliberately the gate's own size *plus two*, not the live setting.
+        # The two extra slots are the foreground class's share (see
+        # :data:`FOREGROUND_SCAN_GATE`): N heavy scans plus four foreground
+        # charts at half a slot each is exactly the total, so both gates
+        # fully admitted still fit. Two slots rather than one because a chart
+        # over a high-cardinality field is the ordinary case, not the corner
+        # one, and a quarter-slot cap made the ordinary case spill on every
+        # render. The divisor and the semaphore describe one
+        # budget from two sides, and this is the only value both can agree on:
+        # :data:`HEAVY_SCAN_GATE` is sized at import and imported by value,
+        # while an admin-console edit to `stat_scan_concurrency` lands on the
+        # next `get_settings()`. Reading the live value here would let a
+        # 4 -> 2 edit double every query's cap while the gate still admitted
+        # four — 2x the total budget, which is precisely the OOM the pair
+        # exists to prevent. `restart_required=True` on the spec is what makes
+        # the frozen value honest, not enforcement.
+        #
+        # `_FOREGROUND_SLOTS` rather than a literal 2: this divisor and the
+        # foreground gate's size are one reservation described from two
+        # sides, and a literal lets an edit to one silently break the
+        # identity `scan_budget_report` goes on to report as fact.
+        _GATE_CONCURRENCY + _FOREGROUND_SLOTS,
         _cache_bytes_under(ceiling),
     )
+
+
+def detect_foreground_memory_budget() -> int:
+    """Per-query ``max_memory_usage`` for a foreground (chart) scan.
+
+    Two heavy slots' worth, divided across the foreground gate — so charts
+    have their own lane without adding to the total the heavy class already
+    accounts for (the heavy divisor reserves exactly those two slots). Half a
+    heavy cap per chart rather than a quarter: charts over high-cardinality
+    fields are the ordinary workload here, and every one of them then spills
+    at half the size a detector does rather than a sixth. Never 0, for the
+    same reason as the heavy cap.
+    """
+    return max(detect_scan_memory_budget() * _FOREGROUND_SLOTS // _FOREGROUND_CONCURRENCY, 1)
+
+
+def detect_foreground_max_threads() -> int:
+    """``max_threads`` for a foreground (chart) scan.
+
+    Two heavy slots' worth of threads, divided across the foreground gate —
+    the same arithmetic :func:`detect_foreground_memory_budget` uses, but
+    **not** the same guarantee, and the difference is deliberate. The memory
+    path is a true reservation: :func:`detect_scan_memory_budget` divides the
+    total by ``_GATE_CONCURRENCY + _FOREGROUND_SLOTS``, so the chart lane's
+    share comes out of the detectors' own and the two lanes together never
+    exceed the budget. :func:`detect_scan_max_threads` divides the cores by
+    ``_GATE_CONCURRENCY`` alone, so the heavy width is unchanged by this lane
+    existing and these threads are *added* to a box a full heavy gate already
+    saturates. Every slot busy at once is therefore up to 2x the core count:
+    on a 20-core host at the default concurrency, ``2 x 10 + 4 x 5 = 40``.
+
+    That bound is accepted rather than closed. It is a quarter of the 8x this
+    replaced — a full gate of four charts, each fanning out two queries at the
+    *heavy* width, was 100 threads on 20 cores (issue #301) — it needs all six
+    slots occupied to appear at all, and closing it would mean dividing the
+    heavy width by ``N + 2`` as well, halving every detector sweep on a box
+    where nobody has opened a chart. An operator who does run charts
+    continuously alongside sweeps can pin ``VESTIGO_STAT_SCAN_MAX_THREADS`` to
+    ``cores // (N + 2)`` and get the strict version.
+
+    Floored at 2 for the same reason :func:`detect_scan_max_threads` is: a
+    single-threaded GROUP BY is not a fallback to land on silently. A gate
+    wider than twice the heavy width therefore *can* exceed even that bound on
+    a very small box, where the floor matters more than the arithmetic.
+
+    Not divided by the fan-out width the way the memory cap is
+    (:func:`scan_fanout`): a fan-out of two at half the heavy width is one
+    heavy slot's threads, which is inside the two-slot allowance already, and
+    dividing again would put the ordinary two-wave chart at the floor.
+    """
+    return max(2, detect_scan_max_threads() * _FOREGROUND_SLOTS // _FOREGROUND_CONCURRENCY)
 
 
 def scan_budget_report() -> dict[str, Any]:
@@ -477,7 +550,10 @@ def scan_budget_report() -> dict[str, Any]:
     """
     s = get_settings()
     per_query = detect_scan_memory_budget()
-    total = per_query * _GATE_CONCURRENCY
+    foreground = detect_foreground_memory_budget()
+    # Both classes fully admitted: N heavy slots plus the two slots the
+    # foreground gate shares.
+    total = per_query * (_GATE_CONCURRENCY + _FOREGROUND_SLOTS)
     ceiling = scan_memory_ceiling()
     committed = total + _clickhouse_cache_bytes
     if _clickhouse_ceiling is None or not _clickhouse_bounded:
@@ -523,6 +599,19 @@ def scan_budget_report() -> dict[str, Any]:
         "pending_concurrency": (
             s.stat_scan_concurrency if s.stat_scan_concurrency != _GATE_CONCURRENCY else None
         ),
+        # The foreground class (charts): its own gate, fed by the two slots
+        # the heavy divisor reserves. Disclosed so "why is my chart capped at
+        # X" has an answer on the same page as the heavy cap.
+        # `max_threads` is disclosed here too, and not only for the heavy
+        # class: an operator asking "why is my chart capped at X" is as
+        # likely to mean CPU — and this is the one number that shows the
+        # chart lane's threads are a bound on top of the heavy width rather
+        # than a slice out of it (see `detect_foreground_max_threads`).
+        "foreground": {
+            "concurrency": _FOREGROUND_CONCURRENCY,
+            "per_query_bytes": foreground,
+            "max_threads": detect_foreground_max_threads(),
+        },
         # Thread width and its provenance. A wrong width has no symptom except
         # "everything is slow", which is the same reason the memory resolution
         # is reported here rather than left to be inferred from a failure.
@@ -544,6 +633,234 @@ def scan_budget_report() -> dict[str, Any]:
     }
 
 
+# ── Scan context: tagging and cancellation ───────────────────────────────────
+
+
+@dataclass
+class ScanContext:
+    """One request-driven scan: the tag its queries carry and its cancel flag.
+
+    Bound by :func:`bind_scan_context` (the API's ``run_scan`` does this per
+    request) and read by the settings-clause builders and
+    :func:`acquire_scan_slot`. Background jobs and the CLI never bind one, so
+    their scans are untagged and uncancellable — exactly as before.
+    """
+
+    token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+_scan_context_var: ContextVar[ScanContext | None] = ContextVar("vestigo_scan_context", default=None)
+
+
+def scan_context() -> ScanContext | None:
+    return _scan_context_var.get()
+
+
+@contextlib.contextmanager
+def bind_scan_context() -> Iterator[ScanContext]:
+    """Bind a fresh :class:`ScanContext` for the duration of the block.
+
+    contextvars propagate into ``starlette.concurrency.run_in_threadpool``,
+    so a context bound in an endpoint is visible to the scan running in the
+    threadpool — which is what lets the clause builders tag the query.
+    """
+    ctx = ScanContext()
+    reset = _scan_context_var.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _scan_context_var.reset(reset)
+
+
+def scan_log_comment(token: str) -> str:
+    """The ``log_comment`` value a tagged scan carries; the key ``KILL QUERY`` uses."""
+    return f"vestigo-scan/{token}"
+
+
+class ScanBusy(RuntimeError):
+    """A bounded wait for a gate slot expired. ``ahead`` is the queue depth when it did."""
+
+    def __init__(self, *, ahead: int, wait: float) -> None:
+        self.ahead = ahead
+        self.wait = wait
+        super().__init__(f"scan lane busy: {ahead} waiting ahead after {wait:g}s — retry shortly")
+
+
+class ScanCancelled(RuntimeError):
+    """The request that started this scan went away while it waited or ran."""
+
+
+#: How often a parked acquire re-checks its cancel flag. Module-level so tests
+#: can shorten it; one second is invisible to a human and cheap for a thread.
+_ACQUIRE_POLL_SECONDS = 1.0
+
+_waiting_lock = threading.Lock()
+# Keyed by the gate *object*, weakly: keying by ``id()`` leaks one entry per
+# gate ever passed in and — because CPython reuses an id once its object is
+# collected — hands a later gate the dead one's count, which is the number an
+# analyst is shown as "waiting behind N scans". A test that swaps
+# FOREGROUND_SCAN_GATE for a throwaway does exactly that.
+_waiting: MutableMapping[Any, int] = weakref.WeakKeyDictionary()
+
+
+def _waiting_count(gate: threading.BoundedSemaphore) -> int:
+    with _waiting_lock:
+        return _waiting.get(gate, 0)
+
+
+def _adjust_waiting(gate: threading.BoundedSemaphore, delta: int) -> None:
+    with _waiting_lock:
+        _waiting[gate] = max(_waiting.get(gate, 0) + delta, 0)
+
+
+@contextlib.contextmanager
+def acquire_scan_slot(gate: threading.BoundedSemaphore, *, wait: float | None) -> Iterator[None]:
+    """Hold one slot of *gate* for the block, cancellably and optionally bounded.
+
+    Polls ``gate.acquire(timeout=_ACQUIRE_POLL_SECONDS)`` so a parked caller
+    notices the bound context's ``cancelled`` flag within a poll interval —
+    a plain ``acquire()`` would block until a slot came free, which on a busy
+    host is minutes after the client left. ``wait=None`` waits indefinitely
+    (heavy class); a float raises :class:`ScanBusy` once that many seconds
+    pass without a slot (foreground class). Without a bound context there is
+    nothing to cancel and the loop is just a slow-motion ``acquire()``.
+    """
+    ctx = scan_context()
+    _adjust_waiting(gate, +1)
+    deadline = None if wait is None else time.monotonic() + wait
+    try:
+        while True:
+            if ctx is not None and ctx.cancelled.is_set():
+                raise ScanCancelled("cancelled while waiting for a scan slot")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                # Counted *here*, not at entry: the number goes on to the
+                # analyst's screen as "waiting behind N scans", and an entry
+                # sample is up to `wait` seconds stale by the time it is
+                # rendered — long enough for the queue it describes to have
+                # drained entirely. Minus this caller's own +1.
+                raise ScanBusy(ahead=max(_waiting_count(gate) - 1, 0), wait=wait or 0.0)
+            timeout = (
+                _ACQUIRE_POLL_SECONDS
+                if remaining is None
+                else min(_ACQUIRE_POLL_SECONDS, remaining)
+            )
+            if gate.acquire(timeout=timeout):
+                break
+    finally:
+        _adjust_waiting(gate, -1)
+    try:
+        yield
+    finally:
+        gate.release()
+
+
+def kill_scan_queries(client: Any, token: str) -> None:
+    """Best-effort ``KILL QUERY`` for every ClickHouse query tagged with *token*.
+
+    ``ASYNC`` so the call returns at once; the running thread then fails with
+    ``QUERY_WAS_CANCELLED`` (code 394) and releases its slot. A failure here
+    is logged and swallowed: the scan simply finishes on its own, as it did
+    before cancellation existed.
+    """
+    try:
+        client.command(
+            "KILL QUERY WHERE Settings['log_comment'] = {tag:String} ASYNC",
+            parameters={"tag": scan_log_comment(token)},
+        )
+    except Exception:  # noqa: BLE001 — best effort by design
+        logger.warning(
+            "KILL QUERY for scan %s failed; it will finish on its own", token, exc_info=True
+        )
+
+
+#: Number of queries a single gate slot currently has in flight. One by
+#: default; a fan-out declares its width with :func:`scan_fanout`.
+_scan_fanout_var: ContextVar[int] = ContextVar("vestigo_scan_fanout", default=1)
+
+
+@contextlib.contextmanager
+def scan_fanout(width: int) -> Iterator[None]:
+    """Declare that *width* queries run concurrently under the caller's one slot.
+
+    The per-query cap a gate slot authorizes is sized **per slot**, not per
+    query: the heavy divisor reserves ``_FOREGROUND_SLOTS`` slots for the
+    whole chart lane, and `detect_foreground_memory_budget` splits those
+    across the foreground gate. A caller that fans out therefore has to split
+    its own share rather than issue each query at the full cap — otherwise a
+    fully admitted lane commits ``fanout x`` the budget that was reserved for
+    it, which is exactly the over-commit the pair of gates exists to prevent.
+    The factor is the fan-out width and nothing else, so no gate sizing can
+    absorb it.
+
+    Multiplies rather than replaces, so a nested fan-out (the violin chart's
+    second wave under its first) divides by the product. contextvars are
+    copied into the worker threads by ``copy_context().run``, so the width
+    set here reaches the clause builder inside each one.
+    """
+    token = _scan_fanout_var.set(max(_scan_fanout_var.get() * max(width, 1), 1))
+    try:
+        yield
+    finally:
+        _scan_fanout_var.reset(token)
+
+
+#: Set while a scan runs for something with nobody watching a spinner.
+_foreground_unbounded_var: ContextVar[bool] = ContextVar(
+    "vestigo_foreground_unbounded", default=False
+)
+
+
+@contextlib.contextmanager
+def unbounded_foreground_wait() -> Iterator[None]:
+    """Queue for a foreground slot indefinitely instead of raising :class:`ScanBusy`.
+
+    The bounded wait exists so a chart an analyst is *looking at* says "busy"
+    rather than spins. A background job — a story export rendering its chart
+    blocks — has no spinner, no request to answer 503 to and no retry: for it
+    the bound turns a slow answer into a failed one. Such a caller wraps its
+    work in this and gets the pre-#300 behavior, queueing behind the lane
+    until a slot comes free.
+    """
+    token = _foreground_unbounded_var.set(True)
+    try:
+        yield
+    finally:
+        _foreground_unbounded_var.reset(token)
+
+
+def foreground_wait_seconds(bounded: float) -> float | None:
+    """*bounded*, or ``None`` under :func:`unbounded_foreground_wait`."""
+    return None if _foreground_unbounded_var.get() else bounded
+
+
+def _scan_settings_clause(budget: int, threads: int) -> str:
+    s = get_settings()
+    # A gate slot's cap is per *slot*: a caller that fans out splits its own
+    # share across the queries it has in flight, rather than issuing each at
+    # the full cap. See `scan_fanout`. Never 0, for the same reason the caps
+    # themselves never are.
+    budget = max(budget // max(_scan_fanout_var.get(), 1), 1)
+    # Spill must engage well before the cap kills the query — a configured
+    # threshold at or above the per-query cap would never fire.
+    group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
+    sort_spill = min(s.stat_scan_external_sort_bytes, budget // 2)
+    # A request-driven scan is tagged so a disconnect can KILL it by this
+    # value (see kill_scan_queries). The token is a uuid hex — nothing to quote.
+    ctx = scan_context()
+    tag = f", log_comment = '{scan_log_comment(ctx.token)}'" if ctx is not None else ""
+    return (
+        f"SETTINGS max_threads = {threads}, "
+        f"max_bytes_before_external_group_by = {group_by_spill}, "
+        # Plain ORDER BY sorts spill at this threshold. Window-function sorts
+        # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those
+        # scans structurally (per source / slim columns) instead.
+        f"max_bytes_before_external_sort = {sort_spill}, "
+        f"max_memory_usage = {budget}{tag}"
+    )
+
+
 def heavy_scan_settings() -> str:
     """The SETTINGS clause every whole-corpus scan must carry.
 
@@ -551,21 +868,20 @@ def heavy_scan_settings() -> str:
     Cheap: a few f-string formats over cached inputs, against a query that is
     about to read the whole corpus.
     """
-    s = get_settings()
-    budget = detect_scan_memory_budget()
-    # Spill must engage well before the cap kills the query — a configured
-    # threshold at or above the per-query cap would never fire.
-    group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
-    sort_spill = min(s.stat_scan_external_sort_bytes, budget // 2)
-    return (
-        f"SETTINGS max_threads = {detect_scan_max_threads()}, "
-        f"max_bytes_before_external_group_by = {group_by_spill}, "
-        # Plain ORDER BY sorts spill at this threshold. Window-function sorts
-        # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those
-        # scans structurally (per source / slim columns) instead.
-        f"max_bytes_before_external_sort = {sort_spill}, "
-        f"max_memory_usage = {budget}"
-    )
+    return _scan_settings_clause(detect_scan_memory_budget(), detect_scan_max_threads())
+
+
+def foreground_scan_settings() -> str:
+    """The SETTINGS clause for an interactive chart aggregation.
+
+    Same shape as :func:`heavy_scan_settings` with the foreground cap *and*
+    the foreground thread width — both two heavy slots split across the gate,
+    applied to the two resources a slot commits. The memory half is a true
+    reservation, taken out of the heavy class's share; the thread half is a
+    bound on top of it. See :func:`detect_foreground_max_threads` for why the
+    width cannot simply be the heavy one, and why the asymmetry stands.
+    """
+    return _scan_settings_clause(detect_foreground_memory_budget(), detect_foreground_max_threads())
 
 
 # Admission gate for heavy detector scans: at most VESTIGO_STAT_SCAN_CONCURRENCY
@@ -577,6 +893,18 @@ def heavy_scan_settings() -> str:
 # the total budget by exactly this number — see the comment at that call.
 _GATE_CONCURRENCY = max(get_settings().stat_scan_concurrency, 1)
 HEAVY_SCAN_GATE = threading.BoundedSemaphore(_GATE_CONCURRENCY)
+
+# Admission gate for *foreground* scans: the chart aggregations an analyst is
+# looking at while they wait (histogram, top terms, numeric stats, …). Its own
+# lane so a 60-bucket GROUP BY never queues behind a whole-corpus detector
+# sweep (issue #300). Sized as two heavy slots split four ways — in memory
+# (detect_foreground_memory_budget) and in threads
+# (detect_foreground_max_threads) alike — so it adds nothing to the total the
+# heavy divisor already reserves, on either resource. Constants rather than settings: how finely the
+# reserved slots are sliced is not a number an operator needs to reason about.
+_FOREGROUND_SLOTS = 2
+_FOREGROUND_CONCURRENCY = 4
+FOREGROUND_SCAN_GATE = threading.BoundedSemaphore(_FOREGROUND_CONCURRENCY)
 
 # Admission gate for *streamed* heavy scans (the value-inventory export).
 # Deliberately separate from HEAVY_SCAN_GATE and deliberately one slot.

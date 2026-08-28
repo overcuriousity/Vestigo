@@ -40,6 +40,54 @@ function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+/** A 503 from a full scan lane (#300): the server is saying "wait", not "no". */
+export function isScanBusy(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 503 && error.queuedAhead !== undefined;
+}
+
+/**
+ * How many times a busy lane is re-asked before the 503 is allowed to surface.
+ *
+ * One attempt costs the server's `FOREGROUND_WAIT_SECONDS` (5s — it waits for
+ * a slot before answering "busy") *plus* the 5s `Retry-After` it hands back,
+ * so 24 attempts is about four minutes, not the two the count alone suggests.
+ * Both halves have to be counted: sizing this against `Retry-After` alone once
+ * put the real window at fourteen minutes while the comment claimed two.
+ *
+ * Long enough to outlast a detector sweep, short enough that a genuinely
+ * wedged lane ends in an error an analyst can act on. Retrying forever is the
+ * same silent stall #300 set out to remove: a busy lane raises no toast, and a
+ * panel still holding previous data never even reaches the spinner that names
+ * the queue.
+ */
+export const BUSY_RETRY_LIMIT = 24;
+
+/** What one busy attempt costs end to end, in seconds: the server's bounded
+ * wait for a slot plus the `Retry-After` it answers with. Exported so the
+ * window `BUSY_RETRY_LIMIT` describes is checkable rather than asserted. */
+export const BUSY_ATTEMPT_SECONDS = 10;
+
+/**
+ * Query options for surfaces that read a scan lane: a busy lane is "still
+ * waiting", never "failed", so keep asking at the server's pace — but only
+ * up to `BUSY_RETRY_LIMIT` times, after which it *is* a failure and says so.
+ * Any other failure surfaces at once — these are charts the analyst is
+ * looking at, and a second of silent retry before the error is a second of
+ * spinner for nothing.
+ */
+export const busyRetry = {
+  retry: (count: number, error: unknown): boolean => isScanBusy(error) && count < BUSY_RETRY_LIMIT,
+  retryDelay: (_count: number, error: unknown): number =>
+    isScanBusy(error) ? (error.retryAfterMs ?? 5000) : 0,
+};
+
+/** What to show in place of a spinner while a busy lane is being retried. */
+export function busyMessage(error: unknown): string | null {
+  if (!isScanBusy(error)) return null;
+  const n = error.queuedAhead ?? 0;
+  return n > 0 ? `Waiting behind ${n} scan${n === 1 ? "" : "s"}…` : "Waiting for a scan slot…";
+}
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -60,6 +108,11 @@ export const queryClient = new QueryClient({
   }),
   queryCache: new QueryCache({
     onError: (error, query) => {
+      // Reached only once retries are exhausted, so a busy scan lane landing
+      // here has stayed busy for the whole `BUSY_RETRY_LIMIT` window (#300):
+      // a failure the analyst should hear about, not a wait to keep hiding.
+      // While it is still being retried the query never enters the error
+      // state and this never runs.
       if (query.meta?.silentError || isUnauthorized(error)) return;
       // Background refetch failures of data already on screen are surfaced
       // too — a stale panel silently pretending to be current is worse than

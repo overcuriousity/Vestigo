@@ -4,8 +4,8 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-08-27, v1.15.1):** four open issues, listed below. Phase 3 is
-complete and the queue is feature-shaped. Priority, roughly by payoff-per-effort:
+**State (verified 2026-08-28, v1.15.1):** three open issues, listed below. Phase 3 is complete
+and the queue is feature-shaped. Priority, roughly by payoff-per-effort:
 
 1. **D11** entropy bigram variant — closes a capability gap the docs used to overclaim;
    truth of what we ship outranks new surface.
@@ -22,10 +22,6 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
 
 ## Open issues
 
-- **#300** — foreground histograms queue behind detector sweeps in the shared
-  `HEAVY_SCAN_GATE`, and the default (no explicit range) histogram scans the corpus twice.
-  Needs the gate split into two admission classes and a single-pass derived-range
-  histogram, bucket boundaries unchanged.
 - **#297** — loosen the Top-values cap on the Visualize page (slider + free numeric input).
 - **#296** — make "+ N more in other values" clickable to load the next page of values.
 - **#298** — Visualize rail: control dependencies run backwards relative to reading order.

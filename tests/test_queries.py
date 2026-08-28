@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -645,6 +646,17 @@ def test_histogram_buckets_over_corrected_timestamp() -> None:
     query, _ = svc.store.client.queries[-1]
     assert "toStartOfInterval(if(" in query
     assert "addSeconds(timestamp, transform(source_id" in query
+
+
+def test_histogram_carries_the_foreground_clause(monkeypatch) -> None:
+    """Charts carry the foreground cap, not a detector's (#300)."""
+    from vestigo.db import _scan
+
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 64 << 30)
+    svc = EventQueryService(store=FakeClickHouseStore())
+    svc.histogram(EventQuery(case_id="case-1", source_ids=["s1"]))
+    query, _ = svc.store.client.queries[-1]
+    assert f"max_memory_usage = {_scan.detect_foreground_memory_budget()}" in query
 
 
 def test_top_level_field_filter_uses_column(service: EventQueryService) -> None:
@@ -1710,10 +1722,13 @@ class _VizFakeClient:
     """Dispatches canned results by matching a substring in the query text.
 
     *responses* is tried in order — put more specific substrings first so a
-    query matching several markers gets the intended canned result.
+    query matching several markers gets the intended canned result. A marker
+    may be a tuple, in which case every part must appear: two scans of the
+    same field (the top-N and its totals aggregate) differ only in what else
+    they select.
     """
 
-    def __init__(self, responses: list[tuple[str, FakeQueryResult]]) -> None:
+    def __init__(self, responses: list[tuple[str | tuple[str, ...], FakeQueryResult]]) -> None:
         self._responses = responses
         self.queries: list[tuple[str, dict[str, Any] | None]] = []
 
@@ -1721,13 +1736,16 @@ class _VizFakeClient:
         self, query: str, parameters: dict[str, Any] | None = None, **_kwargs: Any
     ) -> FakeQueryResult:
         self.queries.append((query, parameters))
-        for substr, result in self._responses:
-            if substr in query:
+        for marker, result in self._responses:
+            needles = (marker,) if isinstance(marker, str) else marker
+            if all(needle in query for needle in needles):
                 return result
         raise AssertionError(f"No fake response configured for query:\n{query}")
 
 
-def _viz_service(responses: list[tuple[str, FakeQueryResult]]) -> EventQueryService:
+def _viz_service(
+    responses: list[tuple[str | tuple[str, ...], FakeQueryResult]],
+) -> EventQueryService:
     store = FakeClickHouseStore()
     store.client = _VizFakeClient(responses)  # type: ignore[assignment]
     return EventQueryService(store=store)
@@ -1736,9 +1754,10 @@ def _viz_service(responses: list[tuple[str, FakeQueryResult]]) -> EventQueryServ
 def test_field_terms_returns_top_values_and_other_count() -> None:
     svc = _viz_service(
         [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[100, 5]])),
             (
                 "GROUP BY val",
-                FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]]),
+                FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]]),
             ),
         ]
     )
@@ -1749,13 +1768,36 @@ def test_field_terms_returns_top_values_and_other_count() -> None:
     assert result["other_count"] == 10
 
 
+def test_field_terms_totals_false_runs_one_scan() -> None:
+    """A caller that reads only the values pays for one grouping, not two.
+
+    The totals scan exists so the tail beyond the top-N can be reported
+    truthfully and *spillably* — but the filter rail's autocomplete maps the
+    values and throws total/distinct/other_count away, so for it the second
+    whole-corpus grouping is pure cost (PR #306 review).
+    """
+    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]]))])
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", totals=False)
+    queries = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert len(queries) == 1
+    assert "n_groups" not in queries[0]
+    assert result["values"] == [{"value": "GET", "count": 60}, {"value": "POST", "count": 30}]
+    # Describes the rows in hand and says so: no tail was measured, so none is
+    # claimed. `other_count` is 0 rather than a subtraction against a total
+    # nobody scanned for.
+    assert result["total"] == 90
+    assert result["distinct"] == 2
+    assert result["other_count"] == 0
+
+
 def test_field_terms_on_timestamp_column_casts_to_string() -> None:
     """`timestamp` is a `DateTime64` top-level column, not `String` — the
     generated SQL must cast it before comparing/grouping, or ClickHouse
     raises a type error on `col != ''`."""
     svc = _viz_service(
         [
-            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1, 10, 10]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[10, 10]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["2024-01-01 00:00:00.000", 1]])),
         ]
     )
     result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "timestamp")
@@ -1766,7 +1808,13 @@ def test_field_terms_on_timestamp_column_casts_to_string() -> None:
 
 
 def test_field_terms_empty_dataset_returns_zero_totals() -> None:
-    svc = _viz_service([("GROUP BY val", FakeQueryResult(result_rows=[]))])
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[0, 0]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[0, 0]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[])),
+        ]
+    )
     result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
     assert result == {
         "field": "artifact",
@@ -1775,14 +1823,17 @@ def test_field_terms_empty_dataset_returns_zero_totals() -> None:
         "values": [],
         "other_count": 0,
     }
-    # Fused single-scan design: an empty dataset still costs exactly one query.
-    assert len(svc.store.client.queries) == 1  # type: ignore[union-attr]
+    # Two scans, always: the top-N and the spillable totals aggregate that
+    # replaced the non-spilling `OVER ()` windows (PR #305 review). They are
+    # issued in parallel, so an empty dataset costs one scan's worth of wait.
+    assert len(svc.store.client.queries) == 2  # type: ignore[union-attr]
 
 
 def test_field_terms_top_level_column_uses_bare_column() -> None:
     svc = _viz_service(
         [
-            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1, 1, 1]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["auth", 1]])),
         ]
     )
     svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
@@ -1794,7 +1845,8 @@ def test_field_terms_top_level_column_uses_bare_column() -> None:
 def test_field_terms_attribute_field_uses_map_lookup() -> None:
     svc = _viz_service(
         [
-            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1, 1, 1]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["200", 1]])),
         ]
     )
     svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "attr:status_code")
@@ -1808,7 +1860,8 @@ def test_field_terms_honors_field_filters() -> None:
     """field_terms must reuse _build_where so it respects the same filters as the grid."""
     svc = _viz_service(
         [
-            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1, 1, 1]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["ok", 1]])),
         ]
     )
     svc.field_terms(
@@ -2037,8 +2090,12 @@ def test_field_numeric_grouped_shares_global_bin_edges_and_reports_omission() ->
     quantiles_b = [5.0, 6.0, 40.0, 50.0, 60.0, 95.0, 99.0]
     svc = _viz_service(
         [
-            # Global stats: 100 values over [0, 100] across 5 distinct groups.
-            ("uniqExact(g)", FakeQueryResult(result_rows=[[100, 0.0, 100.0, 5]])),
+            # Global stats: 100 values over [0, 100] across 5 distinct groups,
+            # aggregated over the groups so it can spill (PR #305 review).
+            (
+                "sum(c), min(mn), max(mx), count()",
+                FakeQueryResult(result_rows=[[100, 0.0, 100.0, 5]]),
+            ),
             (
                 "GROUP BY g\n",
                 FakeQueryResult(
@@ -2087,7 +2144,10 @@ def test_field_numeric_grouped_no_numeric_values_returns_empty() -> None:
     """
     svc = _viz_service(
         [
-            ("uniqExact(g)", FakeQueryResult(result_rows=[[0, None, None, 0]])),
+            (
+                "sum(c), min(mn), max(mx), count()",
+                FakeQueryResult(result_rows=[[0, None, None, 0]]),
+            ),
             ("GROUP BY g", FakeQueryResult(result_rows=[])),
         ]
     )
@@ -2207,6 +2267,7 @@ def test_field_value_timeseries_no_values_returns_empty_series_without_bucket_qu
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[0, 0]])),
             ("GROUP BY val", FakeQueryResult(result_rows=[])),
         ]
     )
@@ -2357,10 +2418,11 @@ def test_compare_field_terms_shares_primary_categories() -> None:
     those same values, its tail folding into comparison_other."""
     svc = _seq_service(
         [
-            # Primary field_terms (window-agg shape: val, c, total, n_groups).
+            # Primary field_terms: top-N, and its own totals aggregate.
+            ("count() AS n_groups", [FakeQueryResult(result_rows=[[100, 5]])]),
             (
-                "OVER ()",
-                [FakeQueryResult(result_rows=[["GET", 60, 100, 5], ["POST", 30, 100, 5]])],
+                "ORDER BY c DESC",
+                [FakeQueryResult(result_rows=[["GET", 60], ["POST", 30]])],
             ),
             # Comparison layer folded onto the shared values: '' = its tail.
             (
@@ -2385,7 +2447,12 @@ def test_compare_field_terms_shares_primary_categories() -> None:
 
 
 def test_compare_field_terms_empty_primary_skips_comparison_query() -> None:
-    svc = _seq_service([("OVER ()", [FakeQueryResult(result_rows=[])])])
+    svc = _seq_service(
+        [
+            ("count() AS n_groups", [FakeQueryResult(result_rows=[[0, 0]])]),
+            ("ORDER BY c DESC", [FakeQueryResult(result_rows=[])]),
+        ]
+    )
     result = svc.compare_field_terms(
         EventQuery(case_id="c1", source_ids=["s1"]),
         EventQuery(case_id="c1", source_ids=["s1"]),
@@ -2494,15 +2561,32 @@ def test_embedding_wizard_scans_carry_memory_settings(service):
         assert heavy_scan_settings() in q
 
 
-# ── heavy-scan guardrails + clock-skew on viz aggregations ──────────────────
+# ── foreground-scan guardrails + clock-skew on viz aggregations ──────────────────
+
+
+def _allowed_foreground_clauses() -> set[str]:
+    """The foreground SETTINGS clause at every width a chart may run under.
+
+    A scan issued inside `_run_parallel` carries its slot's share divided by
+    the fan-out width (`scan_fanout`, #305), so the clause is not one string —
+    but it is still one of a small, known set, and asserting membership keeps
+    this an exact check rather than a substring sniff.
+    """
+    from vestigo.db._scan import foreground_scan_settings, scan_fanout
+
+    clauses = {foreground_scan_settings()}
+    for width in (2, 4):
+        with scan_fanout(width):
+            clauses.add(foreground_scan_settings())
+    return clauses
 
 
 def test_viz_aggregations_carry_memory_settings() -> None:
-    """Every viz aggregation scan must carry the shared heavy-scan SETTINGS
-    clause (db/_scan.py) — a chart over a high-cardinality field is a
+    """Every viz aggregation scan must carry the foreground SETTINGS clause
+    (db/_scan.py, #300) — a chart over a high-cardinality field is a
     whole-corpus GROUP BY exactly like a detector scan, and without the
     per-query memory cap N concurrent charts can stack unbounded scans."""
-    from vestigo.db._scan import heavy_scan_settings
+    allowed = _allowed_foreground_clauses()
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
@@ -2518,7 +2602,12 @@ def test_viz_aggregations_carry_memory_settings() -> None:
         "histogram_explicit": _viz_service(
             [("toStartOfInterval", FakeQueryResult(result_rows=[]))]
         ),
-        "field_terms": _viz_service([("GROUP BY val", terms_row)]),
+        "field_terms": _viz_service(
+            [
+                ("count() AS n_groups", FakeQueryResult(result_rows=[[1, 1]])),
+                ("GROUP BY val", terms_row),
+            ]
+        ),
         "field_numeric_stats": _viz_service(
             [
                 ("stddevPop(v)", stats_row),
@@ -2544,11 +2633,11 @@ def test_viz_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert heavy_scan_settings() in sql, f"{name} scan missing settings:\n{sql}"
+            assert any(clause in sql for clause in allowed), f"{name} scan missing settings:\n{sql}"
 
 
 def test_viz_compare_aggregations_carry_memory_settings() -> None:
-    from vestigo.db._scan import heavy_scan_settings
+    allowed = _allowed_foreground_clauses()
 
     min_ts = datetime(2024, 1, 1, tzinfo=UTC)
     max_ts = datetime(2024, 1, 1, 2, tzinfo=UTC)
@@ -2567,7 +2656,8 @@ def test_viz_compare_aggregations_carry_memory_settings() -> None:
 
     svc_terms = _seq_service(
         [
-            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])]),
+            ("count() AS n_groups", [FakeQueryResult(result_rows=[[10, 2]])]),
+            ("ORDER BY c DESC", [FakeQueryResult(result_rows=[["GET", 6]])]),
             ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
         ]
     )
@@ -2594,23 +2684,26 @@ def test_viz_compare_aggregations_carry_memory_settings() -> None:
         queries = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
         assert queries, name
         for sql in queries:
-            assert heavy_scan_settings() in sql, f"compare {name} scan missing settings:\n{sql}"
+            assert any(clause in sql for clause in allowed), (
+                f"compare {name} scan missing settings:\n{sql}"
+            )
 
 
 class _CountingGate:
-    """Context-manager stand-in for HEAVY_SCAN_GATE that detects re-entry."""
+    """Semaphore stand-in for FOREGROUND_SCAN_GATE that detects re-entry."""
 
     def __init__(self) -> None:
         self.acquired = 0
         self.depth = 0
         self.max_depth = 0
 
-    def __enter__(self) -> None:
+    def acquire(self, timeout: float | None = None) -> bool:
         self.acquired += 1
         self.depth += 1
         self.max_depth = max(self.max_depth, self.depth)
+        return True
 
-    def __exit__(self, *exc: Any) -> None:
+    def release(self) -> None:
         self.depth -= 1
 
 
@@ -2625,7 +2718,7 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     max_ts = datetime(2024, 1, 2, tzinfo=UTC)
 
     gate = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate)
     svc = _viz_service(
         [
             ("min(timestamp)", FakeQueryResult(result_rows=[[min_ts, max_ts]])),
@@ -2639,10 +2732,11 @@ def test_viz_public_aggregations_acquire_scan_gate_once(monkeypatch: Any) -> Non
     assert gate.max_depth == 1
 
     gate2 = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate2)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate2)
     svc2 = _seq_service(
         [
-            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])]),
+            ("count() AS n_groups", [FakeQueryResult(result_rows=[[10, 2]])]),
+            ("ORDER BY c DESC", [FakeQueryResult(result_rows=[["GET", 6]])]),
             ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
         ]
     )
@@ -2742,9 +2836,9 @@ def test_time_punchcard_returns_sparse_cells_and_totals() -> None:
     assert "toDayOfWeek(timestamp, 0, 'UTC')" in sql
     assert "toHour(timestamp, 'UTC')" in sql
     assert VESTIGO_NOT_SENTINEL_SQL in sql
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in sql
+    assert foreground_scan_settings() in sql
 
 
 def test_time_punchcard_honors_source_offsets() -> None:
@@ -2757,12 +2851,18 @@ def test_time_punchcard_honors_source_offsets() -> None:
 def test_field_pivot_builds_matrix_with_other_rollup() -> None:
     svc = _viz_service(
         [
-            # Terms scan for field_x = artifact (bare column expr).
-            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            # Terms scan for field_x = artifact (bare column expr), plus the
+            # totals aggregate that carries its total/distinct.
+            (("artifact AS val", "n_groups"), FakeQueryResult(result_rows=[[100, 3]])),
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60]])),
             # Terms scan for field_y = attr:status (map lookup expr).
             (
+                ("attributes[{field_key:String}] AS val", "n_groups"),
+                FakeQueryResult(result_rows=[[100, 4]]),
+            ),
+            (
                 "attributes[{field_key:String}] AS val",
-                FakeQueryResult(result_rows=[["200", 80, 100, 4]]),
+                FakeQueryResult(result_rows=[["200", 80]]),
             ),
             # Matrix scan: '' cells are the per-axis Other rollups.
             (
@@ -2793,15 +2893,20 @@ def test_field_pivot_builds_matrix_with_other_rollup() -> None:
     assert matrix_params.get("field_key_y") == "status"
     assert matrix_params.get("pivot_x_values") == ["auth"]
     assert matrix_params.get("pivot_y_values") == ["200"]
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in matrix_sql
+    assert foreground_scan_settings() in matrix_sql
 
 
 def test_field_pivot_empty_axis_skips_matrix_scan() -> None:
     svc = _viz_service(
         [
-            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            (("artifact AS val", "n_groups"), FakeQueryResult(result_rows=[[100, 3]])),
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60]])),
+            (
+                ("attributes[{field_key:String}] AS val", "n_groups"),
+                FakeQueryResult(result_rows=[[0, 0]]),
+            ),
             ("attributes[{field_key:String}] AS val", FakeQueryResult(result_rows=[])),
         ]
     )
@@ -2819,13 +2924,18 @@ def test_field_pivot_acquires_scan_gate_once(monkeypatch: Any) -> None:
     import vestigo.db.queries as queries_mod
 
     gate = _CountingGate()
-    monkeypatch.setattr(queries_mod, "HEAVY_SCAN_GATE", gate)
+    monkeypatch.setattr(queries_mod, "FOREGROUND_SCAN_GATE", gate)
     svc = _viz_service(
         [
-            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60, 100, 3]])),
+            (("artifact AS val", "n_groups"), FakeQueryResult(result_rows=[[100, 3]])),
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60]])),
+            (
+                ("attributes[{field_key:String}] AS val", "n_groups"),
+                FakeQueryResult(result_rows=[[100, 4]]),
+            ),
             (
                 "attributes[{field_key:String}] AS val",
-                FakeQueryResult(result_rows=[["200", 80, 100, 4]]),
+                FakeQueryResult(result_rows=[["200", 80]]),
             ),
             ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["auth", "200", 50]])),
         ]
@@ -2882,9 +2992,9 @@ def test_field_scatter_samples_points_with_true_extents() -> None:
         if "ORDER BY ord" in sql
     )
     assert "LIMIT 2" in sample_sql
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import foreground_scan_settings
 
-    assert heavy_scan_settings() in sample_sql
+    assert foreground_scan_settings() in sample_sql
     assert "toFloat64OrNull(toString(" in sample_sql
     # Reproducibility: the sample is drawn in a stable hash order, never rand().
     assert "cityHash64(event_id)" in sample_sql
@@ -2999,7 +3109,8 @@ def test_compare_field_terms_baseline_cache_warm_render() -> None:
     _fresh_viz_cache()
     svc = _seq_service(
         [
-            ("OVER ()", [FakeQueryResult(result_rows=[["GET", 6, 10, 2]])] * 2),
+            ("count() AS n_groups", [FakeQueryResult(result_rows=[[10, 2]])] * 2),
+            ("ORDER BY c DESC", [FakeQueryResult(result_rows=[["GET", 6]])] * 2),
             # One canned comparison scan only: a warm second render must not
             # consult this FIFO again (it would raise "no fake response left").
             ("cmp_values", [FakeQueryResult(result_rows=[["GET", 3]])]),
@@ -3137,3 +3248,127 @@ def test_empty_mode_casts_a_non_string_column_before_comparing(
     query, _ = _last_query(service)
     assert "ifNull(toString(" in query
     assert ", '') = ''" in query
+
+
+# ── Chart scans must be able to spill (PR #305 review) ───────────────────────
+
+
+def test_field_terms_uses_no_window_functions() -> None:
+    """A frameless `OVER ()` cannot spill, so it dies on the data charts are for.
+
+    `field_terms` used to carry `sum(count()) OVER ()` / `count() OVER ()` to
+    get its total and distinct count in one scan. Window aggregates materialise
+    every group after the (spillable) GROUP BY, so a top-N over `filename` or
+    `url` hit `max_memory_usage` on precisely the high-cardinality field the
+    chart exists for. Two spillable scans instead — the same trade
+    `count_field_inventory` documents.
+    """
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[100, 5]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["GET", 60]])),
+        ]
+    )
+    result = svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "attr:url")
+    assert result["total"] == 100 and result["distinct"] == 5
+    assert result["other_count"] == 40
+
+    sqls = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert len(sqls) == 2
+    for sql in sqls:
+        assert "OVER ()" not in sql, f"window aggregate cannot spill:\n{sql}"
+
+
+def test_field_numeric_grouped_counts_groups_without_uniqexact() -> None:
+    """`uniqExact` builds the full distinct set in memory and cannot spill.
+
+    On a high-cardinality grouping field that is the same death as the window
+    aggregates above, so the count comes from a GROUP BY subquery — exact, and
+    through the spillable path.
+    """
+    svc = _viz_service(
+        [
+            (
+                "sum(c), min(mn), max(mx), count()",
+                FakeQueryResult(result_rows=[[10, 0.0, 10.0, 7]]),
+            ),
+            (
+                "GROUP BY g\n",
+                FakeQueryResult(result_rows=[["a", 10, 0.0, 10.0, 5.0, 1.0, 0.0, *[1.0] * 7]]),
+            ),
+            ("GROUP BY g, bin_idx", FakeQueryResult(result_rows=[["a", 0, 10]])),
+        ]
+    )
+    result = svc.field_numeric_grouped(
+        EventQuery(case_id="c1", source_ids=["s1"]), "attr:latency_ms", "attr:url", groups=1, bins=1
+    )
+    assert result["distinct_groups"] == 7
+    sqls = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert not any("uniqExact" in sql for sql in sqls)
+
+
+def test_parallel_chart_scans_stay_tagged_for_cancellation() -> None:
+    """A fanned-out chart is exactly the chart worth cancelling.
+
+    `_run_parallel` submits to a thread pool, and a bare `submit` starts with
+    an empty context — the per-request scan context would not reach the query
+    builders, the scans would go out untagged and a disconnect could not KILL
+    them (#300).
+    """
+    from vestigo.db._scan import bind_scan_context, scan_log_comment
+
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[1, 1]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["a", 1]])),
+        ]
+    )
+    with bind_scan_context() as ctx:
+        svc.field_terms(EventQuery(case_id="c1", source_ids=["s1"]), "artifact")
+    tag = scan_log_comment(ctx.token)
+    sqls = [sql for sql, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert sqls and all(tag in sql for sql in sqls)
+
+
+def test_a_chart_never_puts_more_queries_in_flight_than_its_slot_budgets() -> None:
+    """The foreground cap is per chart, not per query (`db/_scan.py`).
+
+    A pivot fans out over its two axes and each axis now costs two scans, so
+    running both fan-outs in parallel would put four capped queries under one
+    slot — several charts' worth of the class's memory share, from one chart.
+    """
+    import threading
+
+    depth = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class _DepthClient(_VizFakeClient):
+        def query(self, query: str, parameters: Any = None, **kwargs: Any) -> FakeQueryResult:
+            nonlocal depth, peak
+            with lock:
+                depth += 1
+                peak = max(peak, depth)
+            try:
+                time.sleep(0.01)
+                return super().query(query, parameters, **kwargs)
+            finally:
+                with lock:
+                    depth -= 1
+
+    store = FakeClickHouseStore()
+    store.client = _DepthClient(  # type: ignore[assignment]
+        [
+            (("artifact AS val", "n_groups"), FakeQueryResult(result_rows=[[100, 3]])),
+            ("artifact AS val", FakeQueryResult(result_rows=[["auth", 60]])),
+            (
+                ("attributes[{field_key:String}] AS val", "n_groups"),
+                FakeQueryResult(result_rows=[[100, 4]]),
+            ),
+            ("attributes[{field_key:String}] AS val", FakeQueryResult(result_rows=[["200", 80]])),
+            ("GROUP BY xv, yv", FakeQueryResult(result_rows=[["auth", "200", 50]])),
+        ]
+    )
+    svc = EventQueryService(store=store)
+    svc.field_pivot(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status")
+    assert peak <= 2, f"{peak} capped queries in flight under one foreground slot"

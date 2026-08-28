@@ -28,9 +28,15 @@ const base: ScanBudget = {
   max_threads: 10,
   max_threads_source: "clickhouse",
   detected_cores: 20,
+  foreground: { concurrency: 4, per_query_bytes: 0.5 * 1024 ** 3 },
 };
 
 describe("ScanBudgetCard", () => {
+  it("discloses the foreground chart lane", () => {
+    render(<ScanBudgetCard budget={base} />);
+    expect(screen.getByText(/4 chart queries at 0\.5 GiB each/i)).toBeInTheDocument();
+  });
+
   it("states the resolved numbers when everything fits", () => {
     render(<ScanBudgetCard budget={base} />);
     expect(screen.getByText(/fits under ClickHouse/i)).toBeInTheDocument();

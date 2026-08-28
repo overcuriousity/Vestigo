@@ -12,6 +12,7 @@
  */
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { busyMessage, busyRetry } from "@/lib/queryClient";
 import type { ChartConfig } from "@/components/viz/lib/chartConfig";
 import { fetchChartData, type ChartResult } from "@/components/viz/chartFetch";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
@@ -83,7 +84,9 @@ export function ChartCanvas({
     queryKey: ["chart-canvas", caseId, timelineId, config, filters],
     queryFn: () => fetchChartData(caseId, timelineId, config, filters, opts),
     enabled: specComplete,
+    ...busyRetry,
   });
+  const waiting = busyMessage(chartQuery.failureReason);
 
   return (
     <div
@@ -94,8 +97,9 @@ export function ChartCanvas({
         <p className="py-2 text-[var(--color-fg-muted)]">{incompleteMessage}</p>
       )}
       {chartQuery.isLoading && (
-        <div className="flex items-center justify-center py-6">
+        <div className="flex items-center justify-center gap-2 py-6">
           <Spinner size={16} />
+          {waiting && <span className="text-xs text-[var(--color-fg-muted)]">{waiting}</span>}
         </div>
       )}
       {chartQuery.isError && (
@@ -107,12 +111,26 @@ export function ChartCanvas({
         </p>
       )}
       {chartQuery.data && (
-        <ChartMarks
-          config={config}
-          data={chartQuery.data}
-          opts={opts}
-          compareOn={compareOn}
-        />
+        <div className="relative">
+          {/* A busy lane (#300) while marks are already drawn. `isLoading` is
+              false once the key has data, so the spinner branch above never
+              runs for a refetch — without this the chart would sit stale and
+              silent for the whole retry window and only then fail. Gated on
+              `isFetching`, which stays true across the retry delay. */}
+          {waiting && chartQuery.isFetching && (
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+              <span className="rounded bg-[var(--color-bg-elevated)] px-2 py-0.5 text-xs text-[var(--color-fg-muted)] shadow">
+                {waiting}
+              </span>
+            </div>
+          )}
+          <ChartMarks
+            config={config}
+            data={chartQuery.data}
+            opts={opts}
+            compareOn={compareOn}
+          />
+        </div>
       )}
     </div>
   );

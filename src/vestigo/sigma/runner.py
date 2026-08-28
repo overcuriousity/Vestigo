@@ -23,7 +23,7 @@ from typing import Any
 
 from vestigo.core.config import get_settings
 from vestigo.core.jobs import JobStore
-from vestigo.db._scan import HEAVY_SCAN_GATE, heavy_scan_settings
+from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.postgres import PostgresStore, generate_id
 from vestigo.sigma.backend import compile_rule
@@ -100,7 +100,10 @@ def _stream_rule_hits(
             f"WHERE case_id = {{case_id:String}} AND source_id IN ({in_clause}) "
             f"AND ({condition_sql}) {heavy_scan_settings()}"
         )
-        with HEAVY_SCAN_GATE, ch.client.query_rows_stream(query, parameters=params) as stream:
+        with (
+            acquire_scan_slot(HEAVY_SCAN_GATE, wait=None),
+            ch.client.query_rows_stream(query, parameters=params) as stream,
+        ):
             batch: list[tuple[str, str]] = []
             for row in stream:
                 batch.append((str(row[0]), str(row[1])))

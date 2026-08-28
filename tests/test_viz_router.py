@@ -530,8 +530,8 @@ class _FakeTermsService:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def field_terms(self, query, field, limit):
-        self.calls.append((query, field, limit))
+    def field_terms(self, query, field, limit, *, totals=True):
+        self.calls.append((query, field, limit, totals))
         return {"kind": "live"}
 
 
@@ -580,6 +580,25 @@ async def test_field_terms_any_filter_forces_live_path(monkeypatch):
     result = await viz.get_field_terms("c1", "t1", field="artifact", limit=50, case=None, **kwargs)
     assert result == {"kind": "live"}
     assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_totals_flag_reaches_the_service(monkeypatch):
+    """`totals=false` is the caller saying it reads only the values, so the
+    second whole-corpus grouping is skipped (PR #306 review). Defaults to
+    True: every chart that renders an "Other" slice needs the tail."""
+    svc = _patch_terms(monkeypatch, None)
+    # Passed explicitly: calling the endpoint function directly bypasses
+    # FastAPI's parameter resolution, so an omitted arg is the `Query` object
+    # rather than its default.
+    await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, totals=True, case=None, **_FILTER_KWARGS
+    )
+    assert svc.calls[-1][3] is True
+    await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, totals=False, case=None, **_FILTER_KWARGS
+    )
+    assert svc.calls[-1][3] is False
 
 
 @pytest.mark.asyncio
@@ -643,7 +662,7 @@ class _CaptureTermsService:
     def __init__(self) -> None:
         self.last_query = None
 
-    def field_terms(self, query, field_token, limit=50):
+    def field_terms(self, query, field_token, limit=50, *, totals=True):
         self.last_query = query
         return {"values": [], "other": 0, "total": 0}
 
