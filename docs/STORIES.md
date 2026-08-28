@@ -1,8 +1,7 @@
 # Stories
 
 Reference for the Stories subsystem: the per-case block document where the
-investigation's narrative and its evidence live together. Design round:
-`docs/superpowers/specs/2026-07-26-w7-stories-design.md`.
+investigation's narrative and its evidence live together.
 
 A story is a **living report**. Embeds are live queries while the analyst
 writes, so the document tracks the data as ingestion and detection progress;

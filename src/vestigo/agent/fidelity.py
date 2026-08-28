@@ -46,8 +46,7 @@ explains, not a silent tier change. The two never touch: a call's tier is
 picked here from static config; the guard only decides whether that already-
 shaped result is emitted whole, deduped, or capped.
 
-See ``docs/superpowers/specs/2026-07-21-agent-tool-result-fidelity-design.md``
-and ``docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md``.
+See ``docs/AGENT.md`` §"Tool-result fidelity" and §"Sliding context window".
 """
 
 from __future__ import annotations

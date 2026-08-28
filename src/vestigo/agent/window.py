@@ -47,7 +47,7 @@ The ratio is therefore an argument, resolved once per turn and recorded in the
 persisted window row — never ambient state that drifts mid-turn. The stored
 history blob stays complete — the window applies at send time only.
 
-See ``docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md``.
+See ``docs/AGENT.md`` §"Sliding context window".
 """
 
 from __future__ import annotations
