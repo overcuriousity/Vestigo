@@ -6,6 +6,16 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 10
     labels: ["dependencies", "python"]
+    ignore:
+      # The chain is pydantic-ai-slim[mcp] -> fastmcp-slim[client] -> mcp, and
+      # the <2.0 cap is fastmcp-slim 3.x's, so mcp 2.x is unresolvable here no
+      # matter what we change in our own code. pyproject pins `mcp<2` for the
+      # same reason. Not a thing to remember: tests/test_dependency_guards.py
+      # fails the day fastmcp-slim lifts the cap and names what to do — which
+      # includes deleting this entry. Until then every 2.x PR is a red run
+      # nobody can merge.
+      - dependency-name: "mcp"
+        versions: [">=2"]
 
   - package-ecosystem: "npm"
     directory: "/frontend"

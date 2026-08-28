@@ -321,6 +321,16 @@ Decisions, not work items — each stays as decided unless its trigger fires.
   environment, a private cwd and an AST deny-list — no bwrap/firejail/container, so the
   reference uv and image deployments keep working (2026-08-17). Trigger: a report of a
   script escaping the guard in a way rlimits and the deny-list could not have stopped.
+- **`mcp` stays pinned below 2.0** (2026-08-29). The chain is `pydantic-ai-slim[mcp]` ->
+  `fastmcp-slim[client]` -> `mcp`, and the `<2.0` cap is fastmcp-slim 3.x's — not
+  pydantic-ai's, which already allows `fastmcp-slim<5`. So no amount of rewriting our own
+  code makes mcp 2.x resolvable. fastmcp-slim 4.0.0b5 requires `mcp>=2.0`, so **4.0 going
+  stable is the trigger**, and it forces the move rather than merely allowing it. Our side is
+  small and surveyed: `FastMCP` -> `mcp.server.mcpserver.MCPServer`, and
+  `server.settings.{stateless_http,streamable_http_path,transport_security}` become
+  `streamable_http_app()` kwargs; every internal `agent/tools.py` reaches for is unchanged.
+  `tests/test_dependency_guards.py` fails the moment the cap lifts and names the steps, so
+  this does not depend on anyone rereading this file.
 - **Persistent job store** — in-memory is deliberate for the single-process deployment
   model, not an oversight. Trigger: multi-process scale-out, which also needs the event bus,
   login backoff and column-recommendation liveness moved to a shared backend.
