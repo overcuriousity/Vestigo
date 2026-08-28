@@ -27,8 +27,6 @@ jobs:
           POSTGRES_USER: vestigo
           POSTGRES_PASSWORD: vestigo
           POSTGRES_DB: vestigo
-          # See the backend job's comment.
-          POSTGRES_HOST_AUTH_METHOD: trust
           # asyncpg implements SCRAM's PBKDF2 in pure Python — 4100 `hmac.new`
           # calls, ~20 ms — and the suite's API tests run on an unpooled store
           # (see tests/conftest.py), so they open a connection per operation:
@@ -130,6 +128,8 @@ jobs:
           POSTGRES_USER: vestigo
           POSTGRES_PASSWORD: vestigo
           POSTGRES_DB: vestigo
+          # See the backend job's comment.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
