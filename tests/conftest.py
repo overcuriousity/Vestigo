@@ -43,24 +43,46 @@ _PROBE_TIMEOUT_SECONDS = 1.5
 
 
 def _probe_clickhouse(url: str) -> str | None:
-    """Return None if ClickHouse answers ``/ping``, else a one-line reason.
+    """Return None if ClickHouse answers a real query, else a one-line reason.
 
     Uses ``urllib`` rather than ``clickhouse_connect`` on purpose. The driver
     retries, and its failure surfaces as a paragraph of connection-pool
     traceback — which is exactly how a stopped container used to read as a
     mysterious test failure minutes into a run.
+
+    It is a ``SELECT 1`` as the configured user and not ``/ping``, because
+    ``/ping`` is answered before any user is resolved. A server whose ``default``
+    user is restricted to localhost — what the stock ``users.d/default-user.xml``
+    in images >= ~25.x does, so every ClickHouse reached across a container
+    bridge — answers ``Ok.`` to the ping and refuses every query with
+    REQUIRED_PASSWORD/194. That configuration cost a CI run six hours of red
+    that this probe existed to prevent.
     """
-    ping = urllib.parse.urljoin(url.rstrip("/") + "/", "ping")
+    settings = get_settings()
+    query = urllib.parse.urljoin(url.rstrip("/") + "/", "?query=SELECT+1")
+    request = urllib.request.Request(
+        query,
+        headers={
+            "X-ClickHouse-User": settings.clickhouse_username,
+            "X-ClickHouse-Key": settings.clickhouse_password,
+        },
+    )
     try:
-        with urllib.request.urlopen(ping, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(request, timeout=_PROBE_TIMEOUT_SECONDS) as resp:
             if resp.status != 200:
-                return f"HTTP {resp.status} from {ping}"
+                return f"HTTP {resp.status} from {query}"
+            body = resp.read(64).decode("utf-8", "replace").strip()
+        if body != "1":
+            return f"unexpected answer to SELECT 1 from {query}: {body!r}"
         return None
     except urllib.error.HTTPError as exc:
-        return f"HTTP {exc.code} from {ping}"
+        # ClickHouse puts its own diagnosis in the body — "not allowed from
+        # network" names a fix, a bare 403 does not.
+        detail = exc.read(200).decode("utf-8", "replace").strip().replace("\n", " ")
+        return f"HTTP {exc.code} from {query}: {detail}"
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
-        return f"{reason} ({ping})"
+        return f"{reason} ({query})"
 
 
 def pytest_configure(config: pytest.Config) -> None:
