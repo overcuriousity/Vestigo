@@ -101,6 +101,40 @@ describe("FieldCombo", () => {
     expect(onChange).toHaveBeenCalledWith("src_ip");
   });
 
+  it("selects the matching option when its label is typed in full", () => {
+    const onChange = vi.fn();
+    render(<FieldCombo options={OPTIONS} value="" onChange={onChange} />);
+
+    const input = screen.getByRole("combobox");
+    // The list filters on the label as well as the token, so typing a label
+    // narrows to exactly the row it names — and Enter used to commit the
+    // *display text* as free entry, handing the caller `user_agent` where the
+    // option is `attr:user_agent`, or a prose label like "Display name" as a
+    // field name no query can resolve.
+    fireEvent.change(input, { target: { value: "user_agent" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onChange).toHaveBeenCalledWith("attr:user_agent");
+  });
+
+  it("falls through to free text when a label names more than one option", () => {
+    const onChange = vi.fn();
+    const ambiguous = [
+      { value: "attr:host", label: "Host" },
+      { value: "attr:hostname", label: "Host" },
+    ];
+    render(<FieldCombo options={ambiguous} value="" onChange={onChange} />);
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "Host" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    // Guessing which of the two was meant would be worse than the typed token:
+    // free entry at least discloses itself as a field the inventory has not
+    // reported. Arrowing to the row remains the way to pick one.
+    expect(onChange).toHaveBeenCalledWith("Host");
+  });
+
   it("takes the keyboard highlight over the typed text", () => {
     const onChange = vi.fn();
     render(<FieldCombo options={OPTIONS} value="" onChange={onChange} />);

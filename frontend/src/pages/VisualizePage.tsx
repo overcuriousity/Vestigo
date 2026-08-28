@@ -450,6 +450,18 @@ export function VisualizePage() {
    * touched moved while they watched. This holds the last such change and is
    * cleared by the next explicit pick, since their own choice needs no excuse. */
   const [autoNotice, setAutoNotice] = useState<string | null>(null);
+  /** A token typed into the second-field picker that X already holds (#308).
+   *
+   * The X and Y pickers must not name the same field, so the Y list drops
+   * whatever X holds — but the box takes free text, so the token can still be
+   * typed in. Committing it would show the combo's unknown-field disclosure,
+   * which is a claim about the wrong problem entirely: the field *is* in this
+   * timeline's inventory, it is just spoken for. The X→Y direction resolves
+   * the collision by clearing Y and saying so; Y→X cannot mirror that, since X
+   * is the axis the chart is built on and emptying it would only have the
+   * defaulting effect refill it with a field nobody picked. So refuse, and say
+   * why at the picker that refused. */
+  const [fieldYTaken, setFieldYTaken] = useState<string | null>(null);
   const [presetsOpen, setPresetsOpen] = useState(() => !searchParams.has("c_type"));
 
   const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
@@ -567,11 +579,20 @@ export function VisualizePage() {
     const isNumeric = numericQuery.data.count > 0;
     const nextScale: Scale = isNumeric ? "ratio" : "nominal";
     const nextType: ChartType = isNumeric ? "histogram" : "bar";
+    // Say exactly which of the two controls moved, and say nothing when
+    // neither did. The non-numeric branch used to re-pick *both* silently —
+    // a Histogram on a ratio scale became a Bar on a nominal one with no word
+    // about it — and then set the notice to `null`, which also wiped the
+    // "Group by cleared" line the analyst's own edit had just put there a few
+    // hundred milliseconds earlier. Landing on the scale and type the chart
+    // already has is not a change and must not claim to be one.
+    const moved: string[] = [];
+    if (nextScale !== scale) moved.push(`scale set to ${nextScale}`);
+    if (nextType !== chartType) moved.push(`chart set to ${CHART_META[nextType].label}`);
+    if (moved.length === 0) return;
     updateConfig({ scale: nextScale, chartType: nextType });
     setAutoNotice(
-      isNumeric
-        ? `${fieldTokenLabel(field)} looks numeric — scale set to ratio, chart set to ${CHART_META[nextType].label}.`
-        : null,
+      `${fieldTokenLabel(field)} ${isNumeric ? "looks numeric" : "has no numeric values"} — ${moved.join(", ")}.`,
     );
   }, [
     field,
@@ -580,6 +601,8 @@ export function VisualizePage() {
     fieldFree,
     requiresSecondField,
     multiField,
+    scale,
+    chartType,
     updateConfig,
     chartRefLive,
   ]);
@@ -1002,7 +1025,13 @@ export function VisualizePage() {
               ))}
             </SelectContent>
           </Select>
-          {autoNotice && (
+          {/* Never under a live chart reference: the page does not remount when
+              a saved chart is opened (`chartRefLive` is derived from `c_chart`
+              on the same route), so a notice about the chart the analyst was
+              building would otherwise survive onto a stored chart the rail
+              re-picked nothing for — a "we moved this for you" line about a
+              move that never happened here. */}
+          {!chartRefLive && autoNotice && (
             <p className="mt-1 text-xs text-[var(--color-info)]">{autoNotice}</p>
           )}
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
@@ -1149,8 +1178,24 @@ export function VisualizePage() {
                   .map(fieldComboOption),
               ]}
               value={fieldY ?? ""}
-              onChange={(v) => updateConfig({ fieldY: v === CLEAR_GROUP || !v ? null : v })}
+              onChange={(v) => {
+                const next = v === CLEAR_GROUP || !v ? null : v;
+                if (next && next === field) {
+                  setFieldYTaken(next);
+                  return;
+                }
+                setFieldYTaken(null);
+                updateConfig({ fieldY: next });
+              }}
             />
+            {/* Compared against the *current* X, so the line clears itself the
+                moment X moves off the token it was about. */}
+            {fieldYTaken === field && field && (
+              <p className="mt-1 text-xs text-[var(--color-info)]">
+                {fieldTokenLabel(field)} is already the{" "}
+                {requiresSecondField ? "X field" : "charted field"} — pick a different one.
+              </p>
+            )}
           </div>
         )}
 

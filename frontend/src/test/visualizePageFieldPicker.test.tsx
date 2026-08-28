@@ -10,6 +10,11 @@
  * 2. The scale it lands on comes from TIME_FIELDS, and the chart type from
  *    `defaultChartTypeForScale` — never the naive `chartTypesFor(s)[0]`,
  *    which is the field-free `time` histogram for every scale.
+ *
+ * The `auto-change notices` block below pins the other half of #298: every
+ * control the rail moves on the analyst's behalf says which one moved and
+ * why, says it only when something actually moved, and never says it about a
+ * chart the rail did not build.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
@@ -29,6 +34,23 @@ beforeAll(() => {
 const fieldsMock = vi.fn();
 const fieldNumericMock = vi.fn();
 const fieldTermsMock = vi.fn();
+const savedChartsMock = vi.fn();
+const dispositionsMock = vi.fn();
+
+// Every chart query waits on the disposition set (`scopeReady`), so the
+// numeric probe never fires without it — which is what these tests read.
+vi.mock("@/api/dispositions", async () => {
+  const actual = await vi.importActual<typeof import("@/api/dispositions")>(
+    "@/api/dispositions",
+  );
+  return {
+    ...actual,
+    dispositionsApi: {
+      ...actual.dispositionsApi,
+      list: (...args: unknown[]) => dispositionsMock(...args),
+    },
+  };
+});
 
 vi.mock("@/api/viz", async () => {
   const actual = await vi.importActual<typeof import("@/api/viz")>("@/api/viz");
@@ -39,6 +61,10 @@ vi.mock("@/api/viz", async () => {
       fields: (...args: unknown[]) => fieldsMock(...args),
       fieldNumeric: (...args: unknown[]) => fieldNumericMock(...args),
       fieldTerms: (...args: unknown[]) => fieldTermsMock(...args),
+    },
+    savedChartsApi: {
+      ...actual.savedChartsApi,
+      list: (...args: unknown[]) => savedChartsMock(...args),
     },
   };
 });
@@ -111,6 +137,8 @@ beforeEach(() => {
     other_count: 0,
     values: [{ value: "FILE", count: 10 }],
   });
+  savedChartsMock.mockResolvedValue({ charts: [] });
+  dispositionsMock.mockResolvedValue({ dispositions: [] });
 });
 
 /** Open the primary field combo — `FieldCombo` opens its list on focus.
@@ -222,5 +250,92 @@ describe("VisualizePage auto-change notices", () => {
     // Bar is nominal/ordinal only, so the switch is a genuine scale clamp —
     // and "on a interval scale" is not English.
     expect(await screen.findByText(/on an interval scale/)).toBeInTheDocument();
+  });
+
+  it("refuses a second field the primary already holds, and says why there", async () => {
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=pivot&c_scale=nominal&c_field=artifact&c_field_y=data_type",
+    );
+
+    // The Y list drops whatever X holds, but the box takes free text — so the
+    // token can still be typed in, and committing it used to render the
+    // combo's unknown-field disclosure. That is a claim about the wrong
+    // problem: `artifact` is in this timeline's inventory, it is simply the X
+    // field already.
+    const y = await screen.findByRole("combobox", { name: "Field (Y)" });
+    fireEvent.focus(y);
+    fireEvent.change(y, { target: { value: "artifact" } });
+    fireEvent.keyDown(y, { key: "Enter" });
+
+    expect(await screen.findByText(/artifact is already the X field/)).toBeInTheDocument();
+    expect(screen.queryByText(/not in this timeline/i)).toBeNull();
+    // Y is left exactly as it was: X is the axis the chart is built on, so
+    // there is no mirror of the X→Y takeover to make here.
+    expect(new URLSearchParams(lastSearch).get("c_field_y") ?? "data_type").toBe("data_type");
+  });
+
+  it("names the re-pick when a field turns out to have no numeric values", async () => {
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=box&c_scale=ratio&c_field=artifact&c_field_y=data_type",
+    );
+
+    // Box takes an *optional* second field, so its primary picker is labelled
+    // "Field", not "Field (X)".
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+
+    // Two controls the analyst never touched move here — the probe comes back
+    // empty, so a ratio Box plot becomes a nominal Bar. It used to move both
+    // in silence *and* null the notice, wiping the "Group by cleared" line the
+    // analyst's own edit had put there a moment earlier.
+    expect(
+      await screen.findByText(
+        /data_type has no numeric values — scale set to nominal, chart set to Bar/,
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar"));
+    expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
+  });
+
+  it("says nothing when the probe lands on the chart already on screen", async () => {
+    renderPage();
+
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("data_type"),
+    );
+    // The chart is already nominal/bar, which is where the non-numeric answer
+    // points — nothing moved, so there is nothing to announce, and announcing
+    // it would be a false statement about the chart on screen. (The same early
+    // return is what leaves a standing notice from the analyst's own edit
+    // alone.)
+    expect(screen.queryByText(/scale set to/)).toBeNull();
+    expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar");
+  });
+
+  it("drops the notice when a saved chart takes the canvas over", async () => {
+    savedChartsMock.mockResolvedValue({
+      charts: [
+        {
+          id: "ch1",
+          name: "Saved bar",
+          config: { v: 1, chartType: "bar", scale: "nominal", field: "data_type" },
+        },
+      ],
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("radio", { name: /Interval/ }));
+    expect(await screen.findByText(/on an interval scale/)).toBeInTheDocument();
+
+    // The page does not remount for a saved chart — `c_chart` is a param on
+    // the same route — so the notice used to survive onto a stored chart the
+    // rail re-picked nothing for, claiming a move that never happened to it.
+    fireEvent.click(await screen.findByRole("button", { name: "Saved bar" }));
+
+    await waitFor(() => expect(screen.queryByText(/on an interval scale/)).toBeNull());
   });
 });

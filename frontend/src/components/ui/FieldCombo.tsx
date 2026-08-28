@@ -167,8 +167,18 @@ export function FieldCombo({
         const typed = draft.trim();
         // One unambiguous match beats free text: typing a token in full and
         // pressing Enter should select it, not re-enter it as an unknown.
-        const exact = options.find((o) => o.value.toLowerCase() === typed.toLowerCase());
+        // The filter matches the label as well as the token, so the label has
+        // to be honoured here too — otherwise typing what a row *displays*
+        // narrows the list to that one row and Enter commits the display text
+        // as an unknown token: `series_field = "Display name"`, `user_agent`
+        // where the option is `attr:user_agent`, the literal `No grouping`
+        // where the row means "clear this". Ambiguous labels fall through to
+        // free text rather than guessing which row was meant.
+        const lowered = typed.toLowerCase();
+        const exact = options.find((o) => o.value.toLowerCase() === lowered);
+        const byLabel = typed ? options.filter((o) => o.label.toLowerCase() === lowered) : [];
         if (exact) commit(exact.value);
+        else if (byLabel.length === 1) commit(byLabel[0].value);
         else if (typed && allowFreeText) commit(typed);
         else if (!typed && hasEmptyOption) commit("");
       }

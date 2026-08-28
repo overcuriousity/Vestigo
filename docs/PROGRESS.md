@@ -4,7 +4,41 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 197 — PR #308 review fixes).
+Last updated: 2026-08-28 (session 198 — PR #308 review, second pass).
+
+## Session 198 — 2026-08-28: PR #308 review, second pass (four more true-statement bugs)
+
+A second review of the same branch. One in `FieldCombo`, three in the Visualize rail — and all
+four are the branch's own theme: a control that moved without saying so, or said something that
+was not true of the chart on screen.
+
+- **Enter committed a label as a token.** The list filters on the label *and* the token, but
+  Enter's exact-match checked only the token — so typing what a row displays narrowed the list
+  to that one row and then committed the display text as free entry: `series_field = "Display
+  name"`, `user_agent` where the option is `attr:user_agent`, the literal `No grouping` where
+  the row means "clear this". A unique label match now selects its row; an ambiguous one still
+  falls through to free text rather than guessing which row was meant.
+- **The Y picker claimed the wrong problem, in the other direction.** Session 197 fixed X→Y by
+  clearing Y and saying so. Y→X had no guard: the Y list drops whatever X holds, but the box
+  takes free text, so typing X's token into Y committed it and disclosed it as "not in this
+  timeline's reported fields" — about a field that plainly is. There is no mirror of the
+  takeover to make here (X is the axis the chart is built on, and clearing it would only have
+  the defaulting effect refill it with a field nobody picked), so the pick is refused and the
+  reason is said at the picker that refused it.
+- **The auto-notice outlived the chart it was about.** The invariant "never shown under
+  `chartRefLive`" was in the docstring but not in the render. The page does not remount when a
+  saved chart is opened — `c_chart` is a param on the same route — so a notice from the chart
+  the analyst was building survived onto a stored chart the rail re-picked nothing for.
+- **The non-numeric probe moved two controls in silence and wiped a standing notice.** Its
+  branch set the notice to `null`: a ratio Box plot became a nominal Bar with no word about it,
+  and the "Group by cleared" line the analyst's own edit had put there a few hundred
+  milliseconds earlier went with it. It now names exactly which of the two controls moved, and
+  returns early when neither did — landing on the scale and type the chart already has is not a
+  change and must not claim to be one.
+
+Six new tests; the suite is 1010 green. The Visualize page tests now mock `dispositionsApi`:
+every chart query waits on `scopeReady`, so without it the numeric probe never fired and the
+existing "never probes a time field" assertion was passing on a page that probed nothing at all.
 
 ## Session 197 — 2026-08-28: PR #308 review fixes (the one field picker, and what it says)
 
