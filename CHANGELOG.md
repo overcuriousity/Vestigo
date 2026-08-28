@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.2] — 2026-08-28
+
+### Fixed
+
+- **Charts no longer queue behind detector sweeps (#300).** A per-value histogram opened
+  during an Investigate sweep used to spin until the sweep finished, and a reload turned every
+  chart on the page into the same spinner. Scans now run in two admission classes: heavy work
+  (detectors, Sigma, the value inventory, the enrichment rewrite) keeps
+  `VESTIGO_STAT_SCAN_CONCURRENCY` slots, and the chart aggregations an analyst is looking at
+  get their own four-slot lane. The memory budget divides by `N + 2` so both gates fully
+  admitted still fit the total, and a chart that fans out declares its width so its queries
+  split one slot's share rather than multiplying it. A chart that cannot get a slot within 5 s
+  answers 503 with the queue depth and a `Retry-After`, and the UI says "waiting behind N
+  scans" instead of spinning — re-asking at the server's pace for about four minutes before
+  it calls the lane wedged. Background work (the Stories export) queues unboundedly instead,
+  since a job has no spinner and no request to answer.
+- **A reload mid-sweep now frees what it started.** Every request-driven scan carries a
+  `log_comment` tag; when the request disconnects, its slot is released and its ClickHouse
+  query is killed within about a second, instead of leaving orphaned sweeps ahead of the next
+  one. Agent and MCP tools turn a busy lane into a tool error the model can relay rather than
+  an unhandled error.
+- **The Visualize page waits for a busy lane instead of erroring.** Its eleven gated
+  aggregations were the one surface that never opted into the retry, so a busy lane put an
+  error toast on the main chart tab where the previous unbounded queue had always produced an
+  answer. The busy badge also renders on a *refetch* now — a filter change on a chart already
+  on screen used to retry silently behind stale marks for four minutes and then fail.
+- **CI could not pass, and took six hours to say so.** The move to
+  `clickhouse-server:26.6.1.1193` picked up an image that restricts the `default` user to
+  localhost, so every query from the runner was refused with `REQUIRED_PASSWORD` while `/ping`
+  still answered `Ok.` — which the test suite's reachability probe accepted. The probe now
+  runs a real `SELECT 1` as the configured user and reports ClickHouse's own diagnosis, the
+  service container skips the drop-in, and the job carries a timeout.
+
+### Changed
+
+- **Thread accounting for the chart lane is documented as the bound it is.** A chart runs at
+  `max_threads × 2 ÷ 4` rather than the heavy width, but the heavy width still divides the
+  cores by `N` alone, so those two slots are *added* to a saturated box rather than carved out
+  of it the way the memory cap is. `ANOMALY_DETECTION.md`, `DEPLOYMENT.md` and the sizing
+  calculator now say so and point at `VESTIGO_STAT_SCAN_MAX_THREADS = cores ÷ (N + 2)` for
+  operators who want the strict version.
+- **`docs/` is reference documentation again.** The archive, the per-PR review dumps and the
+  dated design records are gone (git history keeps them), and the reference docs were trimmed
+  where prose had drifted from contract. 16,916 lines → 6,755.
+- **The test suite stopped paying for password hashing.** API tests run on an unpooled store,
+  so each database operation opens a connection, and asyncpg computes SCRAM's PBKDF2 in pure
+  Python — 20 ms of a 27 ms connection, 85 connections in an average `client` test. The test
+  and reference-compose PostgreSQL now initialize with `trust` (matching the ClickHouse and
+  Qdrant services in the same file; `VESTIGO_POSTGRES_HOST_AUTH` keeps password auth), and
+  argon2 runs at test work factors for the session. No application code changed.
+
 ## [1.15.1] — 2026-08-26
 
 ### Added
