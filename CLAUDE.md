@@ -40,20 +40,17 @@ trail (`api/routers/auth.py`, `admin.py`, `deps.py`).
   Keep it up to date as items land; delete items once fixed rather than marking them done and
   leaving them.
 - `PROGRESS.md` — append-only chronological session log ("what changed and why"), newest entry
-  on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job. Old sessions are
-  periodically split out to `archive/PROGRESS_SESSIONS_*.md` to keep the live file readable.
-- `superpowers/specs/` + `superpowers/plans/` — dated per-feature design rounds and the
-  execution plans that followed them (`YYYY-MM-DD-<slug>.md`). Point-in-time records of *why a
-  shape was chosen*, referenced from `ROADMAP.md`/`PROGRESS.md`; the shipped behavior lives in
-  the reference docs above, so update those rather than editing an old spec.
-- `archive/` — completed roadmap phases (`ROADMAP_PHASE{N}.md`) and point-in-time PR review
-  findings (`PR{N}_REVIEW_FINDINGS.md`, one file per reviewed PR, full unrestricted finding
-  set). Write a new `PR{N}_REVIEW_FINDINGS.md` when a review surfaces more than can fit as a
-  couple of `ROADMAP.md` lines; `ROADMAP.md` should then hold only condensed items that point
-  back into it, not the full text.
+  on top. Not a plan — don't add TODOs here, that's `ROADMAP.md`'s job. Keeps recent sessions
+  only; trim older ones out rather than letting it grow unbounded (git history keeps them, and
+  `CHANGELOG.md` summarizes every release).
+- `sizing/` — the published sizing calculator (`index.html` plus generated constants).
 
-Don't let ad hoc plans/reviews/audit dumps accumulate as their own top-level `docs/*.md` files
-or as bloated sections inside `ROADMAP.md` — triage into the structure above instead.
+**`docs/` is reference documentation, not a working area.** There is no `archive/`, no
+`superpowers/specs/`, no per-PR review dump — design rationale belongs in the reference doc
+for the subsystem it describes, review findings belong in the PR thread or as a condensed
+`ROADMAP.md` item, and history belongs in git. Don't reintroduce those directories, and don't
+let ad hoc plans/reviews/audit dumps accumulate as their own top-level `docs/*.md` files or as
+bloated sections inside `ROADMAP.md`.
 
 ## Commands
 

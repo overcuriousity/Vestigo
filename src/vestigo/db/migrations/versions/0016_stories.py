@@ -7,8 +7,7 @@ Create Date: 2026-07-26
 Per-case block documents: ``stories`` (title/metadata), ``story_blocks``
 (ordered content, integer gap positions, optimistic ``version`` counter)
 and ``story_exports`` (immutable server-resolved snapshots plus the
-seal-once client-rendered HTML artifact). See docs/STORIES.md and
-``docs/superpowers/specs/2026-07-26-w7-stories-design.md``.
+seal-once client-rendered HTML artifact). See ``docs/STORIES.md``.
 """
 
 from __future__ import annotations

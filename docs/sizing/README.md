@@ -16,10 +16,9 @@ nothing off-host: an operator sizing an airgapped deployment may well be offline
 ## Why `docs/.nojekyll` exists
 
 GitHub Pages runs Jekyll over the published folder by default, and Jekyll parses Liquid
-(`{{ … }}`) inside fenced code blocks. `docs/superpowers/plans/` holds design records
-full of TSX and template-literal snippets, so the build died on
-`{{ width: header.column.id === … }}` and took the *whole site* down with it — this page
-included, which is how it first shipped as a 404.
+(`{{ … }}`) inside fenced code blocks — including the TSX and template-literal snippets in
+the markdown under `docs/`. One such snippet took the *whole site* down, this page included,
+which is how it first shipped as a 404.
 
 `.nojekyll` turns that pipeline off. Nothing here needs it: the page is self-contained
 static HTML, and the markdown under `docs/` is read on github.com, not served from Pages.

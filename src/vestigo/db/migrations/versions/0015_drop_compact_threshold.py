@@ -6,8 +6,8 @@ Create Date: 2026-07-22
 
 LLM history compaction was retired in favour of the deterministic sliding
 context window (``src/vestigo/agent/window.py``), which has no threshold
-setting — ``context_window`` alone drives it. See
-``docs/superpowers/specs/2026-07-22-agent-sliding-window-design.md``.
+setting — ``context_window`` alone drives it. See ``docs/AGENT.md``
+§"Sliding context window".
 """
 
 from __future__ import annotations
