@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] — 2026-08-28
+
+### Added
+
+- **One field picker everywhere, and you can type into it.** Six surfaces asked "which
+  field?" six different ways — two native `<select>`s in Investigate (log templates, sequence
+  patterns), one in the export dialog, two Radix `Select`s in Visualize and the compare-filter
+  editor, and a bare inline `<select>` for the method knobs — and none of them let an analyst
+  type. On a timeline carrying a few hundred `attr:*` tokens a dropdown is the wrong control,
+  and none of the six could reach a field the cardinality inventory had not caught up with yet.
+  All six are now one combo box: it opens its full list on focus (browse, exactly as the
+  dropdowns did), filters as you type against both the token and the label, walks with ↓/↑,
+  and commits whatever you type when nothing matches. The box shows the raw token, because that
+  is what every caller stores and what an analyst would type; the label, the distinct count and
+  `(time field)` live on the rows.
+- **Free entry, disclosed.** A committed token the inventory has not reported renders a muted
+  "not in this timeline's reported fields" note. It never blocks — the inventory legitimately
+  lags a source ingested a minute ago — but a typo used to commit silently and come back as an
+  empty chart or a scan that found nothing, with nothing naming the cause. Where the set is
+  genuinely closed (the correlation matrix's field list, the compare editor's value control on
+  a bounded `time:` field) free entry is off instead, since there the typo can only build a
+  filter matching nothing.
+
+### Changed
+
+- **The Visualize rail reads in dependency order (#298).** It read Field → Scale → Chart type
+  while the dependency ran the other way, so landing on the default time histogram — which
+  charts no field — left the *topmost* control inert, and the only way to discover why was to
+  change a dropdown below it. The order is now scale of measurement → chart type → field →
+  second field → Compare → metric → options: scale gates which chart types are legal, and the
+  chart type decides whether a field means anything.
+- **Nothing in the rail goes quietly dead.** A control that cannot apply says why and offers
+  the way out — the inert field state names the reason the time histogram charts no field and
+  offers a one-click "Chart a field instead (Bar)", the contract Compare already kept.
+- **Every automatic re-pick names itself.** One notice under Chart type, set by the scale radio
+  when it clamps an illegal chart type and by both field probes when they choose a scale
+  ("`attr:src_port` looks numeric — scale set to ratio, chart set to Histogram"). It names
+  which control moved and which of the two possible reasons it was, appears only when something
+  actually moved, is cleared by the analyst's next explicit pick — their own choice needs no
+  excuse — and is never shown over a saved chart, whose configuration is the analyst's and not
+  a probe's.
+
 ## [1.15.2] — 2026-08-28
 
 ### Fixed
