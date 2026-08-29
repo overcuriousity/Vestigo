@@ -1,4 +1,6 @@
 import { del, get, patch, post } from "./client";
+import { deriveToParam } from "@/components/viz/lib/derive";
+import type { DeriveSpec } from "@/components/viz/lib/chartConfig";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
   CompareNumericResponse,
@@ -38,20 +40,24 @@ export const vizApi = {
    * `totals: false` drops the server's second scan over the field's whole
    * distribution. `total`/`distinct` then describe the returned rows only and
    * `other_count` is 0, so it is for callers that read `values` and nothing
-   * else — never for a chart that renders an "Other" slice. */
+   * else — never for a chart that renders an "Other" slice.
+   *
+   * `derive` groups the field's ranges or calendar part instead of its raw
+   * values; the response then carries a `derive` echo with the labels/edges. */
   fieldTerms: (
     caseId: string,
     timelineId: string,
     field: string,
     filters: EventFilters = {},
     limit = 50,
-    opts: { totals?: boolean } = {},
+    opts: { totals?: boolean; derive?: DeriveSpec | null } = {},
   ): Promise<FieldTermsResponse> =>
     get<FieldTermsResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-terms`, {
       ...serializeEventFilterParams(filters),
       field,
       limit,
       ...(opts.totals === false ? { totals: false } : {}),
+      ...(opts.derive ? { derive: deriveToParam(opts.derive) } : {}),
     }),
 
   /** Summary statistics + fixed-width histogram for a numeric field. */
@@ -114,12 +120,14 @@ export const vizApi = {
     filters: EventFilters = {},
     buckets = 60,
     seriesLimit = 12,
+    derive: DeriveSpec | null = null,
   ): Promise<FieldTimeseriesResponse> =>
     get<FieldTimeseriesResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-timeseries`, {
       ...serializeEventFilterParams(filters),
       field,
       buckets,
       series_limit: seriesLimit,
+      ...(derive ? { derive: deriveToParam(derive) } : {}),
     }),
 
   /** Event counts by (day-of-week × hour-of-day), UTC — the punch-card chart. */
@@ -141,6 +149,7 @@ export const vizApi = {
     filters: EventFilters = {},
     limitX = 10,
     limitY = 10,
+    deriveX: DeriveSpec | null = null,
   ): Promise<FieldPivotResponse> =>
     get<FieldPivotResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-pivot`, {
       ...serializeEventFilterParams(filters),
@@ -148,6 +157,7 @@ export const vizApi = {
       field_y: fieldY,
       limit_x: limitX,
       limit_y: limitY,
+      ...(deriveX ? { derive_x: deriveToParam(deriveX) } : {}),
     }),
 
   /** Uniform random sample of numeric (x, y) pairs for the scatter plot. */
@@ -182,6 +192,8 @@ export const vizApi = {
       buckets?: number;
       bins?: number;
       limit?: number;
+      /** `kind: "terms"` only — both layers are counted on the primary's edges. */
+      derive?: DeriveSpec | null;
     },
   ): Promise<CompareTimeResponse | CompareTermsResponse | CompareNumericResponse> =>
     post(`/cases/${caseId}/timelines/${timelineId}/viz/compare`, {
@@ -195,6 +207,7 @@ export const vizApi = {
       buckets: body.buckets,
       bins: body.bins,
       limit: body.limit,
+      derive: body.derive ? JSON.parse(deriveToParam(body.derive)!) : undefined,
     }),
 };
 

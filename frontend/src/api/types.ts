@@ -1265,8 +1265,25 @@ export interface FieldTermCount {
 }
 
 /** Top-N value/count terms aggregation for a field, honoring the active filters. */
+/**
+ * What a derived aggregation resolved its derivation to — the labels every
+ * bin / part can take, in order, and (for width/log bins) the edges the
+ * server computed from the data's range, so the caption can print them.
+ */
+export interface DeriveEcho {
+  kind: "bins" | "time_part";
+  labels: string[];
+  mode?: string;
+  edges?: number[];
+  negative_bin?: boolean;
+  part?: string;
+  timezone?: string;
+}
+
 export interface FieldTermsResponse {
   field: string;
+  /** Present (non-null) when the request carried a `derive`. */
+  derive?: DeriveEcho | null;
   /** Total non-empty matching rows (across all values, not just the top-N returned). */
   total: number;
   /** Number of distinct non-empty values. */
@@ -1399,6 +1416,7 @@ export interface FieldTimeseriesSeries {
  */
 export interface FieldTimeseriesResponse {
   field: string;
+  derive?: DeriveEcho | null;
   interval_seconds: number;
   min: string | null;
   max: string | null;
@@ -1448,6 +1466,8 @@ export interface FieldPivotResponse {
   y_distinct: number;
   x_bounded: boolean;
   y_bounded: boolean;
+  /** Present when the request carried `derive_x`; the axis is then bounded. */
+  derive_x?: DeriveEcho | null;
   cells: FieldPivotCell[];
   total: number;
 }
@@ -1534,6 +1554,7 @@ export interface CompareTermValue {
 export interface CompareTermsResponse {
   kind: "terms";
   field: string;
+  derive?: DeriveEcho | null;
   values: CompareTermValue[];
   distinct: number;
   primary_total: number;
