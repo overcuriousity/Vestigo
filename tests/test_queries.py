@@ -3564,3 +3564,47 @@ def test_rank_change_rows_with_an_empty_window_has_zero_shares_not_a_division_er
             "status": "new",
         }
     ]
+
+
+def test_pair_intervals_closes_the_most_recent_open_start_and_counts_orphans() -> None:
+    from vestigo.db.queries import pair_intervals
+
+    rows = [
+        ("h2", "08:00", "e0", 0),  # end before any start → orphan
+        ("h1", "09:00", "e1", 1),
+        ("h2", "09:00", "e2", 1),
+        ("h1", "10:00", "e3", 0),  # closes e1
+        ("h2", "10:00", "e4", 1),  # second start before one end
+        ("h1", "11:00", "e5", 1),  # never closed
+        ("h2", "11:00", "e6", 0),  # closes e4 (the most recent open start), e2 stays open
+    ]
+    intervals, unpaired, orphans = pair_intervals(rows)
+    assert [
+        (i["start"], i["end"], i["start_event_id"], i["end_event_id"]) for i in intervals["h1"]
+    ] == [
+        ("09:00", "10:00", "e1", "e3"),
+        ("11:00", None, "e5", None),
+    ]
+    assert [(i["start"], i["end"]) for i in intervals["h2"]] == [
+        ("09:00", None),
+        ("10:00", "11:00"),
+    ]
+    assert unpaired == 2 and orphans == 1
+
+
+def test_pair_intervals_over_nothing_is_empty() -> None:
+    from vestigo.db.queries import pair_intervals
+
+    assert pair_intervals([]) == ({}, 0, 0)
+
+
+def test_build_where_param_prefix_keeps_two_clauses_disjoint() -> None:
+    svc = EventQueryService(store=FakeClickHouseStore())
+    a = EventQuery(case_id="c1", source_ids=["s1"], field_filters={"attr:kind": ["logon"]})
+    b = EventQuery(case_id="c1", source_ids=["s1"], field_filters={"attr:kind": ["logoff"]})
+    where_a, params_a = svc._build_where(a)
+    where_b, params_b = svc._build_where(b, param_prefix="s_")
+    assert set(params_a) and set(params_b)
+    assert set(params_a).isdisjoint(set(params_b))
+    assert all(name.startswith("s_") for name in params_b)
+    assert "{s_p0:" in where_b and "{s_p0:" not in where_a

@@ -733,6 +733,7 @@ class _ParameterizedQueryBuilder:
         source_offsets: dict[str, int] | None = None,
         search_blob_ready: bool = False,
         external_tables: _ExternalTables | None = None,
+        param_prefix: str = "",
     ) -> None:
         self.conditions: list[str] = []
         self.parameters: QueryParameters = QueryParameters()
@@ -741,6 +742,7 @@ class _ParameterizedQueryBuilder:
         # and uploaded once. A fresh registry per builder is the default.
         self._external = external_tables if external_tables is not None else _ExternalTables()
         self._counter = 0
+        self._param_prefix = param_prefix
         self._field_mappings = field_mappings
         # Only `time:` tokens read this — they bucket the offset-corrected
         # timestamp, so filtering "hour 02" means the corrected hour, matching
@@ -753,7 +755,7 @@ class _ParameterizedQueryBuilder:
         self._search_blob_ready = search_blob_ready
 
     def _param_name(self) -> str:
-        name = f"p{self._counter}"
+        name = f"{self._param_prefix}p{self._counter}"
         self._counter += 1
         return name
 
@@ -1265,6 +1267,45 @@ def rank_change_rows(
     return rows[:cap], omitted
 
 
+def pair_intervals(
+    rows: Sequence[tuple[str, str, str, int]],
+) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
+    """Pair ordered start/end rows into intervals, one stack per lane.
+
+    Pure so the rule is unit-testable without ClickHouse, and one sentence
+    long so the caption can print it: **an end closes the most recent open
+    start in its lane**; a start that is never closed stays open-ended
+    (``end`` None); an end with no open start before it is an orphan —
+    counted, never drawn. *rows* are ``(lane, ts_iso, event_id, is_start)``
+    already ordered by time (a start before an end at the same instant).
+    Returns the intervals per lane in start order, the count of open-ended
+    starts and the count of orphan ends.
+    """
+    open_by_lane: dict[str, list[dict[str, Any]]] = {}
+    intervals: dict[str, list[dict[str, Any]]] = {}
+    orphans = 0
+    for lane, ts, event_id, is_start in rows:
+        if is_start:
+            interval = {
+                "start": ts,
+                "end": None,
+                "start_event_id": event_id,
+                "end_event_id": None,
+            }
+            intervals.setdefault(lane, []).append(interval)
+            open_by_lane.setdefault(lane, []).append(interval)
+            continue
+        stack = open_by_lane.get(lane)
+        if not stack:
+            orphans += 1
+            continue
+        interval = stack.pop()
+        interval["end"] = ts
+        interval["end_event_id"] = event_id
+    unpaired = sum(len(stack) for stack in open_by_lane.values())
+    return intervals, unpaired, orphans
+
+
 class EventQueryService:
     """Query service for events stored in ClickHouse."""
 
@@ -1352,7 +1393,11 @@ class EventQueryService:
             raise
 
     def _build_where(
-        self, query: EventQuery, *, external_tables: _ExternalTables | None = None
+        self,
+        query: EventQuery,
+        *,
+        external_tables: _ExternalTables | None = None,
+        param_prefix: str = "",
     ) -> tuple[str, QueryParameters]:
         """Build the parameterized WHERE clause for *query*.
 
@@ -1366,12 +1411,20 @@ class EventQueryService:
         *external_tables* lets a caller that rebuilds the clause many times
         for one logical read reuse the already-serialized payloads — see
         :class:`_ExternalTables`. Leave it unset for a one-shot read.
+
+        *param_prefix* prefixes every generated parameter name, so two
+        clauses built for two queries can be ANDed in one statement (the
+        interval lanes' start and end layers) without their ``p0``…
+        colliding. The fixed names — the offset arrays and ``field_key`` —
+        are not prefixed: they are bound once with the same values by every
+        clause.
         """
         builder = _ParameterizedQueryBuilder(
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
             search_blob_ready=self.store.search_blob_ready() if query.q else False,
             external_tables=external_tables,
+            param_prefix=param_prefix,
         )
         builder.add_param("case_id = :name", query.case_id)
 
@@ -3678,6 +3731,217 @@ class EventQueryService:
             "truncated": omitted > 0,
             "omitted": omitted,
         }
+
+    @_foreground_scan
+    def field_lanes(
+        self,
+        primary: EventQuery,
+        field_token: str,
+        *,
+        pairing: str = "first_last",
+        start: EventQuery | None = None,
+        end: EventQuery | None = None,
+        limit_y: int = 10,
+        rows_cap: int = 50_000,
+    ) -> dict[str, Any]:
+        """Return interval lanes: one lane per value of *field_token*, bars from start to end.
+
+        ``first_last``: one interval per lane from its first to its last
+        dated event under *primary* (``argMin``/``argMax`` in one grouped
+        scan). ``next_end``: the start-matching rows (``primary ∧ start``)
+        and the end-matching rows (``primary ∧ end``) are unioned — the two
+        extra WHERE clauses carry prefixed parameter names so the three can
+        share one statement — the lanes are ranked by their row count, and
+        the kept lanes' rows are fetched in time order under *rows_cap* and
+        paired by :func:`pair_intervals`. Two parallel scans (the lane
+        ranking and the whole's counts) then, for ``next_end``, one ordered
+        scan; every cap is in the response. Undated rows never feed a bar.
+        """
+        if pairing not in ("first_last", "next_end"):
+            raise ValueError(f'pairing must be "first_last" or "next_end", got "{pairing}"')
+        if pairing == "next_end" and (start is None or end is None):
+            raise ValueError('pairing="next_end" needs both a start and an end query')
+        self.store.init_schema()
+        database = self.store.database
+        settings = foreground_scan_settings()
+        ext = _ExternalTables()
+        where, parameters = self._build_where(primary, external_tables=ext)
+        lane = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=primary.field_mappings,
+            source_offsets=primary.source_offsets,
+        )
+        eff = effective_ts_sql(primary.source_offsets)
+        base = {
+            "kind": "lanes",
+            "field": field_token,
+            "pairing": pairing,
+            "lane_cap": int(limit_y),
+            "rows_cap": int(rows_cap),
+        }
+
+        if pairing == "first_last":
+            rows_src = f"""
+                SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                       {VESTIGO_NOT_SENTINEL_SQL} AS dated
+                FROM {database}.events
+                WHERE {where} AND {lane} != ''
+            """
+            ranked, whole = self._run_parallel(
+                lambda: (
+                    self._select(
+                        f"""
+                    SELECT lane, count() AS c,
+                           argMin(eid, ts) AS first_id, min(ts) AS first_ts,
+                           argMax(eid, ts) AS last_id, max(ts) AS last_ts
+                    FROM ({rows_src}) WHERE dated
+                    GROUP BY lane ORDER BY c DESC, lane ASC LIMIT {int(limit_y)}
+                    {settings}
+                    """,
+                        parameters=parameters,
+                    ).result_rows
+                ),
+                lambda: (
+                    self._select(
+                        f"""
+                    SELECT uniqExactIf(lane, dated), countIf(NOT dated),
+                           minIf(ts, dated), maxIf(ts, dated)
+                    FROM ({rows_src})
+                    {settings}
+                    """,
+                        parameters=parameters,
+                    ).result_rows
+                ),
+            )
+            lanes_total, undated, min_ts, max_ts = whole[0] if whole else (0, 0, None, None)
+            lanes = [
+                {
+                    "key": key,
+                    "count": int(c),
+                    "intervals": [
+                        {
+                            "start": ensure_utc_iso(first_ts),
+                            "end": ensure_utc_iso(last_ts),
+                            "start_event_id": first_id,
+                            "end_event_id": last_id,
+                        }
+                    ],
+                }
+                for key, c, first_id, first_ts, last_id, last_ts in ranked
+            ]
+            return {
+                **base,
+                "lanes": lanes,
+                "lanes_total": int(lanes_total),
+                "lane_cap_hit": int(lanes_total) > len(lanes),
+                "other_lanes": max(0, int(lanes_total) - len(lanes)),
+                "starts": 0,
+                "ends": 0,
+                "unpaired_starts": 0,
+                "orphan_ends": 0,
+                "rows_truncated": False,
+                "rows_paired": 0,
+                "undated": int(undated),
+                "slice_start": self._slice_edge(primary.start, min_ts, lanes_total),
+                "slice_end": self._slice_edge(primary.end, max_ts, lanes_total),
+            }
+
+        if start is None or end is None:  # unreachable: checked above
+            raise RuntimeError("next_end pairing reached the scan without both layers")
+        start_where, start_params = self._build_where(start, external_tables=ext, param_prefix="s_")
+        end_where, end_params = self._build_where(end, external_tables=ext, param_prefix="e_")
+        parameters = _with_params(parameters, **start_params, **end_params)
+        rows_src = f"""
+            SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                   {VESTIGO_NOT_SENTINEL_SQL} AS dated, 1 AS is_start
+            FROM {database}.events
+            WHERE {where} AND ({start_where}) AND {lane} != ''
+            UNION ALL
+            SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                   {VESTIGO_NOT_SENTINEL_SQL} AS dated, 0 AS is_start
+            FROM {database}.events
+            WHERE {where} AND ({end_where}) AND {lane} != ''
+        """
+        ranked, whole = self._run_parallel(
+            lambda: (
+                self._select(
+                    f"""
+                SELECT lane, count() AS c FROM ({rows_src}) WHERE dated
+                GROUP BY lane ORDER BY c DESC, lane ASC LIMIT {int(limit_y)}
+                {settings}
+                """,
+                    parameters=parameters,
+                ).result_rows
+            ),
+            lambda: (
+                self._select(
+                    f"""
+                SELECT uniqExactIf(lane, dated), countIf(NOT dated),
+                       countIf(dated AND is_start = 1), countIf(dated AND is_start = 0),
+                       minIf(ts, dated), maxIf(ts, dated)
+                FROM ({rows_src})
+                {settings}
+                """,
+                    parameters=parameters,
+                ).result_rows
+            ),
+        )
+        lanes_total, undated, starts, ends, min_ts, max_ts = (
+            whole[0] if whole else (0, 0, 0, 0, None, None)
+        )
+        kept = [key for key, _ in ranked]
+        count_by_lane = {key: int(c) for key, c in ranked}
+        rows: list[tuple[str, str, str, int]] = []
+        truncated = False
+        if kept:
+            parameters = _with_params(parameters, lane_keys=kept)
+            fetched = self._select(
+                f"""
+                SELECT lane, ts, eid, is_start FROM ({rows_src})
+                WHERE dated AND has({{lane_keys:Array(String)}}, lane)
+                ORDER BY ts ASC, is_start DESC, eid ASC
+                LIMIT {int(rows_cap) + 1}
+                {settings}
+                """,
+                parameters=parameters,
+            ).result_rows
+            truncated = len(fetched) > rows_cap
+            rows = [
+                (str(lane_key), ensure_utc_iso(ts), str(eid), int(is_start))
+                for lane_key, ts, eid, is_start in fetched[:rows_cap]
+            ]
+        intervals, unpaired, orphans = pair_intervals(rows)
+        lanes = [
+            {"key": key, "count": count_by_lane[key], "intervals": intervals.get(key, [])}
+            for key in kept
+        ]
+        return {
+            **base,
+            "lanes": lanes,
+            "lanes_total": int(lanes_total),
+            "lane_cap_hit": int(lanes_total) > len(lanes),
+            "other_lanes": max(0, int(lanes_total) - len(lanes)),
+            "starts": int(starts),
+            "ends": int(ends),
+            "unpaired_starts": unpaired,
+            "orphan_ends": orphans,
+            "rows_truncated": truncated,
+            "rows_paired": len(rows),
+            "undated": int(undated),
+            "slice_start": self._slice_edge(primary.start, min_ts, lanes_total),
+            "slice_end": self._slice_edge(primary.end, max_ts, lanes_total),
+        }
+
+    @staticmethod
+    def _slice_edge(explicit: datetime | None, observed: Any, lanes_total: int) -> str | None:
+        """The window edge open-ended bars run to: the query's own bound, else the data's."""
+        if explicit is not None:
+            return ensure_utc(explicit).isoformat()
+        if not lanes_total or observed is None:
+            return None
+        return ensure_utc_iso(observed)
 
     def _numeric_layer_stats(
         self, query: EventQuery, field_token: str
