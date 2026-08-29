@@ -431,7 +431,10 @@ Per kind, `data` is:
   frozen paths is a build failure, not a chart of blank bars. A `table` figure
   freezes the `field_table` response as `chart`, and `SnapshotRenderer` draws
   it as a real `<table>` (`ChartMarks tableAs="html"`), so the HTML export
-  contains a table rather than an image of one.
+  contains a table rather than an image of one. A time-axis chart with marks
+  freezes the resolved `marks` (`{marks, sources, cap}`, each mark with its
+  provenance — `docs/VISUALIZE.md` §"Marks") beside `chart`, and
+  `SnapshotRenderer` draws them from the snapshot, never re-resolving.
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in

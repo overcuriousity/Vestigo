@@ -284,6 +284,24 @@ list used only by the correlation matrix.
   other figure is refused, and `distinct_second` — as a column or a sort — needs `field_y`.
   Rows are capped by `ChartLimits.table_rows` (20 default, 30 ceiling for the agent). The
   summary carries the first five rows and the remainder; the echo carries `resolved.inputs`.
+- **Marks.** `ChartSpec.marks` (up to 20) names instants and windows to draw over a
+  time-axis figure — `docs/VISUALIZE.md` §"Marks". Each is one `ChartMarkSpec` whose
+  `kind` is `events` (a `FilterSpec`), `baseline` (`definition_id`), `view` (`view_id`),
+  `instant` (`at`, `label`) or `range` (`start`, `end`, `label`); a field that belongs to
+  another kind is refused by name. One model with a validator rather than a union: the
+  schema is budgeted. Marks on a figure whose `supports_marks` is false are refused
+  (`chart_type="bar" takes no marks — figures that draw them: time, line.`). Resolution is
+  `agent/marks.py::resolve_marks`, shared with `POST …/viz/marks` and the Stories export;
+  an `events`/`view` source is capped at `ChartLimits.marks_per_source` (20 for the agent;
+  the analyst's ceiling is the `viz_marks_max` setting) and the overflow is disclosed in
+  `summary.marks.sources`. The tool result keeps the summary and `resolved.marks` (the
+  sources); the resolved instants themselves are not returned — the card resolves its own.
+- **`open_url`.** Every `propose_chart` result carries the Visualize page link for that
+  exact figure, so an external `/mcp` client — which gets no card — can hand a human the
+  chart. `agent/deep_link.py::visualize_url` mirrors the page's own URL codec
+  (`filtersToParams` then `chartConfigToParams`, same order and encodings);
+  `frontend/src/test/fixtures/viz-deep-link.json` is the contract, asserted by
+  `tests/test_deep_link.py` on the way out and by `agent.test.ts` parsing it back.
 - **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
   the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
   quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
@@ -547,12 +565,15 @@ Three levers (all in 1.4.1) cut the fixed overhead from ~17.3k tokens to
   Explorer/Visualize frontends depend on.
 
 Both the slim schemas and the encoding notes reach the external `/mcp`
-surface too: `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are appended to
-`FastMCP(instructions=…)`, sharing the exact strings the in-app
+surface too: `SPEC_REFERENCE`, `RESULT_FORMAT_NOTE` and `SCALE_VOCABULARY_NOTE` (the
+page calls `scale` "treat as" — Categories / Ordered categories / Number or time /
+Measure — and the model should use the plain phrase only when speaking to the analyst)
+are appended to `FastMCP(instructions=…)`, sharing the exact strings the in-app
 `SYSTEM_PROMPT` composes from. `tests/test_agent_schema.py` holds a budget
-guard (serialized tool list < 41,000 chars; `ChartSpec.derive` measured 39,382 →
+guard (serialized tool list < 42,000 chars; `ChartSpec.derive` measured 39,382 →
 40,213 on 2026-08-29 and the ceiling moved by that delta; `ChartSpec.inputs` and the
-table options took it to 40,953 the same day, 47 under the ceiling) — if a change
+table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks` and the
+`open_url` docstring took it to 41,947, and the ceiling moved to 42,000) — if a change
 trips it, re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the

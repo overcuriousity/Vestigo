@@ -4,7 +4,46 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 203 — the table figure).
+Last updated: 2026-08-29 (session 204 — marks, `open_url`, the schema budget).
+
+## Session 204 — 2026-08-29: marks, `open_url`, the schema budget (viz plan A)
+
+Plan A of the Visualize design round (step 4 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Marks". Stacked on the table figure (#326).
+
+**One resolution, three callers.** A mark is stored as a *source* (`MarkSource`: an
+events filter, a saved view, a baseline definition, or a typed instant/range) and
+`agent/marks.py::resolve_marks` is the only place a source becomes drawable marks — behind
+`POST …/viz/marks` (the page and the agent's card, through one hook), `execute_chart_spec`
+(the agent) and, through it, the Stories export. An `events`/`view` source goes through the
+new `EventQueryService.mark_instants`: the earliest N dated events under the filter plus a
+`countIf` pair, so an undated event is counted and disclosed rather than drawn at the
+sentinel year. A baseline's windows are drawn as declared; nothing is derived from them.
+
+**Provenance on every mark, the cap in every caption.** Each resolved mark carries
+`{kind: event | view | baseline | analyst, …ids}`; each source reports `count`, `shown`,
+`overflow`, `undated`. The per-source cap is `viz_marks_max` (setting, default 50) on the
+page and `ChartLimits.marks_per_source = 20` for the agent, and `markCaptionLines` writes
+one line per source naming its provenance, its instant numbers, the cap and the undated
+count. `lib/marks.ts` numbers instants in time order across sources and lays them out
+(alternating label tiers when crowded, stacked bands), and both `MarksOverlay` and the
+caption read it, so `#3` on the figure is `#3` in the text.
+
+**The rail's eight sources.** `MarksEditor` lists the chart's marks with their resolved
+status and adds one from event id · tag · confirmed findings · custom filter · baseline
+definition · saved view · instant · range. *Confirmed findings* is an `events` mark over
+disposition event ids, which is why the marks codec now carries `eventIds` inside the
+filter payload while the Explorer's `ids` stay session-only. Rendered after Metric (Compare
+and Metric belong together), before the per-chart options.
+
+**Agent parity and `open_url`.** `ChartSpec.marks` is one `ChartMarkSpec` with a
+kind-validator rather than a five-member union — the tool schema is budgeted. Every
+`propose_chart` result now carries `open_url`, the Visualize deep link for that exact
+figure, for external `/mcp` clients that get no card: `agent/deep_link.py` mirrors the
+page's URL codec and a shared fixture is asserted from both sides (backend produces it,
+`agent.test.ts` parses it back). The "treat as" vocabulary note joins both prompts. The
+schema budget was measured 40,953 → 41,947 and the ceiling moved to 42,000, recorded in
+`docs/AGENT.md`.
 
 ## Session 203 — 2026-08-29: the table figure (viz step 3/9)
 

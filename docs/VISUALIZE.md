@@ -135,6 +135,12 @@ Read top-down, in dependency order:
    stored choice that names it without a second field is drawn without it.
 6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
    reason when a figure has no honest two-layer encoding.
+7. **Marks** — only on figures whose registry row says `supportsMarks` (events over time,
+   value over time): the chart's mark sources, each with the status the server resolved it
+   to (`N drawn`, `N of M drawn — capped at C`, `; U undated not drawn`; a baseline names
+   its windows), a remove button per source, and an eight-entry **Add mark** menu — event
+   id · tag · confirmed findings · custom filter · baseline definition · saved view ·
+   instant · range (§"Marks"). Rendered after Metric, before the per-chart options.
 
 Every automatic re-pick names itself in one `autoNotice` (set by the treat-as chips when they
 clamp an illegal figure and by the field probes), is cleared by the analyst's next explicit
@@ -255,6 +261,73 @@ events across M more values in the remainder row` (only when a remainder exists)
 `highlighted rows: a · b — presentation only` (only when set). The generic "(capped…)" line
 does not fire for a table — the remainder row *is* the disclosure.
 
+## Marks
+
+A **mark** is an instant or a window drawn over a time-axis figure to say *this is when*.
+What the analyst stores is never a pixel: `ChartConfig.marks` is a list of **sources**
+(`MarkSource`, `c_marks` in the URL, `marks` in a saved chart and a Story block), and the
+figure resolves them again on every draw. Five kinds:
+
+| `kind` | stored fields | resolves to |
+|---|---|---|
+| `events` | `filters` (a view payload, plus `eventIds` — see below), `label?` | one instant per **dated** event matching the filter, capped |
+| `view` | `viewId` | one instant per dated event of the saved view's filter, capped |
+| `baseline` | `definitionId` | the definition's baseline window and every suspect window, as ranges, labeled as declared |
+| `instant` | `at`, `label` | itself |
+| `range` | `start`, `end`, `label` | itself |
+
+**One resolution.** `agent/marks.py::resolve_marks(scope, marks, …)` is the only place a
+source becomes marks, and three callers share it: `POST …/viz/marks` (the page and the
+agent's card, through one hook `useResolvedMarks`), `execute_chart_spec` (the agent), and
+through it the Stories export — so a report can never disagree with the page about which
+instant a mark stands for. An `events`/`view` source goes through
+`EventQueryService.mark_instants`: the earliest N dated events under the filter (ascending
+by the offset-corrected timestamp, then `event_id`, so a re-run draws the same instants)
+plus a `countIf` pair that says how many matched with and without a real timestamp — an
+undated event cannot be placed on a time axis and is **counted, never drawn at the
+sentinel year**. Nothing is derived from a baseline definition; its windows are drawn
+exactly as declared.
+
+**Provenance.** Every resolved mark carries `provenance`: `{kind: "event", event_id,
+source_id}`, `{kind: "view", view_id, event_id, source_id}`, `{kind: "baseline",
+definition_id, window_id}` (`"baseline"` or the suspect window's id), or
+`{kind: "analyst"}` for a typed one. The response is `{marks, sources, cap}`, where
+`sources[i]` is the per-source status — `count` (dated matches), `shown`, `overflow`,
+`undated` — and `cap` the ceiling that applied.
+
+**The cap is per source and always disclosed.** `viz_marks_max` (setting, group *Scan
+guardrails*, default 50, 1–500) bounds what one source may draw on the page; the agent's is
+`ChartLimits.marks_per_source = 20`, because every resolved mark is summarised into the
+model's context. Past it the earliest N are drawn and the caption says how many were not.
+
+**Rendering** (`primitives/MarksOverlay.tsx`, inside `CompareHistogram` and `LineChart`):
+instants are numbered dashed rules with `#n` beside them, ranges tinted bands with their
+label; both use `--color-warning` and its dim, never a Compare layer colour, so a mark cannot
+be mistaken for a series. `lib/marks.ts` is the pure module both the overlay and the caption
+read — instants are numbered in time order across every source, labels alternate a tier
+when two rules are closer than 48px, overlapping bands stack, an instant outside the drawn
+axis is counted as `offscreen` — so `#3` on the figure is `#3` in the caption.
+
+**Caption lines** (`markCaptionLines`, pinned in `marks.test.ts`), one per source, in
+source order: `marks #1, #3, #4: "beacons" — 3 events matching a filter; 1 undated event
+not drawn`; `marks #1–#7: "Beacons" — 40 events of saved view; the earliest 7 drawn (cap
+7), 33 not drawn`; `marks: baseline "Quiet" — its baseline window and 1 suspect window, as
+declared`; `mark #2: "first" at 2026-07-20 01:30:00Z — analyst-placed`; `mark: "w"
+… → … — analyst-placed`. More than five instants from one source are listed as a range of
+numbers rather than one by one.
+
+**Confirmed findings are an `events` mark over ids.** The rail's *Confirmed findings*
+entry lists the timeline's `kind="confirmed"` dispositions and writes one
+`{kind: "events", filters: {ids}, label: "confirmed findings"}`; *Event id* writes the
+same shape for one id. That is why the marks codec carries `eventIds` inside the filter
+payload — a mark's event ids are its provenance and travel with the chart — while the
+Explorer's own `ids` stay session-only, as before.
+
+**The endpoint.** `POST /{case}/timelines/{tl}/viz/marks` takes `{marks: MarkSource[]}`
+— the stored shape verbatim, so the page posts what it holds — under `require_case_read`,
+writes nothing, and answers 422 for a malformed mark (the `ChartMarkSpec` validator's
+message) or an unknown baseline definition / saved view (`marks[i]: … not found`).
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -269,20 +342,30 @@ does not fire for a table — the remainder row *is* the disclosure.
   `inputs.columns` on any other figure, and `distinct_second` (as a column or a sort)
   without `field_y`; rows capped by `ChartLimits.table_rows` (agent 20/30, analyst 50/500);
   the echo carries `resolved.inputs`, and `summary` the first five rows and the remainder.
+  `ChartSpec.marks` is a list of one `ChartMarkSpec` — one model with a kind-validator
+  rather than a five-member union, because the tool schema is budgeted and five `$defs`
+  would spend most of a step's headroom on prose the validator states once; refused on a
+  figure whose `supports_marks` is false (naming the figures that draw them); the echo
+  carries `resolved.marks` (the sources) and `summary.marks` the per-source status.
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
-  the schema an external client sees is the in-app one.
+  the schema an external client sees is the in-app one. Every `propose_chart` result also
+  carries `open_url`, the Visualize page link for that exact figure
+  (`agent/deep_link.py`, a Python mirror of `filtersToParams` + `chartConfigToParams`;
+  `frontend/src/test/fixtures/viz-deep-link.json` is asserted from both sides) — an
+  external client gets no card, so it gets the link.
 - **Stories.** A `chart_ref` block stores the config beside the filters it was drawn under;
   the export resolver crosses the casing boundary once (`_stored_chart_to_spec`) — for
   `derive` only the kind's casing differs (`timePart` ↔ `time_part`), tested as a round trip;
   `inputs.columns` and the table options cross unchanged. A table block freezes the
   `field_table` response and is drawn as a real `<table>` in the snapshot and the HTML
-  export (§"Table figure").
+  export (§"Table figure"). A time-axis chart with marks freezes the resolved `marks`
+  (`{marks, sources, cap}`, provenance included) beside `chart`, and the snapshot draws
+  them without re-resolving.
 
 ## 6. Not yet shipped
 
-Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: marks
-(instants and windows from events, tags, confirmed findings, baseline
-definitions, saved views, or typed); the cumulative step; ranked change between two windows;
+Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: the
+cumulative step (which will declare `supportsMarks`); ranked change between two windows;
 the calendar heatmap; interval lanes.
 Until each lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
 describe it. Geo/choropleth remains its own roadmap round.
