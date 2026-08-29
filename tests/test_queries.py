@@ -3516,3 +3516,51 @@ def test_calendar_groups_by_utc_day_and_counts_a_field_when_given() -> None:
     assert "toDate(" in sql and "'UTC'" in sql and "countIf(" in sql and "!= ''" in sql
     assert result["days"] == [{"date": "2026-07-20", "count": 2}]  # zero days are not listed
     assert result["start"] == "2026-07-20" and result["weeks"] == 1
+
+
+def test_rank_change_rows_encodes_share_of_window_and_names_the_status() -> None:
+    from vestigo.db.queries import rank_change_rows
+
+    rows, omitted = rank_change_rows(
+        ["alice", "bob", "carol", "dave", "same"],
+        {"alice": 4, "bob": 12, "dave": 3, "same": 2},
+        {"alice": 6, "bob": 3, "carol": 1, "same": 1},
+        20,
+        10,
+        union_cap=10,
+    )
+    assert omitted == 0
+    assert [r["value"] for r in rows] == ["alice", "bob", "dave", "carol", "same"]
+    assert [r["status"] for r in rows] == ["fell", "rose", "new", "vanished", "same"]
+    # Same count in both windows still *fell* when the window doubled — share, not count.
+    same = rows[-1]
+    assert same["primary_share"] == pytest.approx(0.1) and same[
+        "comparison_share"
+    ] == pytest.approx(0.1)
+    assert same["status"] == "same"
+    capped, dropped = rank_change_rows(
+        ["alice", "bob", "carol"],
+        {"alice": 4, "bob": 12},
+        {"alice": 6, "bob": 3, "carol": 1},
+        20,
+        10,
+        union_cap=2,
+    )
+    assert [r["value"] for r in capped] == ["alice", "bob"] and dropped == 1
+
+
+def test_rank_change_rows_with_an_empty_window_has_zero_shares_not_a_division_error() -> None:
+    from vestigo.db.queries import rank_change_rows
+
+    rows, _ = rank_change_rows(["x"], {"x": 3}, {}, 3, 0, union_cap=5)
+    assert rows == [
+        {
+            "value": "x",
+            "primary": 3,
+            "comparison": 0,
+            "primary_share": 1.0,
+            "comparison_share": 0.0,
+            "delta_share": 1.0,
+            "status": "new",
+        }
+    ]

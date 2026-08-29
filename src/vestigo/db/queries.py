@@ -1214,6 +1214,57 @@ def _foreground_scan(fn):
     return wrapper
 
 
+def rank_change_rows(
+    values: Sequence[str],
+    primary_counts: Mapping[str, int],
+    comparison_counts: Mapping[str, int],
+    primary_total: int,
+    comparison_total: int,
+    union_cap: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Turn two windows' per-value counts into ranked share-of-window rows.
+
+    Pure so the ranking is unit-testable without ClickHouse. ``share`` is
+    ``count / that window's non-empty total`` (0.0 when the total is 0), Δ is
+    primary − comparison, and the status names the direction: ``new`` /
+    ``vanished`` when the value is in one window only, else ``rose`` /
+    ``fell`` / ``same`` by share. Rows are ranked by |Δ| descending, ties by
+    value, and capped at *union_cap*; the second return value is how many
+    (the smallest changes) were dropped, for the caption.
+    """
+    rows: list[dict[str, Any]] = []
+    for value in values:
+        p = int(primary_counts.get(value, 0))
+        c = int(comparison_counts.get(value, 0))
+        ps = p / primary_total if primary_total else 0.0
+        cs = c / comparison_total if comparison_total else 0.0
+        if p and not c:
+            status = "new"
+        elif c and not p:
+            status = "vanished"
+        elif ps > cs:
+            status = "rose"
+        elif ps < cs:
+            status = "fell"
+        else:
+            status = "same"
+        rows.append(
+            {
+                "value": value,
+                "primary": p,
+                "comparison": c,
+                "primary_share": ps,
+                "comparison_share": cs,
+                "delta_share": ps - cs,
+                "status": status,
+            }
+        )
+    rows.sort(key=lambda r: (-abs(r["delta_share"]), r["value"]))
+    cap = max(1, int(union_cap))
+    omitted = max(0, len(rows) - cap)
+    return rows[:cap], omitted
+
+
 class EventQueryService:
     """Query service for events stored in ClickHouse."""
 
@@ -3509,6 +3560,123 @@ class EventQueryService:
             "primary_other": terms["other_count"],
             "comparison_other": max(0, comparison_total - sum(v["comparison"] for v in values)),
             "derive": terms.get("derive"),
+        }
+
+    def _terms_top_for_expr(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int,
+        *,
+        derived_expr: str | None = None,
+    ) -> list[str]:
+        """Return one layer's top-*limit* values (count desc, value asc), optionally on a derived expression.
+
+        *derived_expr* is the **primary** layer's resolved derivation bound to
+        ``field_key`` — the comparison layer never resolves edges of its own,
+        or the two windows would be counted on different bins.
+        """
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        if derived_expr is not None:
+            col_expr = derived_expr
+        result = self._select(
+            f"""
+            SELECT {col_expr} AS val, count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            ORDER BY c DESC, val ASC
+            LIMIT {int(limit)}
+            {foreground_scan_settings()}
+            """,
+            parameters=parameters,
+        )
+        return [row[0] for row in result.result_rows]
+
+    @_foreground_scan
+    def field_change(
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        limit: int = 10,
+        *,
+        union_cap: int = 200,
+        derive: DeriveSpec | None = None,
+    ) -> dict[str, Any]:
+        """Return the ranked share-of-window change of *field_token* between two windows.
+
+        The top-*limit* values of each window (both counted on the primary's
+        resolved derivation, as :py:meth:`compare_field_terms` does) are
+        unioned; then each window is counted over that union in one scan
+        that also yields the window's non-empty total, and
+        :func:`rank_change_rows` turns the counts into shares, statuses and
+        the ranked, capped row list. Four scans, two parallel pairs, under
+        one gate slot. Share rather than count is the encoded quantity
+        because the two windows are rarely the same size.
+        """
+        self.store.init_schema()
+        derived_expr: str | None = None
+        echo: dict[str, Any] | None = None
+        if derive is not None:
+            _, resolved = self._resolve_derive(primary, field_token, derive)
+            if resolved is not None:
+                derived_expr = resolved.expr
+                echo = resolved.echo()
+        primary_top, comparison_top = self._run_parallel(
+            lambda: self._terms_top_for_expr(
+                primary, field_token, limit, derived_expr=derived_expr
+            ),
+            lambda: self._terms_top_for_expr(
+                comparison, field_token, limit, derived_expr=derived_expr
+            ),
+        )
+        union = list(dict.fromkeys([*primary_top, *comparison_top]))
+        base = {
+            "kind": "change",
+            "field": field_token,
+            "derive": echo,
+            "top_n": int(limit),
+            "union_cap": int(union_cap),
+        }
+        if not union:
+            return {
+                **base,
+                "primary_total": 0,
+                "comparison_total": 0,
+                "rows": [],
+                "union_size": 0,
+                "rows_shown": 0,
+                "truncated": False,
+                "omitted": 0,
+            }
+        (primary_counts, primary_total), (comparison_counts, comparison_total) = self._run_parallel(
+            lambda: self._terms_counts_for_values(
+                primary, field_token, union, derived_expr=derived_expr
+            ),
+            lambda: self._terms_counts_for_values(
+                comparison, field_token, union, derived_expr=derived_expr
+            ),
+        )
+        rows, omitted = rank_change_rows(
+            union, primary_counts, comparison_counts, primary_total, comparison_total, union_cap
+        )
+        return {
+            **base,
+            "primary_total": int(primary_total),
+            "comparison_total": int(comparison_total),
+            "rows": rows,
+            "union_size": len(union),
+            "rows_shown": len(rows),
+            "truncated": omitted > 0,
+            "omitted": omitted,
         }
 
     def _numeric_layer_stats(
