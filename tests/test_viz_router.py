@@ -132,7 +132,9 @@ class _FakeCompareService:
         self.calls.append(("time", primary, comparison, baseline_cache_token))
         return {"kind": "time"}
 
-    def compare_field_terms(self, primary, comparison, field, limit, baseline_cache_token=None):
+    def compare_field_terms(
+        self, primary, comparison, field, limit, baseline_cache_token=None, *, derive=None
+    ):
         self.calls.append(("terms", primary, comparison, baseline_cache_token))
         return {"kind": "terms"}
 
@@ -271,7 +273,7 @@ class _FakeAggService:
         self.calls.append(("punchcard", query))
         return {"kind": "punchcard"}
 
-    def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
+    def field_pivot(self, query, field_x, field_y, limit_x, limit_y, *, derive_x=None):
         self.calls.append(("pivot", query, field_x, field_y, limit_x, limit_y))
         return {"kind": "pivot"}
 
@@ -530,7 +532,7 @@ class _FakeTermsService:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def field_terms(self, query, field, limit, *, totals=True):
+    def field_terms(self, query, field, limit, *, totals=True, derive=None):
         self.calls.append((query, field, limit, totals))
         return {"kind": "live"}
 
@@ -662,7 +664,7 @@ class _CaptureTermsService:
     def __init__(self) -> None:
         self.last_query = None
 
-    def field_terms(self, query, field_token, limit=50, *, totals=True):
+    def field_terms(self, query, field_token, limit=50, *, totals=True, derive=None):
         self.last_query = query
         return {"values": [], "other": 0, "total": 0}
 
@@ -778,3 +780,211 @@ async def test_compare_custom_layer_honors_its_own_flag(monkeypatch):
     assert primary.exclude_template_hashes is None
     assert comparison.exclude_template_hashes == [4736]
     assert comparison.exclude_routine_disposition_ids == ["m1"]
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+class _RecordingService:
+    """Records the kwargs the endpoint hands the aggregation."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def field_terms(self, query, field, limit, **kw):
+        self.calls.append(("field_terms", (field, limit), kw))
+        return {"field": field, "total": 0, "distinct": 0, "values": [], "other_count": 0}
+
+    def field_value_timeseries(self, query, field, buckets, series_limit, **kw):
+        self.calls.append(("field_value_timeseries", (field, buckets, series_limit), kw))
+        return {"field": field, "series": [], "interval_seconds": 60, "min": None, "max": None}
+
+    def field_pivot(self, query, fx, fy, lx, ly, **kw):
+        self.calls.append(("field_pivot", (fx, fy, lx, ly), kw))
+        return {
+            "field_x": fx,
+            "field_y": fy,
+            "x_values": [],
+            "y_values": [],
+            "cells": [],
+            "total": 0,
+        }
+
+
+async def _fake_query(*args, **kwargs):
+    from vestigo.db.queries import EventQuery
+
+    return EventQuery(case_id="c1", source_ids=["s1"], q="narrow")  # filtered → bypasses the cache
+
+
+def _wire(monkeypatch) -> _RecordingService:
+    svc = _RecordingService()
+    monkeypatch.setattr(viz, "_resolve_event_query", _fake_query)
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    return svc
+
+
+#: The handlers are called directly, so every `Query(...)` default the
+#: endpoint reads has to be spelled out — FastAPI resolves them only under HTTP.
+_FILTER_PARAMS: dict = {
+    "q": None,
+    "q_regex": False,
+    "artifact": None,
+    "artifacts": None,
+    "source_id": None,
+    "tag": None,
+    "exclude_tag": None,
+    "tags_include": None,
+    "tags_exclude": None,
+    "ids": None,
+    "start": None,
+    "end": None,
+    "filters": None,
+    "exclusions": None,
+    "filter_modes": None,
+    "exclusion_modes": None,
+    "annotated": None,
+    "annotation_tag_value": None,
+    "run_id": None,
+    "collapse_routine": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_field_terms_passes_a_parsed_derive_to_the_aggregation(monkeypatch):
+    from vestigo.db.derive import DeriveSpec
+
+    svc = _wire(monkeypatch)
+    await viz.get_field_terms(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        limit=10,
+        totals=True,
+        derive='{"kind":"bins","mode":"log","count":8}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    name, args, kw = svc.calls[0]
+    assert name == "field_terms" and args == ("attr:bytes", 10)
+    assert kw["derive"] == DeriveSpec(kind="bins", mode="log", count=8)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_rejects_a_malformed_derive_with_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _wire(monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        await viz.get_field_terms(
+            "c1",
+            "t1",
+            field="attr:bytes",
+            limit=50,
+            totals=True,
+            derive='{"kind":"bins"}',
+            case=None,
+            **_FILTER_PARAMS,
+        )
+    assert excinfo.value.status_code == 422
+    assert "mode" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_rejects_a_derive_on_a_virtual_time_field_with_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _wire(monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        await viz.get_field_terms(
+            "c1",
+            "t1",
+            field="time:hour_of_day",
+            limit=50,
+            totals=True,
+            derive='{"kind":"time_part","part":"hour"}',
+            case=None,
+            **_FILTER_PARAMS,
+        )
+    assert excinfo.value.status_code == 422
+    assert "already a calendar part" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_with_derive_never_answers_from_the_stats_cache(monkeypatch):
+    """An unfiltered request normally reads the M24a cache; a derived one cannot
+    — the cache holds raw values, not bins."""
+    from vestigo.db.queries import EventQuery
+
+    svc = _wire(monkeypatch)
+
+    async def unfiltered(*a, **k):
+        return EventQuery(case_id="c1", source_ids=["s1"])
+
+    monkeypatch.setattr(viz, "_resolve_event_query", unfiltered)
+
+    async def must_not_run(*a, **k):
+        raise AssertionError("cache consulted for a derived request")
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", must_not_run)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+    await viz.get_field_terms(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        limit=50,
+        totals=True,
+        derive='{"kind":"time_part","part":"hour"}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    assert svc.calls[0][2]["derive"].part == "hour"
+
+
+@pytest.mark.asyncio
+async def test_timeseries_and_pivot_take_derive(monkeypatch):
+    svc = _wire(monkeypatch)
+    await viz.get_field_value_timeseries(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        buckets=60,
+        series_limit=12,
+        derive='{"kind":"bins","mode":"custom","edges":[1]}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    await viz.get_field_pivot(
+        "c1",
+        "t1",
+        field_x="attr:bytes",
+        field_y="attr:host",
+        limit_x=10,
+        limit_y=10,
+        derive_x='{"kind":"bins","mode":"custom","edges":[1]}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    assert svc.calls[0][2]["derive"].edges == [1.0]
+    assert svc.calls[1][2]["derive_x"].edges == [1.0]
+
+
+def test_compare_request_takes_a_derive_spec() -> None:
+    from vestigo.db.derive import DeriveSpec
+
+    body = viz.CompareRequest.model_validate(
+        {
+            "kind": "terms",
+            "field": "attr:bytes",
+            "comparison": {"mode": "baseline"},
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        }
+    )
+    assert body.derive == DeriveSpec(kind="bins", mode="width", count=4)
+    assert (
+        viz.CompareRequest.model_validate(
+            {"kind": "time", "comparison": {"mode": "baseline"}}
+        ).derive
+        is None
+    )

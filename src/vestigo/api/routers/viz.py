@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from vestigo.api.deps import (
     get_store,
@@ -39,7 +39,8 @@ from vestigo.api.routers.events import (
     _validate_field_modes,
     _validate_regex,
 )
-from vestigo.db._time_fields import TIME_FIELD_SPECS
+from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
+from vestigo.db.derive import DeriveSpec, parse_derive
 from vestigo.db.field_stats import (
     ensure_source_field_stats,
     merged_field_terms,
@@ -208,6 +209,41 @@ def _is_unfiltered(query: EventQuery) -> bool:
     )
 
 
+_DERIVE = Query(
+    default=None,
+    description=(
+        "Optional derivation of the charted field, as a JSON object: "
+        '{"kind":"bins","mode":"width"|"log","count":N} | '
+        '{"kind":"bins","mode":"custom","edges":[…]} | '
+        '{"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"}. '
+        "A change of scale — the result is ordered categories."
+    ),
+)
+
+
+def _parse_derive_param(raw: str | None, field: str | None) -> DeriveSpec | None:
+    """422 with the validator's own words on a bad derivation.
+
+    A virtual ``time:`` field is already a calendar part; deriving it again is
+    refused here with the same sentence the agent's ``propose_chart`` uses,
+    rather than surfacing as a 500 from the query service.
+    """
+    if not isinstance(raw, str):
+        # Absent — or, when a handler is called directly outside HTTP, the
+        # unresolved ``Query`` default object itself.
+        return None
+    try:
+        spec = parse_derive(raw)
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=422, detail=f"derive: {exc}") from exc
+    if spec is not None and field and resolve_time_field(field) is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"derive: {field} is already a calendar part — chart it directly, without derive.",
+        )
+    return spec
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-terms")
 async def get_field_terms(
     case_id: str,
@@ -222,6 +258,7 @@ async def get_field_terms(
             "values (e.g. autocomplete) to halve the scan."
         ),
     ),
+    derive: str | None = _DERIVE,
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -248,7 +285,12 @@ async def get_field_terms(
 
     Powers the per-value histogram modal's top-list and nominal/ordinal
     chart types (bar, pie) on the Visualization page.
+
+    ``derive`` (:mod:`vestigo.db.derive`) groups the field's bins or calendar
+    part instead of its raw values; such a request is never answered from the
+    field-stats cache, which holds raw values only.
     """
+    derive_spec = _parse_derive_param(derive, field)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -278,7 +320,11 @@ async def get_field_terms(
     # canonical mapped field must stay live (coalesce over several raw keys
     # dedupes per event; not derivable from per-key caches), and any filter
     # or a cache gap falls through to the live path below.
-    if _is_unfiltered(query) and not (query.field_mappings and field in query.field_mappings):
+    if (
+        derive_spec is None
+        and _is_unfiltered(query)
+        and not (query.field_mappings and field in query.field_mappings)
+    ):
         stats = await ensure_source_field_stats(
             get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
         )
@@ -293,6 +339,7 @@ async def get_field_terms(
         field,
         limit,
         totals=totals,
+        derive=derive_spec,
     )
 
 
@@ -540,6 +587,7 @@ async def get_field_value_timeseries(
     field: str = Query(..., description="Field token, e.g. 'attr:status_code'"),
     buckets: int = Query(default=60, ge=10, le=200),
     series_limit: int = Query(default=12, ge=1, le=50),
+    derive: str | None = _DERIVE,
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -568,6 +616,7 @@ async def get_field_value_timeseries(
     ``EventQueryService.field_value_timeseries``). Powers the multi-series
     line/area chart and the value×time heatmap on the Visualization page.
     """
+    derive_spec = _parse_derive_param(derive, field)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -600,6 +649,7 @@ async def get_field_value_timeseries(
         field,
         buckets,
         series_limit,
+        derive=derive_spec,
     )
 
 
@@ -676,6 +726,7 @@ async def get_field_pivot(
     field_y: str = Query(..., description="Y-axis field token, e.g. 'attr:workstation'"),
     limit_x: int = Query(default=10, ge=1, le=50),
     limit_y: int = Query(default=10, ge=1, le=50),
+    derive_x: str | None = _DERIVE,
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -703,9 +754,13 @@ async def get_field_pivot(
     ``""`` on either axis of a cell means "outside that axis's top-N"
     (truthful Other rollup). Powers the field×field heatmap and the flow
     (Sankey) chart on the Visualization page.
+
+    ``derive_x`` derives the x axis (:mod:`vestigo.db.derive`); a derived
+    axis is a bounded domain — every range or part, in order, empty or not.
     """
     if field_x == field_y:
         raise HTTPException(status_code=422, detail="field_x and field_y must differ")
+    derive_x_spec = _parse_derive_param(derive_x, field_x)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -739,6 +794,7 @@ async def get_field_pivot(
         field_y,
         limit_x,
         limit_y,
+        derive_x=derive_x_spec,
     )
 
 
@@ -864,6 +920,9 @@ class CompareRequest(BaseModel):
     buckets: int = Field(default=60, ge=10, le=200)
     bins: int = Field(default=30, ge=1, le=200)
     limit: int = Field(default=50, ge=1, le=500)
+    #: ``kind="terms"`` only: derive ``field`` (bins / calendar part) before
+    #: counting — both layers on the primary's edges.
+    derive: DeriveSpec | None = None
 
 
 async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilters):
@@ -912,6 +971,14 @@ async def compare_layers(
     """
     if body.kind in ("terms", "numeric") and not body.field:
         raise HTTPException(status_code=422, detail=f"kind={body.kind!r} requires 'field'")
+    if body.derive is not None:
+        if body.kind != "terms":
+            raise HTTPException(status_code=422, detail="derive applies to kind='terms' only")
+        if body.field and resolve_time_field(body.field) is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"derive: {body.field} is already a calendar part — chart it directly, without derive.",
+            )
 
     primary = await _resolve_body_query(case_id, timeline_id, body.primary)
 
@@ -970,6 +1037,9 @@ async def compare_layers(
                         for sid in comparison.source_ids
                     )
                 ),
+                # A derived request never reads an underived layer (the
+                # service keys on the resolved expression too — belt and braces).
+                body.derive.model_dump_json() if body.derive is not None else None,
             )
     else:
         if body.comparison.filters is None:
@@ -1005,6 +1075,7 @@ async def compare_layers(
             body.field,
             body.limit,
             baseline_cache_token=baseline_token,
+            derive=body.derive,
         )
     return await _run_regex_guarded(
         q_regex,
