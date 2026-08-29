@@ -1232,6 +1232,23 @@ class CompareRequest(BaseModel):
     derive: DeriveSpec | None = None
 
 
+class LanesRequest(BaseModel):
+    """Body for ``POST …/viz/lanes`` — three filter sets don't fit query params.
+
+    ``primary`` is the current filters; ``start_filter``/``end_filter`` are
+    the events that open and close an interval under ``pairing="next_end"``
+    — each ANDed with the primary and pinned to its time range, so an
+    analyst filtering to one host gets that host's starts.
+    """
+
+    field: str
+    pairing: Literal["first_last", "next_end"] = "first_last"
+    primary: CompareFilters = Field(default_factory=CompareFilters)
+    start_filter: CompareFilters | None = None
+    end_filter: CompareFilters | None = None
+    limit_y: int = Field(default=10, ge=1, le=500)
+
+
 async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilters):
     return await _resolve_event_query(
         case_id,
@@ -1410,6 +1427,51 @@ async def compare_layers(
         body.field,
         body.bins,
         baseline_cache_token=baseline_token,
+    )
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/lanes")
+async def get_lanes(
+    case_id: str,
+    timeline_id: str,
+    body: LanesRequest,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return interval lanes — one lane per value of ``field``, bars from start to end.
+
+    See ``EventQueryService.field_lanes``. Reads only; the lane cap is clamped
+    to the analyst ceiling and the row cap is the analyst's, both echoed.
+    """
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+    if body.pairing == "next_end" and (body.start_filter is None or body.end_filter is None):
+        raise HTTPException(
+            status_code=422, detail="pairing='next_end' requires 'start_filter' and 'end_filter'"
+        )
+    primary = await _resolve_body_query(case_id, timeline_id, body.primary)
+    start = end = None
+    regex_flags = [primary.q_regex]
+    modes = [primary.filter_modes, primary.exclusion_modes]
+    if body.pairing == "next_end" and body.start_filter is not None and body.end_filter is not None:
+        start = await _resolve_body_query(case_id, timeline_id, body.start_filter)
+        end = await _resolve_body_query(case_id, timeline_id, body.end_filter)
+        # Pinned to the primary's window, as a custom Compare layer is.
+        start = replace(start, start=primary.start, end=primary.end)
+        end = replace(end, start=primary.start, end=primary.end)
+        regex_flags += [start.q_regex, end.q_regex]
+        modes += [start.filter_modes, start.exclusion_modes, end.filter_modes, end.exclusion_modes]
+    service = _get_query_service()
+    q_regex = _uses_regex(any(regex_flags), *modes)
+    return await _run_regex_guarded(
+        q_regex,
+        service.field_lanes,
+        primary,
+        body.field,
+        pairing=body.pairing,
+        start=start,
+        end=end,
+        limit_y=min(body.limit_y, ANALYST_CHART_LIMITS.lanes[1]),
+        rows_cap=ANALYST_CHART_LIMITS.lanes_rows,
     )
 
 

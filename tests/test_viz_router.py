@@ -146,6 +146,10 @@ class _FakeCompareService:
         self.calls.append(("change", primary, comparison, (field, limit, union_cap, derive)))
         return {"kind": "change", "field": field, "top_n": limit, "union_cap": union_cap}
 
+    def field_lanes(self, primary, field, *, pairing, start=None, end=None, limit_y, rows_cap):
+        self.calls.append(("lanes", primary, (start, end), (field, pairing, limit_y, rows_cap)))
+        return {"kind": "lanes", "field": field, "pairing": pairing, "lane_cap": limit_y}
+
 
 async def _fake_id_filters(case_id, source_ids, **_kwargs):
     return None, None, None
@@ -1280,3 +1284,49 @@ async def test_compare_change_clamps_top_n_to_the_analyst_ceiling_and_needs_a_fi
             case=None,
         )
     assert exc.value.status_code == 422 and "requires 'field'" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_lanes_next_end_pins_both_layers_and_passes_the_caps(monkeypatch):
+    from datetime import UTC, datetime
+
+    svc = _patch_compare(monkeypatch)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, tzinfo=UTC)
+    body = viz.LanesRequest(
+        field="attr:host",
+        pairing="next_end",
+        primary=viz.CompareFilters(filters='{"attr:host": "h1"}', start=start, end=end),
+        start_filter=viz.CompareFilters(filters='{"attr:kind": "logon"}'),
+        end_filter=viz.CompareFilters(filters='{"attr:kind": "logoff"}'),
+        limit_y=500,
+    )
+    result = await viz.get_lanes("c1", "t1", body, case=None)
+    assert result == {"kind": "lanes", "field": "attr:host", "pairing": "next_end", "lane_cap": 100}
+    kind, primary, (start_q, end_q), args = svc.calls[0]
+    assert kind == "lanes"
+    assert primary.field_filters == {"attr:host": ["h1"]}
+    assert start_q.field_filters == {"attr:kind": ["logon"]}
+    assert end_q.field_filters == {"attr:kind": ["logoff"]}
+    assert (start_q.start, start_q.end) == (start, end) and (end_q.start, end_q.end) == (start, end)
+    assert args == ("attr:host", "next_end", 100, 50_000)
+
+
+@pytest.mark.asyncio
+async def test_lanes_first_last_passes_no_layers_and_next_end_needs_both(monkeypatch):
+    from fastapi import HTTPException
+
+    svc = _patch_compare(monkeypatch)
+    await viz.get_lanes("c1", "t1", viz.LanesRequest(field="attr:host"), case=None)
+    assert svc.calls[0][2] == (None, None) and svc.calls[0][3][1] == "first_last"
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_lanes(
+            "c1",
+            "t1",
+            viz.LanesRequest(
+                field="attr:host", pairing="next_end", start_filter=viz.CompareFilters()
+            ),
+            case=None,
+        )
+    assert exc.value.status_code == 422
+    assert "requires 'start_filter' and 'end_filter'" in str(exc.value.detail)

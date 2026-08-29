@@ -273,6 +273,23 @@ async def execute_chart_spec(
         raise ValueError(
             f'chart_type="{chart_type}" takes no marks — figures that draw them: {", ".join(takers)}.'
         )
+    lane_inputs = spec.inputs is not None and any(
+        getattr(spec.inputs, key) is not None for key in ("pairing", "start_filter", "end_filter")
+    )
+    if lane_inputs and chart_type != "lanes":
+        raise ValueError('inputs.pairing / start_filter / end_filter are chart_type="lanes" only.')
+    pairing: str | None = None
+    if data_kind == "lanes":
+        pairing = (spec.inputs.pairing if spec.inputs else None) or "first_last"
+        has_start = spec.inputs is not None and spec.inputs.start_filter is not None
+        has_end = spec.inputs is not None and spec.inputs.end_filter is not None
+        if pairing == "next_end" and not (has_start and has_end):
+            raise ValueError(
+                'pairing="next_end" needs inputs.start_filter and inputs.end_filter — the '
+                'events that open and close an interval; pairing="first_last" needs neither.'
+            )
+        if pairing == "first_last" and (has_start or has_end):
+            warnings.append('inputs.start_filter/end_filter ignored under pairing="first_last".')
     quantity: str | None = None
     if data_kind == "cumulative":
         quantity = opts.quantity or (
@@ -674,6 +691,43 @@ async def execute_chart_spec(
                     "delta_share": round(r["delta_share"], 4),
                 }
                 for r in result["rows"][:5]
+            ],
+        }
+    elif data_kind == "lanes":
+        from dataclasses import replace
+
+        if pairing is None:  # unreachable: resolved in the legality block above
+            raise RuntimeError("lanes reached execution without a resolved pairing")
+        applied["limit_y"] = _capped(opts.limit_y, limits.lanes, "limit_y")
+        lanes_kw: dict[str, Any] = {
+            "pairing": pairing,
+            "limit_y": applied["limit_y"],
+            "rows_cap": limits.lanes_rows,
+        }
+        if pairing == "next_end" and spec.inputs is not None:
+            start_query = await _build_query(scope, validated(spec.inputs.start_filter))
+            end_query = await _build_query(scope, validated(spec.inputs.end_filter))
+            # Pinned to the primary's window, as the endpoint pins them.
+            lanes_kw["start"] = replace(
+                start_query, start=primary_query.start, end=primary_query.end
+            )
+            lanes_kw["end"] = replace(end_query, start=primary_query.start, end=primary_query.end)
+        result = await run_gated_scan(
+            functools.partial(service.field_lanes, **lanes_kw), primary_query, spec.field
+        )
+        summary = {
+            "pairing": result["pairing"],
+            "lanes_shown": len(result["lanes"]),
+            "lanes_total": result["lanes_total"],
+            "lane_cap_hit": result["lane_cap_hit"],
+            "intervals": sum(len(lane["intervals"]) for lane in result["lanes"]),
+            "unpaired_starts": result["unpaired_starts"],
+            "orphan_ends": result["orphan_ends"],
+            "rows_truncated": result["rows_truncated"],
+            "undated": result["undated"],
+            "top_lanes": [
+                {"key": lane["key"], "count": lane["count"], "intervals": len(lane["intervals"])}
+                for lane in result["lanes"][:5]
             ],
         }
     elif data_kind == "pivot":

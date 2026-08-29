@@ -983,6 +983,66 @@ class _FakeChartService(_FakeVizService):
             "unparsed": 1,
         }
 
+    def field_lanes(self, primary, field, *, pairing, start=None, end=None, limit_y, rows_cap):
+        self.calls.append(
+            (
+                "field_lanes",
+                (field, pairing, limit_y, rows_cap),
+                {"layers": (start is not None, end is not None)},
+            )
+        )
+        return {
+            "kind": "lanes",
+            "field": field,
+            "pairing": pairing,
+            "lanes": [
+                {
+                    "key": "h2",
+                    "count": 4,
+                    "intervals": [
+                        {
+                            "start": "2026-07-20T09:00:00+00:00",
+                            "end": None,
+                            "start_event_id": "e2",
+                            "end_event_id": None,
+                        },
+                        {
+                            "start": "2026-07-20T10:00:00+00:00",
+                            "end": "2026-07-20T11:00:00+00:00",
+                            "start_event_id": "e4",
+                            "end_event_id": "e6",
+                        },
+                    ],
+                },
+                {
+                    "key": "h1",
+                    "count": 3,
+                    "intervals": [
+                        {
+                            "start": "2026-07-20T09:00:00+00:00",
+                            "end": "2026-07-20T10:00:00+00:00",
+                            "start_event_id": "e1",
+                            "end_event_id": "e3",
+                        },
+                    ],
+                },
+            ],
+            "lane_cap": limit_y,
+            "lanes_total": 3,
+            "lane_cap_hit": True,
+            "other_lanes": 1,
+            "starts": 4,
+            "ends": 3,
+            "unpaired_starts": 1,
+            "orphan_ends": 1,
+            "rows_cap": rows_cap,
+            "rows_truncated": False,
+            "rows_paired": 7,
+            "undated": 1,
+            "slice_start": "2026-07-20T08:00:00+00:00",
+            "slice_end": "2026-07-20T14:00:00+00:00",
+        }
+
     def field_change(self, primary, comparison, field, limit, *, union_cap, derive=None):
         self.calls.append(("field_change", (field, limit, union_cap), {"derive": derive}))
         return {
@@ -1180,6 +1240,7 @@ _CHART_TYPE_CASES = [
     ("cumulative", {}, "cumulative"),
     ("calendar", {}, "calendar"),
     ("change", {"field": "attr:status", "compare": {"mode": "baseline"}}, "field_change"),
+    ("lanes", {"field": "attr:status"}, "field_lanes"),
 ]
 
 
@@ -3313,3 +3374,110 @@ async def test_change_takes_no_marks(store, monkeypatch):
         },
     )
     assert 'chart_type="change" takes no marks' in message
+
+
+# ── interval lanes ───────────────────────────────────────────────────────────
+
+
+async def test_lanes_first_last_by_default_and_summarises_the_lanes(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "lanes", "field": "status", "options": {"limit_y": 50}}),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["options"] == {"limit_y": 20}
+    assert any("clamped to 20" in w for w in result["warnings"])
+    assert result["summary"] == {
+        "pairing": "first_last",
+        "lanes_shown": 2,
+        "lanes_total": 3,
+        "lane_cap_hit": True,
+        "intervals": 3,
+        "unpaired_starts": 1,
+        "orphan_ends": 1,
+        "rows_truncated": False,
+        "undated": 1,
+        "top_lanes": [
+            {"key": "h2", "count": 4, "intervals": 2},
+            {"key": "h1", "count": 3, "intervals": 1},
+        ],
+    }
+    assert _called(fake, "field_lanes") == ("status", "first_last", 20, 2000)
+    assert fake.calls[-1][2]["layers"] == (False, False)
+
+
+async def test_lanes_next_end_builds_both_layers_and_echoes_the_inputs(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "lanes",
+                "field": "status",
+                "inputs": {
+                    "pairing": "next_end",
+                    "start_filter": {"filters": {"attr:kind": ["logon"]}},
+                    "end_filter": {"filters": {"attr:kind": ["logoff"]}},
+                },
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["inputs"]["pairing"] == "next_end"
+    assert result["resolved"]["inputs"]["start_filter"]["filters"] == {"attr:kind": ["logon"]}
+    assert _called(fake, "field_lanes") == ("status", "next_end", 10, 2000)
+    assert fake.calls[-1][2]["layers"] == (True, True)
+
+
+async def test_lanes_next_end_needs_both_filters_and_says_so(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "lanes",
+            "field": "status",
+            "inputs": {"pairing": "next_end", "start_filter": {"q": "logon"}},
+        },
+    )
+    assert 'pairing="next_end" needs inputs.start_filter and inputs.end_filter' in message
+
+
+async def test_lane_inputs_on_another_figure_are_refused_and_first_last_ignores_filters(
+    store, monkeypatch
+):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "bar", "field": "status", "inputs": {"pairing": "first_last"}}
+    )
+    assert 'inputs.pairing / start_filter / end_filter are chart_type="lanes" only' in message
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "lanes", "field": "status", "inputs": {"start_filter": {"q": "x"}}}),
+    )
+    assert result["ok"] is True
+    assert any('ignored under pairing="first_last"' in w for w in result["warnings"])
+
+
+async def test_lanes_draw_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "lanes",
+                "field": "status",
+                "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+            }
+        ),
+    )
+    assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1
