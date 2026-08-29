@@ -428,7 +428,10 @@ Per kind, `data` is:
   `components/viz/chartFetch.ts`, beside `fetchChartData` so the two can't
   drift) is the single place that reshaping happens, and it returns the real
   discriminated union rather than a cast — a divergence between the live and
-  frozen paths is a build failure, not a chart of blank bars.
+  frozen paths is a build failure, not a chart of blank bars. A `table` figure
+  freezes the `field_table` response as `chart`, and `SnapshotRenderer` draws
+  it as a real `<table>` (`ChartMarks tableAs="html"`), so the HTML export
+  contains a table rather than an image of one.
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in

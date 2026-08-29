@@ -127,8 +127,12 @@ Read top-down, in dependency order:
    the reason in its tooltip (`lib/figureGallery.ts`: "Histogram needs Number or time or
    Measure."), plus "Click to …" when a single derivation would light it. The selected
    figure's `question` and "how to read" line sit under the gallery.
-5. **The figure's inputs** — one block per declared key: `secondField` (Field (Y) / Group by),
-   `fields` (the correlation list).
+5. **The figure's inputs** — one block per declared key: `secondField` (Field (Y) / Group by;
+   on the table, *Count distinct of (optional)*), `fields` (the correlation list), and
+   `columns` (the table's checklist: count, share, first seen, last seen, distinct <second
+   field>). With nothing ticked the table shows count, share, first seen and last seen, plus
+   *distinct* whenever a second field is set; *distinct* is disabled until one is, and a
+   stored choice that names it without a second field is drawn without it.
 6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
    reason when a figure has no honest two-layer encoding.
 
@@ -185,6 +189,72 @@ bins, `{kind, labels, part, timezone: "UTC"}` for a calendar part. The frontend 
 `negative_bin` for the caption's `derived:` line, which always names what was done and what
 could not be counted (`lib/caption.ts`).
 
+## Table figure
+
+The one figure that is a table: the top-N values of a field with their count, share, first
+and last seen, and — given a second field — how many distinct values of it each row saw. It
+is the value inventory (#295) made bounded, and it is built to agree with it cell for cell.
+
+**One SELECT core.** `EventQueryService.field_table` (`db/queries.py`) and the streamed
+`iter_field_inventory` share `_inventory_select_core` — `val, count(), min(dated),
+max(dated)` over one `GROUP BY val`, with the no-timestamp sentinel nulled *inside* the
+aggregate so a value seen only on undated events keeps its count and reports no time rather
+than the year 2299. `tests/test_table_clickhouse.py` asserts the two agree on every shared
+cell. The table adds `uniqExactIf(second, second != '')` as `distinct_second`, and runs two
+scans in parallel under one slot as `field_terms` does: the sorted top-N, and a spillable
+totals grouping (`sum(c)`, `count()`) from which `total`, `distinct` and the remainder are
+derived — no window functions, for the reasons `iter_field_inventory` gives.
+
+**Share and the remainder.** `share = count / total`, where `total` is the number of events
+with a non-empty value under the current filters — the caption names that denominator on
+every table. Whenever the top-N cut anything (`distinct > len(rows)`) the response carries a
+`remainder` — `{count, share, distinct_values}` — and the figure draws it as a final,
+italic row: "Remainder (N more values)". It carries count and share only; its seen range and
+distinct-second count would be a third scan for a row that exists to say "there is more".
+Absent exactly when nothing was cut. The shown shares plus the remainder's sum to one.
+
+**Sorting.** `sort_by` is any column — `value`, `count`, `share` (orders as `count`),
+`first_seen`, `last_seen`, `distinct_second` (needs a second field; refused otherwise) —
+and `sort_dir` is `asc` or `desc`. Time sorts are `NULLS LAST` in either direction, as the
+inventory's are, and every ordering breaks ties on `val ASC`, so a re-run over unchanged
+sources reproduces the same rows in the same order. The default is count, descending.
+
+**Derivations** are accepted (`bins`, `time_part`) exactly as on a bar: the rows are the
+ranges or calendar parts, and the response echoes `derive`.
+
+**Endpoint.** `GET …/viz/field-table?field=…&second_field=…&limit=1..500&sort_by=…&sort_dir=…&derive=…`
+plus the shared filter parameters. 422 when `second_field == field`, when
+`sort_by=distinct_second` has no `second_field`, and for a malformed `derive`. Registry row
+`table`: `data_kind="table"`, nominal or ordinal, `inputs` field (required), second field
+(optional), `columns` (optional); options `top_n`, `table_sort_by`, `table_sort_dir`,
+`highlight`. `ChartLimits.table_rows` caps the rows — agent (20, 30), analyst (50, 500).
+
+**Options.** `topN` (the slider stops at 50, the exact box reaches 500); `tableSortBy` /
+`tableSortDir`; `highlight` — a list of values whose rows get a faint band. Highlighting is
+presentation only and the caption says which rows were highlighted, so a report reader can
+tell an analyst's emphasis from the data's.
+
+**Two renderings, one row model.** `lib/tableRows.ts` decides which columns show
+(`effectiveColumns`), how each cell reads (`tableRowModels`: `en-US` integers, `45.5%`,
+times trimmed to seconds, `—` for none), which rows are highlighted and what the remainder
+row says. `charts/TableFigure.tsx` draws it twice: `TableFigure` is an `<svg>` (through
+`ChartFrame`, so the page and the PNG/SVG export treat it like every other figure; the
+count column carries an in-cell bar that encodes count only), and `TableHtml` is a real
+`<table>` — headers, `data-highlighted`, `data-remainder` — which `ChartMarks tableAs="html"`
+selects for a Story snapshot and the HTML export, where a table should be a table.
+
+**CSV.** Built client-side (`tableCsv`) from the response the figure already holds, under
+the same row model: the caption lines as `#` comment rows, a header (`value` plus the
+effective columns), one row per value with **raw** values (a share is `0.4545…`, not
+`45.5%`, so the file computes), and the remainder row last. Offered as a third export format
+beside PNG and SVG only while a table is on the canvas.
+
+**Caption lines** (after the field line): `sorted by <column> (ascending|descending)`;
+`share = count / N events with a non-empty <field>`; `showing top K of D distinct values; R
+events across M more values in the remainder row` (only when a remainder exists); and
+`highlighted rows: a · b — presentation only` (only when set). The generic "(capped…)" line
+does not fire for a table — the remainder row *is* the disclosure.
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -194,16 +264,24 @@ could not be counted (`lib/caption.ts`).
   other than `ordinal` (an omitted one resolves to ordinal), and empty bins after the scan —
   and `describe_field` reports `derivations` (`bins` when numeric, `time_part` always,
   nothing for a virtual field). The card's `specToChartConfig` carries `derive` across.
+  For the table, `ChartSpec.inputs.columns` mirrors the rail's checklist and
+  `options.table_sort_by` / `table_sort_dir` / `highlight` its options; two refusals —
+  `inputs.columns` on any other figure, and `distinct_second` (as a column or a sort)
+  without `field_y`; rows capped by `ChartLimits.table_rows` (agent 20/30, analyst 50/500);
+  the echo carries `resolved.inputs`, and `summary` the first five rows and the remainder.
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
   the schema an external client sees is the in-app one.
 - **Stories.** A `chart_ref` block stores the config beside the filters it was drawn under;
   the export resolver crosses the casing boundary once (`_stored_chart_to_spec`) — for
-  `derive` only the kind's casing differs (`timePart` ↔ `time_part`), tested as a round trip.
+  `derive` only the kind's casing differs (`timePart` ↔ `time_part`), tested as a round trip;
+  `inputs.columns` and the table options cross unchanged. A table block freezes the
+  `field_table` response and is drawn as a real `<table>` in the snapshot and the HTML
+  export (§"Table figure").
 
 ## 6. Not yet shipped
 
-Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: the table
-figure; marks (instants and windows from events, tags, confirmed findings, baseline
+Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: marks
+(instants and windows from events, tags, confirmed findings, baseline
 definitions, saved views, or typed); the cumulative step; ranked change between two windows;
 the calendar heatmap; interval lanes.
 Until each lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not

@@ -278,6 +278,12 @@ list used only by the correlation matrix.
   rejected too, with the categorical alternative. `describe_field` reports
   `derivations` so the model can see which apply before proposing. The resolved echo
   carries `derive`.
+- **The table figure has inputs and options of its own.** `chart_type="table"` takes
+  `inputs.columns` (which of count, share, first_seen, last_seen, distinct_second to show)
+  and `options.table_sort_by` / `table_sort_dir` / `highlight`; `inputs.columns` on any
+  other figure is refused, and `distinct_second` — as a column or a sort — needs `field_y`.
+  Rows are capped by `ChartLimits.table_rows` (20 default, 30 ceiling for the agent). The
+  summary carries the first five rows and the remainder; the echo carries `resolved.inputs`.
 - **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
   the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
   quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
@@ -545,8 +551,9 @@ surface too: `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are appended to
 `FastMCP(instructions=…)`, sharing the exact strings the in-app
 `SYSTEM_PROMPT` composes from. `tests/test_agent_schema.py` holds a budget
 guard (serialized tool list < 41,000 chars; `ChartSpec.derive` measured 39,382 →
-40,213 on 2026-08-29 and the ceiling moved by that delta) — if a change trips it,
-re-measure rather than raising the ceiling.
+40,213 on 2026-08-29 and the ceiling moved by that delta; `ChartSpec.inputs` and the
+table options took it to 40,953 the same day, 47 under the ceiling) — if a change
+trips it, re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

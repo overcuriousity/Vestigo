@@ -4,7 +4,38 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 202 — derivations: ranges and calendar parts).
+Last updated: 2026-08-29 (session 203 — the table figure).
+
+## Session 203 — 2026-08-29: the table figure (viz step 3/9)
+
+Step 3 of 9 from the Visualize design round; the reference is `docs/VISUALIZE.md` §"Table
+figure". Stacked on step 2 (#325).
+
+**The value inventory made bounded.** `EventQueryService.field_table` is the top-N of
+`iter_field_inventory` (#295) on the *same* SELECT core — `_inventory_select_core`, lifted
+out so a row's count and seen range can never mean one thing in a streamed inventory and
+another in a table; a live test asserts the two agree cell for cell. It adds `share` against
+the slice's non-empty total, `uniqExactIf` of a second field per row, any column as the sort
+(`NULLS LAST`, `val ASC` tie-break), and derivations. Two parallel scans as `field_terms`.
+
+**The remainder-row rule.** Whenever the top-N cut anything the response carries a
+`remainder` and the figure draws it as a final italic row — count and share only, because a
+seen range for "everything else" would be a third scan for a row that exists to say "there
+is more". Absent exactly when nothing was cut; the shown shares plus the remainder's sum to
+one, and the caption names the share denominator.
+
+**Two renderings over one row model.** `lib/tableRows.ts` decides columns, cell text,
+highlighting and the remainder once; `TableFigure` draws an `<svg>` (page, PNG/SVG export,
+in-cell bar encoding count only) and `TableHtml` a real `<table>` that `ChartMarks
+tableAs="html"` selects for Stories and the HTML export. CSV is built client-side from the
+same model — caption as `#` lines, raw shares — and offered as a third export format only
+while a table is on the canvas.
+
+**The rail's first `columns` renderer** — a checklist, *distinct* disabled until a second
+field ("Count distinct of (optional)") is set — plus sort, direction and highlight options.
+`RAIL_RENDERED_INPUTS` grew in the same commit. Agent parity: `ChartSpec.inputs.columns`,
+`options.table_sort_by/table_sort_dir/highlight`, two refusals, `ChartLimits.table_rows`;
+Stories round-trip `inputs` unchanged.
 
 ## Session 202 — 2026-08-29: derivations — ranges and calendar parts (viz step 2/9)
 
