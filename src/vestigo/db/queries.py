@@ -1151,6 +1151,43 @@ class _ParameterizedQueryBuilder:
 FOREGROUND_WAIT_SECONDS = 5.0
 
 
+#: Columns a table figure can be sorted by. `share` is `count / total`, so it
+#: orders exactly as `count`; `distinct_second` needs a second field.
+TABLE_SORT_COLUMNS: tuple[str, ...] = (
+    "value",
+    "count",
+    "share",
+    "first_seen",
+    "last_seen",
+    "distinct_second",
+)
+
+#: Sort key per table column — the same expressions the inventory orders by,
+#: so a table and an inventory of one field agree row for row.
+_TABLE_SORT_SQL: dict[str, str] = {
+    "value": "val",
+    "count": "c",
+    "share": "c",
+    "first_seen": "first_seen",
+    "last_seen": "last_seen",
+    "distinct_second": "distinct_second",
+}
+
+
+def _inventory_select_core(col_expr: str, dated_expr: str, *, extra: str = "") -> str:
+    """The SELECT list the value inventory and the table figure share.
+
+    ``value, count, first_seen, last_seen`` over one ``GROUP BY val`` — lifted
+    out so the streamed inventory (#295) and the bounded table can never
+    disagree about what a row's count or seen range means. *extra* appends
+    further aggregates (the table's ``distinct_second``).
+    """
+    return (
+        f"SELECT {col_expr} AS val, count() AS c, "
+        f"min({dated_expr}) AS first_seen, max({dated_expr}) AS last_seen{extra}"
+    )
+
+
 def _foreground_scan(fn):
     """Admit at most ``_FOREGROUND_CONCURRENCY`` chart aggregations at once.
 
@@ -2529,8 +2566,7 @@ class EventQueryService:
         dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
         tie_break = "" if order_sql.startswith("val ") else ", val ASC"
         sql = (
-            f"SELECT {col_expr} AS val, count() AS c, "
-            f"min({dated}) AS first_seen, max({dated}) AS last_seen "
+            f"{_inventory_select_core(col_expr, dated)} "
             f"FROM {self.store.database}.events "
             f"WHERE {where} "
             f"GROUP BY val "
@@ -3757,6 +3793,136 @@ class EventQueryService:
         )
         cells = [{"x": row[0], "y": row[1], "count": int(row[2])} for row in result.result_rows]
         return {**base, "cells": cells, "total": sum(c["count"] for c in cells)}
+
+    @_foreground_scan
+    def field_table(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        second_field: str | None = None,
+        sort_by: str = "count",
+        sort_dir: str = "desc",
+        derive: DeriveSpec | None = None,
+    ) -> dict[str, Any]:
+        """Return the top-*limit* values of *field_token* as table rows.
+
+        The value inventory (#295) made bounded: the same SELECT core
+        (:func:`_inventory_select_core`) so a row's count and first/last seen
+        mean exactly what the streamed inventory's do, plus ``share`` against
+        the slice's non-empty total and, given *second_field*, ``uniqExact``
+        of its non-empty values per row.
+
+        Two scans in parallel, as :py:meth:`field_terms`: the sorted top-N and
+        a spillable totals grouping that yields the remainder — ``total -
+        shown``, ``distinct - len(rows)`` — which is reported as a row of its
+        own whenever anything was cut, never silently dropped. The remainder
+        carries count and share only: its seen range and distinct-second
+        count would be a third scan for a row that exists to say "there is
+        more", and the caption names it as such.
+
+        Undated events (sentinel timestamp) contribute to counts but not to
+        the seen range — ``first_seen``/``last_seen`` are None for a value seen
+        only on undated events, never the year-2299 sentinel.
+        """
+        if sort_by not in TABLE_SORT_COLUMNS:
+            raise ValueError(f"unknown table sort column {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"unknown table sort direction {sort_dir!r}")
+        if sort_by == "distinct_second" and not second_field:
+            raise ValueError("sorting by distinct_second needs a second field")
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
+        )
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
+        extra = ""
+        if second_field:
+            col_y = _field_column_expr(
+                second_field,
+                parameters,
+                "field_key_y",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            extra = f", uniqExactIf({col_y}, {col_y} != '') AS distinct_second"
+        scope = f"WHERE {where} AND {col_expr} != ''"
+        direction = "ASC" if sort_dir == "asc" else "DESC"
+        key = _TABLE_SORT_SQL[sort_by]
+        nulls = " NULLS LAST" if sort_by in ("first_seen", "last_seen") else ""
+        tie_break = "" if key == "val" else ", val ASC"
+        order_sql = f"{key} {direction}{nulls}{tie_break}"
+
+        def top_n() -> Any:
+            return self._select(
+                f"""
+                {_inventory_select_core(col_expr, dated, extra=extra)}
+                FROM {database}.events
+                {scope}
+                GROUP BY val
+                ORDER BY {order_sql}
+                LIMIT {int(limit)}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        def all_groups() -> Any:
+            return self._select(
+                f"""
+                SELECT sum(c) AS total, count() AS n_groups FROM (
+                    SELECT {col_expr} AS val, count() AS c
+                    FROM {database}.events
+                    {scope}
+                    GROUP BY val
+                ) AS t
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        result, totals_result = self._run_parallel(top_n, all_groups)
+        totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        total, distinct = int(totals_row[0] or 0), int(totals_row[1] or 0)
+        rows: list[dict[str, Any]] = []
+        for row in result.result_rows:
+            value, count, first_seen, last_seen = row[0], int(row[1]), row[2], row[3]
+            rows.append(
+                {
+                    "value": value,
+                    "count": count,
+                    "share": (count / total) if total else 0.0,
+                    "first_seen": ensure_utc_iso(first_seen) if first_seen is not None else None,
+                    "last_seen": ensure_utc_iso(last_seen) if last_seen is not None else None,
+                    "distinct_second": int(row[4]) if second_field else None,
+                }
+            )
+        shown = sum(r["count"] for r in rows)
+        cut = distinct - len(rows)
+        remainder = (
+            {
+                "count": total - shown,
+                "share": ((total - shown) / total) if total else 0.0,
+                "distinct_values": cut,
+            }
+            if cut > 0
+            else None
+        )
+        return {
+            "kind": "table",
+            "field": field_token,
+            "second_field": second_field,
+            "total": total,
+            "distinct": distinct,
+            "rows": rows,
+            "remainder": remainder,
+            "sort": {"by": sort_by, "dir": sort_dir},
+            "derive": resolved.echo() if resolved is not None else None,
+        }
 
     @_foreground_scan
     def field_scatter(

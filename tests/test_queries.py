@@ -3401,3 +3401,38 @@ def test_field_terms_with_bins_runs_a_range_preflight_then_groups_by_the_multi_i
         "edges": [50.0],
         "negative_bin": False,
     }
+
+
+def test_field_table_uses_the_inventory_select_core_and_a_totals_scan() -> None:
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[10, 3]])),
+            (
+                "AS first_seen",
+                FakeQueryResult(result_rows=[["a", 6, None, None, 2], ["b", 3, None, None, 1]]),
+            ),
+        ]
+    )
+    result = svc.field_table(
+        EventQuery(case_id="c", source_ids=["s"]),
+        "attr:user",
+        2,
+        second_field="attr:host",
+        sort_by="distinct_second",
+        sort_dir="desc",
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    top = next(s for s in sqls if "AS first_seen" in s)
+    assert "count() AS c, min(" in top and "AS last_seen" in top
+    assert "uniqExactIf(" in top and "AS distinct_second" in top
+    assert "ORDER BY distinct_second DESC, val ASC" in top
+    assert "LIMIT 2" in top
+    assert result["remainder"] == {"count": 1, "share": 0.1, "distinct_values": 1}
+    assert result["rows"][0] == {
+        "value": "a",
+        "count": 6,
+        "share": 0.6,
+        "first_seen": None,
+        "last_seen": None,
+        "distinct_second": 2,
+    }
