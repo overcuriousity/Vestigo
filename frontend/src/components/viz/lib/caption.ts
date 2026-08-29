@@ -5,9 +5,10 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { DeriveEcho, EventFilters, ScatterStats } from "@/api/types";
+import type { DeriveEcho, EventFilters, ResolvedMarksResponse, ScatterStats } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { describeDerive } from "./derive";
+import { markCaptionLines } from "./marks";
 import { TABLE_COLUMN_LABELS } from "./tableRows";
 import { METRIC_INFO } from "./transforms";
 
@@ -79,6 +80,8 @@ export interface CaptionFacts {
   corrDropped?: string[];
   corrMinPairN?: number;
   corrMaxPairN?: number;
+  /** Time-axis figures: the server's resolution of `config.marks`. */
+  marks?: ResolvedMarksResponse;
 }
 
 /** Distinct grouping values past which the grouping field reads as an
@@ -248,6 +251,9 @@ export function buildCaptionLines(args: {
     if (facts.tableHighlight?.length) {
       lines.push(`highlighted rows: ${facts.tableHighlight.join(" · ")} — presentation only`);
     }
+  }
+  if (facts.marks && facts.marks.sources.length > 0) {
+    lines.push(...markCaptionLines(facts.marks));
   }
   if (
     chartType !== "table" &&

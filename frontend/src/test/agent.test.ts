@@ -563,3 +563,27 @@ describe("open_url — the page parses the backend's deep link back to the same 
     expect(paramsToFilters(params)).toEqual(deepLink.filters);
   });
 });
+
+describe("specToChartConfig — marks", () => {
+  it("maps the agent's snake_case marks onto MarkSource, dropping a malformed one", () => {
+    const config = specToChartConfig({
+      chart_type: "time",
+      marks: [
+        { kind: "events", filters: { tags_include: ["exfil"], event_ids: ["e1"] }, label: "x" },
+        { kind: "baseline", definition_id: "bd1" },
+        { kind: "view", view_id: "v1" },
+        { kind: "instant", at: "2026-03-13T09:41:00+00:00", label: "first" },
+        { kind: "range", start: "2026-03-13T09:00:00+00:00", end: "2026-03-13T10:00:00+00:00", label: "w" },
+        { kind: "instant" } as never,
+      ],
+    });
+    expect(config.marks).toEqual([
+      { kind: "events", filters: { tagsInclude: ["exfil"], ids: ["e1"] }, label: "x" },
+      { kind: "baseline", definitionId: "bd1" },
+      { kind: "view", viewId: "v1" },
+      { kind: "instant", at: "2026-03-13T09:41:00+00:00", label: "first" },
+      { kind: "range", start: "2026-03-13T09:00:00+00:00", end: "2026-03-13T10:00:00+00:00", label: "w" },
+    ]);
+    expect(specToChartConfig({ chart_type: "time" }).marks).toEqual([]);
+  });
+});

@@ -476,3 +476,37 @@ describe("buildCaptionLines — table", () => {
     expect(lines.some((l) => l.includes("(capped"))).toBe(false);
   });
 });
+
+describe("buildCaptionLines — marks", () => {
+  it("appends one line per mark source with provenance", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Events over time",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "time",
+        marks: [{ kind: "instant", at: "2026-07-20T09:41:00Z", label: "first" }],
+      },
+      filters: {},
+      facts: {
+        marks: {
+          cap: 50,
+          marks: [
+            {
+              kind: "instant",
+              at: "2026-07-20T09:41:00+00:00",
+              label: "first",
+              source: 0,
+              provenance: { kind: "analyst" },
+            },
+          ],
+          sources: [
+            { index: 0, kind: "instant", label: "first", count: 1, shown: 1, overflow: false, undated: 0 },
+          ],
+        },
+      },
+    });
+    expect(lines).toContain('mark #1: "first" at 2026-07-20 09:41:00Z — analyst-placed');
+  });
+});

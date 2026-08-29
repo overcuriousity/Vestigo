@@ -96,6 +96,7 @@ import {
   type CaptionFacts,
 } from "@/components/viz/lib/caption";
 import { ChartRail } from "@/components/viz/ChartRail";
+import { useResolvedMarks } from "@/components/viz/useResolvedMarks";
 import {
   SCALE_DISPLAY,
   treatAsNotice,
@@ -406,6 +407,8 @@ export function VisualizePage() {
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
     enabled: !!(caseId && timelineId),
   });
+
+  const marksQuery = useResolvedMarks(caseId, timelineId, config);
 
   const fieldsQuery = useQuery({
     queryKey: ["viz-fields", caseId, timelineId],
@@ -978,6 +981,7 @@ export function VisualizePage() {
       ? barReadabilityWarning(barCount, resolved.orientation)
       : null;
   if (barWarning) facts.readabilityWarning = barWarning;
+  if (marksQuery.data) facts.marks = marksQuery.data;
 
   const captionLines = buildCaptionLines({
     caseId,
@@ -1054,6 +1058,7 @@ export function VisualizePage() {
           updateConfig={updateConfig}
           fields={fieldsQuery.data?.fields ?? []}
           resolved={resolved}
+          resolvedMarks={marksQuery.data}
           autoBinCount={numericQuery.data?.bins.length}
           autoNotice={autoNotice}
           setAutoNotice={setAutoNotice}
@@ -1196,6 +1201,7 @@ export function VisualizePage() {
                 onRangeSelect={(start, end) =>
                   updateFilters({ ...urlFilters, start, end })
                 }
+                marks={marksQuery.data?.marks}
               />
             )}
             {chartType === "bar" && barTerms && (
@@ -1287,6 +1293,7 @@ export function VisualizePage() {
                 showLegend={resolved.legend}
                 svgRef={svgRef}
                 onValueClick={handleChartValueClick}
+                marks={marksQuery.data?.marks}
               />
             )}
             {chartType === "histogram" &&

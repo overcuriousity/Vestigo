@@ -21,6 +21,7 @@ import {
   parseDeriveSpec,
   type ChartConfig,
   type ChartType,
+  type MarkSource,
   type TableColumn,
 } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
@@ -93,6 +94,20 @@ export interface AgentChartSpecV2 {
   } | null;
   /** Figure-specific inputs — today only the table's `columns`. */
   inputs?: { columns?: TableColumn[] | null } | null;
+  /** Mark sources (`docs/VISUALIZE.md` §"Marks"); `ChartConfig` spells the ids camelCase. */
+  marks?: AgentMarkSpec[] | null;
+}
+
+/** Backend `ChartMarkSpec` (snake_case): one model for the five mark kinds. */
+export interface AgentMarkSpec {
+  kind: "events" | "baseline" | "view" | "instant" | "range";
+  filters?: AgentFilterSpec | null;
+  label?: string | null;
+  definition_id?: string | null;
+  view_id?: string | null;
+  at?: string | null;
+  start?: string | null;
+  end?: string | null;
 }
 
 /**
@@ -201,6 +216,48 @@ function specInputsToConfig(raw: AgentChartSpecV2["inputs"] | string): ChartConf
   return parseChartInputs(d ?? {});
 }
 
+/** Agent-spec marks → `MarkSource[]`; an entry without its kind's fields is dropped. */
+function specMarksToConfig(raw: AgentChartSpecV2["marks"] | string): MarkSource[] {
+  let list: unknown = raw;
+  if (typeof list === "string") {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  const out: MarkSource[] = [];
+  for (const m of list as AgentMarkSpec[]) {
+    if (!m || typeof m !== "object") continue;
+    const label = typeof m.label === "string" ? m.label : undefined;
+    switch (m.kind) {
+      case "events":
+        if (m.filters)
+          out.push({
+            kind: "events",
+            filters: specToEventFilters(m.filters),
+            ...(label !== undefined ? { label } : {}),
+          });
+        break;
+      case "baseline":
+        if (m.definition_id) out.push({ kind: "baseline", definitionId: m.definition_id });
+        break;
+      case "view":
+        if (m.view_id) out.push({ kind: "view", viewId: m.view_id });
+        break;
+      case "instant":
+        if (m.at && label !== undefined) out.push({ kind: "instant", at: m.at, label });
+        break;
+      case "range":
+        if (m.start && m.end && label !== undefined)
+          out.push({ kind: "range", start: m.start, end: m.end, label });
+        break;
+    }
+  }
+  return out;
+}
+
 export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   const spec = parseToolArgObject<AgentChartSpec>(raw);
   if (!spec) throw new Error("chart spec is not a JSON object");
@@ -233,7 +290,7 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
     v: 2,
     derive: specDeriveToConfig(spec.derive),
     inputs: specInputsToConfig(spec.inputs),
-    marks: [],
+    marks: specMarksToConfig(spec.marks),
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     fields: spec.fields ?? null,
