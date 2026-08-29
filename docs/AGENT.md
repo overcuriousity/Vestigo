@@ -269,6 +269,15 @@ list used only by the correlation matrix.
   unsupported comparison, illegal metric, unknown field token with `difflib`
   near-miss suggestions) and after it for silent-success cases (numeric chart over
   a non-numeric field, scatter with no numeric pairs).
+- **Derivations are validated from the registry.** `ChartSpec.derive` (the same
+  `DeriveSpec` the viz endpoints parse — `docs/VISUALIZE.md` §"Derivations") is
+  admitted only by figures whose `derives` lists its kind (bar, heatmap, pivot, sankey
+  today; the rejection names the figures that take it), never on a `time:` field
+  (already a calendar part), and forces `scale="ordinal"` — an omitted scale resolves
+  to ordinal, any other is rejected. Bins that find no numeric value after the scan are
+  rejected too, with the categorical alternative. `describe_field` reports
+  `derivations` so the model can see which apply before proposing. The resolved echo
+  carries `derive`.
 - **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
   the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
   quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
@@ -535,7 +544,8 @@ Both the slim schemas and the encoding notes reach the external `/mcp`
 surface too: `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are appended to
 `FastMCP(instructions=…)`, sharing the exact strings the in-app
 `SYSTEM_PROMPT` composes from. `tests/test_agent_schema.py` holds a budget
-guard (serialized tool list < 40,000 chars) — if a change trips it,
+guard (serialized tool list < 41,000 chars; `ChartSpec.derive` measured 39,382 →
+40,213 on 2026-08-29 and the ceiling moved by that delta) — if a change trips it,
 re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the

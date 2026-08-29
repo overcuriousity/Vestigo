@@ -109,13 +109,27 @@ Read top-down, in dependency order:
 
    The field probe pre-selects one and explains itself (`treatAsNotice`); it never overrides a
    `scale` that arrived from the URL, a saved chart or the agent.
-3. **Figure** — every figure as a thumbnail (`primitives/FigureThumbnail.tsx`). Lit when legal
-   for (treat-as, field) by the registry plus the `time:` field guard; greyed with the reason
-   in its tooltip (`lib/figureGallery.ts`: "Histogram needs Number or time or Measure."). The
-   selected figure's `question` and "how to read" line sit under the gallery.
-4. **The figure's inputs** — one block per declared key: `secondField` (Field (Y) / Group by),
+3. **Derive** — shown only when the treat-as admits a change of scale (`lib/derive.ts`
+   `deriveOptionsFor`): *Measure* offers ranges; *Number or time* offers ranges or a calendar
+   part; a `time:` field, already a calendar part, offers nothing and the section is absent.
+   Three radios — *Use the value as is* / *Group into ranges* (equal-width, log-spaced, or my
+   own edges) / *Calendar part* (hour of day, day of week, day of month, ISO week, month —
+   all UTC). With one active the rail states "now treated as ordered categories": the figure
+   gallery and every legality check run at that *effective* scale (`effectiveScale`), the bar
+   axis defaults to value order so ranges read in order, and a treat-as or field change that
+   no longer offers the derivation drops it. Clicking a **greyed** figure that exactly one
+   derivation would light applies that derivation, switches to the figure and says so in
+   `autoNotice` ("Bar needs categories — grouped attr:bytes into 8 log-spaced ranges."); when
+   two could (a *Number or time* field: ranges or a calendar part) the tile stays inert — the
+   rail never guesses. See §"Derivations" below.
+4. **Figure** — every figure as a thumbnail (`primitives/FigureThumbnail.tsx`). Lit when legal
+   for (effective treat-as, field) by the registry plus the `time:` field guard; greyed with
+   the reason in its tooltip (`lib/figureGallery.ts`: "Histogram needs Number or time or
+   Measure."), plus "Click to …" when a single derivation would light it. The selected
+   figure's `question` and "how to read" line sit under the gallery.
+5. **The figure's inputs** — one block per declared key: `secondField` (Field (Y) / Group by),
    `fields` (the correlation list).
-5. **Compare · Metric · Options** — as before; Compare is always rendered and states its
+6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
    reason when a figure has no honest two-layer encoding.
 
 Every automatic re-pick names itself in one `autoNotice` (set by the treat-as chips when they
@@ -125,20 +139,72 @@ pick, and is never shown under a live saved-chart reference (`chartRefLive`).
 What was removed: the scale radio (Nominal / Ordinal / Interval / Ratio), and the presets
 drawer — each preset's question is now its figure's `question`.
 
+## Derivations
+
+A derivation is a **change of scale and nothing else**: number → ordered ranges, or a
+timestamp-valued attribute → calendar part. Both yield the ordinal scale. There are exactly
+two kinds, and nothing in the subsystem knows what an IP address, a URL or a port *is* —
+domain parsing belongs to the enrichers, not to a chart's axis. `ChartConfig.derive` holds
+one (`{kind: "bins", mode: "width"|"log", count}` / `{kind: "bins", mode: "custom", edges}` /
+`{kind: "timePart", part}`); on the wire the kind is `time_part` (`lib/derive.ts`
+`deriveToParam`). `CHART_META[c].derives` says which figures admit one — bar, heatmap, pivot
+and sankey today, the terms-fed marks — and the registry is the only rule.
+
+**Computed in ClickHouse, before aggregation** (`db/derive.py`, threaded by
+`EventQueryService._resolve_derive`):
+
+- `width` / `log` bins come from a one-scan pre-flight (`min` / `max` / `minIf(v > 0)` over
+  the float-cast column under the same WHERE as the aggregation that follows), so the edges
+  are the *slice's* edges and the response echoes them — a chart of ranges that did not say
+  where its bins are would be a chart nobody could check. `log` cannot place a value ≤ 0, so
+  those get their own, disclosed bin (`negative_bin`). `custom` takes the analyst's edges,
+  open-ended at both ends. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`;
+  three significant digits for non-integers); the bins SQL is one `multiIf` over
+  `_finite_float_cast`.
+- `time_part` reuses `TIME_FIELD_SPECS` over `parseDateTimeBestEffortOrNull(…, 'UTC')`, so a
+  derived hour and a `time:hour_of_day` chart can never disagree — same zero-padding, same
+  ISO weekday, same UTC. A `time:` field itself is refused (HTTP 422 / `propose_chart`
+  rejection): it is already a calendar part.
+- Unparseable values (a `bytes` of `n/a`, a `logon_at` of `yesterday`) map to `''` and fall
+  out through the callers' existing `!= ''` guard, so they are in no bin and counted
+  nowhere; the caption says so.
+
+Where it is threaded: `field_terms` (`derive=`), `compare_field_terms` (`derive=` — **both
+layers are counted on the primary's resolved expression**, and that expression is part of
+the baseline-cache key, so a derived request never reads an underived layer),
+`field_value_timeseries` (`derive=`), `field_pivot` (`derive_x=` — a derived x axis is a
+**bounded domain** like a cyclical `time:` axis: every label, in order, empty or not; an
+empty range is a finding). The endpoints take `derive` (`field-terms`, `field-timeseries`),
+`derive_x` (`field-pivot`) as a JSON query parameter, and `CompareRequest.derive` (`kind:
+"terms"` only); malformed → 422 with the validator's words. A derived `field-terms` request
+never answers from the M24a field-stats cache, which holds raw values.
+
+The response echo — `derive` (or `derive_x`): `{kind, labels, mode, edges, negative_bin}` for
+bins, `{kind, labels, part, timezone: "UTC"}` for a calendar part. The frontend uses
+`labels` as the bar axis's value order (`BarChart.valueOrder`) and `edges` /
+`negative_bin` for the caption's `derived:` line, which always names what was done and what
+could not be counted (`lib/caption.ts`).
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
-  §"`propose_chart`"); the chat card renders through the same `ChartCanvas`.
+  §"`propose_chart`"); the chat card renders through the same `ChartCanvas`. `ChartSpec.derive`
+  is the same `DeriveSpec` the endpoints parse, with four rejections — a figure whose
+  `derives` lacks the kind (naming the figures that take it), a `time:` field, a `scale`
+  other than `ordinal` (an omitted one resolves to ordinal), and empty bins after the scan —
+  and `describe_field` reports `derivations` (`bins` when numeric, `time_part` always,
+  nothing for a virtual field). The card's `specToChartConfig` carries `derive` across.
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
   the schema an external client sees is the in-app one.
 - **Stories.** A `chart_ref` block stores the config beside the filters it was drawn under;
-  the export resolver crosses the casing boundary once (`_stored_chart_to_spec`).
+  the export resolver crosses the casing boundary once (`_stored_chart_to_spec`) — for
+  `derive` only the kind's casing differs (`timePart` ↔ `time_part`), tested as a round trip.
 
 ## 6. Not yet shipped
 
-Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: derivations
-(bins, calendar part) on the terms-fed figures; the table figure; marks (instants and
-windows from events, tags, confirmed findings, baseline definitions, saved views, or typed);
-the cumulative step; ranked change between two windows; the calendar heatmap; interval lanes.
+Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: the table
+figure; marks (instants and windows from events, tags, confirmed findings, baseline
+definitions, saved views, or typed); the cumulative step; ranked change between two windows;
+the calendar heatmap; interval lanes.
 Until each lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
 describe it. Geo/choropleth remains its own roadmap round.

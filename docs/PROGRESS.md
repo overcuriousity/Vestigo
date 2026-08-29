@@ -4,7 +4,49 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 201 — figure registry, ChartConfig v2, the field-first rail).
+Last updated: 2026-08-29 (session 202 — derivations: ranges and calendar parts).
+
+## Session 202 — 2026-08-29: derivations — ranges and calendar parts (viz step 2/9)
+
+Step 2 of 9 from the Visualize design round; the reference is `docs/VISUALIZE.md`
+§"Derivations". Stacked on step 1 (#324).
+
+**A derivation is a change of scale and nothing else.** `db/derive.py` owns the one
+`DeriveSpec` (two kinds: `bins` — number → ordered ranges, `width`/`log`/`custom`; and
+`time_part` — a timestamp-valued attribute → hour/weekday/day/week/month), the edge maths,
+the human labels and the SQL (one `multiIf` over `_finite_float_cast`, or the existing
+`TIME_FIELD_SPECS` expression over `parseDateTimeBestEffortOrNull(…, 'UTC')`, so a derived
+hour can never disagree with `time:hour_of_day`). Nothing knows what an IP or a URL is — that
+stays with the enrichers. Both kinds yield the ordinal scale.
+
+**Resolved once, in ClickHouse, before aggregation.** `EventQueryService._resolve_derive`
+runs the one-scan min/max pre-flight `width`/`log` bins need, under the same WHERE as the
+aggregation that follows, and returns the expression plus a `ResolvedDerive` whose `echo()`
+(`labels`, `edges`, `negative_bin` / `part`, `timezone`) rides on every response — a chart of
+ranges that did not say where its bins are would be uncheckable. `log` gives values ≤ 0
+their own disclosed bin; unparseable values map to `''` and fall out through the existing
+guard, counted nowhere, and the caption says so. Threaded through `field_terms`,
+`compare_field_terms` (both layers on the **primary's** resolved expression, which is also
+part of the baseline-cache key), `field_value_timeseries`, and `field_pivot`, where a derived
+x axis is a bounded domain like a cyclical `time:` axis — every label in order, empty or not.
+
+**Endpoints and parity.** `derive` on `field-terms` / `field-timeseries`, `derive_x` on
+`field-pivot`, `CompareRequest.derive`; malformed → 422 in the validator's words, a `time:`
+field → 422 rather than a 500; a derived terms request bypasses the M24a stats cache.
+`ChartSpec.derive` is the same model in nested-argument position (`ChartDeriveSpec`, an
+`ObjectArgModel`, so the schema-slimming and stringified-object tolerance both apply); four
+registry-driven rejections; `describe_field.derivations`. The tool-schema budget moved
+39,382 → 40,213 chars, ceiling now 41,000. Stories export round-trips `timePart` ↔
+`time_part`.
+
+**The rail.** A **Derive** step between *Treat as* and *Figure*, present only when the
+treat-as admits a change (`lib/derive.ts`). The gallery and every legality check run at the
+effective scale; a bar over ranges defaults to value order and `BarChart.valueOrder` follows
+the echoed labels rather than the alphabet; the caption gains a `derived:` line with the
+resolved edges. The greyed-figure fix deferred from step 1: clicking a greyed figure that
+exactly one derivation would light applies it and says so; with two candidates the tile
+stays inert. A derived chart also suppresses the numeric auto-probe's re-pick, which would
+otherwise have dropped it silently.
 
 ## Session 201 — 2026-08-29: figure registry, `ChartConfig` v2, the field-first rail
 
