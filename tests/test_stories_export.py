@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from vestigo.db.postgres import User, View
 from vestigo.db.queries import EventPage
 from vestigo.stories.export import _view_filter_to_spec, resolve_story_snapshot
@@ -705,3 +707,41 @@ def test_spec_to_stored_chart_config_writes_the_current_version() -> None:
 
     stored = spec_to_stored_chart_config(ChartSpec(chart_type="bar", field="artifact"))
     assert stored["v"] == CHART_CONFIG_VERSION == 2
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("stored", "spec_kind"),
+    [
+        ({"kind": "bins", "mode": "log", "count": 8}, "bins"),
+        ({"kind": "bins", "mode": "custom", "edges": [0, 1024]}, "bins"),
+        ({"kind": "timePart", "part": "weekday"}, "time_part"),
+    ],
+)
+def test_derive_round_trips_between_stored_config_and_spec(stored, spec_kind) -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "bar",
+        "scale": "ordinal",
+        "field": "attr:bytes",
+        "options": {},
+        "derive": stored,
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.derive is not None and spec.derive.kind == spec_kind
+    back = spec_to_stored_chart_config(spec)
+    assert back["derive"] == stored
+
+
+def test_stored_config_without_derive_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "bar", "scale": "nominal", "field": "x", "options": {}}
+    )
+    assert spec.derive is None
+    assert "derive" not in spec_to_stored_chart_config(spec)

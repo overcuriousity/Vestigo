@@ -223,6 +223,30 @@ _CHART_OPTION_KEYS = {
 CHART_CONFIG_VERSION = 2
 
 
+#: Stored ``ChartConfig.derive.kind`` (camelCase) ↔ ``DeriveSpec.kind``. Only
+#: ``kind`` differs in casing; ``mode``/``count``/``edges``/``part`` are shared.
+_DERIVE_KIND_TO_SPEC = {"bins": "bins", "timePart": "time_part"}
+_DERIVE_KIND_TO_STORED = {v: k for k, v in _DERIVE_KIND_TO_SPEC.items()}
+
+
+def _stored_derive_to_spec(raw: Any) -> dict[str, Any] | None:
+    """Stored derivation → ``ChartSpec.derive`` payload; an unknown shape is none."""
+    if not isinstance(raw, dict) or raw.get("kind") not in _DERIVE_KIND_TO_SPEC:
+        return None
+    out = {k: v for k, v in raw.items() if v is not None}
+    out["kind"] = _DERIVE_KIND_TO_SPEC[raw["kind"]]
+    return out
+
+
+def _spec_derive_to_stored(derive: Any) -> dict[str, Any] | None:
+    """Inverse of ``_stored_derive_to_spec``."""
+    if derive is None:
+        return None
+    out = derive.model_dump(exclude_none=True)
+    out["kind"] = _DERIVE_KIND_TO_STORED[out["kind"]]
+    return out
+
+
 def _stored_chart_to_spec(config: dict[str, Any]):
     """Translate a saved chart's stored config into an executable ChartSpec.
 
@@ -249,6 +273,10 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     }
     if spec_options:
         spec["options"] = spec_options
+
+    derive = _stored_derive_to_spec(config.get("derive"))
+    if derive:
+        spec["derive"] = derive
 
     # The primary filter layer — the Explorer filters the chart was saved
     # under, stored beside the ChartConfig keys (the frontend's
@@ -328,6 +356,10 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
         if dumped_options.get(spec_key) is not None
     }
     config["options"] = options
+
+    stored_derive = _spec_derive_to_stored(getattr(spec, "derive", None))
+    if stored_derive:
+        config["derive"] = stored_derive
 
     mode = getattr(spec.compare, "mode", "off") if spec.compare is not None else "off"
     if mode != "off":
