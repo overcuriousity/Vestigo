@@ -647,3 +647,88 @@ describe("buildCaptionLines — ranked change", () => {
     );
   });
 });
+
+describe("buildCaptionLines — interval lanes", () => {
+  const lanes = {
+    pairing: "next_end" as const,
+    lanesShown: 2,
+    lanesTotal: 3,
+    laneCapHit: true,
+    otherLanes: 1,
+    starts: 4,
+    ends: 3,
+    unpairedStarts: 1,
+    orphanEnds: 1,
+    rowsTruncated: false,
+    rowsPaired: 7,
+    rowsCap: 50000,
+    undated: 1,
+    sliceEnd: "2026-07-20T14:00:00+00:00",
+  };
+
+  it("states the pairing rule, the lane cap, the open and orphan counts and the undated", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes (one lane per value, bars from start to end)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes },
+    });
+    expect(lines).toContain(
+      "intervals of attr:host over time — Interval lanes (one lane per value, bars from start to end)",
+    );
+    expect(lines).toContain(
+      "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn",
+    );
+    expect(lines).toContain("lanes: 2 shown of 3 (top by event count); 1 more not drawn");
+    expect(lines).toContain(
+      "starts: 4 · ends: 3 — 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+    );
+    expect(lines).toContain("1 undated event not drawn");
+    expect(lines.some((l) => l?.startsWith("first "))).toBe(false);
+  });
+
+  it("first-to-last states its own rule and skips the start/end line; the row cap is disclosed", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "lanes", field: "attr:host" },
+      facts: {
+        lanes: {
+          ...lanes,
+          pairing: "first_last",
+          lanesShown: 3,
+          laneCapHit: false,
+          otherLanes: 0,
+          starts: 0,
+          ends: 0,
+          unpairedStarts: 0,
+          orphanEnds: 0,
+          undated: 0,
+        },
+      },
+    });
+    expect(lines).toContain("pairing: first to last — one bar per lane, from its first event to its last");
+    expect(lines).toContain("lanes: 3");
+    expect(lines.some((l) => l?.startsWith("starts:"))).toBe(false);
+    expect(lines.some((l) => l?.includes("undated"))).toBe(false);
+    const truncated = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes: { ...lanes, rowsTruncated: true, rowsPaired: 50000, rowsCap: 50000 } },
+    });
+    expect(truncated).toContain(
+      "first 50,000 start/end events (by time) paired — the row cap; later ones not drawn",
+    );
+  });
+});

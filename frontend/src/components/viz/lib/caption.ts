@@ -55,6 +55,23 @@ export interface CaptionFacts {
     newCount: number;
     vanishedCount: number;
   };
+  /** kind=lanes: the pairing rule's inputs and every cap. */
+  lanes?: {
+    pairing: "first_last" | "next_end";
+    lanesShown: number;
+    lanesTotal: number;
+    laneCapHit: boolean;
+    otherLanes: number;
+    starts: number;
+    ends: number;
+    unpairedStarts: number;
+    orphanEnds: number;
+    rowsTruncated: boolean;
+    rowsPaired: number;
+    rowsCap: number;
+    undated: number;
+    sliceEnd: string | null;
+  };
   /** kind=terms/timeseries: top-N truthfulness. */
   distinct?: number;
   shownValues?: number;
@@ -187,8 +204,10 @@ export function buildCaptionLines(args: {
   lines.push(
     facts.focusedValue != null && field
       ? `field: ${field} = ${facts.focusedValue}`
-      : chartType === "change" && field
-        ? `share-of-window change of ${field}${
+      : chartType === "lanes" && field
+        ? `intervals of ${field} over time — ${chartLabel}`
+        : chartType === "change" && field
+          ? `share-of-window change of ${field}${
             config.derive ? ` (${scale} → ordered categories)` : ""
           } between two windows — ${chartLabel}`
         : chartType === "time"
@@ -266,6 +285,35 @@ export function buildCaptionLines(args: {
       lines.push(
         `union capped at ${fmtInt(c.rowsShown)} of ${fmtInt(c.unionSize)} values; the ${fmtInt(c.omitted)} with the smallest change not drawn`,
       );
+    }
+  }
+
+  // Interval lanes: the pairing rule in one sentence, then every cap — the
+  // reader must be able to say what a bar means and what is not on the canvas.
+  if (facts.lanes) {
+    const l = facts.lanes;
+    lines.push(
+      l.pairing === "next_end"
+        ? "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn"
+        : "pairing: first to last — one bar per lane, from its first event to its last",
+    );
+    lines.push(
+      l.laneCapHit
+        ? `lanes: ${fmtInt(l.lanesShown)} shown of ${fmtInt(l.lanesTotal)} (top by event count); ${fmtInt(l.otherLanes)} more not drawn`
+        : `lanes: ${fmtInt(l.lanesShown)}`,
+    );
+    if (l.pairing === "next_end") {
+      lines.push(
+        `starts: ${fmtInt(l.starts)} · ends: ${fmtInt(l.ends)} — ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
+      );
+      if (l.rowsTruncated) {
+        lines.push(
+          `first ${fmtInt(l.rowsPaired)} start/end events (by time) paired — the row cap; later ones not drawn`,
+        );
+      }
+    }
+    if (l.undated > 0) {
+      lines.push(`${fmtInt(l.undated)} undated event${l.undated === 1 ? "" : "s"} not drawn`);
     }
   }
 

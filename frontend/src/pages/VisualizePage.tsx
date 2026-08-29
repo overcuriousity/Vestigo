@@ -65,6 +65,7 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import { RankedChange } from "@/components/viz/charts/RankedChange";
+import { IntervalLanes } from "@/components/viz/charts/IntervalLanes";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -112,6 +113,7 @@ import { NumericStatStrip } from "@/components/viz/NumericStatStrip";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import type {
   ChangeResponse,
+  LanesResponse,
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
@@ -374,6 +376,9 @@ export function VisualizePage() {
   // one, the field's values with one. Probed like a bar when a field is set.
   const fieldOptional = CHART_META[chartType].inputs.field === "optional";
   const compareOn = config.compare.mode !== "off";
+  const lanesPairing = config.inputs.pairing ?? "firstLast";
+  const lanesReady =
+    lanesPairing === "firstLast" || (!!config.inputs.startFilter && !!config.inputs.endFilter);
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
       ? { mode: "baseline" }
@@ -823,6 +828,21 @@ export function VisualizePage() {
     ...busyRetry,
   });
 
+  const lanesQuery = useQuery({
+    queryKey: ["viz-lanes", caseId, timelineId, field, filters, config.inputs, limitY],
+    queryFn: async () =>
+      (await vizApi.lanes(caseId!, timelineId!, {
+        field: field!,
+        pairing: lanesPairing,
+        primary: filters,
+        startFilter: lanesPairing === "nextEnd" ? config.inputs.startFilter : undefined,
+        endFilter: lanesPairing === "nextEnd" ? config.inputs.endFilter : undefined,
+        limitY,
+      })) as LanesResponse,
+    enabled: scopeReady && !!field && dataKind === "lanes" && lanesReady,
+    ...busyRetry,
+  });
+
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
   // — switching between those chart types refetches nothing.
   const tableQuery = useQuery({
@@ -1010,6 +1030,24 @@ export function VisualizePage() {
       newCount: d.rows.filter((r) => r.status === "new").length,
       vanishedCount: d.rows.filter((r) => r.status === "vanished").length,
     };
+  } else if (dataKind === "lanes" && lanesQuery.data) {
+    const d = lanesQuery.data;
+    facts.lanes = {
+      pairing: d.pairing,
+      lanesShown: d.lanes.length,
+      lanesTotal: d.lanes_total,
+      laneCapHit: d.lane_cap_hit,
+      otherLanes: d.other_lanes,
+      starts: d.starts,
+      ends: d.ends,
+      unpairedStarts: d.unpaired_starts,
+      orphanEnds: d.orphan_ends,
+      rowsTruncated: d.rows_truncated,
+      rowsPaired: d.rows_paired,
+      rowsCap: d.rows_cap,
+      undated: d.undated,
+      sliceEnd: d.slice_end,
+    };
   } else if (dataKind === "table" && tableQuery.data) {
     facts.primaryTotal = tableQuery.data.total;
     facts.tableTotal = tableQuery.data.total;
@@ -1135,6 +1173,8 @@ export function VisualizePage() {
                   ? calendarQuery
                   : dataKind === "change"
                     ? changeQuery
+                  : dataKind === "lanes"
+                    ? lanesQuery
                   : dataKind === "pivot"
                     ? pivotQuery
                     : dataKind === "table"
@@ -1260,6 +1300,11 @@ export function VisualizePage() {
         ) : dataKind === "change" && !compareOn ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
             Ranked change needs a second window — turn on Compare (Baseline or Custom filters).
+          </div>
+        ) : dataKind === "lanes" && field && !lanesReady ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-sm text-[var(--color-fg-muted)]">
+            Start → next end pairing needs a start filter and an end filter — set both under the
+            figure's inputs.
           </div>
         ) : !fieldFree && !fieldOptional && !multiField && !field ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
@@ -1503,6 +1548,9 @@ export function VisualizePage() {
             )}
             {chartType === "change" && changeQuery.data && (
               <RankedChange data={changeQuery.data} layout={layout} svgRef={svgRef} />
+            )}
+            {chartType === "lanes" && lanesQuery.data && (
+              <IntervalLanes data={lanesQuery.data} marks={marksQuery.data?.marks} svgRef={svgRef} />
             )}
             {chartType === "table" && tableQuery.data && (
               <TableFigure
