@@ -23,6 +23,7 @@ const CHART_TYPES = Object.keys(CHART_META) as ChartType[];
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
+import deepLink from "./fixtures/viz-deep-link.json";
 
 describe("specToEventFilters", () => {
   it("maps every FilterSpec field onto EventFilters", () => {
@@ -552,5 +553,13 @@ describe("specToChartConfig — inputs", () => {
       }).inputs,
     ).toEqual({ columns: ["count", "share"] });
     expect(specToChartConfig({ chart_type: "bar", field: "a" }).inputs).toEqual({});
+  });
+});
+
+describe("open_url — the page parses the backend's deep link back to the same chart", () => {
+  it("round-trips config and filters through the URL the agent hands an external client", () => {
+    const params = new URLSearchParams(deepLink.url.split("?")[1]);
+    expect(paramsToChartConfig(params)).toEqual(deepLink.config);
+    expect(paramsToFilters(params)).toEqual(deepLink.filters);
   });
 });

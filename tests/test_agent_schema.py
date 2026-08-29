@@ -41,7 +41,9 @@ from vestigo.db.postgres import User
 # and update docs/AGENT.md rather than just raising the number.
 # 2026-08-29: `ChartSpec.derive` (viz step 2) measured 39,382 → 40,213, so
 # the ceiling moved by that delta (recorded in docs/AGENT.md).
-SCHEMA_BUDGET_CHARS = 41_000
+# 2026-08-29: 40,953 → 41,947 with ChartMarkSpec / ChartSpec.marks and `open_url`
+# (viz plan A); ceiling moved by that delta.
+SCHEMA_BUDGET_CHARS = 42_000
 
 
 def _scope(case_id: str = "c1", timeline_id: str = "t1") -> AgentScope:

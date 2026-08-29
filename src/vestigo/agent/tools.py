@@ -851,6 +851,13 @@ are in this payload). When they differ the list was capped — say so rather
 than reasoning as if you had seen all of them.
 """
 
+SCALE_VOCABULARY_NOTE = """## Scale vocabulary
+
+The analyst's Visualize page calls `scale` "treat as": nominal = *Categories*, ordinal =
+*Ordered categories*, interval = *Number or time*, ratio = *Measure*. The wire format is
+the Stevens term; use the plain phrase only when speaking to the analyst.
+"""
+
 
 @dataclass
 class AgentScope:
@@ -1335,7 +1342,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "Read-only forensic log investigation tools, scoped to one case "
             "timeline. Iterate: inspect fields, search, aggregate, then "
             "return refined filters as findings.\n\n"
-            f"{RESULT_FORMAT_NOTE}\n{SPEC_REFERENCE}"
+            f"{RESULT_FORMAT_NOTE}\n{SCALE_VOCABULARY_NOTE}\n{SPEC_REFERENCE}"
         ),
     )
     service = _get_query_service()
@@ -1957,6 +1964,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         any limit clamped for the validation query. Those clamps bound *this*
         call's result size for your context only — the analyst's card is drawn
         at the full size you asked for.
+
+        `open_url` is the Visualize page link for this exact figure — hand it
+        to a human when you are not running inside the app.
         """
         payload = await execute_chart_spec(
             scope, spec, service=service, validated=_validated, check_field=_check_chart_field
@@ -1967,6 +1977,17 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # The card resolves its own marks through POST …/viz/marks from the
         # same config; the summary carries what the model needs.
         payload.pop("marks", None)
+
+        from vestigo.agent.deep_link import visualize_url
+        from vestigo.stories.export import _spec_filters_to_payload, spec_to_stored_chart_config
+
+        # External /mcp clients get no card: this is the exact figure, as a link.
+        payload["open_url"] = visualize_url(
+            scope.case_id,
+            scope.timeline_id,
+            spec_to_stored_chart_config(spec),
+            _spec_filters_to_payload(spec.filters),
+        )
         return payload
 
     if scope.conversation_id is not None:

@@ -3011,3 +3011,13 @@ async def test_execute_chart_spec_carries_resolved_marks_for_the_export(store, m
         "provenance": {"kind": "analyst"},
     }
     assert envelope["marks"]["cap"] == 50  # viz_marks_max default under the analyst limits
+
+
+async def test_propose_chart_returns_the_visualize_deep_link(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "time", "filters": {"q": "4624"}})
+    )
+    assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
+    assert "q=4624" in result["open_url"] and "c_type=time" in result["open_url"]

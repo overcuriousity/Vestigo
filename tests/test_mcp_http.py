@@ -278,3 +278,53 @@ def test_mcp_tools_list_respects_admin_disabled(mcp_client, admin_bootstrap, mon
         assert "list_saved_views" in names
     finally:
         get_settings.cache_clear()
+
+
+def test_mcp_propose_chart_hands_an_external_client_the_visualize_url(
+    mcp_client, admin_bootstrap, monkeypatch
+):
+    import vestigo.api.routers.events as events_router
+    from tests.test_agent_tools import _FakeChartService
+
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: _FakeChartService())
+    as_admin(mcp_client, admin_bootstrap)
+    case_id, tl_id, token = _setup_token(mcp_client)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": f"Bearer {token}",
+    }
+    init = _rpc_initialize(mcp_client, token)
+    assert init.status_code == 200, init.text
+    session_id = init.headers.get("mcp-session-id")
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    called = mcp_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "propose_chart",
+                "arguments": {
+                    "title": "t",
+                    "description": "",
+                    "spec": {
+                        "chart_type": "time",
+                        "marks": [
+                            {
+                                "kind": "instant",
+                                "at": "2026-03-13T09:41:00Z",
+                                "label": "first beacon",
+                            }
+                        ],
+                    },
+                },
+            },
+        },
+        headers=headers,
+    )
+    assert called.status_code == 200, called.text
+    assert f"/cases/{case_id}/timelines/{tl_id}/visualize?" in called.text
+    assert "c_marks=" in called.text
