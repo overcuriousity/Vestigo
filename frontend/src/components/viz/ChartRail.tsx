@@ -29,7 +29,7 @@ import { SavedChartsRail } from "./SavedChartsRail";
 import { ExplainerPopover } from "./primitives/ExplainerPopover";
 import { FigureThumbnail } from "./primitives/FigureThumbnail";
 import type { CorrMethod } from "./charts/CorrMatrix";
-import type { ChartConfig, ChartType, Scale } from "./lib/chartConfig";
+import type { ChartConfig, ChartType, DeriveSpec, Scale, TimePart } from "./lib/chartConfig";
 import {
   CHART_META,
   SCALES,
@@ -50,6 +50,15 @@ import { isTimeField } from "./lib/timeFields";
 import { CHART_HOW_TO_READ } from "./lib/explainers";
 import { SCALE_DISPLAY, scaleTooltip } from "./lib/scaleDisplay";
 import { galleryEntries } from "./lib/figureGallery";
+import {
+  defaultDerive,
+  deriveOptionsFor,
+  describeDerive,
+  effectiveScale,
+  singleFixFor,
+  TIME_PART_LABELS,
+  type DeriveKind,
+} from "./lib/derive";
 
 export interface ChartRailProps {
   caseId: string;
@@ -254,6 +263,54 @@ function TopNInput({
   );
 }
 
+/** Comma-separated edges, committed on blur/Enter when they parse as a
+ * strictly increasing list; otherwise the draft stays and says why. */
+function EdgesInput({
+  edges,
+  onCommit,
+}: {
+  edges: number[];
+  onCommit: (edges: number[]) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const shown = draft ?? edges.join(", ");
+  const commit = () => {
+    const parsed = shown
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== "")
+      .map(Number);
+    const ok =
+      parsed.length > 0 &&
+      parsed.every((n, i) => Number.isFinite(n) && (i === 0 || n > parsed[i - 1]));
+    if (!ok) {
+      setProblem("Edges must be numbers in increasing order, e.g. 0, 1024, 10240");
+      return;
+    }
+    setProblem(null);
+    setDraft(null);
+    onCommit(parsed);
+  };
+  return (
+    <div>
+      <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">Edges</label>
+      <input
+        type="text"
+        aria-label="Range edges"
+        value={shown}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+      />
+      {problem && <p className="mt-1 text-xs text-[var(--color-warning)]">{problem}</p>}
+    </div>
+  );
+}
+
 /**
  * The Top-values control: a slider over the range most charts want, the exact
  * box beside it as the escape hatch to the chart type's ceiling (#297), and
@@ -420,25 +477,54 @@ export function ChartRail({
    * the defaulting effect refill it with a field nobody picked. */
   const [fieldYTaken, setFieldYTaken] = useState<string | null>(null);
 
+  // A derivation is a change of scale: the field is treated as `scale`, but
+  // the figure sees `effScale` — ordered categories whenever one is active.
+  const derive = config.derive;
+  const deriveKinds = deriveOptionsFor(scale, field);
+  const effScale = effectiveScale(scale, derive);
+
   // Keep chartType valid when the analyst changes what the field is treated
   // as — clamped at event time rather than in an effect, so there is never a
   // render with an inconsistent scale/chartType pair.
   const handleScaleChange = (s: Scale) => {
-    if (!chartTypesForField(s, field).includes(chartType)) {
-      const next = defaultChartTypeForScale(s, field);
-      updateConfig({ scale: s, chartType: next });
+    // A derivation the new treat-as no longer offers is dropped with it.
+    const nextDerive = derive && deriveOptionsFor(s, field).includes(derive.kind) ? derive : null;
+    const eff = effectiveScale(s, nextDerive);
+    const patch: Partial<ChartConfig> = { scale: s };
+    if (nextDerive !== derive) patch.derive = nextDerive;
+    if (!chartTypesForField(eff, field).includes(chartType)) {
+      const next = defaultChartTypeForScale(eff, field);
+      updateConfig({ ...patch, chartType: next });
       // Say which of the two reasons forced the re-pick: blaming the scale for
       // a clamp the *field* forced is a false statement about the chart.
-      const legalForScale = chartTypesFor(s).includes(chartType);
+      const legalForScale = chartTypesFor(eff).includes(chartType);
       setAutoNotice(
         legalForScale && field
           ? `Figure switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} can't plot ${fieldTokenLabel(field)}.`
           : `Figure switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available for a field treated as ${SCALE_DISPLAY[s].label.toLowerCase()}.`,
       );
     } else {
-      updateConfig({ scale: s });
+      updateConfig(patch);
       setAutoNotice(null);
     }
+  };
+
+  /** Apply *next* (or none). A derived field is ordered categories, so the
+   * figure is re-picked at that scale when the current one is illegal there,
+   * and the bar axis defaults to value order — ranges read in order. */
+  const applyDerive = (next: DeriveSpec | null, chartOverride?: ChartType) => {
+    const eff = effectiveScale(scale, next);
+    const patch: Partial<ChartConfig> = { derive: next };
+    const target = chartOverride ?? chartType;
+    if (!chartTypesForField(eff, field).includes(target)) {
+      patch.chartType = defaultChartTypeForScale(eff, field);
+    } else if (chartOverride) {
+      patch.chartType = chartOverride;
+    }
+    if (next && (patch.chartType ?? chartType) === "bar" && config.options.sort == null) {
+      patch.options = { ...config.options, sort: "value" };
+    }
+    updateConfig(patch);
   };
 
   const fieldOptions: FieldComboOption[] = [
@@ -525,6 +611,8 @@ export function ChartRail({
             const patch: Partial<ChartConfig> = takesOverY
               ? { field: v, fieldY: null }
               : { field: v };
+            // A derivation the new field does not offer goes with the old one.
+            if (derive && !deriveOptionsFor(scale, v).includes(derive.kind)) patch.derive = null;
             if (fieldFree) {
               // Leaving a field-free figure: land on the first figure that
               // charts a field, and say so — the analyst picked a field, not
@@ -593,6 +681,123 @@ export function ChartRail({
         )}
       </fieldset>
 
+      {/* Derive — a change of scale, offered only where the treat-as admits
+          one (a measure → ranges; a number or time → ranges or a calendar
+          part; never a `time:` field, which is already a part). Computed in
+          ClickHouse before aggregation; the caption names the edges. */}
+      {deriveKinds.length > 0 && (
+        <fieldset data-rail-section="derive" role="group" aria-label="Derive">
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Derive
+          </label>
+          <div className="space-y-1">
+            {(
+              [
+                { key: null, label: "Use the value as is" },
+                ...(deriveKinds.includes("bins")
+                  ? [{ key: "bins" as const, label: "Group into ranges" }]
+                  : []),
+                ...(deriveKinds.includes("timePart")
+                  ? [{ key: "timePart" as const, label: "Calendar part" }]
+                  : []),
+              ] as { key: DeriveKind | null; label: string }[]
+            ).map((opt) => (
+              <label
+                key={opt.key ?? "none"}
+                className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
+                  (derive?.kind ?? null) === opt.key
+                    ? "bg-[var(--color-accent-dim)]"
+                    : "hover:bg-[var(--color-bg-hover)]"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="derive"
+                  aria-label={opt.label}
+                  checked={(derive?.kind ?? null) === opt.key}
+                  onChange={() => applyDerive(opt.key ? defaultDerive(opt.key, scale) : null)}
+                  className="accent-[var(--color-accent)]"
+                />
+                {opt.label}
+              </label>
+            ))}
+          </div>
+          {derive?.kind === "bins" && (
+            <div className="mt-2 space-y-2">
+              <Select
+                value={derive.mode}
+                onValueChange={(v) =>
+                  applyDerive(
+                    v === "custom"
+                      ? { kind: "bins", mode: "custom", edges: [0] }
+                      : {
+                          kind: "bins",
+                          mode: v as "width" | "log",
+                          count: derive.mode === "custom" ? 8 : derive.count,
+                        },
+                  )
+                }
+              >
+                <SelectTrigger className="h-7 text-xs" aria-label="Range spacing">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="width">Equal-width ranges</SelectItem>
+                  <SelectItem value="log">Log-spaced ranges (bytes, durations)</SelectItem>
+                  <SelectItem value="custom">My own edges</SelectItem>
+                </SelectContent>
+              </Select>
+              {derive.mode !== "custom" ? (
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Ranges: {derive.count}
+                  </label>
+                  <input
+                    type="range"
+                    aria-label="Number of ranges"
+                    min={2}
+                    max={50}
+                    step={1}
+                    value={derive.count}
+                    onChange={(e) =>
+                      applyDerive({ kind: "bins", mode: derive.mode, count: Number(e.target.value) })
+                    }
+                    className="w-full accent-[var(--color-accent)]"
+                  />
+                </div>
+              ) : (
+                <EdgesInput
+                  edges={derive.edges}
+                  onCommit={(edges) => applyDerive({ kind: "bins", mode: "custom", edges })}
+                />
+              )}
+            </div>
+          )}
+          {derive?.kind === "timePart" && (
+            <Select
+              value={derive.part}
+              onValueChange={(v) => applyDerive({ kind: "timePart", part: v as TimePart })}
+            >
+              <SelectTrigger className="mt-2 h-7 text-xs" aria-label="Calendar part">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(TIME_PART_LABELS) as TimePart[]).map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {TIME_PART_LABELS[p]} (UTC)
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {derive && (
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+              {describeDerive(derive)} — now treated as ordered categories.
+            </p>
+          )}
+        </fieldset>
+      )}
+
       {/* Figure — every figure, lit when legal for (field, treat-as); a greyed
           one carries its reason as the tooltip rather than vanishing. */}
       <div data-rail-section="figure">
@@ -604,8 +809,12 @@ export function ChartRail({
           aria-label="Figure"
           className="grid grid-cols-3 gap-1"
         >
-          {galleryEntries(scale, field).map(
-            ({ chartType: c, legal, reason }) => (
+          {galleryEntries(effScale, field).map(({ chartType: c, legal, reason }) => {
+            // A greyed figure that exactly one derivation would light applies
+            // it on click and says so; two candidates would be a guess, so
+            // the tile stays inert and its tooltip stays the reason.
+            const fix = legal ? null : singleFixFor(c, scale, field);
+            return (
               <Button
                 key={c}
                 variant="ghost"
@@ -614,18 +823,35 @@ export function ChartRail({
                 aria-checked={chartType === c}
                 aria-disabled={!legal}
                 aria-label={CHART_META[c].label}
-                title={reason ?? CHART_META[c].question}
+                title={
+                  fix && reason
+                    ? `${reason} Click to ${describeDerive(fix)}.`
+                    : (reason ?? CHART_META[c].question)
+                }
                 onClick={() => {
-                  if (!legal) return;
-                  updateConfig({ chartType: c });
-                  setAutoNotice(null);
+                  if (legal) {
+                    updateConfig({ chartType: c });
+                    setAutoNotice(null);
+                    return;
+                  }
+                  if (!fix || !field) return;
+                  applyDerive(fix, c);
+                  setAutoNotice(
+                    `${CHART_META[c].label} needs categories — ${
+                      fix.kind === "timePart"
+                        ? `took the ${TIME_PART_LABELS[fix.part]} (UTC) of ${fieldTokenLabel(field)}`
+                        : describeDerive(fix).replace(/^grouped/, `grouped ${fieldTokenLabel(field)}`)
+                    }.`,
+                  );
                 }}
                 className={`flex h-auto flex-col items-center gap-0.5 rounded border px-1 py-1.5 ${
                   chartType === c
                     ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-fg-primary)]"
                     : legal
                       ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
-                      : "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40"
+                      : fix
+                        ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40 hover:opacity-70"
+                        : "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40"
                 }`}
               >
                 <FigureThumbnail chartType={c} />
@@ -633,8 +859,8 @@ export function ChartRail({
                   {shortLabel(c)}
                 </span>
               </Button>
-            ),
-          )}
+            );
+          })}
         </div>
         <p className="mt-1 text-xs text-[var(--color-fg-secondary)]">
           {CHART_META[chartType].question}

@@ -211,3 +211,86 @@ describe("ChartRail", () => {
     }
   });
 });
+
+describe("ChartRail — Derive", () => {
+  it("offers Derive only where the treat-as admits one, between Treat as and Figure", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "histogram", field: "attr:bytes", scale: "ratio" });
+    expect(sectionOrder().slice(1, 4)).toEqual(["field", "scale", "derive"]);
+    document.body.innerHTML = "";
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "bar", field: "artifact", scale: "nominal" });
+    expect(sectionOrder()).not.toContain("derive");
+  });
+
+  it("grouping into ranges makes the field ordered categories and lights the category figures", () => {
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Group into ranges" }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      derive: { kind: "bins", mode: "log", count: 8 },
+      chartType: "bar",
+      options: { sort: "value" },
+    });
+  });
+
+  it("with a derivation active, the gallery judges legality at the derived scale", () => {
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "attr:bytes",
+      scale: "ratio",
+      derive: { kind: "bins", mode: "log", count: 8 },
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    expect(within(gallery).getByRole("radio", { name: "Bar" }).getAttribute("aria-disabled")).toBe("false");
+    expect(within(gallery).getByRole("radio", { name: "Histogram" }).getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText(/now treated as ordered categories/i)).toBeTruthy();
+  });
+
+  it("clicking a greyed figure applies the one derivation that lights it, and says so", () => {
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: "Bar" }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      chartType: "bar",
+      derive: { kind: "bins", mode: "log", count: 8 },
+      options: { sort: "value" },
+    });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      "Bar needs categories — grouped attr:bytes into 8 log-spaced ranges.",
+    );
+  });
+
+  it("leaves a greyed figure alone when two derivations could light it", () => {
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "heatmap",
+      field: "attr:logon_at",
+      scale: "interval",
+      // heatmap is legal at interval; pie is not, and admits no derivation at all
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: "Pie / Donut" }));
+    expect(updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("changing treat-as to categories drops a derivation that no longer applies", () => {
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "attr:bytes",
+      scale: "ratio",
+      derive: { kind: "bins", mode: "log", count: 8 },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Categories" }));
+    expect(updateConfig).toHaveBeenCalledWith({ scale: "nominal", derive: null });
+  });
+});
