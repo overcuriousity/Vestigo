@@ -90,6 +90,8 @@ import {
   resolveChartOptions,
   defaultChartTypeForScale,
   chartTypesForField,
+  TOPN_MAX,
+  TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
@@ -1550,17 +1552,47 @@ export function VisualizePage() {
             <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Top values: {topN}
             </label>
-            <input
-              type="range"
-              min={3}
-              max={dataKind === "timeseries" ? 20 : 50}
-              step={1}
-              value={topN}
-              onChange={(e) =>
-                updateConfig({ options: { ...config.options, topN: Number(e.target.value) } })
-              }
-              className="w-full accent-[var(--color-accent)]"
-            />
+            <div className="flex items-center gap-2">
+              {/* The slider covers the range most charts want; the number
+                  beside it is the escape hatch up to this chart type's
+                  ceiling, so asking for 300 bars does not need 300 pixels of
+                  slider travel (#297). */}
+              <input
+                type="range"
+                min={3}
+                max={TOPN_SLIDER_MAX[chartType]}
+                step={1}
+                value={Math.min(topN, TOPN_SLIDER_MAX[chartType])}
+                onChange={(e) =>
+                  updateConfig({ options: { ...config.options, topN: Number(e.target.value) } })
+                }
+                className="min-w-0 flex-1 accent-[var(--color-accent)]"
+              />
+              <input
+                type="number"
+                min={1}
+                max={TOPN_MAX[chartType]}
+                step={1}
+                value={topN}
+                onChange={(e) => {
+                  const raw = Number(e.target.value);
+                  if (!Number.isFinite(raw)) return;
+                  updateConfig({
+                    options: {
+                      ...config.options,
+                      topN: Math.max(1, Math.min(Math.round(raw), TOPN_MAX[chartType])),
+                    },
+                  });
+                }}
+                aria-label="Top values (exact)"
+                className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+              />
+            </div>
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+              {dataKind === "timeseries"
+                ? `Up to ${TOPN_MAX[chartType]} — each value is its own series, so a crowded chart stops being readable well before that.`
+                : `Up to ${TOPN_MAX[chartType]} — past the slider's ${TOPN_SLIDER_MAX[chartType]}, type an exact number.`}
+            </p>
           </div>
         )}
         {dataKind === "pivot" && (

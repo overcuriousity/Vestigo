@@ -75,13 +75,64 @@ export interface ResolvedChartOptions {
   showPoints: boolean;
 }
 
+/**
+ * Hard ceiling on `options.topN`, per chart type.
+ *
+ * Two different things bound it. The *backend* caps `field-terms` at 500 and
+ * `field-timeseries`' `series_limit` at 50, so nothing above those is even
+ * fetchable — the timeseries charts sit at their endpoint's ceiling. The rest
+ * is legibility: a bar axis can carry hundreds of rows in a scroll container,
+ * while a pie past a few dozen slices is unreadable whatever the slider
+ * permits (`pieReadability.ts`) and a waffle only has 100 cells to share out.
+ *
+ * These match `ANALYST_CHART_LIMITS` in `agent/chart_exec.py`, so an exported
+ * chart freezes what the analyst could ask for by hand rather than a smaller
+ * subset of it.
+ */
+export const TOPN_MAX: Record<ChartType, number> = {
+  time: 50,
+  bar: 500,
+  pie: 50,
+  waffle: 50,
+  heatmap: 50,
+  line: 50,
+  histogram: 50,
+  box: 50,
+  violin: 50,
+  ecdf: 50,
+  punchcard: 50,
+  pivot: 50,
+  sankey: 50,
+  scatter: 50,
+  corr: 50,
+};
+
+/**
+ * Where the *slider* stops. The slider is the fast path over the range an
+ * analyst wants most of the time; the numeric input beside it is the escape
+ * hatch up to `TOPN_MAX`, so raising the ceiling does not cost slider
+ * precision in the common range.
+ */
+export const TOPN_SLIDER_MAX: Record<ChartType, number> = {
+  ...TOPN_MAX,
+  bar: 50,
+  pie: 25,
+  waffle: 25,
+  heatmap: 20,
+  line: 20,
+};
+
+export function topNMax(chartType: ChartType): number {
+  return TOPN_MAX[chartType] ?? 50;
+}
+
 export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
   const { options } = config;
-  const dataKind = CHART_META[config.chartType].dataKind;
   return {
-    // Value-over-time charts draw one line per value, so they cap lower than
-    // a bar chart's axis does.
-    topN: Math.min(options.topN ?? 10, dataKind === "timeseries" ? 20 : 50),
+    // Per chart type (see TOPN_MAX): a bar axis reaches the backend's 500,
+    // while a value-over-time chart draws one line per value and stops at its
+    // endpoint's series ceiling.
+    topN: Math.min(options.topN ?? 10, topNMax(config.chartType)),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
     limitX: options.limitX ?? 10,

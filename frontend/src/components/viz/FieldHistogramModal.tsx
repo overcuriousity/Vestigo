@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
+import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -20,6 +21,16 @@ import { buildCaptionLines } from "@/components/viz/lib/caption";
 import type { EventFilters } from "@/api/types";
 
 const BUCKET_OPTIONS = [30, 60, 100, 150] as const;
+
+/** Rows added per click of the "+ N more" expander. */
+const TERMS_PAGE = 50;
+/**
+ * Hard ceiling on the expanded top-list, matching the `field-terms` endpoint's
+ * own `limit` cap. The list is a scroll container, so an unbounded expansion on
+ * a field with a million distinct values is its own problem (#296); past this
+ * the tail stays reported as a count rather than rendered as rows.
+ */
+const TERMS_MAX = 500;
 
 interface Props {
   open: boolean;
@@ -53,6 +64,7 @@ export function FieldHistogramModal({
   onAddFilter,
 }: Props) {
   const [activeValue, setActiveValue] = useState(value);
+  const [termsLimit, setTermsLimit] = useState(TERMS_PAGE);
   const [buckets, setBuckets] = useState<(typeof BUCKET_OPTIONS)[number]>(60);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
@@ -62,6 +74,7 @@ export function FieldHistogramModal({
   if (lastResetKey.current !== resetKey) {
     lastResetKey.current = resetKey;
     setActiveValue(value);
+    setTermsLimit(TERMS_PAGE);
   }
 
   const totalHistogramQuery = useQuery({
@@ -103,11 +116,18 @@ export function FieldHistogramModal({
   });
 
   const termsQuery = useQuery({
-    queryKey: ["field-terms", caseId, timelineId, fieldKey, filters],
-    queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, 50),
+    queryKey: ["field-terms", caseId, timelineId, fieldKey, filters, termsLimit],
+    queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, termsLimit),
     enabled: open,
+    // Expanding the list re-asks for a longer prefix rather than appending a
+    // page, so the already-shown rows must stay on screen while the bigger
+    // answer is in flight — otherwise every click blanks the list. The window
+    // aggregation recomputes `other_count` for the new limit, so the tail
+    // count stays truthful after each expansion.
+    placeholderData: keepPreviousData,
     ...busyRetry,
   });
+  const canExpandTerms = termsLimit < TERMS_MAX;
   // In-flight busy-lane signals (#300): shown beside the spinner while retrying.
   const histogramWaiting = busyMessage(
     histogramQuery.failureReason ?? totalHistogramQuery.failureReason,
@@ -300,7 +320,28 @@ export function FieldHistogramModal({
                   ))}
                   {termsQuery.data && termsQuery.data.other_count > 0 && (
                     <li className="px-1 py-1 text-[var(--color-fg-muted)]">
-                      + {termsQuery.data.other_count.toLocaleString()} more in other values
+                      {canExpandTerms ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-auto w-full justify-start gap-1.5 whitespace-normal px-0.5 py-0 text-left text-xs font-normal text-[var(--color-fg-muted)] underline decoration-dotted underline-offset-2"
+                          disabled={termsQuery.isFetching}
+                          onClick={() =>
+                            setTermsLimit((n) => Math.min(n + TERMS_PAGE, TERMS_MAX))
+                          }
+                          title={`Load ${Math.min(TERMS_PAGE, TERMS_MAX - termsLimit)} more values`}
+                        >
+                          {termsQuery.isFetching && <Spinner size={11} />}+{" "}
+                          {termsQuery.data.other_count.toLocaleString()} more in other values —
+                          show {Math.min(TERMS_PAGE, TERMS_MAX - termsLimit).toLocaleString()} more
+                        </Button>
+                      ) : (
+                        <>
+                          + {termsQuery.data.other_count.toLocaleString()} more in other values
+                          (showing the top {TERMS_MAX.toLocaleString()}; filter the view to reach
+                          the rest)
+                        </>
+                      )}
                     </li>
                   )}
                 </ul>

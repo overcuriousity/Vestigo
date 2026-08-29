@@ -10,6 +10,8 @@ import {
   resolveChartOptions,
   defaultChartTypeForScale,
   chartTypesForField,
+  TOPN_MAX,
+  TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
 import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
@@ -48,13 +50,24 @@ describe("resolveChartOptions", () => {
     expect(resolved.sort).toBe("value");
   });
 
-  it("caps topN lower for value-over-time charts than for a bar axis", () => {
-    // One line per value, so a timeseries caps at 20 where a bar caps at 50.
-    expect(resolveChartOptions(config({ chartType: "line", options: { topN: 999 } })).topN).toBe(20);
+  it("caps topN per chart type, lower for value-over-time and pie than for a bar axis", () => {
+    // A bar axis reaches the field-terms endpoint's 500; a timeseries stops at
+    // the series_limit ceiling of 50; a pie is bounded by legibility, not by
+    // what is fetchable.
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 999 } })).topN).toBe(500);
+    expect(resolveChartOptions(config({ chartType: "line", options: { topN: 999 } })).topN).toBe(50);
     expect(
       resolveChartOptions(config({ chartType: "heatmap", options: { topN: 999 } })).topN,
-    ).toBe(20);
-    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 999 } })).topN).toBe(50);
+    ).toBe(50);
+    expect(resolveChartOptions(config({ chartType: "pie", options: { topN: 999 } })).topN).toBe(50);
+  });
+
+  it("keeps every slider ceiling at or below the hard ceiling it escapes from", () => {
+    // A slider max above TOPN_MAX would let the analyst drag to a value the
+    // resolver then silently clamps — the exact failure #297 was filed for.
+    for (const type of Object.keys(TOPN_MAX) as (keyof typeof TOPN_MAX)[]) {
+      expect(TOPN_SLIDER_MAX[type]).toBeLessThanOrEqual(TOPN_MAX[type]);
+    }
   });
 
   it("keeps a legend explicitly turned off, rather than treating false as unset", () => {

@@ -4,7 +4,36 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 199 — release CI, dependency bumps).
+Last updated: 2026-08-29 (session 200 — Top-values ceilings and a pageable top-list).
+
+## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
+
+Two limits an analyst kept hitting, both in the terms path.
+
+**#296 — "+ N more in other values" is now a button.** The per-value histogram modal
+(`FieldHistogramModal.tsx`) fetched a hardcoded top-50 and rendered the tail as inert text.
+It now holds a `termsLimit` in state, expanding by 50 per click up to 500 — the
+`field-terms` endpoint's own `limit` cap, and the point past which a scroll container full of
+rows stops helping. The query re-asks for a longer prefix rather than appending a page (the
+window aggregation in `_field_terms_impl` recomputes `other_count` for whatever limit it is
+given, so the tail count stays truthful after every expansion), and `keepPreviousData` keeps
+the rows already on screen while the bigger answer is in flight. No backend change: the first
+load at 50 still resolves from the `field_stats` cache, and `merged_field_terms` already
+returns `None` above its cached top-N, so every expansion falls through to the live path
+rather than being answered from a cache that cannot see that far.
+
+**#297 — per-chart-type Top-values ceilings, with an escape hatch.** The slider capped at
+20 (timeseries) / 50 (terms) and `resolveChartOptions` clamped to the same numbers, so a
+config from a URL, a saved chart or an agent could not exceed what the controls allowed.
+Both now read `TOPN_MAX`, keyed by chart type rather than by data kind: bar reaches the
+backend's 500, the timeseries charts stop at `series_limit`'s 50, and pie/waffle stop at 50
+for legibility rather than for anything fetchable — a pie past a few dozen slices is
+unreadable whatever the slider permits. These match `ANALYST_CHART_LIMITS` in
+`agent/chart_exec.py`, so an exported chart freezes what the analyst could ask for by hand.
+The slider keeps a shorter `TOPN_SLIDER_MAX` travel for the common range and a numeric input
+beside it reaches the ceiling, with a line naming it — the old behaviour silently clamped
+instead. A test asserts no slider ceiling can exceed the hard one it escapes from, which is
+the exact failure mode the issue was filed for.
 
 ## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
 
