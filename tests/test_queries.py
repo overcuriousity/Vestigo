@@ -1822,6 +1822,7 @@ def test_field_terms_empty_dataset_returns_zero_totals() -> None:
         "distinct": 0,
         "values": [],
         "other_count": 0,
+        "derive": None,
     }
     # Two scans, always: the top-N and the spillable totals aggregate that
     # replaced the non-spilling `OVER ()` windows (PR #305 review). They are
@@ -3372,3 +3373,31 @@ def test_a_chart_never_puts_more_queries_in_flight_than_its_slot_budgets() -> No
     svc = EventQueryService(store=store)
     svc.field_pivot(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status")
     assert peak <= 2, f"{peak} capped queries in flight under one foreground slot"
+
+
+def test_field_terms_with_bins_runs_a_range_preflight_then_groups_by_the_multi_if() -> None:
+    from vestigo.db.derive import DeriveSpec
+
+    svc = _viz_service(
+        [
+            ("minIf(v, v > 0)", FakeQueryResult(result_rows=[[0.0, 100.0, 1.0]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[7, 2]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["< 50", 4], ["≥ 50", 3]])),
+        ]
+    )
+    result = svc.field_terms(
+        EventQuery(case_id="c", source_ids=["s"]),
+        "attr:bytes",
+        10,
+        derive=DeriveSpec(kind="bins", mode="width", count=2),
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert any("minIf(v, v > 0)" in s for s in sqls)
+    assert any("multiIf(isNull(" in s and "GROUP BY val" in s for s in sqls)
+    assert result["derive"] == {
+        "kind": "bins",
+        "mode": "width",
+        "labels": ["< 50", "≥ 50"],
+        "edges": [50.0],
+        "negative_bin": False,
+    }

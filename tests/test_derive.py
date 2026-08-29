@@ -53,7 +53,7 @@ def test_bins_expr_is_a_multi_if_over_the_cast_value() -> None:
 
 def test_time_part_expr_parses_then_reuses_the_time_field_spec() -> None:
     sql = time_part_expr("attributes[{field_key:String}]", "hour")
-    assert "parseDateTimeBestEffortOrNull(toString(attributes[{field_key:String}]))" in sql
+    assert "parseDateTimeBestEffortOrNull(toString(attributes[{field_key:String}]), 'UTC')" in sql
     assert "toHour(" in sql and "'UTC'" in sql
     assert sql.startswith("ifNull(")
 

@@ -132,6 +132,8 @@ def _oracle(
         "min": None,
         "max": None,
         "series": [],
+        # No derivation was asked for; the fused path echoes that as None.
+        "derive": None,
     }
     if min_ts is None or max_ts is None:
         return empty
@@ -187,6 +189,7 @@ def _oracle(
         "min": min_ts.isoformat(),
         "max": max_ts.isoformat(),
         "series": series,
+        "derive": None,
     }
 
 

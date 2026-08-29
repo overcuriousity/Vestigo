@@ -55,8 +55,17 @@ from vestigo.db._scan import (
     heavy_scan_settings,
     scan_fanout,
 )
-from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
+from vestigo.db._time_fields import TIME_FIELD_SPECS, TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.derive import (
+    TIME_PART_TOKENS,
+    DeriveSpec,
+    ResolvedDerive,
+    bin_edges,
+    bin_labels,
+    bins_expr,
+    time_part_expr,
+)
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
@@ -2160,7 +2169,13 @@ class EventQueryService:
 
     @_foreground_scan
     def field_terms(
-        self, query: EventQuery, field_token: str, limit: int = 50, *, totals: bool = True
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        totals: bool = True,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
@@ -2178,8 +2193,92 @@ class EventQueryService:
         ``total``/``distinct`` from the returned rows, which is exact when
         the field has no tail and an undercount when it does. Nothing that
         renders an "Other" slice may use it.
+
+        ``derive`` groups a *derived* field instead (:mod:`vestigo.db.derive`):
+        the same scans over the bins / calendar-part expression, and the
+        response carries a ``derive`` echo naming the resolved edges.
         """
-        return self._field_terms_impl(query, field_token, limit=limit, totals=totals)
+        return self._field_terms_impl(query, field_token, limit=limit, totals=totals, derive=derive)
+
+    def _resolve_derive(
+        self,
+        query: EventQuery,
+        field_token: str,
+        derive: DeriveSpec | None,
+        *,
+        param_name: str = "field_key",
+        prebuilt: tuple[str, dict[str, Any]] | None = None,
+    ) -> tuple[str, ResolvedDerive | None]:
+        """Resolve *field_token* to its SQL, derived if *derive* says so.
+
+        ``width``/``log`` bins need the slice's actual value range, which is one
+        cheap scan here (``min``/``max``/``minIf(>0)`` over the float-cast
+        column under the same WHERE as the aggregation that follows). The
+        result carries the edges so the caption can print them — a derived
+        chart that did not say where its bins are would be a chart nobody
+        could check.
+
+        *prebuilt* is the caller's own ``(where, parameters)`` from
+        :meth:`_build_where`; the field key is bound into that dict so the
+        returned expression is valid in the caller's query. Without it the
+        pair is built here.
+        """
+        where, parameters = prebuilt if prebuilt is not None else self._build_where(query)
+        base = _field_column_expr(
+            field_token,
+            parameters,
+            param_name,
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        if derive is None:
+            return base, None
+        if resolve_time_field(field_token) is not None:
+            raise ValueError(
+                f"{field_token} is already a calendar part — chart it directly, without derive"
+            )
+        if derive.kind == "time_part":
+            part = derive.part or "hour"
+            expr = time_part_expr(base, part)
+            spec = TIME_FIELD_SPECS[TIME_PART_TOKENS[part]]
+            labels = list(spec.domain or [])
+            return expr, ResolvedDerive(
+                spec=derive, expr=expr, labels=labels, edges=None, negative_bin=False
+            )
+        value = _finite_float_cast(base)
+        if derive.mode == "custom":
+            edges = [float(e) for e in derive.edges or []]
+            negative = False
+        else:
+            row = self._select(
+                f"""
+                SELECT min(v), max(v), minIf(v, v > 0)
+                FROM (SELECT {value} AS v FROM {self.store.database}.events WHERE {where}) AS t
+                WHERE v IS NOT NULL
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            ).result_rows
+            lo, hi, min_pos = row[0] if row else (None, None, None)
+            count = derive.count or 8
+            if lo is None or hi is None:
+                edges, negative = [], False
+            elif derive.mode == "log":
+                # log10 cannot place a value <= 0, so those get their own,
+                # disclosed bin and the edges span the *positive* range.
+                negative = lo <= 0
+                edges = bin_edges("log", count, float(min_pos), float(hi)) if min_pos else []
+            else:
+                negative = False
+                edges = bin_edges("width", count, float(lo), float(hi))
+        expr = bins_expr(value, edges, negative_bin=negative)
+        return expr, ResolvedDerive(
+            spec=derive,
+            expr=expr,
+            labels=bin_labels(edges, negative_bin=negative),
+            edges=edges,
+            negative_bin=negative,
+        )
 
     def _field_terms_impl(
         self,
@@ -2189,6 +2288,7 @@ class EventQueryService:
         *,
         parallel: bool = True,
         totals: bool = True,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate.
 
@@ -2206,13 +2306,10 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
-        col_expr = _field_column_expr(
-            field_token,
-            parameters,
-            "field_key",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
         )
+        echo = resolved.echo() if resolved is not None else None
 
         scope = f"WHERE {where} AND {col_expr} != ''"
 
@@ -2270,6 +2367,7 @@ class EventQueryService:
                 "distinct": len(values),
                 "values": values,
                 "other_count": 0,
+                "derive": echo,
             }
 
         run = self._run_parallel if parallel else self._run_serial
@@ -2282,6 +2380,7 @@ class EventQueryService:
                 "distinct": 0,
                 "values": [],
                 "other_count": 0,
+                "derive": echo,
             }
 
         totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
@@ -2294,6 +2393,7 @@ class EventQueryService:
             "distinct": distinct,
             "values": values,
             "other_count": max(0, other_count),
+            "derive": echo,
         }
 
     # ── Field value inventory (#295) ─────────────────────────────────────────
@@ -2983,6 +3083,8 @@ class EventQueryService:
         field_token: str,
         buckets: int = 60,
         series_limit: int = 12,
+        *,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return per-value event counts bucketed over time for *field_token*.
 
@@ -3030,24 +3132,22 @@ class EventQueryService:
                 settings=foreground_scan_settings(),
             )
 
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
+        )
+        echo = resolved.echo() if resolved is not None else None
         empty: dict[str, Any] = {
             "field": field_token,
             "interval_seconds": 0,
             "min": None,
             "max": None,
             "series": [],
+            "derive": echo,
         }
         if min_ts is None or max_ts is None:
             return empty
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        col_expr = _field_column_expr(
-            field_token,
-            parameters,
-            "field_key",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
-        )
 
         fused_result = self._select(
             f"""
@@ -3109,6 +3209,7 @@ class EventQueryService:
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
             "series": series,
+            "derive": echo,
         }
 
     def _union_timestamp_range(
@@ -3254,9 +3355,20 @@ class EventQueryService:
         }
 
     def _terms_counts_for_values(
-        self, query: EventQuery, field_token: str, values: list[str]
+        self,
+        query: EventQuery,
+        field_token: str,
+        values: list[str],
+        *,
+        derived_expr: str | None = None,
     ) -> tuple[dict[str, int], int]:
-        """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
+        """Return per-value counts restricted to *values*, plus the layer's non-empty total.
+
+        *derived_expr* is the **primary** layer's resolved derivation
+        expression (bound to ``field_key``): both layers must share bins, or
+        the comparison is meaningless, so the comparison layer never resolves
+        edges of its own.
+        """
         where, parameters = self._build_where(query)
         col_expr = _field_column_expr(
             field_token,
@@ -3265,6 +3377,8 @@ class EventQueryService:
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
         )
+        if derived_expr is not None:
+            col_expr = derived_expr
         parameters["cmp_values"] = values
         result = self._select(
             f"""
@@ -3293,6 +3407,8 @@ class EventQueryService:
         field_token: str,
         limit: int = 50,
         baseline_cache_token: tuple | None = None,
+        *,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return top-N term counts for two layers over one shared category list.
 
@@ -3306,11 +3422,19 @@ class EventQueryService:
         includes it — hits happen only on re-renders whose primary top-N is
         unchanged (option toggles, tab switches, repeat renders), a
         deliberately narrower win than the time/numeric kinds.
+
+        ``derive``: both layers are counted on the **primary's** resolved
+        expression (its edges, its part), and that expression is part of the
+        cache key, so a derived request never reads an underived layer.
         """
         self.store.init_schema()
-        terms = self._field_terms_impl(primary, field_token, limit=limit)
+        terms = self._field_terms_impl(primary, field_token, limit=limit, derive=derive)
         top_values = [v["value"] for v in terms["values"]]
         primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
+        derived_expr: str | None = None
+        if derive is not None:
+            _, resolved = self._resolve_derive(primary, field_token, derive)
+            derived_expr = resolved.expr if resolved is not None else None
 
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
@@ -3318,8 +3442,17 @@ class EventQueryService:
             window = (primary.start, primary.end)
             comparison_by_value, comparison_total = self._baseline_cached(
                 baseline_cache_token,
-                ("terms_counts", baseline_cache_token, window, field_token, tuple(top_values)),
-                lambda: self._terms_counts_for_values(comparison, field_token, top_values),
+                (
+                    "terms_counts",
+                    baseline_cache_token,
+                    window,
+                    field_token,
+                    tuple(top_values),
+                    derived_expr,
+                ),
+                lambda: self._terms_counts_for_values(
+                    comparison, field_token, top_values, derived_expr=derived_expr
+                ),
             )
 
         values = [
@@ -3339,6 +3472,7 @@ class EventQueryService:
             "comparison_total": comparison_total,
             "primary_other": terms["other_count"],
             "comparison_other": max(0, comparison_total - sum(v["comparison"] for v in values)),
+            "derive": terms.get("derive"),
         }
 
     def _numeric_layer_stats(
@@ -3527,6 +3661,8 @@ class EventQueryService:
         field_y: str,
         limit_x: int = 10,
         limit_y: int = 10,
+        *,
+        derive_x: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return a top-X × top-Y co-occurrence count matrix for two fields.
 
@@ -3553,15 +3689,26 @@ class EventQueryService:
         charted whole. A caller comparing "values shown" against "distinct" to
         caption a truncation has to know the difference — for a bounded axis
         the two are equal by construction, and nothing was cut off.
+
+        A **derived** x axis (``derive_x``, :mod:`vestigo.db.derive`) is a
+        bounded domain in exactly the same sense: its label list is known
+        before any row is read, so the axis is charted whole and in order —
+        an empty range is a finding, like an empty hour.
         """
         self.store.init_schema()
         spec_x = resolve_time_field(field_x)
         spec_y = resolve_time_field(field_y)
+        where, parameters = self._build_where(query)
+        col_x, resolved_x = self._resolve_derive(
+            query, field_x, derive_x, param_name="field_key_x", prebuilt=(where, parameters)
+        )
 
         def _axis(
             field_token: str, spec: TimeFieldSpec | None, limit: int
         ) -> tuple[list[str], int, bool]:
             """One axis's ``(values, distinct, bounded)`` — domain, or top-N by count."""
+            if field_token == field_x and resolved_x is not None:
+                return list(resolved_x.labels), len(resolved_x.labels), True
             if spec is not None and spec.domain is not None:
                 return list(spec.domain), len(spec.domain), True
             # Serial: this helper is one arm of a two-way fan-out already.
@@ -3582,18 +3729,11 @@ class EventQueryService:
             "y_distinct": y_distinct,
             "x_bounded": x_bounded,
             "y_bounded": y_bounded,
+            "derive_x": resolved_x.echo() if resolved_x is not None else None,
         }
         if not x_values or not y_values:
             return {**base, "cells": [], "total": 0}
 
-        where, parameters = self._build_where(query)
-        col_x = _field_column_expr(
-            field_x,
-            parameters,
-            "field_key_x",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
-        )
         col_y = _field_column_expr(
             field_y,
             parameters,

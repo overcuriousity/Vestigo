@@ -158,9 +158,11 @@ def time_part_expr(base_expr: str, part: str) -> str:
     ``parseDateTimeBestEffortOrNull`` yields NULL for a value that is not a
     timestamp; the part functions propagate NULL and ``ifNull`` folds it to
     ``''`` — the same "unusable rows are empty" contract as ``bins_expr``.
+    A value carrying no zone is read as UTC — the parser would otherwise
+    assume the *server's* zone, and the caption promises UTC.
     """
     spec = TIME_FIELD_SPECS[TIME_PART_TOKENS[part]]
-    parsed = f"parseDateTimeBestEffortOrNull(toString({base_expr}))"
+    parsed = f"parseDateTimeBestEffortOrNull(toString({base_expr}), 'UTC')"
     return f"ifNull({spec.expr(parsed)}, '')"
 
 
