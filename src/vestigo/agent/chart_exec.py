@@ -258,6 +258,35 @@ async def execute_chart_spec(
         raise ValueError(
             f'chart_type="{chart_type}" takes no marks — figures that draw them: {", ".join(takers)}.'
         )
+    quantity: str | None = None
+    if data_kind == "cumulative":
+        quantity = opts.quantity or (
+            "events" if not spec.field else "sum" if scale == "ratio" else "distinct"
+        )
+        if quantity != "events" and not spec.field:
+            raise ValueError(
+                f'quantity="{quantity}" needs field — only quantity="events" counts without one.'
+            )
+        if quantity == "sum" and scale != "ratio":
+            raise ValueError(
+                'quantity="sum" needs scale="ratio" — a running sum over anything but a '
+                'measure is not a quantity; use "distinct" (values seen so far) or "events".'
+            )
+        if quantity == "distinct" and scale not in ("nominal", "ordinal"):
+            raise ValueError(
+                'quantity="distinct" needs scale="nominal" or "ordinal" — distinct values of a '
+                'measure are not a count of anything; use "sum" or "events".'
+            )
+        if quantity == "events" and spec.field:
+            warnings.append(
+                f'field is ignored — quantity="events" counts every event, not '
+                f'field="{spec.field}"; use "sum" or "distinct" to accumulate the field.'
+            )
+    if data_kind == "calendar" and spec.field and resolve_time_field(spec.field) is not None:
+        raise ValueError(
+            f"{spec.field}: a calendar part is always present — a calendar over it counts "
+            "every event; omit field."
+        )
     if scale not in meta.scales:
         raise ValueError(
             f'chart_type="{chart_type}" requires scale in '
@@ -269,7 +298,8 @@ async def execute_chart_spec(
     if requires_field(chart_type) and not meta.multi_field and not spec.field:
         raise ValueError(
             f'chart_type="{chart_type}" requires field. Only chart_type="time" and '
-            '"punchcard" chart the whole event count with no field.'
+            '"punchcard" chart every event with no field; "cumulative" and "calendar" '
+            "take an optional one."
         )
     if meta.requires_second_field and not spec.field_y:
         raise ValueError(
@@ -566,6 +596,38 @@ async def execute_chart_spec(
     elif data_kind == "punchcard":
         result = await run_gated_scan(service.time_punchcard, primary_query)
         summary = {"total": result["total"], "max_count": result["max_count"]}
+    elif data_kind == "cumulative":
+        applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
+        applied["quantity"] = quantity
+        result = await run_gated_scan(
+            functools.partial(
+                service.cumulative,
+                field=spec.field,
+                quantity=quantity,
+                buckets=applied["buckets"],
+            ),
+            primary_query,
+        )
+        summary = {
+            "total": result["total"],
+            "events": result["events"],
+            "unparsed": result["unparsed"],
+            "buckets": len(result["buckets"]),
+            "interval_seconds": result["interval_seconds"],
+        }
+    elif data_kind == "calendar":
+        result = await run_gated_scan(
+            functools.partial(service.calendar, field=spec.field, max_weeks=limits.calendar_weeks),
+            primary_query,
+        )
+        summary = {
+            "total": result["total"],
+            "max_count": result["max_count"],
+            "weeks": result["weeks"],
+            "weeks_total": result["weeks_total"],
+            "truncated": result["truncated"],
+            "dropped": result["dropped"],
+        }
     elif data_kind == "pivot":
         applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")
         applied["limit_y"] = _capped(opts.limit_y, limits.pivot_limit, "limit_y")

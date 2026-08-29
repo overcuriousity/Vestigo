@@ -731,6 +731,156 @@ async def get_time_punchcard(
     )
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/viz/cumulative")
+async def get_cumulative(
+    case_id: str,
+    timeline_id: str,
+    field: str | None = Query(default=None, description="Optional field token."),
+    quantity: Literal["events", "sum", "distinct"] | None = Query(
+        default=None,
+        description=(
+            'What accumulates. Omitted: "events" without a field, "distinct" with one; '
+            '"sum" must be asked for.'
+        ),
+    ),
+    buckets: int = Query(default=60, ge=4, le=200),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return a running total over time (the cumulative step figure).
+
+    See ``EventQueryService.cumulative``. The endpoint knows no scale, so a
+    ``sum`` is never assumed — the page asks for it when the field is
+    treated as a measure.
+    """
+    resolved_quantity = quantity or ("distinct" if field else "events")
+    if resolved_quantity != "events" and not field:
+        raise HTTPException(status_code=422, detail=f'quantity="{resolved_quantity}" needs field')
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.cumulative,
+        query,
+        field=field,
+        quantity=resolved_quantity,
+        buckets=buckets,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/calendar")
+async def get_calendar(
+    case_id: str,
+    timeline_id: str,
+    field: str | None = Query(
+        default=None, description="Optional: count only events whose field is non-empty."
+    ),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return event counts per UTC day, latest 53 weeks (the calendar heatmap).
+
+    See ``EventQueryService.calendar``; the week cap is
+    ``ANALYST_CHART_LIMITS.calendar_weeks`` so the page and a Story export
+    draw the same weeks.
+    """
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.calendar,
+        query,
+        field=field,
+        max_weeks=ANALYST_CHART_LIMITS.calendar_weeks,
+    )
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-pivot")
 async def get_field_pivot(
     case_id: str,

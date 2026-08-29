@@ -968,6 +968,38 @@ class _FakeChartService(_FakeVizService):
             "overflow": False,
         }
 
+    def cumulative(self, query, *, field=None, quantity="events", buckets=60):
+        self.calls.append(("cumulative", (field, quantity, buckets), {}))
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": 3600,
+            "min": "2026-07-20T00:00:00+00:00",
+            "max": "2026-07-20T03:00:00+00:00",
+            "buckets": [{"start": "2026-07-20T00:00:00+00:00", "delta": 3, "value": 3}],
+            "total": 3,
+            "events": 4,
+            "unparsed": 1,
+        }
+
+    def calendar(self, query, *, field=None, max_weeks=53):
+        self.calls.append(("calendar", (field, max_weeks), {}))
+        return {
+            "kind": "calendar",
+            "field": field,
+            "timezone": "UTC",
+            "start": "2026-07-20",
+            "end": "2026-07-22",
+            "days": [{"date": "2026-07-20", "count": 2}],
+            "total": 2,
+            "max_count": 2,
+            "weeks": 1,
+            "weeks_total": 1,
+            "truncated": False,
+            "dropped": 0,
+        }
+
     def field_table(self, query, field, limit, **kw):
         self.calls.append(("field_table", (field, limit), kw))
         return {
@@ -1100,6 +1132,8 @@ _CHART_TYPE_CASES = [
     ("scatter", {"field": "attr:bytes", "field_y": "attr:latency"}, "field_scatter"),
     ("corr", {"fields": ["attr:bytes", "attr:latency"]}, "field_correlation"),
     ("table", {"field": "attr:user"}, "field_table"),
+    ("cumulative", {}, "cumulative"),
+    ("calendar", {}, "calendar"),
 ]
 
 
@@ -3021,3 +3055,136 @@ async def test_propose_chart_returns_the_visualize_deep_link(store, monkeypatch)
     )
     assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
     assert "q=4624" in result["open_url"] and "c_type=time" in result["open_url"]
+
+
+# ── cumulative and calendar ──────────────────────────────────────────────────
+
+
+async def test_cumulative_resolves_the_quantity_from_field_and_scale(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    fieldless = await _call(server, "propose_chart", _chart({"chart_type": "cumulative"}))
+    assert fieldless["ok"] is True and fieldless["resolved"]["options"]["quantity"] == "events"
+    assert fieldless["summary"] == {
+        "total": 3,
+        "events": 4,
+        "unparsed": 1,
+        "buckets": 1,
+        "interval_seconds": 3600,
+    }
+    measure = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "ratio",
+                "options": {"buckets": 12},
+            }
+        ),
+    )
+    assert measure["resolved"]["options"] == {"buckets": 12, "quantity": "sum"}
+    categories = await _call(
+        server, "propose_chart", _chart({"chart_type": "cumulative", "field": "user"})
+    )
+    assert categories["resolved"]["options"]["quantity"] == "distinct"
+    assert [a for n, a, _ in fake.calls if n == "cumulative"] == [
+        (None, "events", 30),
+        ("bytes", "sum", 12),
+        ("user", "distinct", 30),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("spec", "needle"),
+    [
+        (
+            {"chart_type": "cumulative", "options": {"quantity": "sum"}},
+            'quantity="sum" needs field',
+        ),
+        (
+            {"chart_type": "cumulative", "options": {"quantity": "distinct"}},
+            'quantity="distinct" needs field',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "user",
+                "scale": "nominal",
+                "options": {"quantity": "sum"},
+            },
+            'quantity="sum" needs scale="ratio"',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "ratio",
+                "options": {"quantity": "distinct"},
+            },
+            'quantity="distinct" needs scale="nominal" or "ordinal"',
+        ),
+        (
+            {"chart_type": "calendar", "field": "time:hour_of_day"},
+            "a calendar part is always present",
+        ),
+    ],
+)
+async def test_cumulative_and_calendar_refusals(store, monkeypatch, spec, needle):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    assert needle in await _reject(server, spec)
+
+
+async def test_cumulative_events_with_a_field_warns_that_the_field_is_ignored(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "cumulative", "field": "user", "options": {"quantity": "events"}}),
+    )
+    assert result["ok"] is True
+    assert any("field is ignored" in w for w in result["warnings"])
+
+
+async def test_calendar_summarises_the_cap_and_takes_marks_nowhere(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "calendar", "field": "user"})
+    )
+    assert result["summary"] == {
+        "total": 2,
+        "max_count": 2,
+        "weeks": 1,
+        "weeks_total": 1,
+        "truncated": False,
+        "dropped": 0,
+    }
+    assert next(a for n, a, _ in fake.calls if n == "calendar") == ("user", 53)
+    message = await _reject(
+        server,
+        {
+            "chart_type": "calendar",
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="calendar" takes no marks' in message
+
+
+async def test_cumulative_takes_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "cumulative",
+                "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+            }
+        ),
+    )
+    assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1

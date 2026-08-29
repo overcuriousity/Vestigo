@@ -298,6 +298,14 @@ class _FakeAggService:
         self.calls.append(("numeric", query, field, bins, points, points_limit))
         return {"kind": "numeric"}
 
+    def cumulative(self, query, *, field=None, quantity="events", buckets=60):
+        self.calls.append(("cumulative", query, field, quantity, buckets))
+        return {"kind": "cumulative", "quantity": quantity, "field": field}
+
+    def calendar(self, query, *, field=None, max_weeks=53):
+        self.calls.append(("calendar", query, field, max_weeks))
+        return {"kind": "calendar", "field": field}
+
     def field_correlation(self, query, fields):
         self.calls.append(("corr", query, tuple(fields)))
         return {"kind": "corr"}
@@ -1182,3 +1190,40 @@ async def test_viz_marks_rejects_a_malformed_mark_and_an_unknown_baseline(monkey
         )
     assert unknown.value.status_code == 422
     assert 'baseline definition "nope" not found' in str(unknown.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_viz_cumulative_resolves_quantity_and_passes_field_and_buckets(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_cumulative(
+        "c1", "t1", field="attr:user", quantity=None, buckets=24, case=None, **_FILTER_KWARGS
+    )
+    assert result["quantity"] == "distinct"
+    kind, query, field, quantity, buckets = svc.calls[0]
+    assert (kind, field, quantity, buckets) == ("cumulative", "attr:user", "distinct", 24)
+    assert query.source_ids == ["s1", "s2"]
+    fieldless = await viz.get_cumulative(
+        "c1", "t1", field=None, quantity=None, buckets=60, case=None, **_FILTER_KWARGS
+    )
+    assert fieldless["quantity"] == "events"
+
+
+@pytest.mark.asyncio
+async def test_viz_cumulative_refuses_a_fieldless_sum(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_cumulative(
+            "c1", "t1", field=None, quantity="sum", buckets=60, case=None, **_FILTER_KWARGS
+        )
+    assert exc.value.status_code == 422 and 'quantity="sum" needs field' in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_viz_calendar_passes_the_field_and_the_week_cap(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_calendar("c1", "t1", field="attr:user", case=None, **_FILTER_KWARGS)
+    assert result == {"kind": "calendar", "field": "attr:user"}
+    kind, query, field, max_weeks = svc.calls[0]
+    assert (kind, field, max_weeks) == ("calendar", "attr:user", 53)
