@@ -364,6 +364,14 @@ top-50 bar chart froze as top-30 and the report picked up a clamp warning
 reading "agent context budget" — an attested document must not silently show
 less than the analyst signed off on.
 
+The converse matters just as much, and `terms_top_n` alone cannot express it:
+bar, pie and waffle all run the same `field_terms` aggregation, so the 500 a
+bar axis is entitled to would let a pie freeze ten times what the Visualize
+page clamps the same config to — a snapshot the analyst can neither reproduce
+nor edit back to what it shows. `TERMS_TOP_N_BY_CHART` narrows the ceiling for
+the marks bounded by legibility rather than by what is fetchable, mirroring
+`TOPN_MAX` in `frontend/src/components/viz/lib/chartOptions.ts`.
+
 View blocks run their stored filter through the same regex validation every
 interactive path applies before building a query, so the export path can't drift
 into accepting a pattern the Explorer rejects.

@@ -7,6 +7,10 @@ import { describe, it, expect } from "vitest";
 import { allocateWaffleCells, WAFFLE_CELLS } from "@/components/viz/lib/waffle";
 import { OTHER_KEY, OTHER_LABEL } from "@/components/viz/lib/colors";
 import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
+import {
+  barReadabilityWarning,
+  VERTICAL_BARS_COMFORTABLE_MAX,
+} from "@/components/viz/lib/barReadability";
 import { jitterOffset } from "@/components/viz/lib/jitter";
 import type { FieldTermsResponse } from "@/api/types";
 
@@ -103,6 +107,22 @@ describe("pieReadabilityWarning", () => {
 
   it("warns when two slices are too close to tell apart by angle", () => {
     expect(pieReadabilityWarning(terms([100, 96]))).toMatch(/less than 10%/);
+  });
+});
+
+describe("barReadabilityWarning", () => {
+  it("stays silent for a horizontal axis at the bar ceiling, which grows with the rows", () => {
+    expect(barReadabilityWarning(500, "horizontal")).toBeNull();
+  });
+
+  it("stays silent for a vertical axis inside the comfortable band count", () => {
+    expect(barReadabilityWarning(VERTICAL_BARS_COMFORTABLE_MAX, "vertical")).toBeNull();
+  });
+
+  it("warns for a crowded vertical axis and names the cheaper fix first", () => {
+    const warning = barReadabilityWarning(VERTICAL_BARS_COMFORTABLE_MAX + 1, "vertical");
+    expect(warning).toMatch(/bars/);
+    expect(warning).toMatch(/horizontal/);
   });
 });
 

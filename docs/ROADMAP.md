@@ -20,11 +20,6 @@ shipped subsystems. Milestones 6 (streaming ingest) and 7 (forensic examination)
 phases gated on a joint S1+E1 design round — **standing rule: when either resumes, both are
 designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates once.**
 
-## Open issues
-
-- **#297** — loosen the Top-values cap on the Visualize page (slider + free numeric input).
-- **#296** — make "+ N more in other values" clickable to load the next page of values.
-
 ## Milestone 2 — visualization gaps
 
 - [ ] **Choropleth / geographic charts.** The one family from the 2026-07-22 viz round left

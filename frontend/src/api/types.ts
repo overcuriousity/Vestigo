@@ -1274,6 +1274,15 @@ export interface FieldTermsResponse {
   values: FieldTermCount[];
   /** Count of non-empty values outside the returned top-N — render as an "Other" slice. */
   other_count: number;
+  /**
+   * True when the answer came from the per-source `field_stats` cache instead
+   * of a live ClickHouse scan (unfiltered queries, `limit <= 50` only). Counts
+   * are exact sums either way, but `distinct` is max-across-sources and the
+   * top-N merge across sources is approximate — so the same field can rank its
+   * values differently once a request falls through to the live path. Absent
+   * on a live answer.
+   */
+  cached?: boolean;
 }
 
 /** One fixed-width bin of a numeric field's value distribution. */

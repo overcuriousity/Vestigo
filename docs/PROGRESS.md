@@ -4,7 +4,123 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-28 (session 199 — release CI, dependency bumps).
+Last updated: 2026-08-29 (session 200 — Top-values ceilings and a pageable top-list).
+
+## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
+
+Two limits an analyst kept hitting, both in the terms path.
+
+**#296 — "+ N more in other values" is now a button.** The per-value histogram modal
+(`FieldHistogramModal.tsx`) fetched a hardcoded top-50 and rendered the tail as inert text.
+It now holds a `termsLimit` in state, expanding by 50 per click up to 500 — the
+`field-terms` endpoint's own `limit` cap, and the point past which a scroll container full of
+rows stops helping. The query re-asks for a longer prefix rather than appending a page (the
+window aggregation in `_field_terms_impl` recomputes `other_count` for whatever limit it is
+given, so the tail count stays truthful after every expansion), and `keepPreviousData` keeps
+the rows already on screen while the bigger answer is in flight. No backend change: the first
+load at 50 still resolves from the `field_stats` cache, and `merged_field_terms` already
+returns `None` above its cached top-N, so every expansion falls through to the live path
+rather than being answered from a cache that cannot see that far.
+
+**#297 — per-chart-type Top-values ceilings, with an escape hatch.** The slider capped at
+20 (timeseries) / 50 (terms) and `resolveChartOptions` clamped to the same numbers, so a
+config from a URL, a saved chart or an agent could not exceed what the controls allowed.
+Both now read `TOPN_MAX`, keyed by chart type rather than by data kind: bar reaches the
+backend's 500, the timeseries charts stop at `series_limit`'s 50, and pie/waffle stop at 50
+for legibility rather than for anything fetchable — a pie past a few dozen slices is
+unreadable whatever the slider permits. These match `ANALYST_CHART_LIMITS` in
+`agent/chart_exec.py`, so an exported chart freezes what the analyst could ask for by hand.
+The slider keeps a shorter `TOPN_SLIDER_MAX` travel for the common range and a numeric input
+beside it reaches the ceiling, with a line naming it — the old behaviour silently clamped
+instead. A test asserts no slider ceiling can exceed the hard one it escapes from, which is
+the exact failure mode the issue was filed for.
+
+**Review follow-ups (same session).** Six findings from the review of #323, all in the
+surfaces the two issues touched.
+
+- `keepPreviousData` was keyed on the whole query key, but the modal's `filters` change
+  *while it stays open* — a row's Filter IN/OUT narrows the Explorer without closing it. The
+  kept rows then showed pre-filter values, counts and `distinct` as if they were scoped to
+  the new filter, with nothing on screen saying otherwise. The placeholder now compares the
+  previous query's key against the current *scope* (everything but `termsLimit`) and blanks
+  to the spinner on anything else.
+- The numeric Top-values box could not be cleared: `Number("")` is `0`, which is finite, so
+  the first Backspace committed `topN: 1` and the digits of "300" landed on top of it —
+  breaking the one thing the control exists for. It is now a small `TopNInput` holding its
+  own draft string; an empty or out-of-range entry stays a draft until blur.
+- Slider `min` (3) and box `min` (1) disagreed, so a typed 1 left the DOM clamping the thumb
+  to 3 while state said 1, and dragging to exactly 3 fired no change event at all. Both read
+  a shared `TOPN_MIN`.
+- The line naming the escape hatch only rendered on the terms branch. The gap is *widest* on
+  heatmap/line (slider 20, ceiling 50), where the number box was therefore undiscoverable.
+- "These match `ANALYST_CHART_LIMITS`" held only for bar: `chart_exec` caps by `data_kind`,
+  so an agent-proposed or exported pie/waffle could carry 500 slices the UI clamps to 50.
+  `TERMS_TOP_N_BY_CHART` now narrows the ceiling per mark (`docs/STORIES.md`).
+- Raising bar to 500 made the *vertical* orientation degenerate — fixed 300px frame, so
+  sub-pixel bands and overdrawn labels — while only the horizontal branch grows with the row
+  count. `barReadabilityWarning` gives it the advisory pie already had, with a one-click
+  switch to horizontal.
+
+**Second review round (same session).** Six more, all in the controls the first round built.
+
+- The slider's `value` was clamped with `Math.min(topN, TOPN_SLIDER_MAX)`, which reintroduced
+  at the ceiling exactly what unifying `TOPN_MIN` had just fixed at the floor: with a typed
+  300 the thumb already sits at bar's 50, so dragging it there changes nothing in the DOM and
+  fires no change event — the chart went on drawing 300. It now also commits on release
+  (`onPointerUp`, and `onKeyUp` for the keys that actually move a range input — a bare Tab
+  into the slider fires keyup on it too), since a range input's value follows the pointer, so
+  what the thumb reads when the analyst lets go is the answer they gave.
+- The vertical-bar readability warning counted *categories*, but compare mode draws two
+  half-width sub-bars per band. The threshold was therefore twice as permissive exactly where
+  the crowding is worst, and the text named half the bars on screen. It counts bars now, and
+  the parameter is named for it.
+- `resolveChartOptions` capped `topN` but never floored it, and `c_opts` arrives from the URL
+  as `JSON.parse`d, unvalidated data. A shared or hand-edited link carrying `{"topN": 0}`
+  resolved to `0`, reached `/viz/field-terms` as `limit=0`, and came back 422 — a permanently
+  blank chart with nothing on screen to explain it; `"x"` did the same as `NaN`. `clampTopN`
+  now floors, caps, rounds, and falls back to the default for anything that is not a number.
+- The exact-value box committed every in-range keystroke, so typing "500" spent three gated
+  ClickHouse scans (5, 50, 500) on the way to one answer. It debounces by 400 ms, which keeps
+  the live preview the control is built around; blur and Enter still commit immediately.
+- Enter did nothing in that box, so an entry above the ceiling sat on screen — uncommitted and
+  unclamped — until the analyst happened to click elsewhere. It now commits with the same
+  clamp as blur.
+- `FieldHistogramModal` kept an expanded `termsLimit` across a Filter IN/OUT, which already
+  blanks the rows on purpose. The first fetch of the new scope then asked for more than 50
+  values, and `merged_field_terms` serves nothing above 50 out of the `field_stats` cache — so
+  the cheap path stayed skipped for as long as the modal was open. A scope change resets to
+  the first page.
+
+**Third review round (same session).** Five more, all downstream of the raised ceiling.
+
+- PNG export failed on exactly the charts the 500 ceiling makes reachable. A horizontal bar
+  chart sizes itself to its row count, so 500 rows is a ~13,000px `<svg>` (~21,000px in
+  compare mode) and `downloadChartPng` rasterized at `height * scale` — past the 16,384px a
+  canvas may be at *any* resolution, at which point `toBlob` yields `null` and the analyst
+  reads "PNG export failed", or worse gets a blank image. `effectiveExportScale` now lowers
+  the requested scale to what the canvas limits allow (dimension *and* Chrome's 2^28-pixel
+  area cap), and `ExportControls` says which scale it actually used and points at SVG for
+  full detail. A silently downscaled export would make the resolution picker lie.
+- Expanding the top-values list crosses a computation boundary the analyst could not see. An
+  unfiltered first page comes from the `field_stats` cache, whose per-value counts are exact
+  but whose cross-source top-N merge is approximate and whose `distinct` is a
+  max-across-sources; the cache answers nothing above 50, so the first "+ N more" click falls
+  through to an exact live scan that may reorder or replace values *inside* the 50 already on
+  screen. The response has carried a `cached` flag all along and the modal ignored it. It now
+  names the cache while it is serving, marks the approximate distinct count with `≈`, and
+  says the list was re-read once the answer becomes live.
+- The Top-values slider committed on every intermediate step while the box beside it
+  debounced for the very same reason — dragging a bar chart's full travel was ~50 gated
+  ClickHouse scans and ~50 history entries for one gesture. The slider now keeps a live draft
+  (the label still tracks the thumb) and commits once, on release.
+- Committing on release also meant a press-and-release on the *pinned* thumb — no drag, no
+  change event, nothing moved — rewrote a typed 500 down to the slider's 50. A release now
+  only commits if something moved on the way to it; above the slider's range the label and
+  the exact box stay authoritative.
+- The expanded list renders every row it is given, and each carried two Radix `Tooltip`
+  roots: ~1,000 of them mounted for the ~14 rows the scroll container shows. The three
+  per-row icon buttons use native `title` (plus `aria-label`) now, which is what the row's
+  focus button already did.
 
 ## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
 

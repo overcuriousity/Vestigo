@@ -85,11 +85,14 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, SCALES, chartTypesFor } from "@/components/viz/lib/chartMeta";
+import { CHART_META, SCALES, chartTypesFor, type DataKind } from "@/components/viz/lib/chartMeta";
 import {
   resolveChartOptions,
   defaultChartTypeForScale,
   chartTypesForField,
+  TOPN_MAX,
+  TOPN_MIN,
+  TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
@@ -97,6 +100,7 @@ import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
+import { barReadabilityWarning } from "@/components/viz/lib/barReadability";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
 import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
 import { CHART_HOW_TO_READ } from "@/components/viz/lib/explainers";
@@ -189,6 +193,215 @@ function compareUnavailableReason(chartType: ChartType): string {
     return "Compare isn't supported for this chart type yet.";
   }
   return "This chart type has no honest two-layer encoding — overlaid layers would misrepresent one of them. Use Bar, Histogram, or the Time histogram to compare.";
+}
+
+/**
+ * How long the exact-value box waits after the last keystroke before it
+ * commits. Every commit re-runs a gated ClickHouse foreground scan, and the
+ * digits of "500" are all in range on the way there — undebounced, typing one
+ * number spent three of them (5, 50, 500). Long enough to swallow a multi-digit
+ * entry, short enough that the live preview the box is built around survives.
+ */
+const TOPN_COMMIT_DEBOUNCE_MS = 400;
+
+/** The keys a range input moves on — see the Top-values slider's `onKeyUp`. */
+const SLIDER_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
+
+/**
+ * The exact-value box beside the Top-values slider (#297).
+ *
+ * It keeps its own draft string, because coercing every keystroke through
+ * `Number` makes the field impossible to retype: `Number("")` is `0`, which is
+ * finite, so the first Backspace committed `topN: 1` and the digits of "300"
+ * then landed on top of it. A draft that is empty, or that parses outside
+ * `[TOPN_MIN, max]`, is simply not committed — it stays on screen until blur
+ * or Enter, which clamp to whatever the chart can actually draw.
+ */
+function TopNInput({
+  value,
+  max,
+  onCommit,
+}: {
+  value: number;
+  max: number;
+  onCommit: (n: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPending = () => {
+    if (pending.current != null) {
+      clearTimeout(pending.current);
+      pending.current = null;
+    }
+  };
+  // A commit scheduled by the last keystroke must not outlive the control.
+  useEffect(() => cancelPending, []);
+  const parse = (raw: string): number | null => {
+    if (raw.trim() === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return Math.round(n);
+  };
+  const commitNow = (n: number) => {
+    cancelPending();
+    onCommit(Math.max(TOPN_MIN, Math.min(n, max)));
+  };
+  return (
+    <input
+      type="number"
+      min={TOPN_MIN}
+      max={max}
+      step={1}
+      value={draft ?? String(value)}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        cancelPending();
+        const n = parse(raw);
+        // Only an in-range number is a finished answer. "3" on the way to
+        // "300" is in range and previews once typing pauses; "900" against a
+        // ceiling of 500 waits for blur or Enter rather than snapping
+        // mid-keystroke.
+        if (n != null && n >= TOPN_MIN && n <= max) {
+          pending.current = setTimeout(() => {
+            pending.current = null;
+            onCommit(n);
+          }, TOPN_COMMIT_DEBOUNCE_MS);
+        }
+      }}
+      onKeyDown={(e) => {
+        // Enter is the one gesture that says "I am done typing". Without it an
+        // out-of-range entry sat on screen, uncommitted and unclamped, until
+        // the analyst happened to click elsewhere.
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        const n = parse(draft ?? String(value));
+        if (n != null) commitNow(n);
+        setDraft(null);
+      }}
+      onBlur={() => {
+        const n = parse(draft ?? "");
+        if (n != null) commitNow(n);
+        else cancelPending();
+        setDraft(null);
+      }}
+      aria-label="Top values (exact)"
+      className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+    />
+  );
+}
+
+/**
+ * The Top-values control: a slider over the range most charts want, the exact
+ * box beside it as the escape hatch to the chart type's ceiling (#297), and
+ * the sentence naming that escape hatch.
+ *
+ * The slider keeps a draft while the analyst is interacting and commits once,
+ * on release, for two reasons that pull the same way.
+ *
+ * Cost: every commit re-runs a gated ClickHouse foreground scan, the same
+ * reason the box beside it debounces. Committing on `change` spent one per
+ * intermediate step — dragging across a bar chart's full travel was fifty
+ * scans and fifty history entries for one gesture.
+ *
+ * Truth: `topN` may sit above the slider's own maximum, so the thumb is
+ * pinned and reads a smaller number than the label by design. A drag that
+ * ends there reports its answer only through the release — but a release is
+ * an answer only if something moved. A click that lands on the pinned thumb
+ * and lets go moved nothing, and must not silently rewrite a typed 500 down
+ * to 50. `moved` is that distinction: a drag away from the pinned position
+ * and back fires `change` events on the way, so it commits; a press that
+ * never leaves it is indistinguishable from a click and does not. Above the
+ * slider's range the label and the exact box stay authoritative.
+ */
+function TopNControl({
+  chartType,
+  dataKind,
+  value,
+  onCommit,
+}: {
+  chartType: ChartType;
+  dataKind: DataKind;
+  value: number;
+  onCommit: (n: number) => void;
+}) {
+  const sliderMax = TOPN_SLIDER_MAX[chartType];
+  const [draft, setDraft] = useState<number | null>(null);
+  const moved = useRef(false);
+  const shown = draft ?? Math.min(value, sliderMax);
+  const commit = (n: number) => {
+    setDraft(null);
+    moved.current = false;
+    if (n !== value) onCommit(n);
+  };
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+        Top values: {draft ?? value}
+      </label>
+      <div className="flex items-center gap-2">
+        <input
+          type="range"
+          aria-label="Top values"
+          min={TOPN_MIN}
+          max={sliderMax}
+          step={1}
+          value={shown}
+          onChange={(e) => {
+            moved.current = true;
+            setDraft(Number(e.target.value));
+          }}
+          onPointerDown={() => {
+            moved.current = false;
+          }}
+          onPointerUp={(e) => {
+            if (moved.current) commit(Number(e.currentTarget.value));
+            else setDraft(null);
+          }}
+          onPointerCancel={() => {
+            setDraft(null);
+            moved.current = false;
+          }}
+          onKeyUp={(e) => {
+            // Only the keys that actually move a range input. A bare Tab
+            // *into* the slider also fires keyup on it, and with a typed 500
+            // the clamped thumb reads 50 — committing there would rewrite the
+            // value for merely focusing the control.
+            if (!SLIDER_KEYS.has(e.key)) return;
+            commit(Number(e.currentTarget.value));
+          }}
+          onBlur={() => {
+            // A gesture that ended without its own release event (a keypress
+            // interrupted by a click elsewhere) still has an answer on screen.
+            if (draft != null) commit(draft);
+          }}
+          className="min-w-0 flex-1 accent-[var(--color-accent)]"
+        />
+        <TopNInput value={value} max={TOPN_MAX[chartType]} onCommit={onCommit} />
+      </div>
+      {/* The escape hatch has to be named wherever it exists, and the gap is
+          *widest* on the timeseries charts (slider 20, ceiling 50) — naming it
+          only on the terms branch left the number box undiscoverable exactly
+          where it matters most. */}
+      <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+        {`Up to ${TOPN_MAX[chartType]}`}
+        {sliderMax < TOPN_MAX[chartType]
+          ? ` — past the slider's ${sliderMax}, type an exact number.`
+          : "."}
+        {dataKind === "timeseries" &&
+          " Each value is its own series, so a crowded chart stops being readable well before that."}
+      </p>
+    </div>
+  );
 }
 
 export function VisualizePage() {
@@ -874,6 +1087,30 @@ export function VisualizePage() {
     chartType === "pie" && termsQuery.data ? pieReadabilityWarning(termsQuery.data) : null;
   if (pieWarning) facts.readabilityWarning = pieWarning;
 
+  // Same advisory footing for the bar axis, which since #297 reaches 500
+  // values: only the *vertical* orientation has a fixed frame, so that is the
+  // one where a high Top-values renders a texture rather than a chart.
+  const barTerms = compareTermsOn ? compareTermsQuery.data : termsQuery.data;
+  const barBands =
+    barTerms == null
+      ? 0
+      : barTerms.values.length +
+        ((compareTermsOn
+          ? (compareTermsQuery.data?.primary_other ?? 0) > 0 ||
+            (compareTermsQuery.data?.comparison_other ?? 0) > 0
+          : (termsQuery.data?.other_count ?? 0) > 0)
+          ? 1
+          : 0);
+  // Compare mode draws two half-width sub-bars per band, so the rule counts
+  // bars rather than categories — otherwise the threshold silently doubles on
+  // the crowded case, and the warning names half of what is on screen.
+  const barCount = compareTermsOn ? barBands * 2 : barBands;
+  const barWarning =
+    chartType === "bar" && barTerms
+      ? barReadabilityWarning(barCount, resolved.orientation)
+      : null;
+  if (barWarning) facts.readabilityWarning = barWarning;
+
   const captionLines = buildCaptionLines({
     caseId,
     timelineId,
@@ -1546,22 +1783,12 @@ export function VisualizePage() {
           </div>
         )}
         {(dataKind === "terms" || dataKind === "timeseries") && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Top values: {topN}
-            </label>
-            <input
-              type="range"
-              min={3}
-              max={dataKind === "timeseries" ? 20 : 50}
-              step={1}
-              value={topN}
-              onChange={(e) =>
-                updateConfig({ options: { ...config.options, topN: Number(e.target.value) } })
-              }
-              className="w-full accent-[var(--color-accent)]"
-            />
-          </div>
+          <TopNControl
+            chartType={chartType}
+            dataKind={dataKind}
+            value={topN}
+            onCommit={(n) => updateConfig({ options: { ...config.options, topN: n } })}
+          />
         )}
         {dataKind === "pivot" && (
           <>
@@ -1802,16 +2029,36 @@ export function VisualizePage() {
                 onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
               />
             )}
-            {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (
-              <BarChart
-                terms={compareTermsOn ? undefined : termsQuery.data}
-                compare={compareTermsOn ? compareTermsQuery.data : undefined}
-                orientation={resolved.orientation}
-                sort={resolved.sort}
-                logScale={resolved.logScale}
-                svgRef={svgRef}
-                onValueClick={handleChartValueClick}
-              />
+            {chartType === "bar" && barTerms && (
+              <>
+                {barWarning && (
+                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
+                    <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
+                    {barWarning}{" "}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-auto px-0.5 py-0 text-xs font-normal underline hover:text-[var(--color-accent)]"
+                      onClick={() =>
+                        updateConfig({
+                          options: { ...config.options, orientation: "horizontal" },
+                        })
+                      }
+                    >
+                      Switch to horizontal
+                    </Button>
+                  </div>
+                )}
+                <BarChart
+                  terms={compareTermsOn ? undefined : termsQuery.data}
+                  compare={compareTermsOn ? compareTermsQuery.data : undefined}
+                  orientation={resolved.orientation}
+                  sort={resolved.sort}
+                  logScale={resolved.logScale}
+                  svgRef={svgRef}
+                  onValueClick={handleChartValueClick}
+                />
+              </>
             )}
             {chartType === "pie" && termsQuery.data && (
               <>

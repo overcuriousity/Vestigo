@@ -10,6 +10,9 @@ import {
   resolveChartOptions,
   defaultChartTypeForScale,
   chartTypesForField,
+  TOPN_MAX,
+  TOPN_MIN,
+  TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
 import { TIME_FIELDS } from "@/components/viz/lib/timeFields";
@@ -48,13 +51,31 @@ describe("resolveChartOptions", () => {
     expect(resolved.sort).toBe("value");
   });
 
-  it("caps topN lower for value-over-time charts than for a bar axis", () => {
-    // One line per value, so a timeseries caps at 20 where a bar caps at 50.
-    expect(resolveChartOptions(config({ chartType: "line", options: { topN: 999 } })).topN).toBe(20);
+  it("caps topN per chart type, lower for value-over-time and pie than for a bar axis", () => {
+    // A bar axis reaches the field-terms endpoint's 500; a timeseries stops at
+    // the series_limit ceiling of 50; a pie is bounded by legibility, not by
+    // what is fetchable.
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 999 } })).topN).toBe(500);
+    expect(resolveChartOptions(config({ chartType: "line", options: { topN: 999 } })).topN).toBe(50);
     expect(
       resolveChartOptions(config({ chartType: "heatmap", options: { topN: 999 } })).topN,
-    ).toBe(20);
-    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 999 } })).topN).toBe(50);
+    ).toBe(50);
+    expect(resolveChartOptions(config({ chartType: "pie", options: { topN: 999 } })).topN).toBe(50);
+  });
+
+  it("keeps every slider ceiling at or below the hard ceiling it escapes from", () => {
+    // A slider max above TOPN_MAX would let the analyst drag to a value the
+    // resolver then silently clamps — the exact failure #297 was filed for.
+    for (const type of Object.keys(TOPN_MAX) as (keyof typeof TOPN_MAX)[]) {
+      expect(TOPN_SLIDER_MAX[type]).toBeLessThanOrEqual(TOPN_MAX[type]);
+    }
+  });
+
+  it("keeps every slider floor at the shared minimum the number box allows", () => {
+    // A range input clamps to its own `min` while React state holds the lower
+    // number — the slider then reads a value the chart is not drawing. One
+    // constant for both controls is what stops them disagreeing.
+    expect(TOPN_MIN).toBeLessThanOrEqual(Math.min(...Object.values(TOPN_SLIDER_MAX)));
   });
 
   it("keeps a legend explicitly turned off, rather than treating false as unset", () => {
@@ -63,8 +84,34 @@ describe("resolveChartOptions", () => {
     );
   });
 
-  it("keeps an explicit zero", () => {
-    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 0 } })).topN).toBe(0);
+  it("floors an explicit zero rather than treating it as unset", () => {
+    // Two distinct things are asserted here. `0` is falsy, so a `||` default
+    // would turn it into 10 and hide the analyst's input; and `0` is also not
+    // a drawable answer — it reached `/viz/field-terms` as `limit=0`, which the
+    // endpoint rejects with a 422, leaving a permanently blank chart with
+    // nothing on screen to explain it. It lands on the floor, not the default.
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 0 } })).topN).toBe(
+      TOPN_MIN,
+    );
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: -5 } })).topN).toBe(
+      TOPN_MIN,
+    );
+  });
+
+  it("falls back to the default for a topN that is not a number", () => {
+    // `c_opts` arrives from the URL as `JSON.parse`d, unvalidated data, so a
+    // shared or hand-edited link can carry anything at all. `"x"` used to
+    // resolve to `NaN` and blank the chart the same way `0` did.
+    const opts = (topN: unknown) => ({ topN }) as unknown as ChartConfig["options"];
+    expect(resolveChartOptions(config({ chartType: "bar", options: opts("x") })).topN).toBe(10);
+    expect(resolveChartOptions(config({ chartType: "bar", options: opts(null) })).topN).toBe(10);
+    expect(
+      resolveChartOptions(config({ chartType: "bar", options: opts(Number.NaN) })).topN,
+    ).toBe(10);
+  });
+
+  it("rounds a fractional topN, which the endpoint's integer limit requires", () => {
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 12.6 } })).topN).toBe(13);
   });
 });
 

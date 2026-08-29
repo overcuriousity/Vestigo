@@ -1,10 +1,10 @@
 import { useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { hashKey, useQuery } from "@tanstack/react-query";
 import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
+import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import { Tooltip } from "@/components/ui/Tooltip";
 import {
   Select,
   SelectContent,
@@ -20,6 +20,16 @@ import { buildCaptionLines } from "@/components/viz/lib/caption";
 import type { EventFilters } from "@/api/types";
 
 const BUCKET_OPTIONS = [30, 60, 100, 150] as const;
+
+/** Rows added per click of the "+ N more" expander. */
+const TERMS_PAGE = 50;
+/**
+ * Hard ceiling on the expanded top-list, matching the `field-terms` endpoint's
+ * own `limit` cap. The list is a scroll container, so an unbounded expansion on
+ * a field with a million distinct values is its own problem (#296); past this
+ * the tail stays reported as a count rather than rendered as rows.
+ */
+const TERMS_MAX = 500;
 
 interface Props {
   open: boolean;
@@ -53,8 +63,17 @@ export function FieldHistogramModal({
   onAddFilter,
 }: Props) {
   const [activeValue, setActiveValue] = useState(value);
+  const [termsLimit, setTermsLimit] = useState(TERMS_PAGE);
   const [buckets, setBuckets] = useState<(typeof BUCKET_OPTIONS)[number]>(60);
   const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // The identity of the top-values list: everything in its query key except
+  // the limit. `filters` is part of it because a row's Filter IN/OUT narrows
+  // the Explorer's view without closing this modal.
+  const termsScope = useMemo(
+    () => hashKey(["field-terms", caseId, timelineId, fieldKey, filters]),
+    [caseId, timelineId, fieldKey, filters],
+  );
 
   // Reset the focused value whenever the modal is opened for a new field/value.
   const resetKey = `${fieldKey}:${value}`;
@@ -62,6 +81,23 @@ export function FieldHistogramModal({
   if (lastResetKey.current !== resetKey) {
     lastResetKey.current = resetKey;
     setActiveValue(value);
+    setTermsLimit(TERMS_PAGE);
+  }
+
+  // A new scope is a new list, so it starts at the first page. Carrying an
+  // expanded limit across a Filter IN/OUT — which already blanks the rows on
+  // purpose, see `placeholderData` below — made the very first fetch of the
+  // new scope ask for more than 50 values, and `merged_field_terms` serves
+  // nothing above 50 out of the `field_stats` cache: the cheap path this list
+  // is meant to hit stayed skipped for as long as the modal was open.
+  const lastTermsScope = useRef(termsScope);
+  // Whether this scope has ever been answered out of the `field_stats` cache.
+  // Reset with the scope: a new list has its own provenance.
+  const sawCachedTerms = useRef(false);
+  if (lastTermsScope.current !== termsScope) {
+    lastTermsScope.current = termsScope;
+    setTermsLimit(TERMS_PAGE);
+    sawCachedTerms.current = false;
   }
 
   const totalHistogramQuery = useQuery({
@@ -103,11 +139,41 @@ export function FieldHistogramModal({
   });
 
   const termsQuery = useQuery({
-    queryKey: ["field-terms", caseId, timelineId, fieldKey, filters],
-    queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, 50),
+    queryKey: ["field-terms", caseId, timelineId, fieldKey, filters, termsLimit],
+    queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, termsLimit),
     enabled: open,
+    // Expanding the list re-asks for a longer prefix rather than appending a
+    // page, so the already-shown rows must stay on screen while the bigger
+    // answer is in flight — otherwise every click blanks the list. The window
+    // aggregation recomputes `other_count` for the new limit, so the tail
+    // count stays truthful after each expansion.
+    //
+    // Only `termsLimit` may change under a kept list. The rest of the key is
+    // the *scope* — and `filters` changes while this modal is open, because a
+    // row's Filter IN/OUT narrows the Explorer's view without closing it.
+    // Holding the previous rows across that would show pre-filter values,
+    // counts and `distinct` as if they were scoped to the new filter, with
+    // nothing on screen saying otherwise. Blank to the spinner instead.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery && hashKey(previousQuery.queryKey.slice(0, 5)) === termsScope
+        ? previous
+        : undefined,
     ...busyRetry,
   });
+  const canExpandTerms = termsLimit < TERMS_MAX;
+  // Expanding crosses a computation boundary, and the analyst has to be told.
+  // An unfiltered first page is served from the per-source `field_stats` cache
+  // (`merged_field_terms`), whose per-value counts are exact sums but whose
+  // cross-source top-N merge is approximate and whose `distinct` is a
+  // max-across-sources. That cache answers nothing above 50, so the first
+  // "+ N more" click falls through to an exact live scan — which on a
+  // multi-source timeline may reorder or replace values inside the 50 already
+  // on screen, and change their counts, `other_count` and the distinct total.
+  // Two rows changing under an analyst with nothing saying why is not
+  // something a forensic tool may do silently.
+  const termsCached = termsQuery.data?.cached === true;
+  if (termsCached) sawCachedTerms.current = true;
+  const termsRescanned = termsQuery.data != null && !termsCached && sawCachedTerms.current;
   // In-flight busy-lane signals (#300): shown beside the spinner while retrying.
   const histogramWaiting = busyMessage(
     histogramQuery.failureReason ?? totalHistogramQuery.failureReason,
@@ -221,8 +287,16 @@ export function FieldHistogramModal({
             <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Top values
               {termsQuery.data && (
-                <span className="ml-1.5 normal-case font-normal text-[var(--color-fg-muted)]">
-                  ({termsQuery.data.distinct} distinct)
+                <span
+                  className="ml-1.5 normal-case font-normal text-[var(--color-fg-muted)]"
+                  title={
+                    termsCached
+                      ? "From the per-source summary cache — the highest count any single source reported, not a cross-source distinct count."
+                      : "Exact, over the current filtered view."
+                  }
+                >
+                  ({termsCached ? "≈" : ""}
+                  {termsQuery.data.distinct} distinct)
                 </span>
               )}
             </p>
@@ -268,44 +342,87 @@ export function FieldHistogramModal({
                         className="h-1.5 w-8 shrink-0 rounded-sm bg-[var(--color-accent)]"
                         style={{ opacity: Math.max(0.15, v.count / maxTermCount) }}
                       />
-                      <Tooltip content="Focus histogram" side="top">
-                        <button
-                          className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
-                          onClick={() => setActiveValue(v.value)}
-                        >
-                          <BarChart2 size={11} />
-                        </button>
-                      </Tooltip>
+                      {/* Native `title`, not our Radix `Tooltip`, and only
+                          here: this list is a plain `<ul>` that renders every
+                          row it has been asked for, and #296 raised that to
+                          500. Two tooltip roots per row is a thousand of them
+                          mounted and subscribed for the fourteen rows the
+                          scroll container actually shows, which is felt as
+                          jank on the last expansions. The row's focus button
+                          above already carries a `title`, so the affordance
+                          was mixed in this list either way. */}
+                      <button
+                        className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
+                        onClick={() => setActiveValue(v.value)}
+                        title="Focus histogram"
+                        aria-label={`Focus histogram on ${v.value}`}
+                      >
+                        <BarChart2 size={11} />
+                      </button>
                       {onAddFilter && (
                         <>
-                          <Tooltip content={`Filter IN: ${fieldKey} = ${v.value}`} side="top">
-                            <button
-                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
-                              onClick={() => onAddFilter(fieldKey, v.value, true)}
-                            >
-                              <Filter size={11} />
-                            </button>
-                          </Tooltip>
-                          <Tooltip content={`Filter OUT: ${fieldKey} ≠ ${v.value}`} side="top">
-                            <button
-                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)]"
-                              onClick={() => onAddFilter(fieldKey, v.value, false)}
-                            >
-                              <FilterX size={11} />
-                            </button>
-                          </Tooltip>
+                          <button
+                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
+                            onClick={() => onAddFilter(fieldKey, v.value, true)}
+                            title={`Filter IN: ${fieldKey} = ${v.value}`}
+                            aria-label={`Filter IN: ${fieldKey} = ${v.value}`}
+                          >
+                            <Filter size={11} />
+                          </button>
+                          <button
+                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)]"
+                            onClick={() => onAddFilter(fieldKey, v.value, false)}
+                            title={`Filter OUT: ${fieldKey} ≠ ${v.value}`}
+                            aria-label={`Filter OUT: ${fieldKey} ≠ ${v.value}`}
+                          >
+                            <FilterX size={11} />
+                          </button>
                         </>
                       )}
                     </li>
                   ))}
                   {termsQuery.data && termsQuery.data.other_count > 0 && (
                     <li className="px-1 py-1 text-[var(--color-fg-muted)]">
-                      + {termsQuery.data.other_count.toLocaleString()} more in other values
+                      {canExpandTerms ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-auto w-full justify-start gap-1.5 whitespace-normal px-0.5 py-0 text-left text-xs font-normal text-[var(--color-fg-muted)] underline decoration-dotted underline-offset-2"
+                          disabled={termsQuery.isFetching}
+                          onClick={() =>
+                            setTermsLimit((n) => Math.min(n + TERMS_PAGE, TERMS_MAX))
+                          }
+                          title={`Load ${Math.min(TERMS_PAGE, TERMS_MAX - termsLimit)} more values`}
+                        >
+                          {termsQuery.isFetching && <Spinner size={11} />}+{" "}
+                          {termsQuery.data.other_count.toLocaleString()} more in other values —
+                          show {Math.min(TERMS_PAGE, TERMS_MAX - termsLimit).toLocaleString()} more
+                        </Button>
+                      ) : (
+                        <>
+                          + {termsQuery.data.other_count.toLocaleString()} more in other values
+                          (showing the top {TERMS_MAX.toLocaleString()}; filter the view to reach
+                          the rest)
+                        </>
+                      )}
                     </li>
                   )}
                 </ul>
               )}
             </div>
+            {termsCached && (
+              <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+                From the per-source summary cache — counts are exact, the ranking across sources
+                and the distinct total are approximate. Showing more re-reads the events and can
+                reorder these rows.
+              </p>
+            )}
+            {termsRescanned && (
+              <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+                Re-read from the events — the ranking, counts and distinct total are exact and may
+                differ from the cached first page shown a moment ago.
+              </p>
+            )}
           </div>
         </div>
       </DialogContent>

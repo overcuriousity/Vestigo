@@ -101,6 +101,25 @@ ANALYST_CHART_LIMITS = ChartLimits(
 )
 
 
+#: Per-chart-type ceiling on a terms chart's ``top_n``, narrowing whatever
+#: ``ChartLimits.terms_top_n`` allows.
+#:
+#: ``terms_top_n``'s cap is what the *endpoint* can return; this is what the
+#: *mark* can honestly draw. A bar axis scrolls, so it reaches the endpoint's
+#: 500 — but pie and waffle share that same ``data_kind="terms"`` aggregation
+#: while being bounded by legibility instead: a pie past a few dozen slices is
+#: unreadable and a waffle only has 100 cells to share out. Without this, an
+#: agent-proposed or exported pie could carry 500 slices that the Visualize
+#: page clamps to 50, so the analyst could not reproduce or edit back the very
+#: chart their story snapshot shows.
+#:
+#: Mirrors ``TOPN_MAX`` in ``frontend/src/components/viz/lib/chartOptions.ts``.
+TERMS_TOP_N_BY_CHART: dict[str, int] = {
+    "pie": 50,
+    "waffle": 50,
+}
+
+
 async def run_gated_scan(fn: Any, *args: Any) -> Any:
     """Run a gated aggregation; a busy foreground lane is a tool error, not a crash.
 
@@ -316,7 +335,9 @@ async def execute_chart_spec(
 
     # ── execute, dispatching on the aggregation the mark needs ───────────
     if data_kind == "terms":
-        applied["top_n"] = _capped(opts.top_n, limits.terms_top_n, "top_n")
+        terms_default, terms_cap = limits.terms_top_n
+        terms_cap = min(terms_cap, TERMS_TOP_N_BY_CHART.get(chart_type, terms_cap))
+        applied["top_n"] = _capped(opts.top_n, (min(terms_default, terms_cap), terms_cap), "top_n")
         if comparison_query is not None:
             result = await run_gated_scan(
                 service.compare_field_terms,

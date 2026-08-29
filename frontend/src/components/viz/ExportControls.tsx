@@ -28,16 +28,23 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
   const [format, setFormat] = useState<"svg" | "png">("png");
   const [scale, setScale] = useState<(typeof SCALES)[number]>(2);
   const [busy, setBusy] = useState(false);
+  // Set when the browser's canvas limits forced the PNG below the picked
+  // resolution — a tall horizontal bar chart at a high `topN` reaches that at
+  // any scale. Saying nothing would leave the picker reading 4× over a file
+  // that is not 4×.
+  const [downscaled, setDownscaled] = useState<number | null>(null);
 
   const handleDownload = async () => {
     const svg = svgRef.current;
     if (!svg) return;
     setBusy(true);
+    setDownscaled(null);
     try {
       if (format === "svg") {
         downloadChartSvg(svg, filename, captionLines);
       } else {
-        await downloadChartPng(svg, filename, scale, captionLines);
+        const used = await downloadChartPng(svg, filename, scale, captionLines);
+        if (used < scale) setDownscaled(used);
       }
     } finally {
       setBusy(false);
@@ -46,7 +53,19 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
 
   return (
     <div className="flex items-center gap-2">
-      <Select value={format} onValueChange={(v) => setFormat(v as "svg" | "png")}>
+      {downscaled != null && format === "png" && (
+        <span role="status" className="max-w-64 text-xs text-[var(--color-fg-muted)]">
+          Exported at {downscaled < 1 ? downscaled.toFixed(2) : downscaled.toFixed(1)}× — this
+          chart is too tall for a {scale}× canvas. Export as SVG for full detail.
+        </span>
+      )}
+      <Select
+        value={format}
+        onValueChange={(v) => {
+          setFormat(v as "svg" | "png");
+          setDownscaled(null);
+        }}
+      >
         <SelectTrigger className="h-8 w-20 text-xs">
           <SelectValue />
         </SelectTrigger>
@@ -58,7 +77,10 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
       {format === "png" && (
         <Select
           value={String(scale)}
-          onValueChange={(v) => setScale(Number(v) as (typeof SCALES)[number])}
+          onValueChange={(v) => {
+            setScale(Number(v) as (typeof SCALES)[number]);
+            setDownscaled(null);
+          }}
         >
           <SelectTrigger className="h-8 w-16 text-xs">
             <SelectValue />
