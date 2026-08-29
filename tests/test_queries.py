@@ -3460,3 +3460,46 @@ def test_mark_instants_takes_the_ordered_head_and_a_countif_pair() -> None:
     assert "LIMIT 3" in head and "ORDER BY ts ASC, event_id ASC" in head
     assert [i["event_id"] for i in result["instants"]] == ["e1", "e2"]
     assert result["overflow"] is True and result["dated"] == 3 and result["undated"] == 1
+
+
+def test_cumulative_distinct_merges_states_over_a_window_and_counts_empties() -> None:
+    svc = _viz_service(
+        [
+            (
+                "uniqExactMerge(st) OVER",
+                FakeQueryResult(
+                    result_rows=[
+                        [datetime(2026, 7, 20, 0, tzinfo=UTC), 0, 2],
+                        [datetime(2026, 7, 20, 2, tzinfo=UTC), 0, 3],
+                    ]
+                ),
+            ),
+            ("countIf(", FakeQueryResult(result_rows=[[7, 1]])),
+        ]
+    )
+    result = svc.cumulative(
+        EventQuery(
+            case_id="c",
+            source_ids=["s"],
+            start=datetime(2026, 7, 20, 0, tzinfo=UTC),
+            end=datetime(2026, 7, 20, 4, tzinfo=UTC),
+        ),
+        field="attr:user",
+        quantity="distinct",
+        buckets=4,
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    steps = next(s for s in sqls if "uniqExactMerge" in s)
+    assert "uniqExactState(" in steps and "!= ''" in steps
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" in steps
+    # Zero-filled across the range (the bucket holding `end` included); an
+    # empty hour carries the previous value.
+    assert [b["value"] for b in result["buckets"]] == [2, 2, 3, 3, 3]
+    assert [b["delta"] for b in result["buckets"]] == [2, 0, 1, 0, 0]
+    assert result["unparsed"] == 1 and result["events"] == 7
+
+
+def test_cumulative_refuses_a_fieldless_sum() -> None:
+    svc = _viz_service([])
+    with pytest.raises(ValueError, match='quantity="sum" needs a field'):
+        svc.cumulative(EventQuery(case_id="c", source_ids=["s"]), quantity="sum")

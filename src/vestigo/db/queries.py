@@ -3980,6 +3980,136 @@ class EventQueryService:
         }
 
     @_foreground_scan
+    def cumulative(
+        self,
+        query: EventQuery,
+        *,
+        field: str | None = None,
+        quantity: str = "events",
+        buckets: int = 60,
+    ) -> dict[str, Any]:
+        """Return a running total over time — the cumulative step figure.
+
+        ``quantity``: ``events`` (a running event count, no field), ``sum``
+        (a running ``sum()`` of *field* parsed as a number; values that do not
+        parse are skipped and counted in ``unparsed``) or ``distinct`` (the
+        number of distinct *field* values seen so far — per-bucket
+        ``uniqExactState`` merged cumulatively by ``uniqExactMerge`` over a
+        window, never a sum of per-bucket distinct counts, which would count a
+        value once per bucket it appears in; empty values are skipped and
+        counted).
+
+        Buckets are epoch-aligned like ``histogram``; the range is the query's
+        explicit ``start``/``end`` or the dated events' min/max. The result is
+        zero-filled so every bucket is present and a flat step is a flat step.
+        Two scans in parallel under one slot: the bucketed running total and
+        the totals (dated events, unparsed).
+        """
+        if quantity not in ("events", "sum", "distinct"):
+            raise ValueError(f'quantity must be "events", "sum" or "distinct", got "{quantity}"')
+        if quantity != "events" and not field:
+            raise ValueError(f'quantity="{quantity}" needs a field')
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"{where} AND {VESTIGO_NOT_SENTINEL_SQL}"
+        settings = foreground_scan_settings()
+
+        if query.start is not None and query.end is not None:
+            min_ts, max_ts = ensure_utc(query.start), ensure_utc(query.end)
+        else:
+            rng = self._select(
+                f"SELECT minOrNull({eff}), maxOrNull({eff}) FROM {database}.events WHERE {dated} {settings}",
+                parameters=parameters,
+            ).result_rows
+            if not rng or rng[0][0] is None:
+                return self._empty_cumulative(quantity, field)
+            min_ts, max_ts = ensure_utc(rng[0][0]), ensure_utc(rng[0][1])
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        bucket_expr = f"toStartOfInterval({eff}, INTERVAL {interval} second)"
+        running = "OVER (ORDER BY bucket ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+
+        col = (
+            _field_column_expr(
+                field,
+                parameters,
+                "cum_field",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            if field
+            else None
+        )
+        if quantity == "events":
+            inner = f"SELECT {bucket_expr} AS bucket, count() AS delta FROM {database}.events WHERE {dated} GROUP BY bucket"
+            outer = f"SELECT bucket, delta, sum(delta) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = "0"
+        elif quantity == "sum":
+            num = f"toFloat64OrNull({col})"
+            inner = f"SELECT {bucket_expr} AS bucket, sum({num}) AS delta FROM {database}.events WHERE {dated} AND {num} IS NOT NULL GROUP BY bucket"
+            outer = f"SELECT bucket, delta, sum(delta) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = f"countIf({num} IS NULL)"
+        else:  # distinct
+            inner = f"SELECT {bucket_expr} AS bucket, uniqExactState({col}) AS st FROM {database}.events WHERE {dated} AND {col} != '' GROUP BY bucket"
+            outer = f"SELECT bucket, 0, uniqExactMerge(st) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = f"countIf({col} = '')"
+
+        def steps() -> Any:
+            return self._select(f"{outer} {settings}", parameters=parameters)
+
+        def totals() -> Any:
+            return self._select(
+                f"SELECT count(), {unparsed_sql} FROM {database}.events WHERE {dated} {settings}",
+                parameters=parameters,
+            )
+
+        step_result, totals_result = self._run_parallel(steps, totals)
+        by_start: dict[str, tuple[float, float]] = {
+            ensure_utc_iso(row[0]): (row[1], row[2]) for row in step_result.result_rows
+        }
+        cast = float if quantity == "sum" else int
+        out: list[dict[str, Any]] = []
+        prev: float = 0
+        for start in aligned_bucket_starts(min_ts, max_ts, interval):
+            if start in by_start:
+                delta, value = by_start[start]
+                value = cast(value)
+                delta = value - prev if quantity == "distinct" else cast(delta)
+            else:
+                delta, value = cast(0), cast(prev)
+            out.append({"start": start, "delta": delta, "value": value})
+            prev = value
+        trow = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "buckets": out,
+            "total": out[-1]["value"] if out else cast(0),
+            "events": int(trow[0] or 0),
+            "unparsed": int(trow[1] or 0),
+        }
+
+    @staticmethod
+    def _empty_cumulative(quantity: str, field: str | None) -> dict[str, Any]:
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": 0,
+            "min": None,
+            "max": None,
+            "buckets": [],
+            "total": 0,
+            "events": 0,
+            "unparsed": 0,
+        }
+
+    @_foreground_scan
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:
