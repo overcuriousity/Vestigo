@@ -4110,6 +4110,86 @@ class EventQueryService:
         }
 
     @_foreground_scan
+    def calendar(
+        self, query: EventQuery, *, field: str | None = None, max_weeks: int = 53
+    ) -> dict[str, Any]:
+        """Return event counts per UTC day — the calendar heatmap.
+
+        One scan grouped by ``toDate(ts, 'UTC')``; with *field*, a day counts
+        the events whose field is non-empty. Day boundaries are UTC on
+        purpose (the same rule as ``time_punchcard``): no timeline or user
+        carries a display timezone, and a boundary that moved with the
+        viewer would redraw the figure between two analysts. The figure
+        keeps the latest *max_weeks* ISO weeks (Monday-start); earlier days
+        are dropped and their events counted in ``dropped`` so the caption
+        can say what is not drawn.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"{where} AND {VESTIGO_NOT_SENTINEL_SQL}"
+        if field:
+            col = _field_column_expr(
+                field,
+                parameters,
+                "cal_field",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            count_expr = f"countIf({col} != '')"
+        else:
+            count_expr = "count()"
+        result = self._select(
+            f"""
+            SELECT toDate({eff}, 'UTC') AS day, {count_expr} AS c
+            FROM {database}.events
+            WHERE {dated}
+            GROUP BY day
+            ORDER BY day
+            {foreground_scan_settings()}
+            """,
+            parameters=parameters,
+        )
+        days = [(row[0], int(row[1])) for row in result.result_rows if int(row[1]) > 0]
+        empty = {
+            "kind": "calendar",
+            "field": field,
+            "timezone": "UTC",
+            "start": None,
+            "end": None,
+            "days": [],
+            "total": 0,
+            "max_count": 0,
+            "weeks": 0,
+            "weeks_total": 0,
+            "truncated": False,
+            "dropped": 0,
+        }
+        if not days:
+            return empty
+        first_day, last_day = days[0][0], days[-1][0]
+        first_monday = first_day - timedelta(days=first_day.isoweekday() - 1)
+        last_monday = last_day - timedelta(days=last_day.isoweekday() - 1)
+        weeks_total = (last_monday - first_monday).days // 7 + 1
+        weeks = min(weeks_total, max(1, int(max_weeks)))
+        start = last_monday - timedelta(weeks=weeks - 1)
+        shown = [(d, c) for d, c in days if d >= start]
+        dropped = sum(c for d, c in days if d < start)
+        return {
+            **empty,
+            "start": start.isoformat(),
+            "end": last_day.isoformat(),
+            "days": [{"date": d.isoformat(), "count": c} for d, c in shown],
+            "total": sum(c for _, c in shown),
+            "max_count": max((c for _, c in shown), default=0),
+            "weeks": weeks,
+            "weeks_total": weeks_total,
+            "truncated": weeks_total > weeks,
+            "dropped": dropped,
+        }
+
+    @_foreground_scan
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:

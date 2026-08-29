@@ -3503,3 +3503,16 @@ def test_cumulative_refuses_a_fieldless_sum() -> None:
     svc = _viz_service([])
     with pytest.raises(ValueError, match='quantity="sum" needs a field'):
         svc.cumulative(EventQuery(case_id="c", source_ids=["s"]), quantity="sum")
+
+
+def test_calendar_groups_by_utc_day_and_counts_a_field_when_given() -> None:
+    from datetime import date
+
+    svc = _viz_service(
+        [("toDate(", FakeQueryResult(result_rows=[[date(2026, 7, 20), 2], [date(2026, 7, 22), 0]]))]
+    )
+    result = svc.calendar(EventQuery(case_id="c", source_ids=["s"]), field="attr:user")
+    sql, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "toDate(" in sql and "'UTC'" in sql and "countIf(" in sql and "!= ''" in sql
+    assert result["days"] == [{"date": "2026-07-20", "count": 2}]  # zero days are not listed
+    assert result["start"] == "2026-07-20" and result["weeks"] == 1
