@@ -32,6 +32,7 @@ import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -238,6 +239,7 @@ export function ChartMarks({
           marks={marks}
         />
       )}
+      {data.kind === "cumulative" && <CumulativeStep data={data.data} marks={marks} />}
       {data.kind === "punchcard" && <PunchCard data={data.data} />}
       {data.kind === "pivot" && config.chartType === "pivot" && (
         <PivotHeatmap data={data.data} />

@@ -23,6 +23,7 @@ import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -171,6 +172,30 @@ describe("chart smoke render", () => {
       <BarChart terms={{ ...TERMS, values: [], other_count: 0 }} />,
     );
     getByText(/no values/i);
+  });
+
+  it("CumulativeStep renders with cumulative data", () => {
+    const { container } = render(
+      <CumulativeStep
+        data={{
+          kind: "cumulative",
+          quantity: "sum",
+          field: "attr:bytes",
+          interval_seconds: 60,
+          min: "2026-07-20T00:00:00+00:00",
+          max: "2026-07-20T00:02:00+00:00",
+          buckets: [
+            { start: "2026-07-20T00:00:00+00:00", delta: 1.5, value: 1.5 },
+            { start: "2026-07-20T00:01:00+00:00", delta: 0, value: 1.5 },
+            { start: "2026-07-20T00:02:00+00:00", delta: 2, value: 3.5 },
+          ],
+          total: 3.5,
+          events: 3,
+          unparsed: 1,
+        }}
+      />,
+    );
+    expectSvg(container);
   });
 
   it("PieChart renders with terms data", () => {
