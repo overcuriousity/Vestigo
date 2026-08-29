@@ -54,3 +54,7 @@ qdrant_data/
 # Airgap deployment bundles (scripts/airgap-bundle.sh writes here by default)
 vestigo-airgap-*.tar.gz
 vestigo-airgap-*.tar.gz.sha256
+
+# brainstorming visual companion working area, and local worktrees
+.superpowers/
+.claude/worktrees/
