@@ -170,8 +170,6 @@ export function UploadDialog({ caseId }: Props) {
     }
   })();
   const modelName = agentInfo?.model ?? "the configured model";
-  // Rough: the disclosure quotes bytes exactly and lines approximately.
-  const approxLines = file ? Math.max(1, Math.round(Math.min(file.size, sampleBytes) / 80)) : 0;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -294,13 +292,14 @@ export function UploadDialog({ caseId }: Props) {
                   className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-fg-primary)]"
                 >
                   <p>
-                    A {fmtBytes(sampleBytes)} excerpt
-                    {file ? ` of “${file.name}” (about ${approxLines.toLocaleString()} lines)` : " of the file"}{" "}
-                    — taken from its beginning, its middle and its end, so newest entries are
-                    included — will be sent to <span className="font-mono">{modelName}</span> at{" "}
-                    <span className="font-mono">{endpointHost}</span>. Nothing else about this case
-                    is sent. The script it writes runs on this server in a guarded subprocess, and
-                    every attempt is recorded with the converter.
+                    An excerpt of at most {fmtBytes(sampleBytes)}
+                    {file ? ` of “${file.name}”` : " of the file"} — taken from its beginning, its
+                    middle and its end, so newest entries are included, and condensed to the
+                    file’s distinct line shapes, so a line repeated a thousand times is sent a
+                    handful of times — will be sent to <span className="font-mono">{modelName}</span>{" "}
+                    at <span className="font-mono">{endpointHost}</span>. Nothing else about this
+                    case is sent. The script it writes runs on this server in a guarded subprocess,
+                    and every attempt is recorded with the converter.
                   </p>
                 </div>
               )}

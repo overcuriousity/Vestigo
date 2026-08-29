@@ -73,7 +73,9 @@ swept from disk shortly after, so refusing it would only strand a legitimate exp
 `converter_generation_enabled` (default **off**) lets an analyst upload a plain-text log and
 have the configured AI model write the converter server-side (`INPUT_FORMATS.md` §"Generated
 converters"). It needs the agent endpoint configured and reachable. Companion tunables:
-`converter_max_attempts` (4), `converter_sample_bytes` (64 KiB sent to the model),
+`converter_max_attempts` (4), `converter_sample_bytes` (64 KiB — the ceiling on what is
+sent, after the excerpt is condensed to distinct line shapes; a repetitive log sends far
+less),
 `converter_run_timeout_seconds` (600), `converter_run_memory_mb` (2048; pyarrow does not
 import below that), `converter_run_output_mb` (4096).
 

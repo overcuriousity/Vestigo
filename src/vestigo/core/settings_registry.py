@@ -906,7 +906,8 @@ _SPECS: tuple[SettingSpec, ...] = (
         "converters",
         "Sample size sent to the model (bytes)",
         "Head, middle and tail of the raw file, up to this many bytes, are the only "
-        "evidence that leaves this host.",
+        "evidence that leaves this host. The excerpt is condensed to distinct line "
+        "shapes first, so a repetitive log sends far less than this.",
         subsystem="converter_generation",
     ),
     SettingSpec(

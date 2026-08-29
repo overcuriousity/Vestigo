@@ -30,13 +30,25 @@ ALL_KEYS = (
 
 
 @dataclass
+class _B:
+    label: str
+    lines: list
+
+
+@dataclass
 class _S:
     blocks: list
 
 
 SAMPLE = _S(
     blocks=[
-        ("head", 1, "Jan  5 10:00:01 host sshd[1]: Accepted\nJan  5 10:00:02 host sshd[1]: Failed")
+        _B(
+            "head",
+            [
+                (1, "Jan  5 10:00:01 host sshd[1]: Accepted"),
+                (2, "Jan  5 10:00:02 host sshd[1]: Failed"),
+            ],
+        )
     ]
 )
 KW: dict = {

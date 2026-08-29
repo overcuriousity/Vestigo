@@ -514,8 +514,9 @@ says so instead of a bare "completed".
 ### What leaves the host
 
 Exactly this, and the dialog says so before the analyst confirms: a bounded excerpt of the raw
-file (`converter_sample_bytes`, default 64 KiB — the head, a middle window and the tail, with
-absolute line numbers), the filename, its size, line count and mtime, the version — and,
+file (`converter_sample_bytes`, default 64 KiB — the head, a middle window and the tail,
+condensed to distinct line shapes, with absolute line numbers), the filename, its size, line
+count and mtime, the version — and,
 once known, the name — the script must declare, and the analyst's optional hint. No case, source, timeline or user identifier,
 no key, no host name. Reusing a saved converter sends nothing. `tests/test_converter_prompt.py`
 asserts the rendered prompt against this list.
@@ -530,7 +531,20 @@ year, and to say which in `timezone_assumption`.
 
 ### The loop
 
-1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable).
+1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable). Each of
+   the three windows reads four times its share of `converter_sample_bytes` off disk and is
+   then **condensed**: at most five lines per distinct *shape* — the line with quoted runs,
+   long hex tokens and digit runs masked — so the budget is spent on variety rather than on
+   the thousandth copy of the commonest line. One nginx access log went from ~23k tokens of
+   prompt to ~700 without losing a format. A quoted run masks to three kinds, not one
+   (empty, ordinary text, escaped/control bytes), because those are what break a parser
+   differently; the tail keeps the *last* of each shape, so it still ends at EOF; an
+   indented line and the line above it are never separated, so a stack trace stays whole;
+   and a file that already fits in the budget is sent whole. Elided lines leave a gap in the
+   absolute numbering, which the prompt marks (`… N repeated line(s) elided …`) and the
+   system message explains. The sample-phase run executes the script over the whole
+   condensed excerpt — head, middle and tail — so the lines that break parsers are exercised
+   before the full run.
 2. **Generate.** One typed model call (`converters/generator.py`) returns `{name, artifact,
    script}`, under `converter_generation_timeout_seconds` (default 180) for the whole
    round — availability probe, config resolution and the model request together. A model
