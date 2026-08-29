@@ -25,14 +25,18 @@
  * a complete, shareable description of the chart.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, HelpCircle, Lightbulb, Repeat, X } from "lucide-react";
+import { Repeat } from "lucide-react";
 import { savedChartsApi, vizApi, type CompareMode } from "@/api/viz";
 import { eventsApi } from "@/api/events";
 import { timelinesApi } from "@/api/timelines";
 import { dispositionsApi } from "@/api/dispositions";
-import { FILTER_PARAM_KEYS, filtersToParams, paramsToFilters } from "@/lib/queryParams";
+import {
+  FILTER_PARAM_KEYS,
+  filtersToParams,
+  paramsToFilters,
+} from "@/lib/queryParams";
 import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { InheritedFiltersBar } from "@/components/viz/InheritedFiltersBar";
 import {
@@ -44,16 +48,6 @@ import { applyFieldEntries, removeFilterEntry } from "@/lib/fieldFilters";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { Tooltip } from "@/components/ui/Tooltip";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/Select";
-import { ExportControls } from "@/components/viz/ExportControls";
-import { CompareFilterEditor } from "@/components/viz/CompareFilterEditor";
-import { SavedChartsRail } from "@/components/viz/SavedChartsRail";
 import { ChartActionPopover } from "@/components/viz/ChartActionPopover";
 import type { ChartValueClick } from "@/components/viz/lib/interaction";
 import { BarChart } from "@/components/viz/charts/BarChart";
@@ -71,7 +65,10 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
-import { CorrMatrix, type CorrMethod } from "@/components/viz/charts/CorrMatrix";
+import {
+  CorrMatrix,
+  type CorrMethod,
+} from "@/components/viz/charts/CorrMatrix";
 import {
   CHART_ID_PARAM,
   chartUrlParams,
@@ -85,25 +82,26 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, SCALES, chartTypesFor, type DataKind } from "@/components/viz/lib/chartMeta";
+import { CHART_META } from "@/components/viz/lib/chartMeta";
 import {
   resolveChartOptions,
   defaultChartTypeForScale,
-  chartTypesForField,
-  TOPN_MAX,
-  TOPN_MIN,
-  TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
-import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
-import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
-import { CHART_PRESETS } from "@/components/viz/lib/presets";
+import {
+  buildCaptionLines,
+  type CaptionFacts,
+} from "@/components/viz/lib/caption";
+import { ChartRail } from "@/components/viz/ChartRail";
+import {
+  SCALE_DISPLAY,
+  treatAsNotice,
+} from "@/components/viz/lib/scaleDisplay";
 import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
 import { barReadabilityWarning } from "@/components/viz/lib/barReadability";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
 import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
-import { CHART_HOW_TO_READ } from "@/components/viz/lib/explainers";
 import { NumericStatStrip } from "@/components/viz/NumericStatStrip";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import type {
@@ -111,301 +109,13 @@ import type {
   CompareTermsResponse,
   CompareTimeResponse,
   EventFilters,
-  VizFieldInfo,
 } from "@/api/types";
 
-const SCALE_INFO: Record<Scale, { label: string; hint: string }> = {
-  nominal: {
-    label: "Nominal",
-    hint: "Unordered categories — e.g. HTTP method, source IP, artifact type. Identity only; order carries no meaning.",
-  },
-  ordinal: {
-    label: "Ordinal",
-    hint: "Ordered categories — e.g. log level (debug < info < warning < error). Order matters, but not the distance between steps.",
-  },
-  interval: {
-    label: "Interval",
-    hint: "Numeric with meaningful differences but no true zero — e.g. a timestamp. Differences are meaningful; ratios are not.",
-  },
-  ratio: {
-    label: "Ratio",
-    hint: "Numeric with a true zero — e.g. bytes transferred, response time, request count. Differences and ratios are both meaningful.",
-  },
-};
-
-const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
-
-/** Radix Select forbids an empty-string item value, so "no grouping" needs a
- * sentinel that cannot collide with a real field token. */
-const CLEAR_GROUP = "__viz_no_group__";
-
-/** One field picker option: display name plus a muted qualifier.
- *
- * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
- * virtual field has no measured distinct count, and "time field" tells the
- * analyst more about why than an empty parenthetical would. Ordinary fields
- * guard on null anyway, so an absent count renders nothing rather than
- * "(null distinct)". */
-/** "a ratio scale", but "an interval scale" — the scale names are data. */
-function articleFor(word: string): string {
-  return /^[aeiou]/i.test(word) ? "an" : "a";
-}
-
-function fieldComboOption(f: VizFieldInfo): FieldComboOption {
-  return {
-    value: f.token,
-    label: fieldTokenLabel(f.token),
-    hint: isTimeField(f.token)
-      ? "(time field)"
-      : f.distinct != null
-        ? `(${f.distinct} distinct)`
-        : undefined,
-  };
-}
-
-/** The chart type to switch to when the analyst wants to chart a field and the
- * current one charts none. `defaultChartTypeForScale` is not enough on its own:
- * its preference list ends in `time`, which is itself field-free, so on a scale
- * whose only other legal marks are field-free it would hand back the state we
- * are trying to leave. */
-function firstFieldChartingType(scale: Scale, field: string | null): ChartType | null {
-  const legal = chartTypesForField(scale, field).filter(
-    (c) => CHART_META[c].dataKind !== "time" && CHART_META[c].dataKind !== "punchcard",
-  );
-  if (legal.length === 0) return null;
-  const preferred = defaultChartTypeForScale(scale, field);
-  return legal.includes(preferred) ? preferred : legal[0];
-}
-
-/** Why the field picker is inert — shown instead of a bare greyed box, the same
- * way Compare states its own reason rather than disappearing (#298). */
-function fieldFreeReason(chartType: ChartType): string {
-  return chartType === "punchcard"
-    ? "The punchcard counts events by weekday and hour, so it charts no field of its own."
-    : "The time histogram counts every event in each bucket, so it charts no field of its own.";
-}
-
-/** Why Compare is disabled for a chart type — shown instead of hiding the
- * control (see chartMeta: pie/box/violin/ecdf have no honest two-layer
- * encoding; the newer kinds simply have no compare aggregation yet). */
-function compareUnavailableReason(chartType: ChartType): string {
-  if (chartType === "punchcard" || chartType === "pivot" || chartType === "sankey" || chartType === "scatter") {
-    return "Compare isn't supported for this chart type yet.";
-  }
-  return "This chart type has no honest two-layer encoding — overlaid layers would misrepresent one of them. Use Bar, Histogram, or the Time histogram to compare.";
-}
-
-/**
- * How long the exact-value box waits after the last keystroke before it
- * commits. Every commit re-runs a gated ClickHouse foreground scan, and the
- * digits of "500" are all in range on the way there — undebounced, typing one
- * number spent three of them (5, 50, 500). Long enough to swallow a multi-digit
- * entry, short enough that the live preview the box is built around survives.
- */
-const TOPN_COMMIT_DEBOUNCE_MS = 400;
-
-/** The keys a range input moves on — see the Top-values slider's `onKeyUp`. */
-const SLIDER_KEYS = new Set([
-  "ArrowLeft",
-  "ArrowRight",
-  "ArrowUp",
-  "ArrowDown",
-  "PageUp",
-  "PageDown",
-  "Home",
-  "End",
-]);
-
-/**
- * The exact-value box beside the Top-values slider (#297).
- *
- * It keeps its own draft string, because coercing every keystroke through
- * `Number` makes the field impossible to retype: `Number("")` is `0`, which is
- * finite, so the first Backspace committed `topN: 1` and the digits of "300"
- * then landed on top of it. A draft that is empty, or that parses outside
- * `[TOPN_MIN, max]`, is simply not committed — it stays on screen until blur
- * or Enter, which clamp to whatever the chart can actually draw.
- */
-function TopNInput({
-  value,
-  max,
-  onCommit,
-}: {
-  value: number;
-  max: number;
-  onCommit: (n: number) => void;
-}) {
-  const [draft, setDraft] = useState<string | null>(null);
-  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cancelPending = () => {
-    if (pending.current != null) {
-      clearTimeout(pending.current);
-      pending.current = null;
-    }
-  };
-  // A commit scheduled by the last keystroke must not outlive the control.
-  useEffect(() => cancelPending, []);
-  const parse = (raw: string): number | null => {
-    if (raw.trim() === "") return null;
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return null;
-    return Math.round(n);
-  };
-  const commitNow = (n: number) => {
-    cancelPending();
-    onCommit(Math.max(TOPN_MIN, Math.min(n, max)));
-  };
-  return (
-    <input
-      type="number"
-      min={TOPN_MIN}
-      max={max}
-      step={1}
-      value={draft ?? String(value)}
-      onChange={(e) => {
-        const raw = e.target.value;
-        setDraft(raw);
-        cancelPending();
-        const n = parse(raw);
-        // Only an in-range number is a finished answer. "3" on the way to
-        // "300" is in range and previews once typing pauses; "900" against a
-        // ceiling of 500 waits for blur or Enter rather than snapping
-        // mid-keystroke.
-        if (n != null && n >= TOPN_MIN && n <= max) {
-          pending.current = setTimeout(() => {
-            pending.current = null;
-            onCommit(n);
-          }, TOPN_COMMIT_DEBOUNCE_MS);
-        }
-      }}
-      onKeyDown={(e) => {
-        // Enter is the one gesture that says "I am done typing". Without it an
-        // out-of-range entry sat on screen, uncommitted and unclamped, until
-        // the analyst happened to click elsewhere.
-        if (e.key !== "Enter") return;
-        e.preventDefault();
-        const n = parse(draft ?? String(value));
-        if (n != null) commitNow(n);
-        setDraft(null);
-      }}
-      onBlur={() => {
-        const n = parse(draft ?? "");
-        if (n != null) commitNow(n);
-        else cancelPending();
-        setDraft(null);
-      }}
-      aria-label="Top values (exact)"
-      className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
-    />
-  );
-}
-
-/**
- * The Top-values control: a slider over the range most charts want, the exact
- * box beside it as the escape hatch to the chart type's ceiling (#297), and
- * the sentence naming that escape hatch.
- *
- * The slider keeps a draft while the analyst is interacting and commits once,
- * on release, for two reasons that pull the same way.
- *
- * Cost: every commit re-runs a gated ClickHouse foreground scan, the same
- * reason the box beside it debounces. Committing on `change` spent one per
- * intermediate step — dragging across a bar chart's full travel was fifty
- * scans and fifty history entries for one gesture.
- *
- * Truth: `topN` may sit above the slider's own maximum, so the thumb is
- * pinned and reads a smaller number than the label by design. A drag that
- * ends there reports its answer only through the release — but a release is
- * an answer only if something moved. A click that lands on the pinned thumb
- * and lets go moved nothing, and must not silently rewrite a typed 500 down
- * to 50. `moved` is that distinction: a drag away from the pinned position
- * and back fires `change` events on the way, so it commits; a press that
- * never leaves it is indistinguishable from a click and does not. Above the
- * slider's range the label and the exact box stay authoritative.
- */
-function TopNControl({
-  chartType,
-  dataKind,
-  value,
-  onCommit,
-}: {
-  chartType: ChartType;
-  dataKind: DataKind;
-  value: number;
-  onCommit: (n: number) => void;
-}) {
-  const sliderMax = TOPN_SLIDER_MAX[chartType];
-  const [draft, setDraft] = useState<number | null>(null);
-  const moved = useRef(false);
-  const shown = draft ?? Math.min(value, sliderMax);
-  const commit = (n: number) => {
-    setDraft(null);
-    moved.current = false;
-    if (n !== value) onCommit(n);
-  };
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-        Top values: {draft ?? value}
-      </label>
-      <div className="flex items-center gap-2">
-        <input
-          type="range"
-          aria-label="Top values"
-          min={TOPN_MIN}
-          max={sliderMax}
-          step={1}
-          value={shown}
-          onChange={(e) => {
-            moved.current = true;
-            setDraft(Number(e.target.value));
-          }}
-          onPointerDown={() => {
-            moved.current = false;
-          }}
-          onPointerUp={(e) => {
-            if (moved.current) commit(Number(e.currentTarget.value));
-            else setDraft(null);
-          }}
-          onPointerCancel={() => {
-            setDraft(null);
-            moved.current = false;
-          }}
-          onKeyUp={(e) => {
-            // Only the keys that actually move a range input. A bare Tab
-            // *into* the slider also fires keyup on it, and with a typed 500
-            // the clamped thumb reads 50 — committing there would rewrite the
-            // value for merely focusing the control.
-            if (!SLIDER_KEYS.has(e.key)) return;
-            commit(Number(e.currentTarget.value));
-          }}
-          onBlur={() => {
-            // A gesture that ended without its own release event (a keypress
-            // interrupted by a click elsewhere) still has an answer on screen.
-            if (draft != null) commit(draft);
-          }}
-          className="min-w-0 flex-1 accent-[var(--color-accent)]"
-        />
-        <TopNInput value={value} max={TOPN_MAX[chartType]} onCommit={onCommit} />
-      </div>
-      {/* The escape hatch has to be named wherever it exists, and the gap is
-          *widest* on the timeseries charts (slider 20, ceiling 50) — naming it
-          only on the terms branch left the number box undiscoverable exactly
-          where it matters most. */}
-      <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-        {`Up to ${TOPN_MAX[chartType]}`}
-        {sliderMax < TOPN_MAX[chartType]
-          ? ` — past the slider's ${sliderMax}, type an exact number.`
-          : "."}
-        {dataKind === "timeseries" &&
-          " Each value is its own series, so a crowded chart stops being readable well before that."}
-      </p>
-    </div>
-  );
-}
-
 export function VisualizePage() {
-  const { caseId, timelineId } = useParams<{ caseId: string; timelineId: string }>();
+  const { caseId, timelineId } = useParams<{
+    caseId: string;
+    timelineId: string;
+  }>();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // A saved chart can be addressed by id instead of spelled out as `c_*`
@@ -422,7 +132,10 @@ export function VisualizePage() {
     enabled: !!(caseId && timelineId && chartId),
   });
   const savedChart = useMemo(
-    () => (chartId ? savedChartsQuery.data?.charts.find((c) => c.id === chartId) : undefined),
+    () =>
+      chartId
+        ? savedChartsQuery.data?.charts.find((c) => c.id === chartId)
+        : undefined,
     [chartId, savedChartsQuery.data],
   );
   const storedConfig = useMemo(
@@ -437,13 +150,16 @@ export function VisualizePage() {
   // nothing on screen to explain either. Falling through to the params draws
   // the default chart, which is the same graceful degradation a deleted chart
   // already got.
-  const chartRefSettled = savedChartsQuery.isSuccess || savedChartsQuery.isError;
+  const chartRefSettled =
+    savedChartsQuery.isSuccess || savedChartsQuery.isError;
   // A `c_chart` that names a deleted chart, one saved by an incompatible
   // config version, or one whose list could not be loaded at all falls through
   // to the params — the page still works, and the notice below says why it is
   // not the chart that was linked.
   const chartRefBroken =
-    !!chartId && chartRefSettled && (savedChart === undefined || storedConfig === null);
+    !!chartId &&
+    chartRefSettled &&
+    (savedChart === undefined || storedConfig === null);
   // While the URL names a chart, *nothing writes the URL automatically* — not
   // while the reference is resolving (where `config` below is still the
   // default chart) and not after it has, where the stored chart already
@@ -472,7 +188,11 @@ export function VisualizePage() {
   useEffect(() => {
     if (!chartRefBroken) return;
     setBrokenChartRef(
-      savedChartsQuery.isError ? "unfetchable" : savedChart ? "unreadable" : "missing",
+      savedChartsQuery.isError
+        ? "unfetchable"
+        : savedChart
+          ? "unreadable"
+          : "missing",
     );
   }, [chartRefBroken, savedChartsQuery.isError, savedChart]);
 
@@ -486,7 +206,9 @@ export function VisualizePage() {
     // the URL dropped, when the URL never carried it and the page re-derives
     // it either way. The frozen renderers (`ChartBlockCard`, the export
     // resolver) do read it, which is the whole reason it is stored.
-    const { collapseRoutine: _live, ...stored } = parseStoredChartFilters(savedChart.config);
+    const { collapseRoutine: _live, ...stored } = parseStoredChartFilters(
+      savedChart.config,
+    );
     return stored;
   }, [storedConfig, savedChart, searchParams]);
   const config = useMemo(
@@ -522,9 +244,12 @@ export function VisualizePage() {
   // Settled, not succeeded: a failed chart-list fetch has already fallen back
   // to the params above, and there is nothing left to wait for.
   const scopeReady =
-    !!(caseId && timelineId) && dispositionsQuery.isSuccess && (!chartId || chartRefSettled);
+    !!(caseId && timelineId) &&
+    dispositionsQuery.isSuccess &&
+    (!chartId || chartRefSettled);
   const filters = useMemo(
-    () => (collapseRoutine ? { ...urlFilters, collapseRoutine: true } : urlFilters),
+    () =>
+      collapseRoutine ? { ...urlFilters, collapseRoutine: true } : urlFilters,
     [urlFilters, collapseRoutine],
   );
 
@@ -568,7 +293,8 @@ export function VisualizePage() {
   );
 
   const updateConfig = useCallback(
-    (patch: Partial<ChartConfig>) => takeOver({ ...config, ...patch }, urlFilters),
+    (patch: Partial<ChartConfig>) =>
+      takeOver({ ...config, ...patch }, urlFilters),
     [takeOver, config, urlFilters],
   );
 
@@ -618,7 +344,9 @@ export function VisualizePage() {
 
   // Click-to-filter: charts report the clicked mark's field=value pair(s);
   // the popover offers filter in / filter out / open in Explorer.
-  const [pendingClick, setPendingClick] = useState<ChartValueClick | null>(null);
+  const [pendingClick, setPendingClick] = useState<ChartValueClick | null>(
+    null,
+  );
   const handleChartValueClick = useCallback((click: ChartValueClick) => {
     setPendingClick(click);
   }, []);
@@ -636,7 +364,6 @@ export function VisualizePage() {
   // "time" and "punchcard" chart the whole event count — no field involved.
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
   const compareOn = config.compare.mode !== "off";
-  const compareSupported = !!CHART_META[chartType].supportsCompare;
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
       ? { mode: "baseline" }
@@ -647,7 +374,16 @@ export function VisualizePage() {
   // Shared with the agent's ChartProposalCard so a proposed chart and a
   // hand-built one resolve their defaults identically.
   const resolved = useMemo(() => resolveChartOptions(config), [config]);
-  const { topN, bins, buckets, limitX, limitY, sampleLimit, groups, showPoints } = resolved;
+  const {
+    topN,
+    bins,
+    buckets,
+    limitX,
+    limitY,
+    sampleLimit,
+    groups,
+    showPoints,
+  } = resolved;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   // Preset strip: open by default on a fresh page (no chart state in the
@@ -663,29 +399,6 @@ export function VisualizePage() {
    * touched moved while they watched. This holds the last such change and is
    * cleared by the next explicit pick, since their own choice needs no excuse. */
   const [autoNotice, setAutoNotice] = useState<string | null>(null);
-  /** A token typed into the second-field picker that X already holds (#308).
-   *
-   * The X and Y pickers must not name the same field, so the Y list drops
-   * whatever X holds — but the box takes free text, so the token can still be
-   * typed in. Committing it would show the combo's unknown-field disclosure,
-   * which is a claim about the wrong problem entirely: the field *is* in this
-   * timeline's inventory, it is just spoken for. The X→Y direction resolves
-   * the collision by clearing Y and saying so; Y→X cannot mirror that, since X
-   * is the axis the chart is built on and emptying it would only have the
-   * defaulting effect refill it with a field nobody picked. So refuse, and say
-   * why at the picker that refused. */
-  const [fieldYTaken, setFieldYTaken] = useState<string | null>(null);
-  const [presetsOpen, setPresetsOpen] = useState(() => !searchParams.has("c_type"));
-
-  const applyPreset = (preset: (typeof CHART_PRESETS)[number]) => {
-    updateConfig(preset.config);
-    // A preset is an explicit pick of type, scale and field at once, so any
-    // standing "we moved this for you" note is now about a chart the analyst
-    // no longer has — and would read as an excuse for the one they just chose.
-    setAutoNotice(null);
-    setPresetsOpen(false);
-  };
-
   const timelineQuery = useQuery({
     queryKey: ["timeline", caseId, timelineId],
     queryFn: () => timelinesApi.get(caseId!, timelineId!),
@@ -722,11 +435,27 @@ export function VisualizePage() {
   // on the data kind rather than on `chartTypesForField`, so a URL with an
   // inconsistent scale/chartType pair still falls through to its own handling
   // instead of collecting this (wrong) explanation.
-  const chartTypeUnplottable = fieldIsTime && (dataKind === "numeric" || dataKind === "scatter");
+  const chartTypeUnplottable =
+    fieldIsTime && (dataKind === "numeric" || dataKind === "scatter");
   const numericQuery = useQuery({
-    queryKey: ["viz-field-numeric", caseId, timelineId, field, filters, bins, showPoints],
+    queryKey: [
+      "viz-field-numeric",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      bins,
+      showPoints,
+    ],
     queryFn: () =>
-      vizApi.fieldNumeric(caseId!, timelineId!, field!, filters, bins, showPoints),
+      vizApi.fieldNumeric(
+        caseId!,
+        timelineId!,
+        field!,
+        filters,
+        bins,
+        showPoints,
+      ),
     // Run only when a numeric chart actually needs the data, or when a
     // *field-dependent* chart needs its one-time scale probe. The field-free
     // charts (time, punchcard) never need it, and the two-field charts have
@@ -774,9 +503,17 @@ export function VisualizePage() {
     const nextType = defaultChartTypeForScale(scale, field);
     updateConfig({ scale, chartType: nextType });
     setAutoNotice(
-      `${fieldTokenLabel(field)} is a time field — scale set to ${scale}, chart set to ${CHART_META[nextType].label}.`,
+      `${fieldTokenLabel(field)} is a time field — treating it as ${SCALE_DISPLAY[scale].label.toLowerCase()}; figure set to ${CHART_META[nextType].label}.`,
     );
-  }, [field, fieldIsTime, fieldFree, requiresSecondField, multiField, updateConfig, chartRefLive]);
+  }, [
+    field,
+    fieldIsTime,
+    fieldFree,
+    requiresSecondField,
+    multiField,
+    updateConfig,
+    chartRefLive,
+  ]);
 
   useEffect(() => {
     if (chartRefLive) return;
@@ -799,14 +536,17 @@ export function VisualizePage() {
     // "Group by cleared" line the analyst's own edit had just put there a few
     // hundred milliseconds earlier. Landing on the scale and type the chart
     // already has is not a change and must not claim to be one.
-    const moved: string[] = [];
-    if (nextScale !== scale) moved.push(`scale set to ${nextScale}`);
-    if (nextType !== chartType) moved.push(`chart set to ${CHART_META[nextType].label}`);
-    if (moved.length === 0) return;
+    if (nextScale === scale && nextType === chartType) return;
     updateConfig({ scale: nextScale, chartType: nextType });
-    setAutoNotice(
-      `${fieldTokenLabel(field)} ${isNumeric ? "looks numeric" : "has no numeric values"} — ${moved.join(", ")}.`,
-    );
+    const label = fieldTokenLabel(field);
+    let notice =
+      nextScale !== scale
+        ? treatAsNotice(label, nextScale, isNumeric)
+        : `${label} ${isNumeric ? "looks numeric" : "has no numeric values"}.`;
+    if (nextType !== chartType) {
+      notice = `${notice.replace(/\.$/, "")}; figure set to ${CHART_META[nextType].label}.`;
+    }
+    setAutoNotice(notice);
   }, [
     field,
     fieldIsTime,
@@ -819,31 +559,6 @@ export function VisualizePage() {
     updateConfig,
     chartRefLive,
   ]);
-
-  // Keep chartType valid when the analyst switches scale — clamped at event
-  // time rather than in an effect, so there is never a render with an
-  // inconsistent scale/chartType pair.
-  const handleScaleChange = (s: Scale) => {
-    // Also re-picks when the type is legal for the new scale but not for the
-    // field — a `time:` field cannot feed a numeric mark at any scale.
-    if (!chartTypesForField(s, field).includes(chartType)) {
-      const next = defaultChartTypeForScale(s, field);
-      updateConfig({ scale: s, chartType: next });
-      // The re-pick is correct and used to be silent: two controls where the
-      // analyst touched one. Say which moved and why (#298) — and say which of
-      // the two reasons it was, since blaming the scale for a clamp the *field*
-      // forced is a false statement about the chart the analyst is looking at.
-      const legalForScale = chartTypesFor(s).includes(chartType);
-      setAutoNotice(
-        legalForScale && field
-          ? `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} can't plot ${fieldTokenLabel(field)}.`
-          : `Chart type switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available on ${articleFor(s)} ${s} scale.`,
-      );
-    } else {
-      updateConfig({ scale: s });
-      setAutoNotice(null);
-    }
-  };
 
   // Metric gating: % of baseline needs a comparison layer; delta/rate/
   // cumulative need time-bucketed bins. Clamp the active metric the same way
@@ -862,16 +577,26 @@ export function VisualizePage() {
     if (!metricAvailable(metric)) updateConfig({ metric: "count" });
   }, [metric, metricAvailable, updateConfig, chartRefLive]);
 
-  const compareTermsOn = compareOn && chartType === "bar" && compareApiSpec != null;
+  const compareTermsOn =
+    compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({
     queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
-    queryFn: () => vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
+    queryFn: () =>
+      vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
     enabled: scopeReady && !!field && dataKind === "terms" && !compareTermsOn,
     ...busyRetry,
   });
 
   const compareTermsQuery = useQuery({
-    queryKey: ["viz-compare-terms", caseId, timelineId, field, filters, config.compare, topN],
+    queryKey: [
+      "viz-compare-terms",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      config.compare,
+      topN,
+    ],
     queryFn: async () =>
       (await vizApi.compare(caseId!, timelineId!, {
         kind: "terms",
@@ -884,9 +609,18 @@ export function VisualizePage() {
     ...busyRetry,
   });
 
-  const compareNumericOn = compareOn && chartType === "histogram" && compareApiSpec != null;
+  const compareNumericOn =
+    compareOn && chartType === "histogram" && compareApiSpec != null;
   const compareNumericQuery = useQuery({
-    queryKey: ["viz-compare-numeric", caseId, timelineId, field, filters, config.compare, bins],
+    queryKey: [
+      "viz-compare-numeric",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      config.compare,
+      bins,
+    ],
     queryFn: async () =>
       (await vizApi.compare(caseId!, timelineId!, {
         kind: "numeric",
@@ -932,15 +666,38 @@ export function VisualizePage() {
   });
 
   const correlationQuery = useQuery({
-    queryKey: ["viz-field-correlation", caseId, timelineId, selectedFields, filters],
-    queryFn: () => vizApi.fieldCorrelation(caseId!, timelineId!, selectedFields, filters),
+    queryKey: [
+      "viz-field-correlation",
+      caseId,
+      timelineId,
+      selectedFields,
+      filters,
+    ],
+    queryFn: () =>
+      vizApi.fieldCorrelation(caseId!, timelineId!, selectedFields, filters),
     enabled: scopeReady && multiField && selectedFields.length >= 2,
     ...busyRetry,
   });
 
   const timeseriesQuery = useQuery({
-    queryKey: ["viz-field-timeseries", caseId, timelineId, field, filters, buckets, topN],
-    queryFn: () => vizApi.fieldTimeseries(caseId!, timelineId!, field!, filters, buckets, topN),
+    queryKey: [
+      "viz-field-timeseries",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      buckets,
+      topN,
+    ],
+    queryFn: () =>
+      vizApi.fieldTimeseries(
+        caseId!,
+        timelineId!,
+        field!,
+        filters,
+        buckets,
+        topN,
+      ),
     enabled: scopeReady && !!field && dataKind === "timeseries",
     ...busyRetry,
   });
@@ -948,7 +705,14 @@ export function VisualizePage() {
   // Events-over-time: one shared-grid compare call when a comparison layer
   // is on, otherwise the Explorer's own histogram adapted to the same shape.
   const timeQuery = useQuery({
-    queryKey: ["viz-time", caseId, timelineId, filters, config.compare, buckets],
+    queryKey: [
+      "viz-time",
+      caseId,
+      timelineId,
+      filters,
+      config.compare,
+      buckets,
+    ],
     queryFn: async (): Promise<CompareTimeResponse> => {
       if (compareApiSpec) {
         return (await vizApi.compare(caseId!, timelineId!, {
@@ -958,7 +722,9 @@ export function VisualizePage() {
           buckets,
         })) as CompareTimeResponse;
       }
-      return histogramToCompare(await eventsApi.histogram(caseId!, timelineId!, filters, buckets));
+      return histogramToCompare(
+        await eventsApi.histogram(caseId!, timelineId!, filters, buckets),
+      );
     },
     enabled: scopeReady && dataKind === "time",
     ...busyRetry,
@@ -974,24 +740,56 @@ export function VisualizePage() {
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
   // — switching between those chart types refetches nothing.
   const pivotQuery = useQuery({
-    queryKey: ["viz-field-pivot", caseId, timelineId, field, fieldY, filters, limitX, limitY],
-    queryFn: () => vizApi.fieldPivot(caseId!, timelineId!, field!, fieldY!, filters, limitX, limitY),
+    queryKey: [
+      "viz-field-pivot",
+      caseId,
+      timelineId,
+      field,
+      fieldY,
+      filters,
+      limitX,
+      limitY,
+    ],
+    queryFn: () =>
+      vizApi.fieldPivot(
+        caseId!,
+        timelineId!,
+        field!,
+        fieldY!,
+        filters,
+        limitX,
+        limitY,
+      ),
     enabled: scopeReady && !!(field && fieldY) && dataKind === "pivot",
     ...busyRetry,
   });
 
   const scatterQuery = useQuery({
-    queryKey: ["viz-field-scatter", caseId, timelineId, field, fieldY, filters, sampleLimit],
-    queryFn: () => vizApi.fieldScatter(caseId!, timelineId!, field!, fieldY!, filters, sampleLimit),
+    queryKey: [
+      "viz-field-scatter",
+      caseId,
+      timelineId,
+      field,
+      fieldY,
+      filters,
+      sampleLimit,
+    ],
+    queryFn: () =>
+      vizApi.fieldScatter(
+        caseId!,
+        timelineId!,
+        field!,
+        fieldY!,
+        filters,
+        sampleLimit,
+      ),
     enabled: scopeReady && !!(field && fieldY) && dataKind === "scatter",
     ...busyRetry,
   });
 
-  const availableChartTypes = chartTypesForField(scale, field);
   /** The chart type the "chart a field instead" button switches to — null when
    * this scale offers no field-charting mark at all, in which case the button
    * would be a dead end and is not rendered. */
-  const fieldChartingType = firstFieldChartingType(scale, field);
 
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
@@ -1059,15 +857,21 @@ export function VisualizePage() {
     // count, and was charted whole — there is no "rest in Other" to caption.
     // Left undefined rather than relying on `distinct > shown` happening to be
     // false, so the caption cannot claim truncation that did not occur.
-    facts.xDistinct = pivotQuery.data.x_bounded ? undefined : pivotQuery.data.x_distinct;
+    facts.xDistinct = pivotQuery.data.x_bounded
+      ? undefined
+      : pivotQuery.data.x_distinct;
     facts.xShown = pivotQuery.data.x_values.length;
-    facts.yDistinct = pivotQuery.data.y_bounded ? undefined : pivotQuery.data.y_distinct;
+    facts.yDistinct = pivotQuery.data.y_bounded
+      ? undefined
+      : pivotQuery.data.y_distinct;
     facts.yShown = pivotQuery.data.y_values.length;
   } else if (dataKind === "corr" && correlationQuery.data) {
     facts.primaryTotal = correlationQuery.data.total;
     facts.corrFields = correlationQuery.data.fields;
     facts.corrPairs = correlationQuery.data.pairs.length;
-    facts.corrDropped = correlationQuery.data.dropped_fields.map((d) => d.field);
+    facts.corrDropped = correlationQuery.data.dropped_fields.map(
+      (d) => d.field,
+    );
     facts.corrMinPairN = correlationQuery.data.pairs.length
       ? Math.min(...correlationQuery.data.pairs.map((p) => p.n))
       : undefined;
@@ -1084,7 +888,9 @@ export function VisualizePage() {
   // Advisory only — the pie still renders; the same rule runs in
   // `propose_chart`, so an agent proposal carries the identical caution.
   const pieWarning =
-    chartType === "pie" && termsQuery.data ? pieReadabilityWarning(termsQuery.data) : null;
+    chartType === "pie" && termsQuery.data
+      ? pieReadabilityWarning(termsQuery.data)
+      : null;
   if (pieWarning) facts.readabilityWarning = pieWarning;
 
   // Same advisory footing for the bar axis, which since #297 reaches 500
@@ -1095,10 +901,12 @@ export function VisualizePage() {
     barTerms == null
       ? 0
       : barTerms.values.length +
-        ((compareTermsOn
-          ? (compareTermsQuery.data?.primary_other ?? 0) > 0 ||
-            (compareTermsQuery.data?.comparison_other ?? 0) > 0
-          : (termsQuery.data?.other_count ?? 0) > 0)
+        ((
+          compareTermsOn
+            ? (compareTermsQuery.data?.primary_other ?? 0) > 0 ||
+              (compareTermsQuery.data?.comparison_other ?? 0) > 0
+            : (termsQuery.data?.other_count ?? 0) > 0
+        )
           ? 1
           : 0);
   // Compare mode draws two half-width sub-bars per band, so the rule counts
@@ -1158,740 +966,49 @@ export function VisualizePage() {
   // and then fails, which is what the lane was built to avoid.
   const waiting = busyMessage(activeQuery?.failureReason);
 
+  const exportFilename = `${
+    dataKind === "time"
+      ? "events_over_time"
+      : dataKind === "punchcard"
+        ? "activity_punchcard"
+        : requiresSecondField && field && fieldY
+          ? `${field}_x_${fieldY}`
+          : (field ?? "visualization")
+  }_${chartType}`;
+
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Control rail */}
-      <div className="flex w-72 shrink-0 flex-col gap-4 overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
-        <div>
-          {/* The resolved filters, not the raw params: under `?c_chart=<id>`
-              the URL names a chart and holds no filters at all, and the
-              Explorer has no use for `c_*` keys either way. */}
-          {caseId && timelineId && (
-            <Link
-              to={explorerHref}
-              className="flex items-center gap-1 text-xs text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
-            >
-              <ArrowLeft size={12} /> Back to Explorer
-            </Link>
-          )}
-          <h2 className="mt-1 text-sm font-semibold text-[var(--color-fg-primary)]">
-            Visualize {timelineQuery.data ? `— ${timelineQuery.data.name}` : ""}
-          </h2>
-          <button
-            onClick={() => setPresetsOpen((v) => !v)}
-            className="mt-1 flex items-center gap-1 text-xs text-[var(--color-fg-secondary)] hover:text-[var(--color-fg-primary)]"
-          >
-            <Lightbulb size={12} /> Presets
-          </button>
-        </div>
-
-        {/* A link into a chart that is gone, or one this build cannot read.
-            Said out loud rather than left to look like a chart that was
-            always this shape — the page below is the default chart, not the
-            one the link named. */}
-        {brokenChartRef && (
-          <p role="status" className="text-xs text-[var(--color-warning)]">
-            {brokenChartRef === "unfetchable"
-              ? "That chart could not be loaded — the saved charts could not be fetched. Showing a default chart instead; reload to try again."
-              : brokenChartRef === "unreadable"
-                ? "That chart was saved with an incompatible config version and cannot be loaded."
-                : "That saved chart no longer exists."}
-          </p>
-        )}
-
-        {/* Editing a saved chart spells it into the URL, which cannot carry
-            these narrowings — so the chart on screen is now wider than the one
-            that was loaded. Said out loud, and repeated in the saved-chart rail
-            (re-saving from here would freeze the wider slice). */}
-        {droppedScope && (
-          <p role="status" className="text-xs text-[var(--color-warning)]">
-            Editing this chart dropped {droppedScope.join(" and ")} — it now covers the whole
-            timeline. Reload the saved chart to get that scope back.
-          </p>
-        )}
-
-        {/* Scale of measurement */}
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Scale of measurement
-          </label>
-          <div className="space-y-1">
-            {SCALES.map((s) => (
-              <label
-                key={s}
-                className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                  scale === s ? "bg-[var(--color-accent-dim)]" : "hover:bg-[var(--color-bg-hover)]"
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="scale"
-                  checked={scale === s}
-                  onChange={() => handleScaleChange(s)}
-                  className="accent-[var(--color-accent)]"
-                />
-                {SCALE_INFO[s].label}
-                <Tooltip content={SCALE_INFO[s].hint} side="right">
-                  <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
-                </Tooltip>
-              </label>
-            ))}
-          </div>
-        </div>
-
-        {/* Chart type */}
-        <div>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Chart type
-          </label>
-          <Select
-            value={chartType}
-            onValueChange={(v) => {
-              updateConfig({ chartType: v as ChartType });
-              setAutoNotice(null);
-            }}
-          >
-            <SelectTrigger className="text-sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {availableChartTypes.map((c) => (
-                <SelectItem key={c} value={c}>
-                  {CHART_META[c].label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {/* Never under a live chart reference: the page does not remount when
-              a saved chart is opened (`chartRefLive` is derived from `c_chart`
-              on the same route), so a notice about the chart the analyst was
-              building would otherwise survive onto a stored chart the rail
-              re-picked nothing for — a "we moved this for you" line about a
-              move that never happened here. */}
-          {!chartRefLive && autoNotice && (
-            <p className="mt-1 text-xs text-[var(--color-info)]">{autoNotice}</p>
-          )}
-          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-            {CHART_HOW_TO_READ[chartType]}
-          </p>
-        </div>
-
-        {/* Field picker — hidden for the correlation matrix, which charts a
-            list of fields instead (its own picker is below). */}
-        <div className={multiField ? "hidden" : undefined}>
-          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            {requiresSecondField ? "Field (X)" : "Field"}
-          </label>
-          {fieldFree ? (
-            /* Rendered and inert with the reason shown, never silently dead —
-               the same contract Compare keeps a few blocks down. Greying a
-               control the analyst cannot see the cause of is what made this
-               read as a glitch (#298). */
-            <>
-              <div className="rounded border border-[var(--color-border)] px-3 py-1.5 text-sm text-[var(--color-fg-muted)]">
-                — event count —
-              </div>
-              <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-                {fieldFreeReason(chartType)}
-              </p>
-              {fieldChartingType && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-1.5 w-full"
-                  onClick={() => {
-                    updateConfig({ chartType: fieldChartingType });
-                    setAutoNotice(null);
-                  }}
-                >
-                  Chart a field instead ({CHART_META[fieldChartingType].label})
-                </Button>
-              )}
-            </>
-          ) : (
-            <FieldCombo
-              aria-label={requiresSecondField ? "Field (X)" : "Field"}
-              placeholder="Choose a field…"
-              options={(fieldsQuery.data?.fields ?? []).map(fieldComboOption)}
-              value={field ?? ""}
-              onChange={(v) => {
-                // X and Y must differ, and the Y list drops whatever X holds —
-                // so setting X to the token Y already had left an unreachable
-                // value sitting there under "not in this timeline's reported
-                // fields", which is a claim about the wrong problem entirely.
-                const takesOverY = !!v && v === fieldY;
-                updateConfig(takesOverY ? { field: v, fieldY: null } : { field: v });
-                setAutoNotice(
-                  takesOverY
-                    ? `${acceptsSecondField ? "Group by" : "Field (Y)"} cleared — ${fieldTokenLabel(v)} is now the X field.`
-                    : null,
-                );
-              }}
-            />
-          )}
-        </div>
-
-        {/* Field list — the correlation matrix charts 2–8 fields at once */}
-        {multiField && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Fields to correlate ({selectedFields.length}/8){" "}
-              <ExplainerPopover id="correlationMatrix" />
-            </label>
-            <div className="mb-1 flex flex-wrap gap-1">
-              {selectedFields.map((token) => (
-                <button
-                  key={token}
-                  type="button"
-                  onClick={() =>
-                    updateConfig({ fields: selectedFields.filter((f) => f !== token) })
-                  }
-                  className="flex items-center gap-1 rounded border border-[var(--color-border)] px-2 py-0.5 text-xs text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
-                  title="Remove from the matrix"
-                >
-                  {fieldTokenLabel(token)} <X size={10} />
-                </button>
-              ))}
-              {selectedFields.length === 0 && (
-                <span className="text-xs text-[var(--color-fg-muted)]">
-                  Pick at least two numeric fields.
-                </span>
-              )}
-            </div>
-            <div className="mb-1 flex gap-1">
-              {(["pearson", "spearman"] as const).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setCorrMethod(m)}
-                  className={`flex-1 rounded border px-2 py-1 text-xs ${
-                    corrMethod === m
-                      ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-fg-primary)]"
-                      : "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
-                  }`}
-                >
-                  {m === "pearson" ? "Pearson r" : "Spearman ρ"}
-                </button>
-              ))}
-              <ExplainerPopover id={corrMethod === "pearson" ? "pearson" : "spearman"} />
-            </div>
-            <FieldCombo
-              aria-label="Add a field to correlate"
-              placeholder="Add a field…"
-              // The box stays empty: this picker adds to the chip list above
-              // rather than holding a selection of its own — which also means
-              // its `value` can never carry the unknown-token disclosure. So
-              // close the set instead: the matrix charts fields the inventory
-              // reported, and a typo appended as a chip returns an empty
-              // matrix with nothing naming the cause.
-              allowFreeText={false}
-              value=""
-              options={(fieldsQuery.data?.fields ?? [])
-                .filter((f) => !selectedFields.includes(f.token) && !isTimeField(f.token))
-                .map(fieldComboOption)}
-              onChange={(v) =>
-                v && updateConfig({ fields: [...selectedFields, v].slice(0, 8) })
-              }
-            />
-          </div>
-        )}
-
-        {/* Second field picker — pivot/sankey/scatter chart both axes;
-            box/violin use it optionally as a grouping variable */}
-        {(requiresSecondField || acceptsSecondField) && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              {acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
-            </label>
-            <FieldCombo
-              aria-label={acceptsSecondField ? "Group by (optional)" : "Field (Y)"}
-              placeholder={acceptsSecondField ? "No grouping" : "Choose a second field…"}
-              options={[
-                ...(acceptsSecondField
-                  ? [{ value: CLEAR_GROUP, label: "No grouping" }]
-                  : []),
-                ...(fieldsQuery.data?.fields ?? [])
-                  .filter((f) => f.token !== field)
-                  .map(fieldComboOption),
-              ]}
-              value={fieldY ?? ""}
-              onChange={(v) => {
-                const next = v === CLEAR_GROUP || !v ? null : v;
-                if (next && next === field) {
-                  setFieldYTaken(next);
-                  return;
-                }
-                setFieldYTaken(null);
-                updateConfig({ fieldY: next });
-              }}
-            />
-            {/* Compared against the *current* X, so the line clears itself the
-                moment X moves off the token it was about. */}
-            {fieldYTaken === field && field && (
-              <p className="mt-1 text-xs text-[var(--color-info)]">
-                {fieldTokenLabel(field)} is already the{" "}
-                {requiresSecondField ? "X field" : "charted field"} — pick a different one.
-              </p>
-            )}
-          </div>
-        )}
-
-        {/* Compare — time histogram, bar (grouped), numeric histogram (overlay).
-            Always rendered; disabled (with the reason) for chart types without
-            an honest two-layer encoding, instead of silently disappearing. */}
-        <div>
-          <label className="mb-1 flex items-center gap-1 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-            Compare
-            <Tooltip
-              content={
-                compareSupported
-                  ? "Adds a second layer evaluated on the same time grid: the whole timeline (baseline) or a second filter set. Both layers always share the time range and bucket width, so they are directly comparable."
-                  : compareUnavailableReason(chartType)
-              }
-              side="right"
-            >
-              <HelpCircle size={12} className="text-[var(--color-fg-muted)]" />
-            </Tooltip>
-          </label>
-          <div className="space-y-1">
-            {(
-              [
-                { mode: "off", label: "Off" },
-                { mode: "baseline", label: "Baseline (all events)" },
-                { mode: "custom", label: "Custom filters" },
-              ] as const
-            ).map((opt) => (
-              <label
-                key={opt.mode}
-                className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                  !compareSupported
-                    ? "cursor-not-allowed opacity-50"
-                    : config.compare.mode === opt.mode
-                      ? "cursor-pointer bg-[var(--color-accent-dim)]"
-                      : "cursor-pointer hover:bg-[var(--color-bg-hover)]"
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="compare"
-                  disabled={!compareSupported}
-                  checked={compareSupported && config.compare.mode === opt.mode}
-                  onChange={() =>
-                    updateConfig({
-                      compare:
-                        opt.mode === "custom"
-                          ? { mode: "custom", filters: {} }
-                          : { mode: opt.mode },
-                    })
-                  }
-                  className="accent-[var(--color-accent)]"
-                />
-                {opt.label}
-              </label>
-            ))}
-          </div>
-          {!compareSupported && (
-            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-              {compareUnavailableReason(chartType)}
-            </p>
-          )}
-          {compareSupported && config.compare.mode === "custom" && (
-            <div className="mt-2 rounded border border-[var(--color-border)] p-2">
-              <CompareFilterEditor
-                filters={config.compare.filters}
-                onChange={(f) => updateConfig({ compare: { mode: "custom", filters: f } })}
-                fields={fieldsQuery.data?.fields ?? []}
-              />
-            </div>
-          )}
-        </div>
-
-        {/* Metric */}
-        {dataKind === "time" && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Metric
-            </label>
-            <Select
-              value={metric}
-              onValueChange={(v) => updateConfig({ metric: v as Metric })}
-            >
-              <SelectTrigger className="text-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {METRICS.filter(metricAvailable).map((m) => (
-                  <SelectItem key={m} value={m}>
-                    {METRIC_INFO[m].label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {metric !== "count" && (
-              <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-                {METRIC_INFO[metric].formula}
-              </p>
-            )}
-            {!compareOn && (
-              <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-                Turn on Compare to unlock “% of baseline”.
-              </p>
-            )}
-          </div>
-        )}
-
-        {/* Per-chart options */}
-        {(chartType === "bar" ||
-          chartType === "histogram" ||
-          chartType === "time" ||
-          chartType === "line") && (
-          <details className="rounded border border-[var(--color-border)]">
-            <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Options
-            </summary>
-            <div className="space-y-3 px-2 pb-2 pt-1">
-              {chartType === "bar" && (
-                <>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
-                      Orientation
-                    </label>
-                    <Select
-                      value={config.options.orientation ?? "horizontal"}
-                      onValueChange={(v) =>
-                        updateConfig({
-                          options: {
-                            ...config.options,
-                            orientation: v as "horizontal" | "vertical",
-                          },
-                        })
-                      }
-                    >
-                      <SelectTrigger className="h-7 text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="horizontal">Horizontal</SelectItem>
-                        <SelectItem value="vertical">Vertical</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
-                      Sort
-                    </label>
-                    <Select
-                      value={config.options.sort ?? "count"}
-                      onValueChange={(v) =>
-                        updateConfig({
-                          options: { ...config.options, sort: v as "count" | "value" },
-                        })
-                      }
-                    >
-                      <SelectTrigger className="h-7 text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="count">By count (descending)</SelectItem>
-                        <SelectItem value="value">By value (A→Z)</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </>
-              )}
-              {(chartType === "bar" || chartType === "histogram") && (
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-                  <input
-                    type="checkbox"
-                    checked={config.options.logScale ?? false}
-                    onChange={(e) =>
-                      updateConfig({
-                        options: { ...config.options, logScale: e.target.checked },
-                      })
-                    }
-                    className="accent-[var(--color-accent)]"
-                  />
-                  Log-scale count axis
-                </label>
-              )}
-              {chartType === "time" && (
-                <div>
-                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
-                    Buckets: {buckets}
-                  </label>
-                  <input
-                    type="range"
-                    min={10}
-                    max={200}
-                    step={10}
-                    value={buckets}
-                    onChange={(e) =>
-                      updateConfig({
-                        options: { ...config.options, buckets: Number(e.target.value) },
-                      })
-                    }
-                    className="w-full accent-[var(--color-accent)]"
-                  />
-                </div>
-              )}
-              {chartType === "line" && (
-                <>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
-                      Series mode
-                    </label>
-                    <Select
-                      value={config.options.seriesMode ?? "overlay"}
-                      onValueChange={(v) =>
-                        updateConfig({
-                          options: {
-                            ...config.options,
-                            seriesMode: v as "overlay" | "stacked",
-                          },
-                        })
-                      }
-                    >
-                      <SelectTrigger className="h-7 text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="overlay">Overlay (lines)</SelectItem>
-                        <SelectItem value="stacked">Stacked (areas)</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-                    <input
-                      type="checkbox"
-                      checked={config.options.legend ?? true}
-                      onChange={(e) =>
-                        updateConfig({
-                          options: { ...config.options, legend: e.target.checked },
-                        })
-                      }
-                      className="accent-[var(--color-accent)]"
-                    />
-                    Show legend
-                  </label>
-                  <label className="flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-                    <input
-                      type="checkbox"
-                      checked={config.options.showPoints ?? true}
-                      onChange={(e) =>
-                        updateConfig({
-                          options: { ...config.options, showPoints: e.target.checked },
-                        })
-                      }
-                      className="accent-[var(--color-accent)]"
-                    />
-                    Mark measured points
-                  </label>
-                </>
-              )}
-            </div>
-          </details>
-        )}
-
-        {/* Options */}
-        {dataKind === "numeric" && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Bins: {bins ?? `auto (${numericQuery.data?.bins.length ?? "…"})`}{" "}
-              <ExplainerPopover id="fdRule" />
-            </label>
-            <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-              <input
-                type="checkbox"
-                checked={bins == null}
-                onChange={(e) =>
-                  updateConfig({
-                    options: {
-                      ...config.options,
-                      bins: e.target.checked ? undefined : (numericQuery.data?.bins.length ?? 30),
-                    },
-                  })
-                }
-                className="accent-[var(--color-accent)]"
-              />
-              Automatic bin width (Freedman–Diaconis)
-            </label>
-            {(chartType === "box" || chartType === "violin") && (
-              <>
-                <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-                  <input
-                    type="checkbox"
-                    checked={showPoints}
-                    onChange={(e) =>
-                      updateConfig({
-                        options: { ...config.options, showPoints: e.target.checked },
-                      })
-                    }
-                    className="accent-[var(--color-accent)]"
-                  />
-                  Overlay data points <ExplainerPopover id="sampledPoints" />
-                </label>
-                {groupedOn && (
-                  <div className="mb-1">
-                    <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-                      Groups: {groups}
-                    </label>
-                    <input
-                      type="range"
-                      min={2}
-                      max={8}
-                      step={1}
-                      value={groups}
-                      onChange={(e) =>
-                        updateConfig({
-                          options: { ...config.options, groups: Number(e.target.value) },
-                        })
-                      }
-                      className="w-full accent-[var(--color-accent)]"
-                    />
-                  </div>
-                )}
-              </>
-            )}
-            {chartType === "histogram" && (
-              <label className="mb-1 flex items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-                <input
-                  type="checkbox"
-                  checked={resolved.showDensity}
-                  onChange={(e) =>
-                    updateConfig({
-                      options: { ...config.options, showDensity: e.target.checked },
-                    })
-                  }
-                  className="accent-[var(--color-accent)]"
-                />
-                Density curve (KDE) <ExplainerPopover id="kde" />
-              </label>
-            )}
-            {bins != null && (
-              <input
-                type="range"
-                min={5}
-                max={100}
-                step={5}
-                value={bins}
-                onChange={(e) =>
-                  updateConfig({ options: { ...config.options, bins: Number(e.target.value) } })
-                }
-                className="w-full accent-[var(--color-accent)]"
-              />
-            )}
-          </div>
-        )}
-        {(dataKind === "terms" || dataKind === "timeseries") && (
-          <TopNControl
-            chartType={chartType}
-            dataKind={dataKind}
-            value={topN}
-            onCommit={(n) => updateConfig({ options: { ...config.options, topN: n } })}
-          />
-        )}
-        {dataKind === "pivot" && (
-          <>
-            <div>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-                Top X values: {limitX}
-              </label>
-              <input
-                type="range"
-                min={3}
-                max={50}
-                step={1}
-                value={limitX}
-                onChange={(e) =>
-                  updateConfig({ options: { ...config.options, limitX: Number(e.target.value) } })
-                }
-                className="w-full accent-[var(--color-accent)]"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-                Top Y values: {limitY}
-              </label>
-              <input
-                type="range"
-                min={3}
-                max={50}
-                step={1}
-                value={limitY}
-                onChange={(e) =>
-                  updateConfig({ options: { ...config.options, limitY: Number(e.target.value) } })
-                }
-                className="w-full accent-[var(--color-accent)]"
-              />
-            </div>
-          </>
-        )}
-        {dataKind === "scatter" && (
-          <div className="space-y-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-                Sample size
-              </label>
-              <Select
-                value={String(sampleLimit)}
-                onValueChange={(v) =>
-                  updateConfig({ options: { ...config.options, sampleLimit: Number(v) } })
-                }
-              >
-                <SelectTrigger className="text-sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1000">1,000 points</SelectItem>
-                  <SelectItem value="5000">5,000 points</SelectItem>
-                  <SelectItem value="10000">10,000 points</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--color-fg-secondary)]">
-              <input
-                type="checkbox"
-                checked={config.options.logScale ?? false}
-                onChange={(e) =>
-                  updateConfig({ options: { ...config.options, logScale: e.target.checked } })
-                }
-                className="accent-[var(--color-accent)]"
-              />
-              Log-scale axes (positive values only)
-            </label>
-          </div>
-        )}
-
-        <div className="mt-auto space-y-3 border-t border-[var(--color-border)] pt-3">
-          {caseId && timelineId && (
-            <SavedChartsRail
-              caseId={caseId}
-              timelineId={timelineId}
-              currentConfig={config}
-              // The *resolved* filters, routine collapse included. Only this
-              // page re-derives collapse from live dispositions; the story
-              // card and the frozen export render a saved chart's stored
-              // filters verbatim, so leaving it out here is what would make
-              // those two show the uncollapsed superset of what was saved.
-              currentFilters={filters}
-              onLoad={loadSavedChart}
-            />
-          )}
-          <ExportControls
-            svgRef={svgRef}
-            filename={`${
-              dataKind === "time"
-                ? "events_over_time"
-                : dataKind === "punchcard"
-                  ? "activity_punchcard"
-                  : requiresSecondField && field && fieldY
-                    ? `${field}_x_${fieldY}`
-                    : (field ?? "visualization")
-            }_${chartType}`}
-            captionLines={captionLines}
-          />
-        </div>
-      </div>
+      {caseId && timelineId && (
+        <ChartRail
+          caseId={caseId}
+          timelineId={timelineId}
+          timelineName={timelineQuery.data?.name}
+          explorerHref={explorerHref}
+          config={config}
+          updateConfig={updateConfig}
+          fields={fieldsQuery.data?.fields ?? []}
+          resolved={resolved}
+          autoBinCount={numericQuery.data?.bins.length}
+          autoNotice={autoNotice}
+          setAutoNotice={setAutoNotice}
+          chartRefLive={chartRefLive}
+          brokenChartRef={brokenChartRef}
+          droppedScope={droppedScope}
+          corrMethod={corrMethod}
+          setCorrMethod={setCorrMethod}
+          metricAvailable={metricAvailable}
+          // The *resolved* filters, routine collapse included. Only this page
+          // re-derives collapse from live dispositions; the story card and the
+          // frozen export render a saved chart's stored filters verbatim, so
+          // leaving it out here is what would make those two show the
+          // uncollapsed superset of what was saved.
+          currentFilters={filters}
+          onLoadSavedChart={loadSavedChart}
+          svgRef={svgRef}
+          exportFilename={exportFilename}
+          captionLines={captionLines}
+        />
+      )}
 
       {/* Canvas */}
       <div className="flex-1 overflow-auto p-4">
@@ -1905,7 +1022,9 @@ export function VisualizePage() {
             updateFilters(removeFilterEntry(urlFilters, key, fieldKey, value))
           }
           onClearAll={() => updateFilters({})}
-          onResetRange={() => updateFilters({ ...urlFilters, start: undefined, end: undefined })}
+          onResetRange={() =>
+            updateFilters({ ...urlFilters, start: undefined, end: undefined })
+          }
         />
         {/* Nothing hidden silently: whenever routine dispositions shape the
             charts (or have been revealed), say so — the grid's collapsed-count
@@ -1928,7 +1047,10 @@ export function VisualizePage() {
               <button
                 type="button"
                 onClick={() =>
-                  setRoutineOverride({ value: !collapseRoutine, signature: routineSig })
+                  setRoutineOverride({
+                    value: !collapseRoutine,
+                    signature: routineSig,
+                  })
                 }
                 className={`flex items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-[var(--color-bg-hover)] ${
                   collapseRoutine
@@ -1936,39 +1058,10 @@ export function VisualizePage() {
                     : "border-[var(--color-accent)] text-[var(--color-accent)]"
                 }`}
               >
-                <Repeat size={11} /> {collapseRoutine ? "Show routine events" : "Collapse routine"}
+                <Repeat size={11} />{" "}
+                {collapseRoutine ? "Show routine events" : "Collapse routine"}
               </button>
             </Tooltip>
-          </div>
-        )}
-        {presetsOpen && (
-          <div className="mb-4 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-                What do you want to find out?
-              </span>
-              <button
-                onClick={() => setPresetsOpen(false)}
-                className="text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
-                aria-label="Close presets"
-              >
-                <X size={14} />
-              </button>
-            </div>
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {CHART_PRESETS.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => applyPreset(p)}
-                  className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-2.5 text-left hover:border-[var(--color-accent)]"
-                >
-                  <div className="text-sm font-medium text-[var(--color-fg-primary)]">
-                    {p.label}
-                  </div>
-                  <div className="mt-1 text-xs text-[var(--color-fg-muted)]">{p.question}</div>
-                </button>
-              ))}
-            </div>
           </div>
         )}
         {multiField && selectedFields.length < 2 ? (
@@ -1980,7 +1073,9 @@ export function VisualizePage() {
             {fieldsQuery.isLoading ? (
               <>
                 <Spinner size={20} />
-                <span className="text-xs">Scanning fields — can take a while on large timelines…</span>
+                <span className="text-xs">
+                  Scanning fields — can take a while on large timelines…
+                </span>
               </>
             ) : (
               "Choose a field to visualize."
@@ -1988,7 +1083,8 @@ export function VisualizePage() {
           </div>
         ) : requiresSecondField && !fieldY ? (
           <div className="flex h-full items-center justify-center text-sm text-[var(--color-fg-muted)]">
-            Choose a second field (Y) to chart {CHART_META[chartType].label.toLowerCase()}.
+            Choose a second field (Y) to chart{" "}
+            {CHART_META[chartType].label.toLowerCase()}.
           </div>
         ) : chartTypeUnplottable ? (
           // The rail cannot offer this pairing, but a saved chart or a URL can
@@ -1998,13 +1094,17 @@ export function VisualizePage() {
           // no explanation.
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
             {fieldTokenLabel(field!)} has no numeric values, so{" "}
-            {CHART_META[chartType].label.toLowerCase()} would render empty. Pick a categorical
-            chart type — bar, pie or heatmap.
+            {CHART_META[chartType].label.toLowerCase()} would render empty. Pick
+            a categorical chart type — bar, pie or heatmap.
           </div>
         ) : loading ? (
           <div className="flex h-full flex-col items-center justify-center gap-2">
             <Spinner size={24} />
-            {waiting && <span className="text-xs text-[var(--color-fg-muted)]">{waiting}</span>}
+            {waiting && (
+              <span className="text-xs text-[var(--color-fg-muted)]">
+                {waiting}
+              </span>
+            )}
           </div>
         ) : (
           <div className="relative rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4">
@@ -2026,14 +1126,18 @@ export function VisualizePage() {
                 metric={metric}
                 hasComparison={compareOn}
                 svgRef={svgRef}
-                onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
+                onRangeSelect={(start, end) =>
+                  updateFilters({ ...urlFilters, start, end })
+                }
               />
             )}
             {chartType === "bar" && barTerms && (
               <>
                 {barWarning && (
                   <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
-                    <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
+                    <strong className="text-[var(--color-fg-primary)]">
+                      Readability:
+                    </strong>{" "}
                     {barWarning}{" "}
                     <Button
                       variant="ghost"
@@ -2041,7 +1145,10 @@ export function VisualizePage() {
                       className="h-auto px-0.5 py-0 text-xs font-normal underline hover:text-[var(--color-accent)]"
                       onClick={() =>
                         updateConfig({
-                          options: { ...config.options, orientation: "horizontal" },
+                          options: {
+                            ...config.options,
+                            orientation: "horizontal",
+                          },
                         })
                       }
                     >
@@ -2064,7 +1171,9 @@ export function VisualizePage() {
               <>
                 {pieWarning && (
                   <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
-                    <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
+                    <strong className="text-[var(--color-fg-primary)]">
+                      Readability:
+                    </strong>{" "}
                     {pieWarning}{" "}
                     <button
                       type="button"
@@ -2075,7 +1184,11 @@ export function VisualizePage() {
                     </button>
                   </div>
                 )}
-                <PieChart terms={termsQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
+                <PieChart
+                  terms={termsQuery.data}
+                  svgRef={svgRef}
+                  onValueClick={handleChartValueClick}
+                />
               </>
             )}
             {chartType === "waffle" && termsQuery.data && (
@@ -2086,7 +1199,11 @@ export function VisualizePage() {
               />
             )}
             {chartType === "heatmap" && timeseriesQuery.data && (
-              <Heatmap data={timeseriesQuery.data} svgRef={svgRef} onValueClick={handleChartValueClick} />
+              <Heatmap
+                data={timeseriesQuery.data}
+                svgRef={svgRef}
+                onValueClick={handleChartValueClick}
+              />
             )}
             {chartType === "line" && timeseriesQuery.data && (
               <LineChart
@@ -2103,28 +1220,36 @@ export function VisualizePage() {
               />
             )}
             {chartType === "histogram" &&
-              (compareNumericOn ? compareNumericQuery.data : numericQuery.data) && (
+              (compareNumericOn
+                ? compareNumericQuery.data
+                : numericQuery.data) && (
                 <NumericHistogram
                   stats={compareNumericOn ? undefined : numericQuery.data}
-                  compare={compareNumericOn ? compareNumericQuery.data : undefined}
+                  compare={
+                    compareNumericOn ? compareNumericQuery.data : undefined
+                  }
                   logScale={resolved.logScale}
                   showDensity={resolved.showDensity}
                   showMarkers
                   svgRef={svgRef}
                 />
               )}
-            {chartType === "histogram" && !compareNumericOn && numericQuery.data && (
-              <NumericStatStrip stats={numericQuery.data} />
-            )}
-            {groupedOn && (chartType === "box" || chartType === "violin") && groupedQuery.data && (
-              <GroupedDistribution
-                data={groupedQuery.data}
-                mark={chartType}
-                showPoints={showPoints}
-                svgRef={svgRef}
-                onValueClick={handleChartValueClick}
-              />
-            )}
+            {chartType === "histogram" &&
+              !compareNumericOn &&
+              numericQuery.data && (
+                <NumericStatStrip stats={numericQuery.data} />
+              )}
+            {groupedOn &&
+              (chartType === "box" || chartType === "violin") &&
+              groupedQuery.data && (
+                <GroupedDistribution
+                  data={groupedQuery.data}
+                  mark={chartType}
+                  showPoints={showPoints}
+                  svgRef={svgRef}
+                  onValueClick={handleChartValueClick}
+                />
+              )}
             {(chartType === "box" || chartType === "violin") && (
               <div className="mb-1 flex flex-wrap items-center gap-3 text-xs text-[var(--color-fg-muted)]">
                 <span className="flex items-center gap-1">
@@ -2148,10 +1273,18 @@ export function VisualizePage() {
               </div>
             )}
             {!groupedOn && chartType === "box" && numericQuery.data && (
-              <BoxPlot stats={numericQuery.data} showPoints={showPoints} svgRef={svgRef} />
+              <BoxPlot
+                stats={numericQuery.data}
+                showPoints={showPoints}
+                svgRef={svgRef}
+              />
             )}
             {!groupedOn && chartType === "violin" && numericQuery.data && (
-              <ViolinPlot stats={numericQuery.data} showPoints={showPoints} svgRef={svgRef} />
+              <ViolinPlot
+                stats={numericQuery.data}
+                showPoints={showPoints}
+                svgRef={svgRef}
+              />
             )}
             {chartType === "ecdf" && numericQuery.data && (
               <EcdfChart stats={numericQuery.data} svgRef={svgRef} />
@@ -2179,7 +1312,12 @@ export function VisualizePage() {
                 method={corrMethod}
                 svgRef={svgRef}
                 onPairClick={(x, y) =>
-                  updateConfig({ chartType: "scatter", field: x, fieldY: y, scale: "ratio" })
+                  updateConfig({
+                    chartType: "scatter",
+                    field: x,
+                    fieldY: y,
+                    scale: "ratio",
+                  })
                 }
               />
             )}
@@ -2207,7 +1345,9 @@ export function VisualizePage() {
             applyFieldEntries(filters, pendingClick.entries, true),
           ).toString()}`}
           onFilter={(include) => {
-            updateFilters(applyFieldEntries(filters, pendingClick.entries, include));
+            updateFilters(
+              applyFieldEntries(filters, pendingClick.entries, include),
+            );
             setPendingClick(null);
           }}
           onClose={() => setPendingClick(null)}
