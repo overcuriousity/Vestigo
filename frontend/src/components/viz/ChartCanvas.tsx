@@ -36,6 +36,7 @@ import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { TableFigure, TableHtml } from "@/components/viz/charts/TableFigure";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import { Spinner } from "@/components/ui/Spinner";
 import type { EventFilters } from "@/api/types";
@@ -148,11 +149,15 @@ export function ChartMarks({
   data,
   opts,
   compareOn,
+  tableAs = "svg",
 }: {
   config: ChartConfig;
   data: ChartResult;
   opts: ResolvedChartOptions;
   compareOn: boolean;
+  /** The table figure is an <svg> on the page (so it exports like every other
+   * figure) and a real <table> in a Story snapshot and the HTML export. */
+  tableAs?: "svg" | "html";
 }) {
   return (
     <>
@@ -232,6 +237,12 @@ export function ChartMarks({
       {data.kind === "pivot" && config.chartType === "sankey" && (
         <SankeyFlow data={data.data} />
       )}
+      {data.kind === "table" &&
+        (tableAs === "html" ? (
+          <TableHtml data={data.data} config={config} highlight={opts.highlight} />
+        ) : (
+          <TableFigure data={data.data} config={config} highlight={opts.highlight} />
+        ))}
       {data.kind === "corr" && <CorrMatrix data={data.data} />}
       {data.kind === "scatter" && (
         <>

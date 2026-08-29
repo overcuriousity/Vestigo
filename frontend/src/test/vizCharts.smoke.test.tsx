@@ -29,6 +29,8 @@ import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
 import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
+import { TableFigure } from "@/components/viz/charts/TableFigure";
+import { DEFAULT_CHART_CONFIG } from "@/components/viz/lib/chartConfig";
 import type {
   FieldCorrelationResponse,
   FieldNumericGroupedResponse,
@@ -653,5 +655,36 @@ describe("correlation matrix", () => {
     // frame's margin <g>.
     fireEvent.click(container.querySelector("svg rect")!.parentElement!);
     expect(opened).toEqual([["attr:bytes", "attr:latency"]]);
+  });
+});
+
+describe("TableFigure", () => {
+  it("renders an svg", () => {
+    const { container } = render(
+      <TableFigure
+        data={{
+          kind: "table",
+          field: "attr:user",
+          second_field: null,
+          total: 1,
+          distinct: 1,
+          rows: [
+            {
+              value: "a",
+              count: 1,
+              share: 1,
+              first_seen: null,
+              last_seen: null,
+              distinct_second: null,
+            },
+          ],
+          remainder: null,
+          sort: { by: "count", dir: "desc" },
+        }}
+        config={{ ...DEFAULT_CHART_CONFIG, chartType: "table", field: "attr:user" }}
+        highlight={[]}
+      />,
+    );
+    expect(container.querySelector("svg")).not.toBeNull();
   });
 });

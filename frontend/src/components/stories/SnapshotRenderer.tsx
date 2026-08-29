@@ -139,6 +139,7 @@ function ChartSnapshot({ block }: { block: Resolved<"chart_ref"> }) {
         data={result}
         opts={resolveChartOptions(config)}
         compareOn={data.resolved.compare_mode !== "off"}
+        tableAs="html"
       />
       {data.warnings?.length > 0 && (
         <ul className="list-disc pl-4 text-[10px] text-[var(--color-fg-muted)]">

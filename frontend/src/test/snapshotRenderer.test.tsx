@@ -110,4 +110,58 @@ describe("SnapshotRenderer", () => {
     // Drawn geometry, not just an empty framed <svg>.
     expect(html).toMatch(/<(?:rect|path|circle|line)\b/);
   });
+
+  it("freezes a table block as a real <table>, not an <svg>", () => {
+    const tableBlock = {
+      ...snapshot.blocks.find((b) => b.kind === "chart_ref")!,
+      id: "blk-table",
+      data: {
+        name: "Users",
+        config: {
+          v: 2,
+          chartType: "table",
+          scale: "nominal",
+          field: "attr:user",
+          options: {},
+          derive: null,
+          inputs: {},
+          marks: [],
+        },
+        resolved: { data_kind: "table", compare_mode: "off" },
+        warnings: [],
+        chart: {
+          kind: "table",
+          field: "attr:user",
+          second_field: null,
+          total: 3,
+          distinct: 2,
+          rows: [
+            {
+              value: "alice",
+              count: 2,
+              share: 2 / 3,
+              first_seen: null,
+              last_seen: null,
+              distinct_second: null,
+            },
+            {
+              value: "bob",
+              count: 1,
+              share: 1 / 3,
+              first_seen: null,
+              last_seen: null,
+              distinct_second: null,
+            },
+          ],
+          remainder: null,
+          sort: { by: "count", dir: "desc" },
+        },
+      },
+    };
+    const withTable = { ...snapshot, blocks: [...snapshot.blocks, tableBlock] } as StorySnapshot;
+    const html = renderExportHtml(withTable, "a".repeat(64));
+    expect(html).toMatch(/<table[^>]*data-testid="table-figure-html"/);
+    expect(html).toContain("alice");
+    expect(html).toContain("66.7%");
+  });
 });
