@@ -901,8 +901,8 @@ class _FakeChartService(_FakeVizService):
     terms_values: list[dict[str, Any]] | None = None
     terms_other = 5
 
-    def field_terms(self, query, field, limit):
-        self.calls.append(("field_terms", (field, limit), {}))
+    def field_terms(self, query, field, limit, **kw):
+        self.calls.append(("field_terms", (field, limit), kw))
         values = self.terms_values or [
             {"value": "a", "count": 60},
             {"value": "b", "count": 40},
@@ -1100,6 +1100,7 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "field_y": None,
         "fields": None,
         "options": {"top_n": 30},
+        "derive": None,
     }
     assert result["warnings"] == []
 
@@ -2668,3 +2669,83 @@ async def test_propose_story_block_absent_without_conversation(store):
     async with FastMCPClient(server) as client:
         names = [t.name for t in await client.list_tools()]
     assert "propose_story_block" not in names
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+async def test_derive_is_passed_to_the_terms_scan_and_echoed(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "bytes",
+                "derive": {"kind": "bins", "mode": "log", "count": 8},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    kw = next(kw for name, _, kw in fake.calls if name == "field_terms")
+    assert kw["derive"].mode == "log"
+    assert result["resolved"]["scale"] == "ordinal"
+    assert result["resolved"]["derive"] == {"kind": "bins", "mode": "log", "count": 8}
+
+
+async def test_derive_rejected_on_a_figure_that_admits_none(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "pie",
+            "field": "bytes",
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        },
+    )
+    assert "admits no derivation" in message
+    assert "bar" in message and "heatmap" in message
+
+
+async def test_derive_rejected_on_a_virtual_time_field(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "time:hour_of_day",
+            "derive": {"kind": "time_part", "part": "hour"},
+        },
+    )
+    assert "already a calendar part" in message
+
+
+async def test_derive_with_a_non_ordinal_scale_is_rejected(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "bytes",
+            "scale": "nominal",
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        },
+    )
+    assert 'scale="ordinal"' in message
+
+
+async def test_describe_field_lists_the_derivations_that_make_sense(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    numeric = await _call(server, "describe_field", {"field": "bytes"})
+    assert numeric["derivations"] == ["bins", "time_part"]
+    fake.numeric_count = 0
+    categorical = await _call(server, "describe_field", {"field": "status"})
+    assert categorical["derivations"] == ["time_part"]
+    virtual = await _call(server, "describe_field", {"field": "time:hour_of_day"})
+    assert virtual["derivations"] == []

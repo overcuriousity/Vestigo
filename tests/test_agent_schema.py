@@ -39,7 +39,9 @@ from vestigo.db.postgres import User
 # ~33,000 after; the headroom absorbs a few new tools before this fires.
 # If a change pushes past it, that is a real context regression — re-measure
 # and update docs/AGENT.md rather than just raising the number.
-SCHEMA_BUDGET_CHARS = 40_000
+# 2026-08-29: `ChartSpec.derive` (viz step 2) measured 39,382 → 40,213, so
+# the ceiling moved by that delta (recorded in docs/AGENT.md).
+SCHEMA_BUDGET_CHARS = 41_000
 
 
 def _scope(case_id: str = "c1", timeline_id: str = "t1") -> AgentScope:

@@ -16,6 +16,7 @@ field-vocabulary cache), the export resolver uses the defaults.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -205,6 +206,27 @@ async def execute_chart_spec(
 
     # ── legality, before any query ───────────────────────────────────────
     scale = spec.scale or meta.default_scale
+    if spec.derive is not None:
+        # A derivation is validated from the registry, like everything else
+        # here: only figures whose `derives` lists its kind admit one, a
+        # virtual time: field is already a calendar part, and the result is
+        # ordered categories whatever the field was — so an omitted scale
+        # resolves to ordinal before the legality check below.
+        if spec.derive.kind not in meta.derives:
+            takers = [c for c in CHART_META if spec.derive.kind in CHART_META[c].derives]
+            raise ValueError(
+                f'chart_type="{chart_type}" admits no derivation. Figures that take '
+                f"{spec.derive.kind}: {', '.join(takers)}."
+            )
+        if spec.field and resolve_time_field(spec.field) is not None:
+            raise ValueError(
+                f"{spec.field} is already a calendar part — chart it directly, without derive."
+            )
+        if spec.scale is not None and spec.scale != "ordinal":
+            raise ValueError(
+                'a derived field is ordered categories: set scale="ordinal" or omit it.'
+            )
+        scale = "ordinal"
     if scale not in meta.scales:
         raise ValueError(
             f'chart_type="{chart_type}" requires scale in '
@@ -328,6 +350,9 @@ async def execute_chart_spec(
         comparison_query = await _build_query(scope, comparison_filters)
 
     applied: dict[str, Any] = {}
+    #: Passed only when set, so a positional fake service keeps working and an
+    #: underived request is byte-for-byte the call it always was.
+    derive_kw: dict[str, Any] = {"derive": spec.derive} if spec.derive is not None else {}
     #: Options this chart type nominally reads but that this *particular*
     #: spec made inert (a bounded time axis ignores its limit). Kept out
     #: of the `resolved` echo below, which otherwise re-adds them.
@@ -340,7 +365,7 @@ async def execute_chart_spec(
         applied["top_n"] = _capped(opts.top_n, (min(terms_default, terms_cap), terms_cap), "top_n")
         if comparison_query is not None:
             result = await run_gated_scan(
-                service.compare_field_terms,
+                functools.partial(service.compare_field_terms, **derive_kw),
                 primary_query,
                 comparison_query,
                 spec.field,
@@ -353,8 +378,16 @@ async def execute_chart_spec(
             }
         else:
             result = await run_gated_scan(
-                service.field_terms, primary_query, spec.field, applied["top_n"]
+                functools.partial(service.field_terms, **derive_kw),
+                primary_query,
+                spec.field,
+                applied["top_n"],
             )
+            if spec.derive is not None and spec.derive.kind == "bins" and not result["total"]:
+                raise ValueError(
+                    f'field "{spec.field}" has no numeric values under these filters, so '
+                    "bins would be empty — treat it as categories instead."
+                )
             summary = {
                 "total": result["total"],
                 "distinct": result["distinct"],
@@ -455,7 +488,7 @@ async def execute_chart_spec(
         applied["buckets"] = _capped(opts.buckets, limits.series_buckets, "buckets", floor=4)
         applied["top_n"] = _capped(opts.top_n, limits.series_top_n, "top_n")
         result = await run_gated_scan(
-            service.field_value_timeseries,
+            functools.partial(service.field_value_timeseries, **derive_kw),
             primary_query,
             spec.field,
             applied["buckets"],
@@ -491,7 +524,10 @@ async def execute_chart_spec(
         applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")
         applied["limit_y"] = _capped(opts.limit_y, limits.pivot_limit, "limit_y")
         result = await run_gated_scan(
-            service.field_pivot,
+            functools.partial(
+                service.field_pivot,
+                **({"derive_x": spec.derive} if spec.derive is not None else {}),
+            ),
             primary_query,
             spec.field,
             spec.field_y,
@@ -607,6 +643,7 @@ async def execute_chart_spec(
             "field_y": spec.field_y,
             "fields": spec.fields,
             "options": applied,
+            "derive": spec.derive.model_dump(exclude_none=True) if spec.derive else None,
         },
         "warnings": warnings,
         "summary": summary,

@@ -42,6 +42,7 @@ from vestigo.agent.encoding import columnar, columnar_auto
 from vestigo.agent.fidelity import DEFAULT_FIDELITY, Fidelity
 from vestigo.agent.schema_slim import slim_tool_schema, spec_reference_block
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
+from vestigo.db.derive import DeriveSpec
 from vestigo.db.postgres import User
 from vestigo.db.queries import EventQuery, TagFilter
 from vestigo.models.embeddings import embeddings_available
@@ -547,6 +548,16 @@ class ChartOptionsSpec(ObjectArgModel):
     )
 
 
+class ChartDeriveSpec(ObjectArgModel, DeriveSpec):
+    """`DeriveSpec` in nested-argument position.
+
+    The wire shape and every validation rule are `vestigo.db.derive.DeriveSpec`'s
+    — the same model the viz endpoints parse — plus `ObjectArgModel`'s
+    tolerance of a stringified object, which every nested tool argument
+    carries. Nothing is redefined here, so the two can never disagree.
+    """
+
+
 class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
@@ -626,6 +637,17 @@ class ChartSpec(ObjectArgModel):
     options: ChartOptionsSpec = Field(
         default_factory=ChartOptionsSpec, description="Presentation and sizing options."
     )
+    derive: ChartDeriveSpec | None = Field(
+        default=None,
+        description=(
+            "Optional change of scale applied to `field` before aggregation, making it "
+            'ordered categories: {"kind":"bins","mode":"width"|"log","count":N} groups a '
+            'number into N ranges; {"kind":"bins","mode":"custom","edges":[…]} uses your '
+            'edges; {"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"} takes '
+            "a calendar part (UTC) of a timestamp-valued field. Only bar, heatmap, pivot and "
+            "sankey admit one; a virtual time: field never needs one."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -683,7 +705,7 @@ class ChartSpec(ObjectArgModel):
 # `$defs`, rendered once for the system prompt (A13). Generated from the models
 # above, so it cannot drift from them.
 SPEC_REFERENCE: str = spec_reference_block(
-    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec)
+    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec, ChartDeriveSpec)
 )
 
 # How to read the columnar tool results (A13). Stated once and reused by both
@@ -1376,6 +1398,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "top_values": domain[:10],
                 "suggested_scale": time_spec.scale,
                 "suggested_chart_types": chart_types_for(time_spec.scale),
+                # Already a calendar part: nothing to derive.
+                "derivations": [],
                 "notes": [
                     "Virtual time field: defined for every dated event, extracted in UTC. "
                     "Undated (sentinel-timestamp) events are excluded."
@@ -1418,6 +1442,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "Values do not parse as numbers, so numeric charts "
                 "(histogram/box/violin/ecdf/scatter) would render empty."
             )
+        # Which `propose_chart.derive` kinds make sense here: bins need a
+        # number; a calendar part needs a timestamp-valued attribute, which
+        # nothing here probes — offered, and empty if the values don't parse.
+        derivations = (["bins"] if is_numeric else []) + ["time_part"]
+        if is_numeric:
+            notes.append('Group into ranges with derive={"kind":"bins",…} to chart it as bars.')
         return {
             "field": field,
             "exists": True,
@@ -1437,6 +1467,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "top_values": terms["values"],
             "suggested_scale": scale,
             "suggested_chart_types": chart_types_for(scale),
+            "derivations": derivations,
             "notes": notes,
         }
 
