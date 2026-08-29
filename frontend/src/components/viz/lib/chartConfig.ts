@@ -240,11 +240,12 @@ export function parseMarkSources(raw: unknown): MarkSource[] {
     switch (m.kind) {
       case "events":
         if (isRecord(m.filters)) {
-          out.push({
-            kind: "events",
-            filters: viewPayloadToFilters(m.filters),
-            ...(label !== undefined ? { label } : {}),
-          });
+          const filters = viewPayloadToFilters(m.filters);
+          const ids = Array.isArray(m.filters.eventIds)
+            ? m.filters.eventIds.filter((v): v is string => typeof v === "string" && v !== "")
+            : [];
+          if (ids.length) filters.ids = ids;
+          out.push({ kind: "events", filters, ...(label !== undefined ? { label } : {}) });
         }
         break;
       case "baseline":
@@ -285,7 +286,17 @@ function inputsToPayload(inputs: ChartInputs): Record<string, unknown> {
 }
 export function marksToPayload(marks: MarkSource[]): unknown[] {
   return marks.map((m) =>
-    m.kind === "events" ? { ...m, filters: filtersToViewPayload(m.filters) } : m,
+    m.kind === "events"
+      ? {
+          ...m,
+          filters: {
+            ...filtersToViewPayload(m.filters),
+            // A mark's event ids are its provenance, so unlike the Explorer's
+            // session-only `ids` they travel with the chart.
+            ...(m.filters.ids?.length ? { eventIds: m.filters.ids } : {}),
+          },
+        }
+      : m,
   );
 }
 

@@ -359,6 +359,17 @@ describe("ChartConfig v2", () => {
     expect(paramsToChartConfig(chartConfigToParams(v2Extras))).toEqual(v2Extras);
   });
 
+  it("carries an events mark's event ids as provenance through the URL", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "time",
+      marks: [{ kind: "events", filters: { ids: ["e1", "e2"] }, label: "two events" }],
+    };
+    const params = chartConfigToParams(config);
+    expect(JSON.parse(params.get("c_marks")!)[0].filters.eventIds).toEqual(["e1", "e2"]);
+    expect(paramsToChartConfig(params).marks).toEqual(config.marks);
+  });
+
   it("writes no c_derive / c_inputs / c_marks when they are empty", () => {
     const params = chartConfigToParams(fullConfig);
     expect(params.has("c_derive")).toBe(false);

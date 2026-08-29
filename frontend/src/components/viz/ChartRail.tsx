@@ -22,9 +22,10 @@ import {
   SelectValue,
 } from "@/components/ui/Select";
 import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
-import type { EventFilters, VizFieldInfo } from "@/api/types";
+import type { EventFilters, ResolvedMarksResponse, VizFieldInfo } from "@/api/types";
 import { ExportControls } from "./ExportControls";
 import { CompareFilterEditor } from "./CompareFilterEditor";
+import { MarksEditor } from "./MarksEditor";
 import { SavedChartsRail } from "./SavedChartsRail";
 import { ExplainerPopover } from "./primitives/ExplainerPopover";
 import { FigureThumbnail } from "./primitives/FigureThumbnail";
@@ -77,6 +78,8 @@ export interface ChartRailProps {
   config: ChartConfig;
   updateConfig: (patch: Partial<ChartConfig>) => void;
   fields: VizFieldInfo[];
+  /** The server's resolution of `config.marks`, for the per-source status lines. */
+  resolvedMarks?: ResolvedMarksResponse;
   resolved: ResolvedChartOptions;
   /** The automatic (Freedman–Diaconis) bin count, once the numeric scan landed. */
   autoBinCount: number | undefined;
@@ -498,6 +501,7 @@ export function ChartRail({
   updateConfig,
   fields,
   resolved,
+  resolvedMarks,
   autoBinCount,
   autoNotice,
   setAutoNotice,
@@ -1196,6 +1200,22 @@ export function ChartRail({
               Turn on Compare to unlock “% of baseline”.
             </p>
           )}
+        </div>
+      )}
+
+      {CHART_META[chartType].supportsMarks && (
+        <div data-rail-section="marks">
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Marks
+          </label>
+          <MarksEditor
+            caseId={caseId}
+            timelineId={timelineId}
+            marks={config.marks}
+            onChange={(marks) => updateConfig({ marks })}
+            fields={fields}
+            resolved={resolvedMarks}
+          />
         </div>
       )}
 

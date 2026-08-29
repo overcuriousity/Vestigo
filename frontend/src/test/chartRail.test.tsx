@@ -23,6 +23,14 @@ beforeAll(() => {
   installRadixJsdomStubs();
 });
 
+vi.mock("@/api/baselines", () => ({
+  baselinesApi: { list: vi.fn().mockResolvedValue({ baselines: [] }) },
+}));
+vi.mock("@/api/views", () => ({ viewsApi: { list: vi.fn().mockResolvedValue([]) } }));
+vi.mock("@/api/dispositions", () => ({
+  dispositionsApi: { list: vi.fn().mockResolvedValue({ dispositions: [] }) },
+}));
+
 vi.mock("@/api/viz", async () => {
   const actual = await vi.importActual<typeof import("@/api/viz")>("@/api/viz");
   return {
@@ -338,5 +346,20 @@ describe("ChartRail — table", () => {
     fireEvent.change(highlight, { target: { value: "alice, bob" } });
     fireEvent.blur(highlight);
     expect(updateConfig).toHaveBeenCalledWith({ options: { highlight: ["alice", "bob"] } });
+  });
+});
+
+describe("ChartRail — marks", () => {
+  it("renders the Marks section for figures that draw them, after Compare, and not otherwise", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "time", scale: "nominal" });
+    const order = sectionOrder();
+    // After Compare and its Metric (the two belong together: "% of baseline"),
+    // before the per-chart options.
+    expect(order.indexOf("marks")).toBeGreaterThan(order.indexOf("compare"));
+    expect(order.indexOf("marks")).toBe(order.indexOf("metric") + 1);
+    expect(screen.getByRole("combobox", { name: "Add mark" })).toBeTruthy();
+    document.body.innerHTML = "";
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "bar", field: "artifact", scale: "nominal" });
+    expect(sectionOrder()).not.toContain("marks");
   });
 });
