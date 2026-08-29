@@ -780,3 +780,50 @@ def test_stored_config_without_inputs_yields_none() -> None:
     )
     assert spec.inputs is None
     assert "inputs" not in spec_to_stored_chart_config(spec)
+
+
+def test_marks_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "time",
+        "scale": "interval",
+        "field": None,
+        "options": {},
+        "marks": [
+            {
+                "kind": "events",
+                "filters": {"tagsInclude": ["exfil"], "eventIds": ["e1"]},
+                "label": "tagged exfil",
+            },
+            {"kind": "baseline", "definitionId": "bd1"},
+            {"kind": "view", "viewId": "v1"},
+            {"kind": "instant", "at": "2026-03-13T09:41:00+00:00", "label": "first beacon"},
+            {
+                "kind": "range",
+                "start": "2026-03-13T09:00:00+00:00",
+                "end": "2026-03-13T10:00:00+00:00",
+                "label": "w",
+            },
+        ],
+    }
+    spec = _stored_chart_to_spec(config)
+    assert [m.kind for m in spec.marks] == ["events", "baseline", "view", "instant", "range"]
+    assert spec.marks[0].filters.tags_include == ["exfil"] and spec.marks[0].filters.event_ids == [
+        "e1"
+    ]
+    assert spec.marks[1].definition_id == "bd1" and spec.marks[2].view_id == "v1"
+    assert spec.marks[3].at.isoformat() == "2026-03-13T09:41:00+00:00"
+    back = spec_to_stored_chart_config(spec)
+    assert back["marks"] == config["marks"]
+
+
+def test_stored_config_without_marks_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "time", "scale": "interval", "field": None, "options": {}}
+    )
+    assert spec.marks is None
+    assert "marks" not in spec_to_stored_chart_config(spec)

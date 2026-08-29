@@ -250,6 +250,60 @@ def _spec_derive_to_stored(derive: Any) -> dict[str, Any] | None:
     return out
 
 
+#: Stored ``MarkSource`` keys (camelCase) ↔ ``ChartMarkSpec`` fields.
+_MARK_KEYS = {"definitionId": "definition_id", "viewId": "view_id"}
+
+
+def _stored_marks_to_spec(raw: Any) -> list[dict[str, Any]] | None:
+    """Stored ``marks`` (the frontend's ``MarkSource[]``) → ``ChartSpec.marks`` payload.
+
+    A malformed entry is dropped rather than failing the whole chart; the
+    spec's own validator refuses anything that survives without its fields.
+    """
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+            continue
+        spec: dict[str, Any] = {"kind": item["kind"]}
+        if isinstance(item.get("label"), str):
+            spec["label"] = item["label"]
+        for stored_key, spec_key in _MARK_KEYS.items():
+            if isinstance(item.get(stored_key), str):
+                spec[spec_key] = item[stored_key]
+        for key in ("at", "start", "end"):
+            if isinstance(item.get(key), str):
+                spec[key] = item[key]
+        if isinstance(item.get("filters"), dict):
+            spec["filters"] = _filter_payload_to_spec(item["filters"]).model_dump(exclude_none=True)
+        out.append(spec)
+    return out or None
+
+
+def _spec_marks_to_stored(marks: Any) -> list[dict[str, Any]] | None:
+    """Inverse of ``_stored_marks_to_spec``."""
+    if not marks:
+        return None
+    out: list[dict[str, Any]] = []
+    for mark in marks:
+        stored: dict[str, Any] = {"kind": mark.kind}
+        if mark.kind == "events":
+            stored["filters"] = _spec_filters_to_payload(mark.filters)
+        for stored_key, spec_key in _MARK_KEYS.items():
+            value = getattr(mark, spec_key, None)
+            if value is not None:
+                stored[stored_key] = value
+        for key in ("at", "start", "end"):
+            value = getattr(mark, key, None)
+            if value is not None:
+                stored[key] = value.isoformat()
+        if mark.label is not None:
+            stored["label"] = mark.label
+        out.append(stored)
+    return out
+
+
 def _stored_chart_to_spec(config: dict[str, Any]):
     """Translate a saved chart's stored config into an executable ChartSpec.
 
@@ -284,6 +338,10 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     stored_inputs = config.get("inputs")
     if isinstance(stored_inputs, dict) and isinstance(stored_inputs.get("columns"), list):
         spec["inputs"] = {"columns": list(stored_inputs["columns"])}
+
+    marks = _stored_marks_to_spec(config.get("marks"))
+    if marks:
+        spec["marks"] = marks
 
     # The primary filter layer — the Explorer filters the chart was saved
     # under, stored beside the ChartConfig keys (the frontend's
@@ -371,6 +429,10 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
     inputs = getattr(spec, "inputs", None)
     if inputs is not None and inputs.columns:
         config["inputs"] = {"columns": list(inputs.columns)}
+
+    stored_marks = _spec_marks_to_stored(getattr(spec, "marks", None))
+    if stored_marks:
+        config["marks"] = stored_marks
 
     mode = getattr(spec.compare, "mode", "off") if spec.compare is not None else "off"
     if mode != "off":
