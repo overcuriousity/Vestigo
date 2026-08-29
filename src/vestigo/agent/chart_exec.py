@@ -230,6 +230,19 @@ async def execute_chart_spec(
                 'a derived field is ordered categories: set scale="ordinal" or omit it.'
             )
         scale = "ordinal"
+    if spec.inputs is not None and spec.inputs.columns is not None and chart_type != "table":
+        raise ValueError(
+            f'chart_type="{chart_type}" takes no inputs.columns — only the table figure has columns.'
+        )
+    wants_distinct_second = (
+        spec.inputs is not None
+        and spec.inputs.columns is not None
+        and "distinct_second" in spec.inputs.columns
+    ) or opts.table_sort_by == "distinct_second"
+    if chart_type == "table" and wants_distinct_second and not spec.field_y:
+        raise ValueError(
+            "distinct_second needs field_y — the second field whose distinct values each row counts."
+        )
     if scale not in meta.scales:
         raise ValueError(
             f'chart_type="{chart_type}" requires scale in '
@@ -568,6 +581,40 @@ async def execute_chart_spec(
             # time axis is its whole domain rather than a limit.
             "matrix_size": len(result["x_values"]) * len(result["y_values"]),
         }
+    elif data_kind == "table":
+        applied["top_n"] = _capped(opts.top_n, limits.table_rows, "top_n")
+        sort_by = opts.table_sort_by or "count"
+        sort_dir = opts.table_sort_dir or "desc"
+        applied["table_sort_by"] = sort_by
+        applied["table_sort_dir"] = sort_dir
+        result = await run_gated_scan(
+            functools.partial(
+                service.field_table,
+                second_field=spec.field_y,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                **derive_kw,
+            ),
+            primary_query,
+            spec.field,
+            applied["top_n"],
+        )
+        summary = {
+            "total": result["total"],
+            "distinct": result["distinct"],
+            "rows": [
+                {"value": r["value"], "count": r["count"], "share": r["share"]}
+                for r in result["rows"][:5]
+            ],
+            "remainder": result["remainder"],
+        }
+        if opts.highlight:
+            shown = {r["value"] for r in result["rows"]}
+            missing = [v for v in opts.highlight if v not in shown]
+            if missing:
+                warnings.append(
+                    f"options.highlight names value(s) not among the shown rows: {', '.join(missing)}."
+                )
     elif data_kind == "corr":
         # `fields` is already validated (2–limits.corr_max_fields, distinct)
         # by the multi_field guard above, so no capping happens here.
@@ -647,6 +694,7 @@ async def execute_chart_spec(
             "fields": spec.fields,
             "options": applied,
             "derive": spec.derive.model_dump(exclude_none=True) if spec.derive else None,
+            "inputs": spec.inputs.model_dump(exclude_none=True) if spec.inputs else None,
         },
         "warnings": warnings,
         "summary": summary,

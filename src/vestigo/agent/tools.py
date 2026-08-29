@@ -577,6 +577,26 @@ class ChartDeriveSpec(ObjectArgModel, DeriveSpec):
     """
 
 
+class ChartInputsSpec(ObjectArgModel):
+    """Figure-specific inputs, mirroring the frontend's `ChartConfig.inputs`.
+
+    Only the keys a shipped figure declares in `agent/chart_meta.py` exist
+    here; the rest of the vocabulary lands with its figures.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    columns: (
+        list[Literal["count", "share", "first_seen", "last_seen", "distinct_second"]] | None
+    ) = Field(
+        default=None,
+        description=(
+            'chart_type="table" only: which columns to show beside the value. Omit for '
+            "count, share, first_seen, last_seen (plus distinct_second when field_y is set)."
+        ),
+    )
+
+
 class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
@@ -667,6 +687,10 @@ class ChartSpec(ObjectArgModel):
             "sankey admit one; a virtual time: field never needs one."
         ),
     )
+    inputs: ChartInputsSpec | None = Field(
+        default=None,
+        description="Figure-specific inputs — today only the table's `columns`.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -724,7 +748,7 @@ class ChartSpec(ObjectArgModel):
 # `$defs`, rendered once for the system prompt (A13). Generated from the models
 # above, so it cannot drift from them.
 SPEC_REFERENCE: str = spec_reference_block(
-    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec, ChartDeriveSpec)
+    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec, ChartDeriveSpec, ChartInputsSpec)
 )
 
 # How to read the columnar tool results (A13). Stated once and reused by both

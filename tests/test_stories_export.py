@@ -745,3 +745,38 @@ def test_stored_config_without_derive_yields_none() -> None:
     )
     assert spec.derive is None
     assert "derive" not in spec_to_stored_chart_config(spec)
+
+
+def test_table_inputs_and_options_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "table",
+        "scale": "nominal",
+        "field": "attr:user",
+        "fieldY": "attr:host",
+        "options": {
+            "topN": 20,
+            "tableSortBy": "last_seen",
+            "tableSortDir": "asc",
+            "highlight": ["alice"],
+        },
+        "inputs": {"columns": ["count", "share", "distinct_second"]},
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.columns == ["count", "share", "distinct_second"]
+    assert spec.options.table_sort_by == "last_seen" and spec.options.highlight == ["alice"]
+    back = spec_to_stored_chart_config(spec)
+    assert back["inputs"] == {"columns": ["count", "share", "distinct_second"]}
+    assert back["options"] == config["options"]
+
+
+def test_stored_config_without_inputs_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "bar", "scale": "nominal", "field": "x", "options": {}}
+    )
+    assert spec.inputs is None
+    assert "inputs" not in spec_to_stored_chart_config(spec)

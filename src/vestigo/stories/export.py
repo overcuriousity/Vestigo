@@ -212,6 +212,9 @@ _CHART_OPTION_KEYS = {
     "sampleLimit": "sample_limit",
     "groups": "groups",
     "showPoints": "show_points",
+    "tableSortBy": "table_sort_by",
+    "tableSortDir": "table_sort_dir",
+    "highlight": "highlight",
 }
 
 
@@ -277,6 +280,10 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     derive = _stored_derive_to_spec(config.get("derive"))
     if derive:
         spec["derive"] = derive
+
+    stored_inputs = config.get("inputs")
+    if isinstance(stored_inputs, dict) and isinstance(stored_inputs.get("columns"), list):
+        spec["inputs"] = {"columns": list(stored_inputs["columns"])}
 
     # The primary filter layer — the Explorer filters the chart was saved
     # under, stored beside the ChartConfig keys (the frontend's
@@ -360,6 +367,10 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
     stored_derive = _spec_derive_to_stored(getattr(spec, "derive", None))
     if stored_derive:
         config["derive"] = stored_derive
+
+    inputs = getattr(spec, "inputs", None)
+    if inputs is not None and inputs.columns:
+        config["inputs"] = {"columns": list(inputs.columns)}
 
     mode = getattr(spec.compare, "mode", "off") if spec.compare is not None else "off"
     if mode != "off":

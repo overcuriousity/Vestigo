@@ -56,6 +56,7 @@ SHARED_SPEC_NAMES: tuple[str, ...] = (
     "ChartCompareSpec",
     "ChartOptionsSpec",
     "ChartDeriveSpec",
+    "ChartInputsSpec",
 )
 
 _NULL = {"type": "null"}

@@ -959,6 +959,37 @@ class _FakeChartService(_FakeVizService):
             "points": None,
         }
 
+    def field_table(self, query, field, limit, **kw):
+        self.calls.append(("field_table", (field, limit), kw))
+        return {
+            "kind": "table",
+            "field": field,
+            "second_field": kw.get("second_field"),
+            "total": 100,
+            "distinct": 4,
+            "rows": [
+                {
+                    "value": "a",
+                    "count": 60,
+                    "share": 0.6,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "distinct_second": None,
+                },
+                {
+                    "value": "b",
+                    "count": 30,
+                    "share": 0.3,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "distinct_second": None,
+                },
+            ],
+            "remainder": {"count": 10, "share": 0.1, "distinct_values": 2},
+            "sort": {"by": kw.get("sort_by", "count"), "dir": kw.get("sort_dir", "desc")},
+            "derive": None,
+        }
+
     def field_correlation(self, query, fields):
         self.calls.append(("field_correlation", (tuple(fields),), {}))
         pairs = [
@@ -1059,6 +1090,7 @@ _CHART_TYPE_CASES = [
     ("sankey", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
     ("scatter", {"field": "attr:bytes", "field_y": "attr:latency"}, "field_scatter"),
     ("corr", {"fields": ["attr:bytes", "attr:latency"]}, "field_correlation"),
+    ("table", {"field": "attr:user"}, "field_table"),
 ]
 
 
@@ -1101,6 +1133,7 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "fields": None,
         "options": {"top_n": 30},
         "derive": None,
+        "inputs": None,
     }
     assert result["warnings"] == []
 
@@ -2749,3 +2782,79 @@ async def test_describe_field_lists_the_derivations_that_make_sense(store, monke
     assert categorical["derivations"] == ["time_part"]
     virtual = await _call(server, "describe_field", {"field": "time:hour_of_day"})
     assert virtual["derivations"] == []
+
+
+# ── table figure ─────────────────────────────────────────────────────────────
+
+
+async def test_table_dispatches_with_sort_second_field_and_columns(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "table",
+                "field": "user",
+                "field_y": "country",
+                "inputs": {"columns": ["count", "share", "distinct_second"]},
+                "options": {
+                    "top_n": 100,
+                    "table_sort_by": "distinct_second",
+                    "table_sort_dir": "asc",
+                },
+            }
+        ),
+    )
+    assert result["ok"] is True
+    name, args, kw = next(c for c in fake.calls if c[0] == "field_table")
+    assert args == ("user", 30)  # clamped to AGENT_CHART_LIMITS.table_rows
+    assert kw == {"second_field": "country", "sort_by": "distinct_second", "sort_dir": "asc"}
+    assert result["resolved"]["inputs"] == {"columns": ["count", "share", "distinct_second"]}
+    assert result["resolved"]["options"]["top_n"] == 30
+    assert result["summary"]["remainder"] == {"count": 10, "share": 0.1, "distinct_values": 2}
+    assert [r["value"] for r in result["summary"]["rows"]] == ["a", "b"]
+
+
+async def test_table_columns_on_another_figure_are_refused(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "bar", "field": "user", "inputs": {"columns": ["count"]}}
+    )
+    assert "only the table figure has columns" in message
+
+
+async def test_table_distinct_second_needs_field_y(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {"chart_type": "table", "field": "user", "inputs": {"columns": ["distinct_second"]}},
+    )
+    assert "distinct_second needs field_y" in message
+    message = await _reject(
+        server,
+        {"chart_type": "table", "field": "user", "options": {"table_sort_by": "distinct_second"}},
+    )
+    assert "distinct_second needs field_y" in message
+
+
+async def test_table_takes_a_derivation(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "table",
+                "field": "bytes",
+                "derive": {"kind": "bins", "mode": "log", "count": 4},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    kw = next(kw for name, _, kw in fake.calls if name == "field_table")
+    assert kw["derive"].count == 4 and result["resolved"]["scale"] == "ordinal"
