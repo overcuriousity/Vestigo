@@ -94,6 +94,8 @@ export interface ChartRailProps {
   svgRef: RefObject<SVGSVGElement | null>;
   exportFilename: string;
   captionLines: string[];
+  /** CSV text for the table figure, else null — adds a CSV export format. */
+  csv?: string | null;
 }
 
 /** Radix Select and the field combo forbid an empty value, so "count every
@@ -510,6 +512,7 @@ export function ChartRail({
   svgRef,
   exportFilename,
   captionLines,
+  csv = null,
 }: ChartRailProps) {
   const { field, fieldY, scale, chartType, metric } = config;
   const dataKind = CHART_META[chartType].dataKind;
@@ -1642,6 +1645,7 @@ export function ChartRail({
           svgRef={svgRef}
           filename={exportFilename}
           captionLines={captionLines}
+          csv={csv}
         />
       </div>
     </div>

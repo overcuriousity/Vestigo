@@ -8,6 +8,7 @@
 import type { DeriveEcho, EventFilters, ScatterStats } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { describeDerive } from "./derive";
+import { TABLE_COLUMN_LABELS } from "./tableRows";
 import { METRIC_INFO } from "./transforms";
 
 /** Data-derived facts the active query contributes to the caption. */
@@ -58,6 +59,14 @@ export interface CaptionFacts {
   groupedViolin?: boolean;
   groupsShown?: number;
   groupsOmitted?: number;
+  /** kind=table: the share denominator (events with a non-empty value). */
+  tableTotal?: number;
+  /** kind=table: the row order the server applied. */
+  tableSort?: { by: string; dir: string };
+  /** kind=table: values whose rows are highlighted — presentation only. */
+  tableHighlight?: string[];
+  /** kind=table: what the top-N cut, reported as the remainder row. */
+  tableRemainder?: { count: number; distinctValues: number };
   groupOmittedCount?: number;
   /** box/violin raw-value strip overlay: sample truthfulness. */
   overlayShown?: number;
@@ -218,7 +227,30 @@ export function buildCaptionLines(args: {
   }
 
   // Truthfulness warnings.
+  if (chartType === "table") {
+    if (facts.tableSort) {
+      const label =
+        TABLE_COLUMN_LABELS[facts.tableSort.by as keyof typeof TABLE_COLUMN_LABELS] ??
+        facts.tableSort.by;
+      lines.push(
+        `sorted by ${label} (${facts.tableSort.dir === "asc" ? "ascending" : "descending"})`,
+      );
+    }
+    if (facts.tableTotal != null && field) {
+      lines.push(`share = count / ${fmtInt(facts.tableTotal)} events with a non-empty ${field}`);
+    }
+    if (facts.tableRemainder && facts.distinct != null && facts.shownValues != null) {
+      const more = facts.tableRemainder.distinctValues;
+      lines.push(
+        `showing top ${fmtInt(facts.shownValues)} of ${fmtInt(facts.distinct)} distinct values; ${fmtInt(facts.tableRemainder.count)} events across ${fmtInt(more)} more value${more === 1 ? "" : "s"} in the remainder row`,
+      );
+    }
+    if (facts.tableHighlight?.length) {
+      lines.push(`highlighted rows: ${facts.tableHighlight.join(" · ")} — presentation only`);
+    }
+  }
   if (
+    chartType !== "table" &&
     facts.distinct != null &&
     facts.shownValues != null &&
     facts.distinct > facts.shownValues

@@ -541,3 +541,16 @@ describe("specToChartConfig — derive", () => {
     expect(specToChartConfig({ chart_type: "bar", field: "a", derive: null }).derive).toBeNull();
   });
 });
+
+describe("specToChartConfig — inputs", () => {
+  it("carries the table's columns across, dropping unknown ones", () => {
+    expect(
+      specToChartConfig({
+        chart_type: "table",
+        field: "a",
+        inputs: { columns: ["count", "share", "bogus" as never] },
+      }).inputs,
+    ).toEqual({ columns: ["count", "share"] });
+    expect(specToChartConfig({ chart_type: "bar", field: "a" }).inputs).toEqual({});
+  });
+});

@@ -16,7 +16,13 @@ import type {
   StoryBlock,
   StoryBlockKind,
 } from "./types";
-import { parseDeriveSpec, type ChartConfig, type ChartType } from "@/components/viz/lib/chartConfig";
+import {
+  parseChartInputs,
+  parseDeriveSpec,
+  type ChartConfig,
+  type ChartType,
+  type TableColumn,
+} from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { Metric } from "@/components/viz/lib/transforms";
 
@@ -73,6 +79,9 @@ export interface AgentChartSpecV2 {
     groups?: number | null;
     show_points?: boolean | null;
     show_density?: boolean | null;
+    table_sort_by?: ChartConfig["options"]["tableSortBy"] | null;
+    table_sort_dir?: "asc" | "desc" | null;
+    highlight?: string[] | null;
   } | null;
   /** The backend's `DeriveSpec` (snake_case `time_part`); `ChartConfig` spells it `timePart`. */
   derive?: {
@@ -82,6 +91,8 @@ export interface AgentChartSpecV2 {
     edges?: number[] | null;
     part?: "hour" | "weekday" | "day" | "week" | "month" | null;
   } | null;
+  /** Figure-specific inputs — today only the table's `columns`. */
+  inputs?: { columns?: TableColumn[] | null } | null;
 }
 
 /**
@@ -184,6 +195,12 @@ function specDeriveToConfig(raw: AgentChartSpecV2["derive"] | string): ChartConf
   return parseDeriveSpec({ ...clean, kind: kind === "time_part" ? "timePart" : kind });
 }
 
+/** Agent-spec inputs → `ChartConfig.inputs`; unknown columns are dropped. */
+function specInputsToConfig(raw: AgentChartSpecV2["inputs"] | string): ChartConfig["inputs"] {
+  const d = parseToolArgObject<NonNullable<AgentChartSpecV2["inputs"]>>(raw);
+  return parseChartInputs(d ?? {});
+}
+
 export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   const spec = parseToolArgObject<AgentChartSpec>(raw);
   if (!spec) throw new Error("chart spec is not a JSON object");
@@ -207,12 +224,15 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   if (o.groups != null) options.groups = o.groups;
   if (o.show_points != null) options.showPoints = o.show_points;
   if (o.show_density != null) options.showDensity = o.show_density;
+  if (o.table_sort_by != null) options.tableSortBy = o.table_sort_by;
+  if (o.table_sort_dir != null) options.tableSortDir = o.table_sort_dir;
+  if (o.highlight != null && o.highlight.length) options.highlight = o.highlight;
 
   const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
   return {
     v: 2,
     derive: specDeriveToConfig(spec.derive),
-    inputs: {},
+    inputs: specInputsToConfig(spec.inputs),
     marks: [],
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,

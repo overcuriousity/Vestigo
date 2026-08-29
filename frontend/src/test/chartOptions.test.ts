@@ -39,6 +39,9 @@ describe("resolveChartOptions", () => {
       logScale: false,
       seriesMode: "overlay",
       legend: true,
+      tableSortBy: "count",
+      tableSortDir: "desc",
+      highlight: [],
     });
   });
 

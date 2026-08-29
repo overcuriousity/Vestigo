@@ -443,3 +443,36 @@ describe("buildCaptionLines — derivations", () => {
     );
   });
 });
+
+describe("buildCaptionLines — table", () => {
+  it("names the sort, the share denominator, the remainder and the highlighted rows", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Table (values with counts)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "table",
+        field: "attr:user",
+        scale: "nominal",
+        options: { tableSortBy: "last_seen", tableSortDir: "asc", highlight: ["alice", "bob"] },
+      },
+      filters: {},
+      facts: {
+        tableTotal: 11,
+        distinct: 4,
+        shownValues: 2,
+        tableSort: { by: "last_seen", dir: "asc" },
+        tableHighlight: ["alice", "bob"],
+        tableRemainder: { count: 3, distinctValues: 2 },
+      },
+    });
+    expect(lines).toContain("sorted by last seen (ascending)");
+    expect(lines).toContain("share = count / 11 events with a non-empty attr:user");
+    expect(lines).toContain(
+      "showing top 2 of 4 distinct values; 3 events across 2 more values in the remainder row",
+    );
+    expect(lines).toContain("highlighted rows: alice · bob — presentation only");
+    expect(lines.some((l) => l.includes("(capped"))).toBe(false);
+  });
+});

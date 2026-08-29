@@ -153,6 +153,7 @@ const CHART_TYPES: ChartType[] = [
   "sankey",
   "scatter",
   "corr",
+  "table",
 ];
 const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];

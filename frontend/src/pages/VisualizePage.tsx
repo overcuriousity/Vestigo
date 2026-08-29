@@ -65,6 +65,8 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
+import { TableFigure } from "@/components/viz/charts/TableFigure";
+import { tableCsv } from "@/components/viz/lib/tableRows";
 import {
   CorrMatrix,
   type CorrMethod,
@@ -529,7 +531,9 @@ export function VisualizePage() {
     autoProbedField.current = field;
     // Don't yank the analyst off the field-independent charts (time,
     // punchcard) or a deliberately-picked two-field chart.
-    if (fieldFree || requiresSecondField || multiField) return;
+    // The table is legal at nominal and ordinal only, and the analyst chose a
+    // table: a numeric probe must not re-pick the figure out from under it.
+    if (fieldFree || requiresSecondField || multiField || chartType === "table") return;
     const isNumeric = numericQuery.data.count > 0;
     const nextScale: Scale = isNumeric ? "ratio" : "nominal";
     const nextType: ChartType = isNumeric ? "histogram" : "bar";
@@ -747,6 +751,30 @@ export function VisualizePage() {
 
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
   // — switching between those chart types refetches nothing.
+  const tableQuery = useQuery({
+    queryKey: [
+      "viz-field-table",
+      caseId,
+      timelineId,
+      field,
+      fieldY,
+      filters,
+      topN,
+      resolved.tableSortBy,
+      resolved.tableSortDir,
+      config.derive,
+    ],
+    queryFn: () =>
+      vizApi.fieldTable(caseId!, timelineId!, field!, filters, topN, {
+        secondField: fieldY,
+        sortBy: resolved.tableSortBy,
+        sortDir: resolved.tableSortDir,
+        derive: config.derive,
+      }),
+    enabled: scopeReady && !!field && dataKind === "table",
+    ...busyRetry,
+  });
+
   const pivotQuery = useQuery({
     queryKey: [
       "viz-field-pivot",
@@ -810,6 +838,7 @@ export function VisualizePage() {
       compareTermsQuery.data?.derive ??
       timeseriesQuery.data?.derive ??
       pivotQuery.data?.derive_x ??
+      tableQuery.data?.derive ??
       null;
   }
   if (dataKind === "time" && timeQuery.data) {
@@ -869,6 +898,19 @@ export function VisualizePage() {
     facts.intervalSeconds = timeseriesQuery.data.interval_seconds;
   } else if (dataKind === "punchcard" && punchcardQuery.data) {
     facts.primaryTotal = punchcardQuery.data.total;
+  } else if (dataKind === "table" && tableQuery.data) {
+    facts.primaryTotal = tableQuery.data.total;
+    facts.tableTotal = tableQuery.data.total;
+    facts.distinct = tableQuery.data.distinct;
+    facts.shownValues = tableQuery.data.rows.length;
+    facts.tableSort = tableQuery.data.sort;
+    facts.tableHighlight = resolved.highlight;
+    facts.tableRemainder = tableQuery.data.remainder
+      ? {
+          count: tableQuery.data.remainder.count,
+          distinctValues: tableQuery.data.remainder.distinct_values,
+        }
+      : undefined;
   } else if (dataKind === "pivot" && pivotQuery.data) {
     facts.primaryTotal = pivotQuery.data.total;
     // A bounded `time:` axis reports its domain size, not a measured distinct
@@ -945,6 +987,10 @@ export function VisualizePage() {
     filters,
     facts,
   });
+  // The table's CSV is built from the response the figure already holds, under
+  // the same caption lines the image export carries.
+  const csvText =
+    chartType === "table" && tableQuery.data ? tableCsv(tableQuery.data, config, captionLines) : null;
 
   // The one query behind the chart on screen. Named once rather than
   // re-derived per state, so the spinner, the busy-lane badge and any future
@@ -970,11 +1016,13 @@ export function VisualizePage() {
               ? punchcardQuery
               : dataKind === "pivot"
                 ? pivotQuery
-                : dataKind === "scatter"
-                  ? scatterQuery
-                  : dataKind === "corr"
-                    ? correlationQuery
-                    : null;
+                : dataKind === "table"
+                  ? tableQuery
+                  : dataKind === "scatter"
+                    ? scatterQuery
+                    : dataKind === "corr"
+                      ? correlationQuery
+                      : null;
 
   const loading = activeQuery?.isLoading ?? false;
 
@@ -1025,6 +1073,7 @@ export function VisualizePage() {
           svgRef={svgRef}
           exportFilename={exportFilename}
           captionLines={captionLines}
+          csv={csvText}
         />
       )}
 
@@ -1312,6 +1361,14 @@ export function VisualizePage() {
             )}
             {chartType === "punchcard" && punchcardQuery.data && (
               <PunchCard data={punchcardQuery.data} svgRef={svgRef} />
+            )}
+            {chartType === "table" && tableQuery.data && (
+              <TableFigure
+                data={tableQuery.data}
+                config={config}
+                highlight={resolved.highlight}
+                svgRef={svgRef}
+              />
             )}
             {chartType === "pivot" && pivotQuery.data && (
               <PivotHeatmap
