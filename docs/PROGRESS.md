@@ -4,7 +4,37 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 204 — marks, `open_url`, the schema budget).
+Last updated: 2026-08-29 (session 205 — cumulative step and calendar heatmap).
+
+## Session 205 — 2026-08-29: cumulative step and calendar heatmap (viz plan B)
+
+Plan B of the Visualize design round (steps 5 and 7 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Cumulative step" and §"Calendar heatmap". Stacked on marks (#327).
+
+**A third field state.** `cumulative` and `calendar` are the first figures that chart every
+event without a field and a field's values with one: `inputs={"field": "optional"}` beside
+field-free (`time`, `punchcard`) and field-required. `requires_field` is false for both,
+the rail offers *No field* and keeps the figure whichever way the analyst goes, the page's
+"pick a field" empty state stays out of the way, and `propose_chart` accepts either.
+
+**One quantity rule on both sides.** The cumulative step accumulates `events`, a `sum` or
+`distinct` values, chosen by `options.quantity` or resolved from field and scale by the same
+rule in `resolveChartOptions` and `chart_exec`; the registry refuses `sum` over anything but
+a measure and `distinct` over a measure by name, and a field under `events` is a warning.
+The `distinct` quantity merges per-bucket `uniqExactState`s through a window function
+rather than adding per-bucket distinct counts — 2/3/3/4 users, not 2/4/4/6 — and the live
+test pins the difference. Values that could not be summed or counted are `unparsed` and
+captioned. The step is `curveStepAfter` and never interpolates; marks draw on it, Compare
+does not.
+
+**UTC by decision.** The calendar's day boundary is UTC and the caption says so: no
+timeline or user carries a display timezone, and the punch card already pins UTC. The figure
+keeps the latest 53 ISO weeks (`ChartLimits.calendar_weeks`, the same for the agent and the
+analyst — a display truth, not a context budget), discloses the weeks and the events it
+dropped, and draws an empty day as an outlined cell distinct from the ramp's lowest step.
+
+**Schema budget.** `ChartOptionsSpec.quantity` took the tool schemas from 41,947 to
+42,044 chars; the ceiling moved to 42,500 (`docs/AGENT.md`).
 
 ## Session 204 — 2026-08-29: marks, `open_url`, the schema budget (viz plan A)
 

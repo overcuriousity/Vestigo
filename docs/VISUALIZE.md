@@ -97,7 +97,12 @@ Read top-down, in dependency order:
 1. **Field** — `FieldCombo`, with *No field — count every event* as the first entry, so the
    field-free figures (events over time, punch card) are reached from the picker itself and
    the topmost control is never inert (#298). Picking a field while on a field-free figure
-   lands on the first figure that charts it, and says so.
+   lands on the first figure that charts it, and says so. Two figures are **field-optional**
+   (`inputs: {field: "optional"}` — the cumulative step and the calendar heatmap): the picker
+   offers *No field* and keeps the figure whichever way the analyst goes — every event without
+   a field, the field's values with one — and a hint under the picker says so. That is a
+   third state beside field-free (`time`, `punchcard`, which never take a field) and
+   field-required (everything else); `requires_field` is false for both of the first two.
 2. **Treat as** — four chips; the Stevens term sits in the tooltip:
 
    | chip | tooltip | Stevens |
@@ -134,7 +139,10 @@ Read top-down, in dependency order:
    *distinct* whenever a second field is set; *distinct* is disabled until one is, and a
    stored choice that names it without a second field is drawn without it.
 6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
-   reason when a figure has no honest two-layer encoding.
+   reason when a figure has no honest two-layer encoding. The cumulative step adds
+   **Quantity** (running event count · running sum (measure) · distinct values seen so far)
+   beside *Buckets*; the dishonest choices are greyed with the reason (sum needs *Measure*,
+   distinct needs *Categories* or *Ordered categories*). The calendar has no options.
 7. **Marks** — only on figures whose registry row says `supportsMarks` (events over time,
    value over time): the chart's mark sources, each with the status the server resolved it
    to (`N drawn`, `N of M drawn — capped at C`, `; U undated not drawn`; a baseline names
@@ -328,6 +336,72 @@ Explorer's own `ids` stay session-only, as before.
 writes nothing, and answers 422 for a malformed mark (the `ChartMarkSpec` validator's
 message) or an unknown baseline definition / saved view (`marks[i]: … not found`).
 
+## Cumulative step
+
+`chart_type="cumulative"` (`data_kind="cumulative"`, `EventQueryService.cumulative`,
+`GET …/viz/cumulative?field=&quantity=&buckets=`) draws a running total over time. Three
+**quantities**, chosen by `options.quantity` or resolved from the field and its treat-as by
+one rule that `resolveChartOptions` and `chart_exec` both apply: no field → `events` (a
+running event count); a *Measure* (ratio) → `sum` (a running `sum()` of the field parsed as a
+number); categories (nominal/ordinal) → `distinct` (the number of distinct values seen so
+far). The registry refuses the dishonest combinations by name — `sum` over anything but a
+measure ("a running sum over anything but a measure is not a quantity"), `distinct` over a
+measure, and either without a field — and warns, without refusing, when a field is set under
+`events` (the field is ignored). The endpoint knows no scale, so it never assumes `sum`: the
+page asks for it, and a `quantity` that needs a field without one is a 422.
+
+**The SQL.** Buckets are `toStartOfInterval(ts, INTERVAL n second)` on the histogram's
+epoch-aligned grid (`bucket_interval_seconds` + `aligned_bucket_starts`, the range being the
+query's explicit `start`/`end` or the dated events' min/max), and the running value is a
+window function over the bucketed subquery: `sum(delta) OVER (ORDER BY bucket ROWS BETWEEN
+UNBOUNDED PRECEDING AND CURRENT ROW)` for `events` and `sum`. For `distinct` each bucket
+yields a `uniqExactState(field)` and the window merges the states cumulatively
+(`uniqExactMerge(st) OVER (…)`) — **never a sum of per-bucket distinct counts**, which would
+count a value once per bucket it appears in: alice,bob | alice,carol | — | alice,dave is
+2, 3, 3, 4 distinct users, where a sum of per-bucket distincts would say 2, 4, 4, 6
+(`tests/test_cumulative_clickhouse.py` pins this). The result is zero-filled so every
+aligned bucket is present and a flat step is a flat step; each bucket carries its own
+`delta` (for `distinct`, the values first seen in it) beside the running `value`. A `sum`
+skips values that do not parse as a number and a `distinct` skips empty values; both are
+counted in `unparsed` and the caption says so ("1 event with no numeric attr:bytes value not
+summed" / "… with an empty attr:user not counted"). `buckets` is bounded by
+`ChartLimits.time_buckets` like the histogram (4–200 on the endpoint).
+
+**Drawing** (`charts/CumulativeStep.tsx`): a `curveStepAfter` path — the value holds until
+the next bucket changes it and the line never interpolates, because a diagonal would assert
+growth inside a bucket nobody measured (`cumulativeStep.test.tsx` parses the path and
+forbids a diagonal segment). The tooltip shows the running value and the bucket's own
+contribution. Marks are supported (`MarksOverlay` on the same time axis); Compare is not —
+two cumulatives on one axis is a shared-axis trap — and there is no metric. The caption
+names the quantity and the field in its header line ("cumulative sum of attr:bytes (measure)
+over time", "distinct values of attr:user seen so far", "cumulative event count over
+time"), the bucket width ("1 h buckets, UTC") and the final value over the events scanned.
+
+## Calendar heatmap
+
+`chart_type="calendar"` (`data_kind="calendar"`, `EventQueryService.calendar`,
+`GET …/viz/calendar?field=`) draws one cell per day, weeks as columns and ISO weekdays as
+rows. **Day boundaries are UTC**, and the caption says so ("day boundaries UTC"): no timeline
+or user carries a display timezone today, a boundary that moved with the viewer would redraw
+the figure between two analysts, and the punch card already pins UTC and states it. The scan
+is one `GROUP BY toDate(ts, 'UTC')`; with a field, a day counts the events whose field is
+non-empty (`countIf(field != '')`), and a `time:` field is refused ("a calendar part is
+always present — a calendar over it counts every event; omit field").
+
+**The cap.** The figure keeps the latest `ChartLimits.calendar_weeks` = 53 ISO weeks
+(Monday-start; `start` is the Monday of the first shown week, `end` the last day with data);
+when the data spans more, `truncated` is true, `dropped` counts the events on earlier days,
+and the caption states both ("53 weeks, 2025-07-21 → 2026-07-22, day boundaries UTC" /
+"latest 53 of 61 weeks drawn; 9 earlier events not drawn"). The cap is a display truth
+rather than a context budget, so it is the same 53 for the agent and the analyst.
+
+**Drawing** (`charts/CalendarHeatmap.tsx`): cell shade is the count on the shared sequential
+ramp (`lib/colors.ts`); a day with no events is an outlined empty cell (`fill="none"`,
+`--viz-grid` stroke), deliberately distinct from the ramp's lowest step so "few" and "none"
+never look alike; month labels above the first column of each month, every other weekday
+label on the left, and the tooltip names the weekday, the date and the count. No marks, no
+Compare, no options.
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -347,6 +421,10 @@ message) or an unknown baseline definition / saved view (`marks[i]: … not foun
   would spend most of a step's headroom on prose the validator states once; refused on a
   figure whose `supports_marks` is false (naming the figures that draw them); the echo
   carries `resolved.marks` (the sources) and `summary.marks` the per-source status.
+  For the cumulative step `options.quantity` is resolved by the same field-and-scale rule as
+  the rail and echoed in `resolved.options`; the summary carries `total`, `events`,
+  `unparsed`, `buckets` and `interval_seconds`. For the calendar the summary carries
+  `total`, `max_count`, `weeks`, `weeks_total`, `truncated` and `dropped`.
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
   the schema an external client sees is the in-app one. Every `propose_chart` result also
   carries `open_url`, the Visualize page link for that exact figure
@@ -360,12 +438,13 @@ message) or an unknown baseline definition / saved view (`marks[i]: … not foun
   `field_table` response and is drawn as a real `<table>` in the snapshot and the HTML
   export (§"Table figure"). A time-axis chart with marks freezes the resolved `marks`
   (`{marks, sources, cap}`, provenance included) beside `chart`, and the snapshot draws
-  them without re-resolving.
+  them without re-resolving. A cumulative or calendar block freezes the `CumulativeResponse`
+  / `CalendarResponse` as `chart` like every other kind, and `snapshotToChartResult` rebuilds
+  both without a fetch.
 
 ## 6. Not yet shipped
 
-Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: the
-cumulative step (which will declare `supportsMarks`); ranked change between two windows;
-the calendar heatmap; interval lanes.
+Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: ranked
+change between two windows; interval lanes.
 Until each lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
 describe it. Geo/choropleth remains its own roadmap round.

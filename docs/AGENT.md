@@ -296,6 +296,18 @@ list used only by the correlation matrix.
   the analyst's ceiling is the `viz_marks_max` setting) and the overflow is disclosed in
   `summary.marks.sources`. The tool result keeps the summary and `resolved.marks` (the
   sources); the resolved instants themselves are not returned — the card resolves its own.
+- **Cumulative and calendar.** `chart_type="cumulative"` and `"calendar"` are the
+  field-optional figures (`docs/VISUALIZE.md` §"Cumulative step", §"Calendar heatmap"):
+  the `requires_field` refusal now names them as the two that take an optional field beside
+  `time` and `punchcard`, which take none. `options.quantity` (`events` / `sum` /
+  `distinct`) is resolved from the field and scale when omitted — no field → `events`, a
+  ratio field → `sum`, otherwise `distinct` — and echoed in `resolved.options`. Four
+  refusals name themselves: `sum` or `distinct` without a field, `sum` without
+  `scale="ratio"`, `distinct` on a measure; a field under `quantity="events"` is a warning
+  (the field is ignored), not a refusal. The calendar refuses a `time:` field (a calendar
+  part is always present) and keeps the latest `ChartLimits.calendar_weeks` = 53 weeks —
+  the same number for the agent and the analyst, since the cap is a display truth rather
+  than a context budget; `summary` carries `weeks`, `weeks_total`, `truncated`, `dropped`.
 - **`open_url`.** Every `propose_chart` result carries the Visualize page link for that
   exact figure, so an external `/mcp` client — which gets no card — can hand a human the
   chart. `agent/deep_link.py::visualize_url` mirrors the page's own URL codec
@@ -570,10 +582,11 @@ page calls `scale` "treat as" — Categories / Ordered categories / Number or ti
 Measure — and the model should use the plain phrase only when speaking to the analyst)
 are appended to `FastMCP(instructions=…)`, sharing the exact strings the in-app
 `SYSTEM_PROMPT` composes from. `tests/test_agent_schema.py` holds a budget
-guard (serialized tool list < 42,000 chars; `ChartSpec.derive` measured 39,382 →
+guard (serialized tool list < 42,500 chars; `ChartSpec.derive` measured 39,382 →
 40,213 on 2026-08-29 and the ceiling moved by that delta; `ChartSpec.inputs` and the
 table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks` and the
-`open_url` docstring took it to 41,947, and the ceiling moved to 42,000) — if a change
+`open_url` docstring took it to 41,947, and the ceiling moved to 42,000;
+`ChartOptionsSpec.quantity` took it to 42,044 and the ceiling to 42,500) — if a change
 trips it, re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the

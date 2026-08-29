@@ -434,7 +434,10 @@ Per kind, `data` is:
   contains a table rather than an image of one. A time-axis chart with marks
   freezes the resolved `marks` (`{marks, sources, cap}`, each mark with its
   provenance — `docs/VISUALIZE.md` §"Marks") beside `chart`, and
-  `SnapshotRenderer` draws them from the snapshot, never re-resolving.
+  `SnapshotRenderer` draws them from the snapshot, never re-resolving. A
+  `cumulative` or `calendar` block freezes its `CumulativeResponse` /
+  `CalendarResponse` as `chart` like every other kind, and
+  `snapshotToChartResult` names both (`FrozenChartKind`).
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in
