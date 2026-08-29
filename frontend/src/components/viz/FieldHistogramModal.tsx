@@ -187,7 +187,10 @@ export function FieldHistogramModal({
     chartLabel: "Field histogram",
     headerLabel: "field histogram",
     config: {
-      v: 1,
+      v: 2,
+      derive: null,
+      inputs: {},
+      marks: [],
       field: fieldKey,
       fieldY: null,
     fields: null,

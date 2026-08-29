@@ -193,7 +193,10 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
 
   const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
   return {
-    v: 1,
+    v: 2,
+    derive: null,
+    inputs: {},
+    marks: [],
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     fields: spec.fields ?? null,
@@ -241,7 +244,10 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
     options.topN = spec.limit;
   }
   return {
-    v: 1,
+    v: 2,
+    derive: null,
+    inputs: {},
+    marks: [],
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     // The retired shape had no multi-field chart.

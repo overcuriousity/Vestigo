@@ -13,7 +13,7 @@ import {
 } from "@/components/viz/lib/chartConfig";
 
 const fullConfig: ChartConfig = {
-  v: 1,
+  v: 2,
   field: "attr:src_ip",
   fieldY: null,
   fields: null,
@@ -22,6 +22,9 @@ const fullConfig: ChartConfig = {
   metric: "ratio",
   compare: { mode: "custom", filters: { q: "error", filters: { artifact: ["apache"] } } },
   options: { orientation: "vertical", logScale: true, buckets: 90 },
+  derive: null,
+  inputs: {},
+  marks: [],
 };
 
 describe("URL round-trip", () => {
@@ -118,7 +121,7 @@ describe("stored (saved chart) round-trip", () => {
   });
 
   it("rejects unsupported versions", () => {
-    expect(parseStoredChartConfig({ ...chartConfigToStored(fullConfig), v: 2 })).toBeNull();
+    expect(parseStoredChartConfig({ ...chartConfigToStored(fullConfig), v: 3 })).toBeNull();
   });
 
   it("rejects non-object payloads", () => {
@@ -333,5 +336,72 @@ describe("chartUrlParams", () => {
     const prev = new URLSearchParams({ tour: "viz", c_field: "old", q: "old" });
     const params = chartUrlParams(config, {}, prev);
     expect(params.get("tour")).toBe("viz");
+  });
+});
+
+describe("ChartConfig v2", () => {
+  const v2Extras: ChartConfig = {
+    ...fullConfig,
+    chartType: "bar",
+    metric: "count",
+    compare: { mode: "off" },
+    options: {},
+    derive: { kind: "bins", mode: "log", count: 8 },
+    inputs: { laneKey: "attr:user", pairing: "nextEnd", startFilter: { q: "4624" } },
+    marks: [
+      { kind: "events", filters: { tagsInclude: ["exfil"] }, label: "tagged exfil" },
+      { kind: "baseline", definitionId: "bd1" },
+      { kind: "instant", at: "2026-03-13T09:41:00Z", label: "first beacon" },
+    ],
+  };
+
+  it("round-trips derive, inputs and marks through the URL", () => {
+    expect(paramsToChartConfig(chartConfigToParams(v2Extras))).toEqual(v2Extras);
+  });
+
+  it("writes no c_derive / c_inputs / c_marks when they are empty", () => {
+    const params = chartConfigToParams(fullConfig);
+    expect(params.has("c_derive")).toBe(false);
+    expect(params.has("c_inputs")).toBe(false);
+    expect(params.has("c_marks")).toBe(false);
+  });
+
+  it("round-trips derive, inputs and marks through storage", () => {
+    expect(parseStoredChartConfig(chartConfigToStored(v2Extras))).toEqual(v2Extras);
+  });
+
+  it("upgrades a stored v1 config losslessly", () => {
+    const v1 = {
+      v: 1,
+      chartType: "bar",
+      scale: "nominal",
+      field: "attr:host",
+      fieldY: null,
+      fields: null,
+      metric: "count",
+      compare: { mode: "off" },
+      options: { topN: 12 },
+    };
+    expect(parseStoredChartConfig(v1)).toEqual({
+      ...v1,
+      v: 2,
+      derive: null,
+      inputs: {},
+      marks: [],
+    });
+  });
+
+  it("drops a malformed derive / inputs / marks param field-by-field", () => {
+    const params = chartConfigToParams(fullConfig);
+    params.set("c_derive", '{"kind":"bins","mode":"custom","edges":"nope"}');
+    params.set("c_inputs", '{"pairing":"sideways","laneKey":"attr:user"}');
+    params.set(
+      "c_marks",
+      '[{"kind":"instant","at":"x"},{"kind":"baseline","definitionId":"bd1"}]',
+    );
+    const parsed = paramsToChartConfig(params);
+    expect(parsed.derive).toBeNull();
+    expect(parsed.inputs).toEqual({ laneKey: "attr:user" });
+    expect(parsed.marks).toEqual([{ kind: "baseline", definitionId: "bd1" }]);
   });
 });

@@ -4,7 +4,7 @@
  * captions all derive from this one object, so what an analyst sees, saves,
  * shares, and exports is the same chart by construction.
  *
- * Versioned (`v: 1`): saved charts round-trip through Postgres and may be
+ * Versioned (`v: 2`): saved charts round-trip through Postgres and may be
  * loaded by a future frontend — bump the version on breaking shape changes
  * and handle old versions explicitly instead of silently misreading them.
  */
@@ -63,8 +63,35 @@ export interface ChartOptions {
   showPoints?: boolean;
 }
 
+export type DeriveSpec =
+  | { kind: "bins"; mode: "width" | "log"; count: number }
+  | { kind: "bins"; mode: "custom"; edges: number[] }
+  | { kind: "timePart"; part: TimePart };
+export type TimePart = "hour" | "weekday" | "day" | "week" | "month";
+
+export type TableColumn = "count" | "share" | "first_seen" | "last_seen" | "distinct_second";
+
+/** Figure-specific inputs declared by the registry (`CHART_META[c].inputs`).
+ * Only the keys the current figure declares are meaningful; the rest are
+ * carried so switching figures and back loses nothing. */
+export interface ChartInputs {
+  laneKey?: string;
+  startFilter?: EventFilters;
+  endFilter?: EventFilters;
+  pairing?: "nextEnd" | "firstLast";
+  columns?: TableColumn[];
+}
+
+/** A mark is a *source* resolved at render time — never a stored pixel. */
+export type MarkSource =
+  | { kind: "events"; filters: EventFilters; label?: string }
+  | { kind: "baseline"; definitionId: string }
+  | { kind: "view"; viewId: string }
+  | { kind: "instant"; at: string; label: string }
+  | { kind: "range"; start: string; end: string; label: string };
+
 export interface ChartConfig {
-  v: 1;
+  v: 2;
   /** Field token, or null for pure event-count charts ("time"/"punchcard"). */
   field: string | null;
   /** Second field token for two-field charts (pivot/sankey/scatter), or the
@@ -79,10 +106,14 @@ export interface ChartConfig {
   metric: Metric;
   compare: CompareSpec;
   options: ChartOptions;
+  /** Change of scale applied before aggregation, or null for the raw value. */
+  derive: DeriveSpec | null;
+  inputs: ChartInputs;
+  marks: MarkSource[];
 }
 
 export const DEFAULT_CHART_CONFIG: ChartConfig = {
-  v: 1,
+  v: 2,
   field: null,
   fieldY: null,
   fields: null,
@@ -94,6 +125,9 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   metric: "count",
   compare: { mode: "off" },
   options: {},
+  derive: null,
+  inputs: {},
+  marks: [],
 };
 
 const CHART_TYPES: ChartType[] = [
@@ -133,6 +167,131 @@ const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
  */
 export const CHART_ID_PARAM = "c_chart";
 
+const DERIVE_MODES = ["width", "log"] as const;
+const TIME_PARTS: TimePart[] = ["hour", "weekday", "day", "week", "month"];
+const PAIRINGS = ["nextEnd", "firstLast"] as const;
+const TABLE_COLUMNS: TableColumn[] = ["count", "share", "first_seen", "last_seen", "distinct_second"];
+
+const isRecord = (x: unknown): x is Record<string, unknown> =>
+  !!x && typeof x === "object" && !Array.isArray(x);
+const isPosInt = (x: unknown): x is number =>
+  typeof x === "number" && Number.isInteger(x) && x > 0;
+
+/** A `DeriveSpec` or null — a malformed one is *no* derivation, never a guess. */
+export function parseDeriveSpec(raw: unknown): DeriveSpec | null {
+  if (!isRecord(raw)) return null;
+  if (raw.kind === "bins") {
+    if (raw.mode === "custom") {
+      const edges = raw.edges;
+      if (
+        Array.isArray(edges) &&
+        edges.length > 0 &&
+        edges.every((e) => typeof e === "number" && Number.isFinite(e))
+      ) {
+        return { kind: "bins", mode: "custom", edges: [...(edges as number[])] };
+      }
+      return null;
+    }
+    if ((DERIVE_MODES as readonly unknown[]).includes(raw.mode) && isPosInt(raw.count)) {
+      return { kind: "bins", mode: raw.mode as "width" | "log", count: raw.count };
+    }
+    return null;
+  }
+  if (raw.kind === "timePart" && (TIME_PARTS as unknown[]).includes(raw.part)) {
+    return { kind: "timePart", part: raw.part as TimePart };
+  }
+  return null;
+}
+
+/** Field-by-field: a bad member is dropped, the good ones survive. */
+export function parseChartInputs(raw: unknown): ChartInputs {
+  const out: ChartInputs = {};
+  if (!isRecord(raw)) return out;
+  if (typeof raw.laneKey === "string" && raw.laneKey) out.laneKey = raw.laneKey;
+  if (isRecord(raw.startFilter)) out.startFilter = viewPayloadToFilters(raw.startFilter);
+  if (isRecord(raw.endFilter)) out.endFilter = viewPayloadToFilters(raw.endFilter);
+  if ((PAIRINGS as readonly unknown[]).includes(raw.pairing)) {
+    out.pairing = raw.pairing as ChartInputs["pairing"];
+  }
+  if (Array.isArray(raw.columns)) {
+    const cols = raw.columns.filter((c): c is TableColumn =>
+      TABLE_COLUMNS.includes(c as TableColumn),
+    );
+    if (cols.length > 0) out.columns = cols;
+  }
+  return out;
+}
+
+/** Each mark is validated on its own; a malformed one is dropped. */
+export function parseMarkSources(raw: unknown): MarkSource[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MarkSource[] = [];
+  for (const m of raw) {
+    if (!isRecord(m)) continue;
+    const label = typeof m.label === "string" ? m.label : undefined;
+    switch (m.kind) {
+      case "events":
+        if (isRecord(m.filters)) {
+          out.push({
+            kind: "events",
+            filters: viewPayloadToFilters(m.filters),
+            ...(label !== undefined ? { label } : {}),
+          });
+        }
+        break;
+      case "baseline":
+        if (typeof m.definitionId === "string" && m.definitionId) {
+          out.push({ kind: "baseline", definitionId: m.definitionId });
+        }
+        break;
+      case "view":
+        if (typeof m.viewId === "string" && m.viewId) out.push({ kind: "view", viewId: m.viewId });
+        break;
+      case "instant":
+        if (typeof m.at === "string" && m.at && label !== undefined) {
+          out.push({ kind: "instant", at: m.at, label });
+        }
+        break;
+      case "range":
+        if (
+          typeof m.start === "string" &&
+          m.start &&
+          typeof m.end === "string" &&
+          m.end &&
+          label !== undefined
+        ) {
+          out.push({ kind: "range", start: m.start, end: m.end, label });
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+/** Filters inside inputs/marks travel in the View payload shape, like `compare`. */
+function inputsToPayload(inputs: ChartInputs): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...inputs };
+  if (inputs.startFilter) out.startFilter = filtersToViewPayload(inputs.startFilter);
+  if (inputs.endFilter) out.endFilter = filtersToViewPayload(inputs.endFilter);
+  return out;
+}
+function marksToPayload(marks: MarkSource[]): unknown[] {
+  return marks.map((m) =>
+    m.kind === "events" ? { ...m, filters: filtersToViewPayload(m.filters) } : m,
+  );
+}
+
+/**
+ * Bring any stored/URL config object to the v2 key set. v1 lacked `derive`,
+ * `inputs` and `marks`; every other key kept its meaning, so the upgrade is
+ * lossless and a v2 object passes through untouched. Unknown versions are
+ * returned as-is for the caller to refuse.
+ */
+export function upgradeChartConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  if (raw.v === 1) return { ...raw, v: 2, derive: null, inputs: {}, marks: [] };
+  return raw;
+}
+
 /**
  * Write the chart-specific state into *params* under `c_*` keys, leaving the
  * Explorer filter params (q/filters/start/...) untouched — the two live side
@@ -163,6 +322,11 @@ export function chartConfigToParams(
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
   }
+  if (config.derive) params.set("c_derive", JSON.stringify(config.derive));
+  if (Object.keys(config.inputs).length > 0) {
+    params.set("c_inputs", JSON.stringify(inputsToPayload(config.inputs)));
+  }
+  if (config.marks.length > 0) params.set("c_marks", JSON.stringify(marksToPayload(config.marks)));
   return params;
 }
 
@@ -201,7 +365,13 @@ export function chartUrlParams(
  * back to defaults field-by-field rather than discarding the whole config.
  */
 export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
-  const config: ChartConfig = { ...DEFAULT_CHART_CONFIG, compare: { mode: "off" }, options: {} };
+  const config: ChartConfig = {
+    ...DEFAULT_CHART_CONFIG,
+    compare: { mode: "off" },
+    options: {},
+    inputs: {},
+    marks: [],
+  };
 
   const type = params.get("c_type");
   if (type && (CHART_TYPES as string[]).includes(type)) config.chartType = type as ChartType;
@@ -246,6 +416,18 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
       // malformed options — keep defaults
     }
   }
+  const json = (key: string): unknown => {
+    const raw = params.get(key);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  };
+  config.derive = parseDeriveSpec(json("c_derive"));
+  config.inputs = parseChartInputs(json("c_inputs"));
+  config.marks = parseMarkSources(json("c_marks"));
   return config;
 }
 
@@ -256,12 +438,14 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
  */
 export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   if (!stored || typeof stored !== "object") return null;
-  const raw = stored as Record<string, unknown>;
-  if (raw.v !== 1) return null;
+  const raw = upgradeChartConfig(stored as Record<string, unknown>);
+  if (raw.v !== 2) return null;
   const config: ChartConfig = {
     ...DEFAULT_CHART_CONFIG,
     compare: { mode: "off" },
     options: {},
+    inputs: {},
+    marks: [],
   };
   if (typeof raw.chartType === "string" && (CHART_TYPES as string[]).includes(raw.chartType)) {
     config.chartType = raw.chartType as ChartType;
@@ -292,6 +476,9 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   if (raw.options && typeof raw.options === "object") {
     config.options = raw.options as ChartOptions;
   }
+  config.derive = parseDeriveSpec(raw.derive);
+  config.inputs = parseChartInputs(raw.inputs);
+  config.marks = parseMarkSources(raw.marks);
   return config;
 }
 
@@ -370,6 +557,8 @@ export function chartConfigToStored(
       config.compare.mode === "custom"
         ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
         : config.compare,
+    inputs: inputsToPayload(config.inputs),
+    marks: marksToPayload(config.marks),
   };
   // `filters` is *this function's* key, never `ChartConfig`'s. Cleared before
   // writing rather than merely overwritten: a future `ChartConfig.filters`
