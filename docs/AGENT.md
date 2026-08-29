@@ -258,7 +258,9 @@ grouping variable producing one distribution per group; `fields` is a 2–8 toke
 list used only by the correlation matrix.
 
 - **Legality is enforced from one table.** `agent/chart_meta.py` is the source of
-  truth (admissible scales per mark, comparison support, second field, options);
+  truth (admissible scales per mark, comparison support, second field, options, and
+  since `ChartConfig` v2 each figure's `inputs`, `derives`, `question` and
+  `supports_marks` — `docs/VISUALIZE.md`);
   `viz/lib/chartMeta.ts` is **generated** from it by `scripts/gen_chart_meta.py`
   (committed; `tests/test_chart_meta.py` asserts regeneration is a no-op). The
   analyst gets the rules as UI affordances; the agent gets them as validation

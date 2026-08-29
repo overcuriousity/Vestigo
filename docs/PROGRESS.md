@@ -4,7 +4,43 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 200 — Top-values ceilings and a pageable top-list).
+Last updated: 2026-08-29 (session 201 — figure registry, ChartConfig v2, the field-first rail).
+
+## Session 201 — 2026-08-29: figure registry, `ChartConfig` v2, the field-first rail
+
+Step 1 of 9 from the Visualize design round (durable form: the new `docs/VISUALIZE.md`).
+Behaviour-preserving for every existing chart; the foundation the six new figures land on.
+
+**The chart table became a figure registry.** `agent/chart_meta.py` rows now declare
+`inputs` (what the figure asks for, from a fixed eight-key vocabulary), `derives` (which
+change-of-scale derivations it admits), `question` (the forensic question it answers) and
+`supports_marks`. `requires_second_field` / `accepts_second_field` / `multi_field` are
+read-only views over `inputs`, so the generated `chartMeta.ts` and `propose_chart` keep their
+vocabulary. Two tests pin the registry to the rail from both sides: a row may only declare
+keys the rail renders (`RAIL_RENDERED_INPUTS`), and the rail renders exactly the declared
+keys for every figure.
+
+**`ChartConfig` v2.** Three new slots — `derive`, `inputs`, `marks` — all empty until their
+figures ship, plus `c_derive` / `c_inputs` / `c_marks` in the URL codec (JSON, dropped
+field-by-field when malformed). A stored `v: 1` row upgrades losslessly on read
+(`upgradeChartConfig`); the backend writes `CHART_CONFIG_VERSION = 2`. Saved charts, story
+blocks and links keep meaning what they meant.
+
+**The rail reads field first.** `ChartRail.tsx` leaves `VisualizePage.tsx` (2218 → 1358
+lines) as its own component: Field (with *No field — count every event* as the first entry,
+so the top control is never inert) → **Treat as** (four plain-language chips — Categories,
+Ordered categories, Number or time, Measure — with the Stevens term in the tooltip) →
+**Figure** (a thumbnail gallery; illegal figures greyed with their reason) → the figure's
+declared inputs → Compare → Metric → Options. The scale radio and the presets drawer are
+gone; each preset's question is its figure's `question`. Every automatic re-pick still
+names itself, now in the rail's own words ("`src_port` looks numeric — treating it as a
+measure; change this if its values are categories to you").
+
+Declined and removed from the roadmap: facetting / small multiples — a shared axis across
+panels is a correctness trap, and figures are assembled side by side in the report instead.
+
+Next, in order: derivations (bins, calendar part), the table figure, marks, cumulative
+step, ranked change, calendar heatmap, interval lanes.
 
 ## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
 

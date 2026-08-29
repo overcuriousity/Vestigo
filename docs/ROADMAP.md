@@ -4,7 +4,7 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-08-28, v1.15.1):** three open issues, listed below. Phase 3 is complete
+**State (verified 2026-08-29, v1.15.1):** three open issues, listed below. Phase 3 is complete
 and the queue is feature-shaped. Priority, roughly by payoff-per-effort:
 
 1. **D11** entropy bigram variant — closes a capability gap the docs used to overclaim;
@@ -28,14 +28,6 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   Earth is public domain), the projection, and the count-vs-rate normalization rule — count
   per country is a choropleth, count per city is a proportional-symbol map, and the wrong
   one misleads by area.
-- [ ] **Facetting / small multiples.** Cut in the PR #162 review: each panel derived its own
-  Freedman–Diaconis bin edges while the grid pinned a shared count axis, so equal bar
-  heights meant different densities. Cheap revival: reuse `field_numeric_grouped`, which
-  bins every group over a global range in one scan (caps panels at 8). Full revival: add
-  optional `range_min`/`range_max` to `field_numeric_stats`, resolve one global range from
-  the unfacetted query, pass it to every panel. Either path needs a caption describing the
-  *grid* rather than the aggregate.
-
 ## Milestone 3 — polish
 
 - [ ] **Make `VESTIGO_STAT_SCAN_CONCURRENCY` live.** Every other `stat_scan_*` value now
