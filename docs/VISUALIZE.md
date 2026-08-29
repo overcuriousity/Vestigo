@@ -51,6 +51,16 @@ current. Each figure (`ChartType`) is one `ChartMeta` row:
 `inputs`, kept because the generated TypeScript and `propose_chart` already speak in those
 terms.
 
+Two things the design listed as registry columns live in the frontend instead, keyed by
+`chartType` with a completeness test each: the gallery glyph (`primitives/FigureThumbnail.tsx`,
+`figureThumbnail.test.tsx`) and the "how to read" line (`lib/explainers.ts`,
+`vizExplainers.test.ts`); captions are one facts-driven builder (`lib/caption.ts`) rather
+than a template id per figure. And the design's "`bar pie waffle heatmap` gain `bins`,
+`timePart`" ships as bar, heatmap, pivot, sankey, change and table only: a derivation yields
+the ordinal scale, and `pie` / `waffle` admit nominal alone (a ranked-bins pie would order
+its wedges by a scale the mark cannot show), so by the rule above they declare none — a
+numeric field reaches them through the bar.
+
 The rail renders **one control per declared input key and nothing else**. Two tests hold the
 two sides together: `tests/test_chart_meta.py::test_declared_inputs_have_a_rail_renderer`
 (a row may only declare keys the rail renders — `RAIL_RENDERED_INPUTS`) and
