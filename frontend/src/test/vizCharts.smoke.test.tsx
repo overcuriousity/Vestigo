@@ -24,6 +24,7 @@ import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
+import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -192,6 +193,28 @@ describe("chart smoke render", () => {
           total: 3.5,
           events: 3,
           unparsed: 1,
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("CalendarHeatmap renders with calendar data", () => {
+    const { container } = render(
+      <CalendarHeatmap
+        data={{
+          kind: "calendar",
+          field: "attr:user",
+          timezone: "UTC",
+          start: "2026-07-20",
+          end: "2026-07-20",
+          days: [{ date: "2026-07-20", count: 1 }],
+          total: 1,
+          max_count: 1,
+          weeks: 1,
+          weeks_total: 1,
+          truncated: false,
+          dropped: 0,
         }}
       />,
     );
