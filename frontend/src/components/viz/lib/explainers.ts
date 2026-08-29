@@ -231,6 +231,10 @@ export const CHART_HOW_TO_READ: Record<ChartType, string> = {
     "Width = how common values are at that height — a smoothed, mirrored histogram. Humps are clusters.",
   ecdf: "Height at x = fraction of events with a value ≤ x. Steep sections are where most values sit.",
   punchcard: "Day-of-week × hour-of-day grid — recurring dark cells reveal rhythms, off-hours activity stands out.",
+  cumulative:
+    "Height = the running total so far; each step up is one time slice's contribution. Flat = nothing happened; a jump = a burst.",
+  calendar:
+    "One square per day, darker = more events; columns are weeks, rows are weekdays. Blank squares had no events at all.",
   pivot: "Cell darkness = events with that combination of the two field values.",
   sankey: "Ribbon width = events flowing from the left value to the right value.",
   corr: "One cell per field pair; colour and number give the correlation (−1…+1). Click a cell to see the scatter behind it.",

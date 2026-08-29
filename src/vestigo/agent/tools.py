@@ -528,6 +528,13 @@ class ChartOptionsSpec(ObjectArgModel):
     buckets: int | None = Field(
         default=None, ge=4, description="Time bucket count — time and timeseries charts."
     )
+    quantity: Literal["events", "sum", "distinct"] | None = Field(
+        default=None,
+        description=(
+            'cumulative only: "events" (no field), "sum" (field as measure, scale ratio) or '
+            '"distinct" (values seen so far). Omit to resolve from field and scale.'
+        ),
+    )
     limit_x: int | None = Field(default=None, ge=1, description="X-axis top-N — pivot/sankey.")
     limit_y: int | None = Field(default=None, ge=1, description="Y-axis top-N — pivot/sankey.")
     sample_limit: int | None = Field(default=None, ge=1, description="Point cap — scatter only.")

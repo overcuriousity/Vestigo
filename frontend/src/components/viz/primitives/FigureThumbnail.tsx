@@ -89,6 +89,29 @@ export const THUMBNAILS: Record<ChartType, () => JSX.Element> = {
       strokeWidth="2"
     />
   ),
+  cumulative: () => (
+    <path
+      d="M0 23 L6 23 L6 19 L12 19 L12 17 L18 17 L18 9 L26 9 L26 7 L32 7 L32 2 L40 2"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    />
+  ),
+  calendar: () => (
+    <>
+      {HEAT.map((o, i) => (
+        <rect
+          key={i}
+          x={Math.floor(i / 3) * 10}
+          y={(i % 3) * 8}
+          width={8}
+          height={6}
+          fill="currentColor"
+          opacity={o}
+        />
+      ))}
+    </>
+  ),
   punchcard: () => (
     <>
       {PUNCH.map((r, i) => (

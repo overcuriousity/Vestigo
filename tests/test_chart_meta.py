@@ -18,6 +18,7 @@ from vestigo.agent.chart_meta import (
     CHART_META,
     CHART_TYPES,
     FIELD_FREE_DATA_KINDS,
+    FIELD_OPTIONAL_DATA_KINDS,
     INPUT_KEYS,
     LEGACY_KIND_MAP,
     METRIC_INFO,
@@ -50,7 +51,7 @@ KNOWN_OPTION_KEYS = _known_option_keys()
 
 
 def test_table_covers_every_chart_type_exactly_once() -> None:
-    assert len(CHART_TYPES) == 16
+    assert len(CHART_TYPES) == 18
     assert set(CHART_META) == set(CHART_TYPES)
 
 
@@ -89,8 +90,42 @@ def test_every_scale_offers_at_least_one_chart() -> None:
 
 
 def test_field_free_charts_are_exactly_time_and_punchcard() -> None:
-    assert {c for c in CHART_TYPES if not requires_field(c)} == {"time", "punchcard"}
     assert {"time", "punchcard"} == FIELD_FREE_DATA_KINDS
+    assert {c for c in CHART_TYPES if CHART_META[c].data_kind in FIELD_FREE_DATA_KINDS} == {
+        "time",
+        "punchcard",
+    }
+
+
+def test_field_optional_charts_are_exactly_cumulative_and_calendar() -> None:
+    """A third state beside field-free and field-required: the figure charts
+    every event without a field and a field's values with one."""
+
+    assert {"cumulative", "calendar"} == FIELD_OPTIONAL_DATA_KINDS
+    optional = {c for c in CHART_TYPES if CHART_META[c].inputs.get("field") == "optional"}
+    assert optional == {"cumulative", "calendar"}
+    assert not any(requires_field(c) for c in optional)
+    # Field-free stays exactly what it was: these two never take a field.
+    assert {c for c in CHART_TYPES if not CHART_META[c].inputs} == {"time", "punchcard"}
+
+
+def test_cumulative_row_is_a_marked_time_figure_without_compare() -> None:
+    meta = CHART_META["cumulative"]
+    assert meta.data_kind == "cumulative"
+    assert meta.scales == ("nominal", "ordinal", "interval", "ratio")
+    assert meta.inputs == {"field": "optional"}
+    assert meta.derives == ()
+    assert set(meta.reads_options) == {"buckets", "quantity"}
+    assert meta.supports_marks is True and meta.supports_compare is False
+
+
+def test_calendar_row_takes_nothing_but_an_optional_field() -> None:
+    meta = CHART_META["calendar"]
+    assert meta.data_kind == "calendar"
+    assert meta.scales == ("nominal", "ordinal", "interval", "ratio")
+    assert meta.inputs == {"field": "optional"}
+    assert meta.derives == () and meta.reads_options == ()
+    assert meta.supports_marks is False and meta.supports_compare is False
 
 
 def test_two_field_charts_are_pivot_sankey_scatter() -> None:
@@ -203,6 +238,8 @@ def test_marks_unreachable_through_the_legacy_kind_enum() -> None:
         "ecdf",
         "sankey",
         "table",
+        "cumulative",
+        "calendar",
     }
 
 
@@ -251,6 +288,8 @@ def test_field_requirement_follows_field_free_kinds() -> None:
         meta = CHART_META[chart_type]
         if meta.data_kind in FIELD_FREE_DATA_KINDS or "fields" in meta.inputs:
             assert "field" not in meta.inputs, chart_type
+        elif meta.data_kind in FIELD_OPTIONAL_DATA_KINDS:
+            assert meta.inputs.get("field") == "optional", chart_type
         else:
             assert meta.inputs.get("field") == "required", chart_type
 
@@ -283,7 +322,11 @@ def test_derives_only_where_the_field_is_categorical_after_derivation(chart_type
 
 
 def test_marks_are_supported_on_the_time_axis_figures_only() -> None:
-    assert {c for c in CHART_TYPES if CHART_META[c].supports_marks} == {"time", "line"}
+    assert {c for c in CHART_TYPES if CHART_META[c].supports_marks} == {
+        "time",
+        "line",
+        "cumulative",
+    }
 
 
 #: Input keys the Visualize rail (`components/viz/ChartRail.tsx`) renders a

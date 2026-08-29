@@ -51,6 +51,8 @@ ChartType = Literal[
     "violin",
     "ecdf",
     "punchcard",
+    "cumulative",
+    "calendar",
     "pivot",
     "sankey",
     "scatter",
@@ -60,7 +62,17 @@ ChartType = Literal[
 Scale = Literal["nominal", "ordinal", "interval", "ratio"]
 Metric = Literal["count", "delta", "rate", "ratio", "cumulative"]
 DataKind = Literal[
-    "time", "terms", "numeric", "timeseries", "punchcard", "pivot", "scatter", "corr", "table"
+    "time",
+    "terms",
+    "numeric",
+    "timeseries",
+    "punchcard",
+    "pivot",
+    "scatter",
+    "corr",
+    "table",
+    "cumulative",
+    "calendar",
 ]
 
 #: What a figure asks the analyst for, from a fixed vocabulary. The Visualize
@@ -93,6 +105,12 @@ METRICS: tuple[Metric, ...] = get_args(Metric)
 
 #: Chart types that chart the whole event count and take no field at all.
 FIELD_FREE_DATA_KINDS: frozenset[DataKind] = frozenset({"time", "punchcard"})
+
+#: Chart types that chart the whole event count *or* a field's values: with no
+#: field they count events, with one they count/sum its values. A third state
+#: beside field-free and field-required; the rail shows the field picker with
+#: "No field" selectable, and `propose_chart` accepts either.
+FIELD_OPTIONAL_DATA_KINDS: frozenset[DataKind] = frozenset({"cumulative", "calendar"})
 
 #: Above this many slices a pie stops being readable — angle comparison is the
 #: least accurate visual cue there is (Cleveland & McGill 1985), and small
@@ -282,6 +300,35 @@ CHART_META: dict[ChartType, ChartMeta] = {
         inputs={},
         note="Field-free like `time` — meaningful whatever the picked field's scale is.",
     ),
+    "cumulative": ChartMeta(
+        label="Cumulative step (running total over time)",
+        question="How did the total grow — steadily, in bursts, or all at once — and when?",
+        scales=("nominal", "ordinal", "interval", "ratio"),
+        data_kind="cumulative",
+        default_scale="nominal",
+        inputs={"field": "optional"},
+        reads_options=("buckets", "quantity"),
+        supports_marks=True,
+        note=(
+            "Three quantities, chosen by `quantity` or resolved from the field: no "
+            "field → running event count; a measure (ratio) → running sum; categories "
+            "→ distinct values seen so far. Drawn as a step, never interpolated. No "
+            "Compare: two cumulatives on one axis is a shared-axis trap."
+        ),
+    ),
+    "calendar": ChartMeta(
+        label="Calendar heatmap (events per day)",
+        question="Which days carried the activity — weekdays, weekends, one-off spikes?",
+        scales=("nominal", "ordinal", "interval", "ratio"),
+        data_kind="calendar",
+        default_scale="nominal",
+        inputs={"field": "optional"},
+        note=(
+            "One cell per UTC day, weeks as columns; with a field, a day counts the "
+            "events whose field is non-empty. Capped at 53 weeks, latest kept, "
+            "disclosed in the caption."
+        ),
+    ),
     "pivot": ChartMeta(
         label="Heatmap (field × field)",
         question="How often does each pair of values from two fields occur together?",
@@ -403,8 +450,9 @@ def compare_capable() -> list[ChartType]:
 
 
 def requires_field(chart_type: ChartType) -> bool:
-    """False only for the two marks that chart the whole event count."""
-    return CHART_META[chart_type].data_kind not in FIELD_FREE_DATA_KINDS
+    """False for the field-free marks (time, punchcard) and the field-optional ones."""
+    kind = CHART_META[chart_type].data_kind
+    return kind not in FIELD_FREE_DATA_KINDS and kind not in FIELD_OPTIONAL_DATA_KINDS
 
 
 def metric_available(metric: Metric, chart_type: ChartType, compare_on: bool) -> bool:

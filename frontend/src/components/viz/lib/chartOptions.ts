@@ -62,6 +62,7 @@ export interface ResolvedChartOptions {
   /** null = automatic bin count (server-side Freedman–Diaconis). */
   bins: number | null;
   buckets: number;
+  quantity: "events" | "sum" | "distinct";
   limitX: number;
   limitY: number;
   sampleLimit: number;
@@ -111,6 +112,8 @@ export const TOPN_MAX: Record<ChartType, number> = {
   violin: 50,
   ecdf: 50,
   punchcard: 50,
+  cumulative: 50,
+  calendar: 50,
   pivot: 50,
   sankey: 50,
   scatter: 50,
@@ -173,6 +176,9 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     topN: clampTopN(options.topN, config.chartType),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
+    quantity:
+      options.quantity ??
+      (config.field == null ? "events" : config.scale === "ratio" ? "sum" : "distinct"),
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
     sampleLimit: options.sampleLimit ?? 5000,

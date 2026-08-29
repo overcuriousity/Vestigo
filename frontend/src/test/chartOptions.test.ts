@@ -31,6 +31,7 @@ describe("resolveChartOptions", () => {
       groups: 6,
       showPoints: false,
       buckets: 60,
+      quantity: "events",
       limitX: 10,
       limitY: 10,
       sampleLimit: 5000,
@@ -172,5 +173,26 @@ describe("chartTypesForField", () => {
       // ...and the default pick is one of them.
       expect(chartTypesForField(scale, token)).toContain(defaultChartTypeForScale(scale, token));
     }
+  });
+});
+
+describe("resolveChartOptions — cumulative quantity", () => {
+  it("defaults from field and scale, and keeps an explicit choice", () => {
+    const base = { ...DEFAULT_CHART_CONFIG, chartType: "cumulative" as const };
+    expect(resolveChartOptions({ ...base, field: null }).quantity).toBe("events");
+    expect(resolveChartOptions({ ...base, field: "attr:bytes", scale: "ratio" }).quantity).toBe(
+      "sum",
+    );
+    expect(
+      resolveChartOptions({ ...base, field: "attr:user", scale: "nominal" }).quantity,
+    ).toBe("distinct");
+    expect(
+      resolveChartOptions({
+        ...base,
+        field: "attr:user",
+        scale: "nominal",
+        options: { quantity: "events" },
+      }).quantity,
+    ).toBe("events");
   });
 });

@@ -207,6 +207,7 @@ _CHART_OPTION_KEYS = {
     "bins": "bins",
     "showDensity": "show_density",
     "buckets": "buckets",
+    "quantity": "quantity",
     "limitX": "limit_x",
     "limitY": "limit_y",
     "sampleLimit": "sample_limit",

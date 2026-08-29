@@ -8,7 +8,7 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table" | "cumulative" | "calendar";
 export type InputKey = "field" | "secondField" | "fields" | "laneKey" | "startFilter" | "endFilter" | "pairing" | "columns";
 export type Requirement = "required" | "optional";
 export type Derive = "bins" | "timePart";
@@ -210,6 +210,41 @@ export const CHART_META: Record<
     dataKind: "punchcard",
     defaultScale: "nominal",
     inputs: {},
+    derives: [],
+    readsOptions: [],
+    supportsCompare: false,
+    supportsMarks: false,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+  },
+  // Three quantities, chosen by `quantity` or resolved from the field: no field → running event
+  // count; a measure (ratio) → running sum; categories → distinct values seen so far. Drawn as
+  // a step, never interpolated. No Compare: two cumulatives on one axis is a shared-axis trap.
+  cumulative: {
+    label: "Cumulative step (running total over time)",
+    question: "How did the total grow — steadily, in bursts, or all at once — and when?",
+    scales: ["nominal", "ordinal", "interval", "ratio"],
+    dataKind: "cumulative",
+    defaultScale: "nominal",
+    inputs: { field: "optional" },
+    derives: [],
+    readsOptions: ["buckets", "quantity"],
+    supportsCompare: false,
+    supportsMarks: true,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+  },
+  // One cell per UTC day, weeks as columns; with a field, a day counts the events whose field
+  // is non-empty. Capped at 53 weeks, latest kept, disclosed in the caption.
+  calendar: {
+    label: "Calendar heatmap (events per day)",
+    question: "Which days carried the activity — weekdays, weekends, one-off spikes?",
+    scales: ["nominal", "ordinal", "interval", "ratio"],
+    dataKind: "calendar",
+    defaultScale: "nominal",
+    inputs: { field: "optional" },
     derives: [],
     readsOptions: [],
     supportsCompare: false,

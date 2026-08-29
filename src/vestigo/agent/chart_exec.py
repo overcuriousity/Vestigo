@@ -65,6 +65,8 @@ class ChartLimits:
     #: setting (the analyst's ceiling); the agent's is fixed and smaller because
     #: every resolved mark is summarised into the model's context.
     marks_per_source: int | None
+    #: Weeks the calendar heatmap draws (latest kept, earlier disclosed).
+    calendar_weeks: int
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -84,6 +86,7 @@ AGENT_CHART_LIMITS = ChartLimits(
     pivot_limit=(8, 12),
     table_rows=(20, 30),
     marks_per_source=20,
+    calendar_weeks=53,
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -104,6 +107,7 @@ ANALYST_CHART_LIMITS = ChartLimits(
     pivot_limit=(10, 50),
     table_rows=(50, 500),
     marks_per_source=None,
+    calendar_weeks=53,
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,

@@ -30,6 +30,8 @@ export type ChartType =
   | "violin"
   | "ecdf"
   | "punchcard"
+  | "cumulative"
+  | "calendar"
   | "pivot"
   | "sankey"
   | "scatter"
@@ -53,6 +55,8 @@ export interface ChartOptions {
   /** Histogram: smoothed density (KDE) curve overlay. Default on. */
   showDensity?: boolean;
   buckets?: number;
+  /** cumulative: what accumulates — resolved from field/scale when omitted. */
+  quantity?: "events" | "sum" | "distinct";
   /** pivot/sankey: per-axis top-N caps. */
   limitX?: number;
   limitY?: number;
@@ -149,6 +153,8 @@ const CHART_TYPES: ChartType[] = [
   "violin",
   "ecdf",
   "punchcard",
+  "cumulative",
+  "calendar",
   "pivot",
   "sankey",
   "scatter",

@@ -1441,6 +1441,48 @@ export interface PunchcardResponse {
   cells: PunchcardCell[];
 }
 
+export type CumulativeQuantity = "events" | "sum" | "distinct";
+export interface CumulativeBucket {
+  start: string;
+  /** This bucket's own contribution. */
+  delta: number;
+  /** Running total at the end of this bucket. */
+  value: number;
+}
+/** Running total over time from `viz/cumulative` — zero-filled, epoch-aligned buckets. */
+export interface CumulativeResponse {
+  kind: "cumulative";
+  quantity: CumulativeQuantity;
+  field: string | null;
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  buckets: CumulativeBucket[];
+  total: number;
+  events: number;
+  /** sum: events with no numeric value; distinct: events with an empty value. */
+  unparsed: number;
+}
+export interface CalendarDay {
+  date: string;
+  count: number;
+}
+/** Events per UTC day from `viz/calendar`, latest 53 weeks; `days` is sparse. */
+export interface CalendarResponse {
+  kind: "calendar";
+  field: string | null;
+  timezone: "UTC";
+  start: string | null;
+  end: string | null;
+  days: CalendarDay[];
+  total: number;
+  max_count: number;
+  weeks: number;
+  weeks_total: number;
+  truncated: boolean;
+  dropped: number;
+}
+
 /** One co-occurrence cell; `""` on an axis means "outside that axis's top-N" (Other). */
 export interface FieldPivotCell {
   x: string;

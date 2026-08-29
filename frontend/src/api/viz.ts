@@ -4,6 +4,9 @@ import type { DeriveSpec, MarkSource } from "@/components/viz/lib/chartConfig";
 import { marksToPayload } from "@/components/viz/lib/chartConfig";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
+  CalendarResponse,
+  CumulativeQuantity,
+  CumulativeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
@@ -142,6 +145,32 @@ export const vizApi = {
   ): Promise<PunchcardResponse> =>
     get<PunchcardResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/time-punchcard`, {
       ...serializeEventFilterParams(filters),
+    }),
+
+  /** Running total over time — events, a measure's sum, or distinct values so far. */
+  cumulative: (
+    caseId: string,
+    timelineId: string,
+    filters: EventFilters = {},
+    opts: { field?: string | null; quantity?: CumulativeQuantity; buckets?: number } = {},
+  ): Promise<CumulativeResponse> =>
+    get<CumulativeResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/cumulative`, {
+      ...serializeEventFilterParams(filters),
+      ...(opts.field ? { field: opts.field } : {}),
+      ...(opts.quantity ? { quantity: opts.quantity } : {}),
+      ...(opts.buckets ? { buckets: opts.buckets } : {}),
+    }),
+
+  /** Event count per UTC day, latest 53 weeks. */
+  calendar: (
+    caseId: string,
+    timelineId: string,
+    filters: EventFilters = {},
+    opts: { field?: string | null } = {},
+  ): Promise<CalendarResponse> =>
+    get<CalendarResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/calendar`, {
+      ...serializeEventFilterParams(filters),
+      ...(opts.field ? { field: opts.field } : {}),
     }),
 
   /** Top-X × top-Y co-occurrence matrix — feeds the pivot heatmap and Sankey flow. */

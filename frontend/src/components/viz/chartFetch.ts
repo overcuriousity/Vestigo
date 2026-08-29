@@ -11,6 +11,8 @@ import { histogramToCompare, type ChartConfig } from "@/components/viz/lib/chart
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { ResolvedChartOptions } from "@/components/viz/lib/chartOptions";
 import type {
+  CalendarResponse,
+  CumulativeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
@@ -155,6 +157,20 @@ export async function fetchChartData(
         kind: "punchcard" as const,
         data: await vizApi.punchcard(caseId, timelineId, filters),
       };
+    case "cumulative":
+      return {
+        kind: "cumulative" as const,
+        data: await vizApi.cumulative(caseId, timelineId, filters, {
+          field: config.field,
+          quantity: opts.quantity,
+          buckets: opts.buckets,
+        }),
+      };
+    case "calendar":
+      return {
+        kind: "calendar" as const,
+        data: await vizApi.calendar(caseId, timelineId, filters, { field: config.field }),
+      };
     case "pivot":
       return {
         kind: "pivot" as const,
@@ -214,6 +230,8 @@ export type FrozenChartKind =
   | "timeseries"
   | "time"
   | "punchcard"
+  | "cumulative"
+  | "calendar"
   | "pivot"
   | "corr"
   | "scatter"
@@ -263,6 +281,10 @@ export function snapshotToChartResult(
       };
     case "punchcard":
       return { kind: "punchcard", data: frozen as PunchcardResponse };
+    case "cumulative":
+      return { kind: "cumulative", data: frozen as CumulativeResponse };
+    case "calendar":
+      return { kind: "calendar", data: frozen as CalendarResponse };
     case "pivot":
       return { kind: "pivot", data: frozen as FieldPivotResponse };
     case "corr":
