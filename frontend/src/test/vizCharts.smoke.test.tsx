@@ -26,6 +26,7 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import { RankedChange } from "@/components/viz/charts/RankedChange";
+import { IntervalLanes } from "@/components/viz/charts/IntervalLanes";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -216,6 +217,47 @@ describe("chart smoke render", () => {
           weeks_total: 1,
           truncated: false,
           dropped: 0,
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("IntervalLanes renders with lanes data", () => {
+    const { container } = render(
+      <IntervalLanes
+        data={{
+          kind: "lanes",
+          field: "attr:host",
+          pairing: "first_last",
+          lanes: [
+            {
+              key: "h1",
+              count: 2,
+              intervals: [
+                {
+                  start: "2026-07-20T09:00:00+00:00",
+                  end: "2026-07-20T10:00:00+00:00",
+                  start_event_id: "e1",
+                  end_event_id: "e2",
+                },
+              ],
+            },
+          ],
+          lane_cap: 10,
+          lanes_total: 1,
+          lane_cap_hit: false,
+          other_lanes: 0,
+          starts: 0,
+          ends: 0,
+          unpaired_starts: 0,
+          orphan_ends: 0,
+          rows_cap: 50000,
+          rows_truncated: false,
+          rows_paired: 0,
+          undated: 0,
+          slice_start: "2026-07-20T09:00:00+00:00",
+          slice_end: "2026-07-20T10:00:00+00:00",
         }}
       />,
     );

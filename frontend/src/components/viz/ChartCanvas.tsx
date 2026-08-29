@@ -35,6 +35,7 @@ import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import { RankedChange } from "@/components/viz/charts/RankedChange";
+import { IntervalLanes } from "@/components/viz/charts/IntervalLanes";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -244,6 +245,7 @@ export function ChartMarks({
       {data.kind === "cumulative" && <CumulativeStep data={data.data} marks={marks} />}
       {data.kind === "calendar" && <CalendarHeatmap data={data.data} />}
       {data.kind === "change" && <RankedChange data={data.data} layout={opts.layout} />}
+      {data.kind === "lanes" && <IntervalLanes data={data.data} marks={marks} />}
       {data.kind === "punchcard" && <PunchCard data={data.data} />}
       {data.kind === "pivot" && config.chartType === "pivot" && (
         <PivotHeatmap data={data.data} />
