@@ -3436,3 +3436,27 @@ def test_field_table_uses_the_inventory_select_core_and_a_totals_scan() -> None:
         "last_seen": None,
         "distinct_second": 2,
     }
+
+
+def test_mark_instants_takes_the_ordered_head_and_a_countif_pair() -> None:
+    svc = _viz_service(
+        [
+            ("countIf(", FakeQueryResult(result_rows=[[3, 1]])),
+            (
+                "ORDER BY ts ASC",
+                FakeQueryResult(
+                    result_rows=[
+                        ["e1", "s1", datetime(2026, 7, 20, 1, tzinfo=UTC)],
+                        ["e2", "s1", datetime(2026, 7, 20, 2, tzinfo=UTC)],
+                        ["e3", "s1", datetime(2026, 7, 20, 3, tzinfo=UTC)],
+                    ]
+                ),
+            ),
+        ]
+    )
+    result = svc.mark_instants(EventQuery(case_id="c", source_ids=["s"], q="beacon"), limit=2)
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    head = next(s for s in sqls if "ORDER BY ts ASC" in s)
+    assert "LIMIT 3" in head and "ORDER BY ts ASC, event_id ASC" in head
+    assert [i["event_id"] for i in result["instants"]] == ["e1", "e2"]
+    assert result["overflow"] is True and result["dated"] == 3 and result["undated"] == 1

@@ -3925,6 +3925,61 @@ class EventQueryService:
         }
 
     @_foreground_scan
+    def mark_instants(self, query: EventQuery, limit: int = 50) -> dict[str, Any]:
+        """Return the earliest *limit* dated events under *query* as mark instants.
+
+        The aggregation behind an ``events`` mark source (Visualize marks): a
+        filter becomes instants on a time axis. Two scans in parallel under
+        one slot — the ordered head, and a ``countIf`` pair that says how many
+        events matched with and without a real timestamp — so the caption can
+        state both the cap and the undated events the figure cannot place.
+        Ascending by the offset-corrected timestamp, then ``event_id``, so a
+        re-run over unchanged sources draws the same instants.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+
+        def head() -> Any:
+            return self._select(
+                f"""
+                SELECT event_id, source_id, {eff} AS ts
+                FROM {database}.events
+                WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
+                ORDER BY ts ASC, event_id ASC
+                LIMIT {int(limit) + 1}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        def totals() -> Any:
+            return self._select(
+                f"""
+                SELECT countIf({VESTIGO_NOT_SENTINEL_SQL}) AS dated,
+                       countIf(NOT ({VESTIGO_NOT_SENTINEL_SQL})) AS undated
+                FROM {database}.events
+                WHERE {where}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        result, totals_result = self._run_parallel(head, totals)
+        rows = result.result_rows
+        totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        return {
+            "instants": [
+                {"event_id": str(row[0]), "source_id": row[1], "at": ensure_utc_iso(row[2])}
+                for row in rows[: int(limit)]
+            ],
+            "dated": int(totals_row[0] or 0),
+            "undated": int(totals_row[1] or 0),
+            "overflow": len(rows) > int(limit),
+        }
+
+    @_foreground_scan
     def field_scatter(
         self, query: EventQuery, field_x: str, field_y: str, limit: int = 5000
     ) -> dict[str, Any]:
