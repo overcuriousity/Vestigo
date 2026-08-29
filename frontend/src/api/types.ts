@@ -1507,6 +1507,43 @@ export interface FieldTableResponse {
   derive?: DeriveEcho | null;
 }
 
+export type MarkProvenance =
+  | { kind: "analyst" }
+  | { kind: "event"; event_id: string; source_id: string }
+  | { kind: "view"; view_id: string; event_id: string; source_id: string }
+  | { kind: "baseline"; definition_id: string; window_id: string };
+export interface ResolvedInstantMark {
+  kind: "instant";
+  at: string;
+  label: string;
+  source: number;
+  provenance: MarkProvenance;
+}
+export interface ResolvedRangeMark {
+  kind: "range";
+  start: string;
+  end: string;
+  label: string;
+  source: number;
+  provenance: MarkProvenance;
+}
+export type ResolvedMark = ResolvedInstantMark | ResolvedRangeMark;
+export interface ResolvedMarkSource {
+  index: number;
+  kind: "events" | "baseline" | "view" | "instant" | "range";
+  label: string | null;
+  count: number;
+  shown: number;
+  overflow: boolean;
+  undated: number;
+}
+/** `POST …/viz/marks` — every mark with its provenance, one status row per source. */
+export interface ResolvedMarksResponse {
+  marks: ResolvedMark[];
+  sources: ResolvedMarkSource[];
+  cap: number;
+}
+
 /**
  * Uniform sample of numeric (x, y) pairs from `viz/field-scatter`, drawn in
  * a stable hash order so an identical query redraws identical points.
@@ -1791,6 +1828,8 @@ export interface SnapshotChartData {
   warnings: string[];
   /** Raw aggregation payload — reshape via `snapshotToChartResult`, never cast. */
   chart: unknown;
+  /** Resolved marks frozen beside the aggregation (time-axis figures with marks). */
+  marks?: ResolvedMarksResponse | null;
 }
 
 export interface SnapshotEventData {

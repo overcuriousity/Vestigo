@@ -1,6 +1,7 @@
 import { del, get, patch, post } from "./client";
 import { deriveToParam } from "@/components/viz/lib/derive";
-import type { DeriveSpec } from "@/components/viz/lib/chartConfig";
+import type { DeriveSpec, MarkSource } from "@/components/viz/lib/chartConfig";
+import { marksToPayload } from "@/components/viz/lib/chartConfig";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
   CompareNumericResponse,
@@ -17,6 +18,7 @@ import type {
   FieldTermsResponse,
   FieldTimeseriesResponse,
   PunchcardResponse,
+  ResolvedMarksResponse,
   SavedChart,
   VizFieldsResponse,
 } from "./types";
@@ -186,6 +188,18 @@ export const vizApi = {
       ...(opts.sortBy ? { sort_by: opts.sortBy } : {}),
       ...(opts.sortDir ? { sort_dir: opts.sortDir } : {}),
       ...(opts.derive ? { derive: deriveToParam(opts.derive) } : {}),
+    }),
+
+  /** Resolve a chart's mark sources into instants/ranges with provenance.
+   * Posts the stored `MarkSource` shape verbatim (`marksToPayload`) — the
+   * same bytes `c_marks` and a saved chart carry. */
+  resolveMarks: (
+    caseId: string,
+    timelineId: string,
+    marks: MarkSource[],
+  ): Promise<ResolvedMarksResponse> =>
+    post<ResolvedMarksResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/marks`, {
+      marks: marksToPayload(marks),
     }),
 
   /** Uniform random sample of numeric (x, y) pairs for the scatter plot. */

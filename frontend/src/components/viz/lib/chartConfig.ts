@@ -283,7 +283,7 @@ function inputsToPayload(inputs: ChartInputs): Record<string, unknown> {
   if (inputs.endFilter) out.endFilter = filtersToViewPayload(inputs.endFilter);
   return out;
 }
-function marksToPayload(marks: MarkSource[]): unknown[] {
+export function marksToPayload(marks: MarkSource[]): unknown[] {
   return marks.map((m) =>
     m.kind === "events" ? { ...m, filters: filtersToViewPayload(m.filters) } : m,
   );
