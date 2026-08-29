@@ -347,7 +347,7 @@ describe("ChartConfig v2", () => {
     compare: { mode: "off" },
     options: {},
     derive: { kind: "bins", mode: "log", count: 8 },
-    inputs: { laneKey: "attr:user", pairing: "nextEnd", startFilter: { q: "4624" } },
+    inputs: { pairing: "nextEnd", startFilter: { q: "4624" }, endFilter: { q: "4634" } },
     marks: [
       { kind: "events", filters: { tagsInclude: ["exfil"] }, label: "tagged exfil" },
       { kind: "baseline", definitionId: "bd1" },
@@ -405,14 +405,14 @@ describe("ChartConfig v2", () => {
   it("drops a malformed derive / inputs / marks param field-by-field", () => {
     const params = chartConfigToParams(fullConfig);
     params.set("c_derive", '{"kind":"bins","mode":"custom","edges":"nope"}');
-    params.set("c_inputs", '{"pairing":"sideways","laneKey":"attr:user"}');
+    params.set("c_inputs", '{"pairing":"sideways","startFilter":{"q":"x"},"endFilter":"nope"}');
     params.set(
       "c_marks",
       '[{"kind":"instant","at":"x"},{"kind":"baseline","definitionId":"bd1"}]',
     );
     const parsed = paramsToChartConfig(params);
     expect(parsed.derive).toBeNull();
-    expect(parsed.inputs).toEqual({ laneKey: "attr:user" });
+    expect(parsed.inputs).toEqual({ startFilter: { q: "x" } });
     expect(parsed.marks).toEqual([{ kind: "baseline", definitionId: "bd1" }]);
   });
 });

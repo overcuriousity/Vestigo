@@ -306,6 +306,11 @@ def _spec_marks_to_stored(marks: Any) -> list[dict[str, Any]] | None:
     return out
 
 
+#: `inputs.pairing` crosses the casing boundary like `derive.kind` does.
+_PAIRING_TO_SPEC = {"nextEnd": "next_end", "firstLast": "first_last"}
+_PAIRING_TO_STORED = {v: k for k, v in _PAIRING_TO_SPEC.items()}
+
+
 def _stored_chart_to_spec(config: dict[str, Any]):
     """Translate a saved chart's stored config into an executable ChartSpec.
 
@@ -338,8 +343,19 @@ def _stored_chart_to_spec(config: dict[str, Any]):
         spec["derive"] = derive
 
     stored_inputs = config.get("inputs")
-    if isinstance(stored_inputs, dict) and isinstance(stored_inputs.get("columns"), list):
-        spec["inputs"] = {"columns": list(stored_inputs["columns"])}
+    if isinstance(stored_inputs, dict):
+        spec_inputs: dict[str, Any] = {}
+        if isinstance(stored_inputs.get("columns"), list):
+            spec_inputs["columns"] = list(stored_inputs["columns"])
+        if stored_inputs.get("pairing") in _PAIRING_TO_SPEC:
+            spec_inputs["pairing"] = _PAIRING_TO_SPEC[stored_inputs["pairing"]]
+        for stored_key, spec_key in (("startFilter", "start_filter"), ("endFilter", "end_filter")):
+            if isinstance(stored_inputs.get(stored_key), dict):
+                spec_inputs[spec_key] = _filter_payload_to_spec(
+                    stored_inputs[stored_key]
+                ).model_dump(exclude_none=True)
+        if spec_inputs:
+            spec["inputs"] = spec_inputs
 
     marks = _stored_marks_to_spec(config.get("marks"))
     if marks:
@@ -429,8 +445,18 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
         config["derive"] = stored_derive
 
     inputs = getattr(spec, "inputs", None)
-    if inputs is not None and inputs.columns:
-        config["inputs"] = {"columns": list(inputs.columns)}
+    if inputs is not None:
+        stored_inputs: dict[str, Any] = {}
+        if inputs.columns:
+            stored_inputs["columns"] = list(inputs.columns)
+        if inputs.pairing:
+            stored_inputs["pairing"] = _PAIRING_TO_STORED[inputs.pairing]
+        if inputs.start_filter is not None:
+            stored_inputs["startFilter"] = _spec_filters_to_payload(inputs.start_filter)
+        if inputs.end_filter is not None:
+            stored_inputs["endFilter"] = _spec_filters_to_payload(inputs.end_filter)
+        if stored_inputs:
+            config["inputs"] = stored_inputs
 
     stored_marks = _spec_marks_to_stored(getattr(spec, "marks", None))
     if stored_marks:

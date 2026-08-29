@@ -237,6 +237,8 @@ export const CHART_HOW_TO_READ: Record<ChartType, string> = {
     "One square per day, darker = more events; columns are weeks, rows are weekdays. Blank squares had no events at all.",
   change:
     "Each row is one value; the grey dot is its share of the reference window, the coloured dot its share of this window. Longer bar = bigger shift. \"new\" and \"vanished\" mark values present in one window only.",
+  lanes:
+    "Each row is one value of the field; a bar runs from an interval's start to its end. A bar ending in an arrow never saw an end — it runs to the edge of the slice. Ends with no start before them are counted in the caption, not drawn.",
   pivot: "Cell darkness = events with that combination of the two field values.",
   sankey: "Ribbon width = events flowing from the left value to the right value.",
   corr: "One cell per field pair; colour and number give the correlation (−1…+1). Click a cell to see the scatter behind it.",

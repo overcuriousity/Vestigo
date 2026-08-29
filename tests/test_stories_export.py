@@ -882,3 +882,46 @@ async def test_chart_block_freezes_resolved_marks_beside_the_aggregation(store):
     )
     blk = snapshot["blocks"][0]
     assert blk["data"]["marks"]["marks"][0]["label"] == "first"
+
+
+def test_lanes_inputs_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "lanes",
+        "scale": "nominal",
+        "field": "attr:host",
+        "options": {"limitY": 12},
+        "inputs": {
+            "pairing": "nextEnd",
+            "startFilter": {"filters": {"attr:kind": ["logon"]}},
+            "endFilter": {"q": "logoff", "filters": {"attr:kind": ["logoff"]}},
+        },
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.pairing == "next_end"
+    assert spec.inputs.start_filter is not None
+    assert spec.inputs.start_filter.filters == {"attr:kind": ["logon"]}
+    assert spec.inputs.end_filter is not None and spec.inputs.end_filter.q == "logoff"
+    assert spec.options.limit_y == 12
+    back = spec_to_stored_chart_config(spec)
+    assert back["inputs"] == config["inputs"]
+    assert back["options"] == {"limitY": 12}
+
+
+def test_first_last_lanes_config_carries_only_the_pairing() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {
+            "v": 2,
+            "chartType": "lanes",
+            "scale": "nominal",
+            "field": "attr:host",
+            "inputs": {"pairing": "firstLast"},
+        }
+    )
+    assert spec.inputs is not None and spec.inputs.pairing == "first_last"
+    assert spec.inputs.start_filter is None and spec.inputs.end_filter is None
+    assert spec_to_stored_chart_config(spec)["inputs"] == {"pairing": "firstLast"}

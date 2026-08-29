@@ -13,6 +13,7 @@ import type { ResolvedChartOptions } from "@/components/viz/lib/chartOptions";
 import type {
   CalendarResponse,
   ChangeResponse,
+  LanesResponse,
   CumulativeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
@@ -188,6 +189,23 @@ export async function fetchChartData(
         })) as ChangeResponse,
       };
     }
+    case "lanes": {
+      const pairing = config.inputs.pairing ?? "firstLast";
+      if (pairing === "nextEnd" && (!config.inputs.startFilter || !config.inputs.endFilter)) {
+        throw new Error("Start → next end pairing needs a start filter and an end filter.");
+      }
+      return {
+        kind: "lanes" as const,
+        data: await vizApi.lanes(caseId, timelineId, {
+          field: config.field!,
+          pairing,
+          primary: filters,
+          startFilter: pairing === "nextEnd" ? config.inputs.startFilter : undefined,
+          endFilter: pairing === "nextEnd" ? config.inputs.endFilter : undefined,
+          limitY: opts.limitY,
+        }),
+      };
+    }
     case "pivot":
       return {
         kind: "pivot" as const,
@@ -250,6 +268,7 @@ export type FrozenChartKind =
   | "cumulative"
   | "calendar"
   | "change"
+  | "lanes"
   | "pivot"
   | "corr"
   | "scatter"
@@ -305,6 +324,8 @@ export function snapshotToChartResult(
       return { kind: "calendar", data: frozen as CalendarResponse };
     case "change":
       return { kind: "change", data: frozen as ChangeResponse };
+    case "lanes":
+      return { kind: "lanes", data: frozen as LanesResponse };
     case "pivot":
       return { kind: "pivot", data: frozen as FieldPivotResponse };
     case "corr":

@@ -51,7 +51,7 @@ KNOWN_OPTION_KEYS = _known_option_keys()
 
 
 def test_table_covers_every_chart_type_exactly_once() -> None:
-    assert len(CHART_TYPES) == 19
+    assert len(CHART_TYPES) == 20
     assert set(CHART_META) == set(CHART_TYPES)
 
 
@@ -242,6 +242,7 @@ def test_marks_unreachable_through_the_legacy_kind_enum() -> None:
         "cumulative",
         "calendar",
         "change",
+        "lanes",
     }
 
 
@@ -328,6 +329,7 @@ def test_marks_are_supported_on_the_time_axis_figures_only() -> None:
         "time",
         "line",
         "cumulative",
+        "lanes",
     }
 
 
@@ -335,7 +337,9 @@ def test_marks_are_supported_on_the_time_axis_figures_only() -> None:
 #: control for. Grown in the same commit as the renderer — a key declared here
 #: before its control exists would ask the analyst a question with no box to
 #: answer it in.
-RAIL_RENDERED_INPUTS: frozenset[str] = frozenset({"field", "second_field", "fields", "columns"})
+RAIL_RENDERED_INPUTS: frozenset[str] = frozenset(
+    {"field", "second_field", "fields", "columns", "pairing", "start_filter", "end_filter"}
+)
 
 
 @pytest.mark.parametrize("chart_type", CHART_TYPES)
@@ -374,3 +378,25 @@ def test_requires_compare_implies_supports_compare_and_is_only_change() -> None:
         if meta.requires_compare:
             assert meta.supports_compare, chart_type
     assert {c for c in CHART_TYPES if CHART_META[c].requires_compare} == {"change"}
+
+
+def test_lanes_row_is_a_field_keyed_interval_figure_with_marks() -> None:
+    meta = CHART_META["lanes"]
+    assert meta.data_kind == "lanes"
+    assert meta.scales == ("nominal", "ordinal")
+    assert meta.inputs == {
+        "field": "required",
+        "pairing": "optional",
+        "start_filter": "optional",
+        "end_filter": "optional",
+    }
+    assert meta.derives == ()
+    assert set(meta.reads_options) == {"limit_y"}
+    assert meta.supports_compare is False and meta.supports_marks is True
+
+
+def test_every_input_key_is_declared_by_some_shipped_figure() -> None:
+    """No dead vocabulary: `lane_key` left when the lane key became `field`."""
+    declared = {key for c in CHART_TYPES for key in CHART_META[c].inputs}
+    assert declared == set(INPUT_KEYS)
+    assert "lane_key" not in INPUT_KEYS

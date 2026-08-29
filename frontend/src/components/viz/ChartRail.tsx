@@ -548,6 +548,7 @@ export function ChartRail({
   const compareOn = config.compare.mode !== "off";
   const compareSupported = CHART_META[chartType].supportsCompare;
   const compareRequired = CHART_META[chartType].requiresCompare;
+  const pairing = config.inputs.pairing ?? "firstLast";
   const {
     topN,
     bins,
@@ -1123,6 +1124,75 @@ export function ChartRail({
         </div>
       )}
 
+      {"pairing" in CHART_META[chartType].inputs && (
+        <fieldset data-rail-section="pairing" role="group" aria-label="Pairing">
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Pairing
+          </label>
+          {(
+            [
+              {
+                value: "firstLast",
+                label: "First to last",
+                hint: "One bar per lane, from its first event to its last.",
+              },
+              {
+                value: "nextEnd",
+                label: "Start → next end",
+                hint: "An end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start is counted, not drawn.",
+              },
+            ] as const
+          ).map((opt) => (
+            <label
+              key={opt.value}
+              className={`flex cursor-pointer items-start gap-2 rounded px-2 py-1.5 text-sm ${
+                pairing === opt.value
+                  ? "bg-[var(--color-accent-dim)]"
+                  : "hover:bg-[var(--color-bg-hover)]"
+              }`}
+            >
+              <input
+                type="radio"
+                name="pairing"
+                checked={pairing === opt.value}
+                onChange={() =>
+                  updateConfig({ inputs: { ...config.inputs, pairing: opt.value } })
+                }
+                className="mt-0.5 accent-[var(--color-accent)]"
+              />
+              <span>
+                <span className="block">{opt.label}</span>
+                <span className="block text-xs text-[var(--color-fg-muted)]">{opt.hint}</span>
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      )}
+
+      {(["startFilter", "endFilter"] as const).map(
+        (key) =>
+          key in CHART_META[chartType].inputs && (
+            <div key={key} data-rail-section={key}>
+              <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+                {key === "startFilter" ? "Start events" : "End events"}
+              </label>
+              {pairing === "nextEnd" ? (
+                <div className="rounded border border-[var(--color-border)] p-2">
+                  <CompareFilterEditor
+                    filters={config.inputs[key] ?? {}}
+                    onChange={(f) => updateConfig({ inputs: { ...config.inputs, [key]: f } })}
+                    fields={fields}
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-[var(--color-fg-muted)]">
+                  Not used — first-to-last pairing needs no filters.
+                </p>
+              )}
+            </div>
+          ),
+      )}
+
       {"columns" in CHART_META[chartType].inputs && (
         <fieldset data-rail-section="columns" role="group" aria-label="Columns">
           <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
@@ -1309,12 +1379,35 @@ export function ChartRail({
         chartType === "line" ||
         chartType === "cumulative" ||
         chartType === "change" ||
+        chartType === "lanes" ||
         chartType === "table") && (
         <details className="rounded border border-[var(--color-border)]">
           <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Options
           </summary>
           <div className="space-y-3 px-2 pb-2 pt-1">
+            {chartType === "lanes" && (
+              <div>
+                <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                  Lanes: {limitY}
+                </label>
+                <input
+                  type="range"
+                  min={1}
+                  max={50}
+                  value={Math.min(limitY, 50)}
+                  onChange={(e) =>
+                    updateConfig({
+                      options: { ...config.options, limitY: Number(e.target.value) },
+                    })
+                  }
+                  className="w-full accent-[var(--color-accent)]"
+                />
+                <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+                  The lanes with the most events are kept; the rest are counted in the caption.
+                </p>
+              </div>
+            )}
             {chartType === "change" && (
               <>
                 <div>

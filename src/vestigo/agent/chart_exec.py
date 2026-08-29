@@ -70,6 +70,10 @@ class ChartLimits:
     #: Ranked change: top-N per window before the union, and the union's row cap.
     change_top_n: tuple[int, int]
     change_union: int
+    #: Interval lanes: the lane cap (by event count) and the row cap of the
+    #: ordered start/end scan the pairing runs over.
+    lanes: tuple[int, int]
+    lanes_rows: int
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -92,6 +96,8 @@ AGENT_CHART_LIMITS = ChartLimits(
     calendar_weeks=53,
     change_top_n=(10, 20),
     change_union=30,
+    lanes=(10, 20),
+    lanes_rows=2_000,
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -115,6 +121,8 @@ ANALYST_CHART_LIMITS = ChartLimits(
     calendar_weeks=53,
     change_top_n=(10, 100),
     change_union=200,
+    lanes=(10, 100),
+    lanes_rows=50_000,
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,

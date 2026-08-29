@@ -54,6 +54,7 @@ ChartType = Literal[
     "cumulative",
     "calendar",
     "change",
+    "lanes",
     "pivot",
     "sankey",
     "scatter",
@@ -75,19 +76,18 @@ DataKind = Literal[
     "cumulative",
     "calendar",
     "change",
+    "lanes",
 ]
 
 #: What a figure asks the analyst for, from a fixed vocabulary. The Visualize
 #: rail renders one control per declared key and nothing else — there is no
 #: figure-specific JSX in the rail — and the agent's ``propose_chart`` reports
-#: a missing ``required`` key by name. Keys beyond ``fields`` belong to figures
-#: that land in later steps; they are part of the vocabulary now so the rail
-#: renderer and this table are checked against one list.
+#: a missing ``required`` key by name. Every key is declared by a shipped
+#: figure; the vocabulary and the rail's renderers are checked against one list.
 InputKey = Literal[
     "field",
     "second_field",
     "fields",
-    "lane_key",
     "start_filter",
     "end_filter",
     "pairing",
@@ -351,6 +351,28 @@ CHART_META: dict[ChartType, ChartMeta] = {
             "window in both, ranked by |Δ share|. Share, never count — the windows "
             "are rarely the same size. Compare is required: baseline (the whole "
             "timeline) or custom filters name the reference window."
+        ),
+    ),
+    "lanes": ChartMeta(
+        label="Interval lanes (one lane per value, bars from start to end)",
+        question="How long did each value's activity run — which runs overlap, which never ended, which ended without a start?",
+        scales=("nominal", "ordinal"),
+        data_kind="lanes",
+        default_scale="nominal",
+        inputs={
+            "field": "required",
+            "pairing": "optional",
+            "start_filter": "optional",
+            "end_filter": "optional",
+        },
+        reads_options=("limit_y",),
+        supports_marks=True,
+        note=(
+            "The charted field is the lane key. first_last: one bar per lane from its "
+            "first to its last event. next_end: start_filter and end_filter name the "
+            "events that open and close an interval; an end closes the most recent open "
+            "start in its lane, an open start runs to the slice end, an orphan end is "
+            "counted, not drawn. Lanes capped by event count, rows capped and disclosed."
         ),
     ),
     "pivot": ChartMeta(

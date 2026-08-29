@@ -8,12 +8,12 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table" | "cumulative" | "calendar" | "change";
-export type InputKey = "field" | "secondField" | "fields" | "laneKey" | "startFilter" | "endFilter" | "pairing" | "columns";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table" | "cumulative" | "calendar" | "change" | "lanes";
+export type InputKey = "field" | "secondField" | "fields" | "startFilter" | "endFilter" | "pairing" | "columns";
 export type Requirement = "required" | "optional";
 export type Derive = "bins" | "timePart";
 
-export const INPUT_KEYS: InputKey[] = ["field", "secondField", "fields", "laneKey", "startFilter", "endFilter", "pairing", "columns"];
+export const INPUT_KEYS: InputKey[] = ["field", "secondField", "fields", "startFilter", "endFilter", "pairing", "columns"];
 
 export const CHART_META: Record<
   ChartType,
@@ -282,6 +282,27 @@ export const CHART_META: Record<
     supportsCompare: true,
     requiresCompare: true,
     supportsMarks: false,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+  },
+  // The charted field is the lane key. first_last: one bar per lane from its first to its last
+  // event. next_end: start_filter and end_filter name the events that open and close an
+  // interval; an end closes the most recent open start in its lane, an open start runs to the
+  // slice end, an orphan end is counted, not drawn. Lanes capped by event count, rows capped
+  // and disclosed.
+  lanes: {
+    label: "Interval lanes (one lane per value, bars from start to end)",
+    question: "How long did each value's activity run — which runs overlap, which never ended, which ended without a start?",
+    scales: ["nominal", "ordinal"],
+    dataKind: "lanes",
+    defaultScale: "nominal",
+    inputs: { field: "required", pairing: "optional", startFilter: "optional", endFilter: "optional" },
+    derives: [],
+    readsOptions: ["limitY"],
+    supportsCompare: false,
+    requiresCompare: false,
+    supportsMarks: true,
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: false,

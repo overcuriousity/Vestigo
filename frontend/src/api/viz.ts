@@ -17,6 +17,7 @@ import type {
   FieldNumericResponse,
   FieldPivotResponse,
   FieldTableResponse,
+  LanesResponse,
   TableSortColumnWire,
   FieldScatterResponse,
   FieldTermsResponse,
@@ -282,6 +283,27 @@ export const vizApi = {
       bins: body.bins,
       limit: body.limit,
       derive: body.derive ? JSON.parse(deriveToParam(body.derive)!) : undefined,
+    }),
+  /** Interval lanes — a POST because three filter sets do not fit query params. */
+  lanes: (
+    caseId: string,
+    timelineId: string,
+    body: {
+      field: string;
+      pairing: "firstLast" | "nextEnd";
+      primary: EventFilters;
+      startFilter?: EventFilters;
+      endFilter?: EventFilters;
+      limitY: number;
+    },
+  ): Promise<LanesResponse> =>
+    post(`/cases/${caseId}/timelines/${timelineId}/viz/lanes`, {
+      field: body.field,
+      pairing: body.pairing === "nextEnd" ? "next_end" : "first_last",
+      primary: serializeEventFilterParams(body.primary),
+      start_filter: body.startFilter ? serializeEventFilterParams(body.startFilter) : undefined,
+      end_filter: body.endFilter ? serializeEventFilterParams(body.endFilter) : undefined,
+      limit_y: body.limitY,
     }),
 };
 

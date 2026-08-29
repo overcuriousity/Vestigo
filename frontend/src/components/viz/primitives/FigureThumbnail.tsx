@@ -127,6 +127,27 @@ export const THUMBNAILS: Record<ChartType, () => JSX.Element> = {
       ))}
     </>
   ),
+  lanes: () => (
+    <>
+      {[
+        [4, 2, 18],
+        [12, 10, 30],
+        [20, 6, 24],
+      ].map(([y, x1, x2]) => (
+        <rect
+          key={y}
+          x={x1}
+          y={y - 2.5}
+          width={x2 - x1}
+          height={5}
+          rx={1}
+          fill="currentColor"
+          opacity={y === 12 ? 0.5 : 1}
+        />
+      ))}
+      <path d="M30 9.5 L35 12 L30 14.5 Z" fill="currentColor" opacity={0.5} />
+    </>
+  ),
   punchcard: () => (
     <>
       {PUNCH.map((r, i) => (

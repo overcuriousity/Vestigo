@@ -606,6 +606,21 @@ class ChartInputsSpec(ObjectArgModel):
             "count, share, first_seen, last_seen (plus distinct_second when field_y is set)."
         ),
     )
+    pairing: Literal["first_last", "next_end"] | None = Field(
+        default=None,
+        description=(
+            'lanes only: "first_last" (default; one bar per lane, first to last event) or '
+            '"next_end" (needs start_filter and end_filter).'
+        ),
+    )
+    start_filter: FilterSpec | None = Field(
+        default=None,
+        description='lanes, pairing="next_end": events that open an interval, ANDed with filters.',
+    )
+    end_filter: FilterSpec | None = Field(
+        default=None,
+        description='lanes, pairing="next_end": events that close an interval, ANDed with filters.',
+    )
 
 
 class ChartMarkSpec(ObjectArgModel):

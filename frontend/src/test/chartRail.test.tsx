@@ -185,6 +185,9 @@ describe("ChartRail", () => {
       secondField: /^(Field \(Y\)|Group by \(optional\)|Count distinct of \(optional\))$/,
       fields: /^Fields to correlate/,
       columns: /^Columns$/,
+      pairing: /^Pairing$/,
+      startFilter: /^Start events$/,
+      endFilter: /^End events$/,
     };
     for (const chartType of Object.keys(
       CHART_META,
@@ -446,5 +449,40 @@ describe("ChartRail — a figure that requires Compare", () => {
     expect(screen.getByText(/Top values per window: 10/)).toBeTruthy();
     fireEvent.click(screen.getByRole("combobox", { name: "Layout" }));
     expect(screen.getByRole("option", { name: "Slope (two columns)" })).toBeTruthy();
+  });
+});
+
+describe("ChartRail — interval lanes inputs", () => {
+  it("renders the pairing radios and the not-used notes under first-to-last", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "lanes", field: "artifact" });
+    const first = screen.getByRole("radio", { name: /First to last/ }) as HTMLInputElement;
+    expect(first.checked).toBe(true);
+    expect(screen.getAllByText(/Not used — first-to-last pairing needs no filters/)).toHaveLength(2);
+  });
+
+  it("switches the pairing through inputs and shows both filter editors under next end", () => {
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "lanes",
+      field: "artifact",
+    });
+    fireEvent.click(screen.getByRole("radio", { name: /Start → next end/ }));
+    expect(updateConfig).toHaveBeenLastCalledWith({ inputs: { pairing: "nextEnd" } });
+    document.body.innerHTML = "";
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "lanes",
+      field: "artifact",
+      inputs: { pairing: "nextEnd" },
+    });
+    expect(screen.queryByText(/Not used — first-to-last/)).toBeNull();
+    expect(screen.getByText("Start events")).toBeTruthy();
+    expect(screen.getByText("End events")).toBeTruthy();
+  });
+
+  it("renders the lane cap under Options", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "lanes", field: "artifact" });
+    fireEvent.click(screen.getByText("Options"));
+    expect(screen.getByText(/Lanes: 10/)).toBeTruthy();
   });
 });

@@ -116,6 +116,7 @@ export const TOPN_MAX: Record<ChartType, number> = {
   cumulative: 50,
   calendar: 50,
   change: 100,
+  lanes: 100,
   pivot: 50,
   sankey: 50,
   scatter: 50,
@@ -146,6 +147,7 @@ export const TOPN_SLIDER_MAX: Record<ChartType, number> = {
   line: 20,
   table: 50,
   change: 20,
+  lanes: 20,
 };
 
 export function topNMax(chartType: ChartType): number {

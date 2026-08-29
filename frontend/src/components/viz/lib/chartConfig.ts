@@ -33,6 +33,7 @@ export type ChartType =
   | "cumulative"
   | "calendar"
   | "change"
+  | "lanes"
   | "pivot"
   | "sankey"
   | "scatter"
@@ -89,7 +90,6 @@ export type TableSortColumn = "value" | TableColumn;
  * Only the keys the current figure declares are meaningful; the rest are
  * carried so switching figures and back loses nothing. */
 export interface ChartInputs {
-  laneKey?: string;
   startFilter?: EventFilters;
   endFilter?: EventFilters;
   pairing?: "nextEnd" | "firstLast";
@@ -159,6 +159,7 @@ const CHART_TYPES: ChartType[] = [
   "cumulative",
   "calendar",
   "change",
+  "lanes",
   "pivot",
   "sankey",
   "scatter",
@@ -225,7 +226,6 @@ export function parseDeriveSpec(raw: unknown): DeriveSpec | null {
 export function parseChartInputs(raw: unknown): ChartInputs {
   const out: ChartInputs = {};
   if (!isRecord(raw)) return out;
-  if (typeof raw.laneKey === "string" && raw.laneKey) out.laneKey = raw.laneKey;
   if (isRecord(raw.startFilter)) out.startFilter = viewPayloadToFilters(raw.startFilter);
   if (isRecord(raw.endFilter)) out.endFilter = viewPayloadToFilters(raw.endFilter);
   if ((PAIRINGS as readonly unknown[]).includes(raw.pairing)) {

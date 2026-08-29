@@ -1515,6 +1515,45 @@ export interface ChangeResponse {
   omitted: number;
 }
 
+export interface LaneInterval {
+  start: string;
+  /** null = open-ended (no end seen); drawn to `slice_end`. */
+  end: string | null;
+  start_event_id: string;
+  end_event_id: string | null;
+}
+export interface Lane {
+  key: string;
+  /** The dated rows that fed this lane — the ranking quantity. */
+  count: number;
+  intervals: LaneInterval[];
+}
+/**
+ * Interval lanes from `viz/lanes`: one lane per value of the field, ranked
+ * by event count and capped; each interval either first→last per lane or a
+ * start paired with the most recent-open-start rule. Every cap is disclosed.
+ */
+export interface LanesResponse {
+  kind: "lanes";
+  field: string;
+  pairing: "first_last" | "next_end";
+  lanes: Lane[];
+  lane_cap: number;
+  lanes_total: number;
+  lane_cap_hit: boolean;
+  other_lanes: number;
+  starts: number;
+  ends: number;
+  unpaired_starts: number;
+  orphan_ends: number;
+  rows_cap: number;
+  rows_truncated: boolean;
+  rows_paired: number;
+  undated: number;
+  slice_start: string | null;
+  slice_end: string | null;
+}
+
 /** One co-occurrence cell; `""` on an axis means "outside that axis's top-N" (Other). */
 export interface FieldPivotCell {
   x: string;
