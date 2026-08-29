@@ -209,16 +209,26 @@ def _is_unfiltered(query: EventQuery) -> bool:
     )
 
 
-_DERIVE = Query(
-    default=None,
-    description=(
-        "Optional derivation of the charted field, as a JSON object: "
-        '{"kind":"bins","mode":"width"|"log","count":N} | '
-        '{"kind":"bins","mode":"custom","edges":[…]} | '
-        '{"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"}. '
-        "A change of scale — the result is ordered categories."
-    ),
-)
+def _derive_query() -> Any:
+    """A fresh ``Query`` per endpoint — never a shared module-level one.
+
+    FastAPI stamps the parameter name onto the ``Query`` object's ``alias`` the
+    first time it is bound, so one object shared between ``derive`` and
+    ``derive_x`` would make the pivot endpoint read the query key ``derive``
+    while advertising ``derive_x`` (found during verification of #viz-step-2).
+    The shared filter ``Query`` objects above are safe only because every
+    endpoint binds them under the same name.
+    """
+    return Query(
+        default=None,
+        description=(
+            "Optional derivation of the charted field, as a JSON object: "
+            '{"kind":"bins","mode":"width"|"log","count":N} | '
+            '{"kind":"bins","mode":"custom","edges":[…]} | '
+            '{"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"}. '
+            "A change of scale — the result is ordered categories."
+        ),
+    )
 
 
 def _parse_derive_param(raw: str | None, field: str | None) -> DeriveSpec | None:
@@ -258,7 +268,7 @@ async def get_field_terms(
             "values (e.g. autocomplete) to halve the scan."
         ),
     ),
-    derive: str | None = _DERIVE,
+    derive: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -587,7 +597,7 @@ async def get_field_value_timeseries(
     field: str = Query(..., description="Field token, e.g. 'attr:status_code'"),
     buckets: int = Query(default=60, ge=10, le=200),
     series_limit: int = Query(default=12, ge=1, le=50),
-    derive: str | None = _DERIVE,
+    derive: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -726,7 +736,7 @@ async def get_field_pivot(
     field_y: str = Query(..., description="Y-axis field token, e.g. 'attr:workstation'"),
     limit_x: int = Query(default=10, ge=1, le=50),
     limit_y: int = Query(default=10, ge=1, le=50),
-    derive_x: str | None = _DERIVE,
+    derive_x: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,

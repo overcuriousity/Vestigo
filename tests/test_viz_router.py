@@ -988,3 +988,19 @@ def test_compare_request_takes_a_derive_spec() -> None:
         ).derive
         is None
     )
+
+
+def test_each_derive_parameter_binds_under_its_own_name() -> None:
+    """FastAPI stamps the first bound parameter name onto a `Query` object's
+    alias, so a `Query` shared between `derive` and `derive_x` made the pivot
+    endpoint read `derive` while advertising `derive_x` — a request that used
+    the documented name was silently underived. Each endpoint gets its own."""
+    import inspect
+
+    for endpoint, name in [
+        (viz.get_field_terms, "derive"),
+        (viz.get_field_value_timeseries, "derive"),
+        (viz.get_field_pivot, "derive_x"),
+    ]:
+        default = inspect.signature(endpoint).parameters[name].default
+        assert default.alias in (None, name), (endpoint.__name__, default.alias)
