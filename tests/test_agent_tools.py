@@ -983,6 +983,51 @@ class _FakeChartService(_FakeVizService):
             "unparsed": 1,
         }
 
+    def field_change(self, primary, comparison, field, limit, *, union_cap, derive=None):
+        self.calls.append(("field_change", (field, limit, union_cap), {"derive": derive}))
+        return {
+            "kind": "change",
+            "field": field,
+            "derive": None,
+            "top_n": limit,
+            "primary_total": 20,
+            "comparison_total": 10,
+            "rows": [
+                {
+                    "value": "alice",
+                    "primary": 4,
+                    "comparison": 6,
+                    "primary_share": 0.2,
+                    "comparison_share": 0.6,
+                    "delta_share": -0.4,
+                    "status": "fell",
+                },
+                {
+                    "value": "bob",
+                    "primary": 12,
+                    "comparison": 3,
+                    "primary_share": 0.6,
+                    "comparison_share": 0.3,
+                    "delta_share": 0.3,
+                    "status": "rose",
+                },
+                {
+                    "value": "dave",
+                    "primary": 3,
+                    "comparison": 0,
+                    "primary_share": 0.15,
+                    "comparison_share": 0.0,
+                    "delta_share": 0.15,
+                    "status": "new",
+                },
+            ],
+            "union_size": 4,
+            "rows_shown": 3,
+            "union_cap": union_cap,
+            "truncated": True,
+            "omitted": 1,
+        }
+
     def calendar(self, query, *, field=None, max_weeks=53):
         self.calls.append(("calendar", (field, max_weeks), {}))
         return {
@@ -1134,6 +1179,7 @@ _CHART_TYPE_CASES = [
     ("table", {"field": "attr:user"}, "field_table"),
     ("cumulative", {}, "cumulative"),
     ("calendar", {}, "calendar"),
+    ("change", {"field": "attr:status", "compare": {"mode": "baseline"}}, "field_change"),
 ]
 
 
@@ -3188,3 +3234,82 @@ async def test_cumulative_takes_marks(store, monkeypatch):
         ),
     )
     assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1
+
+
+# ── ranked change ────────────────────────────────────────────────────────────
+
+
+async def test_change_needs_a_comparison_layer_and_says_why(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "change", "field": "user"})
+    assert 'chart_type="change" needs a comparison layer' in message
+    assert 'compare.mode to "baseline" or "custom"' in message
+
+
+async def test_change_runs_both_windows_and_summarises_the_ranking(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "change",
+                "field": "user",
+                "compare": {"mode": "custom", "filters": {"q": "phase-a"}},
+                "options": {"top_n": 5, "layout": "slope"},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["options"] == {"top_n": 5, "layout": "slope"}
+    assert result["resolved"]["compare_mode"] == "custom"
+    assert result["summary"] == {
+        "primary_total": 20,
+        "comparison_total": 10,
+        "union_size": 4,
+        "rows_shown": 3,
+        "truncated": True,
+        "top_rows": [
+            {"value": "alice", "status": "fell", "delta_share": -0.4},
+            {"value": "bob", "status": "rose", "delta_share": 0.3},
+            {"value": "dave", "status": "new", "delta_share": 0.15},
+        ],
+    }
+    assert _called(fake, "field_change") == ("user", 5, 30)
+
+
+async def test_change_clamps_top_n_to_the_agent_ceiling_and_defaults_the_layout(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "change",
+                "field": "user",
+                "compare": {"mode": "baseline"},
+                "options": {"top_n": 50},
+            }
+        ),
+    )
+    assert result["resolved"]["options"] == {"top_n": 20, "layout": "dumbbell"}
+    assert any("clamped to 20" in w for w in result["warnings"])
+    assert _called(fake, "field_change") == ("user", 20, 30)
+
+
+async def test_change_takes_no_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "change",
+            "field": "user",
+            "compare": {"mode": "baseline"},
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="change" takes no marks' in message

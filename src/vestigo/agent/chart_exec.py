@@ -367,6 +367,12 @@ async def execute_chart_spec(
             'compare.mode="custom" needs compare.filters. Use mode="baseline" to '
             "compare against this timeline's whole unfiltered event set."
         )
+    if meta.requires_compare and not compare_on:
+        raise ValueError(
+            f'chart_type="{chart_type}" needs a comparison layer — it ranks how each '
+            "value's share of the window moved between two windows; set compare.mode "
+            'to "baseline" or "custom".'
+        )
     if not metric_available(spec.metric, chart_type, compare_on):
         info = METRIC_INFO[spec.metric]
         if info.requires_compare and not compare_on:
@@ -634,6 +640,33 @@ async def execute_chart_spec(
             "weeks_total": result["weeks_total"],
             "truncated": result["truncated"],
             "dropped": result["dropped"],
+        }
+    elif data_kind == "change":
+        if comparison_query is None:  # unreachable: the requires_compare refusal above
+            raise RuntimeError("change chart reached execution without a comparison layer")
+        applied["top_n"] = _capped(opts.top_n, limits.change_top_n, "top_n")
+        applied["layout"] = opts.layout or "dumbbell"
+        result = await run_gated_scan(
+            functools.partial(service.field_change, union_cap=limits.change_union, **derive_kw),
+            primary_query,
+            comparison_query,
+            spec.field,
+            applied["top_n"],
+        )
+        summary = {
+            "primary_total": result["primary_total"],
+            "comparison_total": result["comparison_total"],
+            "union_size": result["union_size"],
+            "rows_shown": result["rows_shown"],
+            "truncated": result["truncated"],
+            "top_rows": [
+                {
+                    "value": r["value"],
+                    "status": r["status"],
+                    "delta_share": round(r["delta_share"], 4),
+                }
+                for r in result["rows"][:5]
+            ],
         }
     elif data_kind == "pivot":
         applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")

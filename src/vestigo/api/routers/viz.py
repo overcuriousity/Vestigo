@@ -1220,15 +1220,15 @@ class ComparisonSpec(BaseModel):
 class CompareRequest(BaseModel):
     """Body for ``POST .../viz/compare`` — two filter sets don't fit query params."""
 
-    kind: Literal["time", "terms", "numeric"]
+    kind: Literal["time", "terms", "numeric", "change"]
     field: str | None = None
     primary: CompareFilters = Field(default_factory=CompareFilters)
     comparison: ComparisonSpec
     buckets: int = Field(default=60, ge=10, le=200)
     bins: int = Field(default=30, ge=1, le=200)
     limit: int = Field(default=50, ge=1, le=500)
-    #: ``kind="terms"`` only: derive ``field`` (bins / calendar part) before
-    #: counting — both layers on the primary's edges.
+    #: ``kind="terms"`` and ``kind="change"``: derive ``field`` (bins / calendar
+    #: part) before counting — both layers on the primary's edges.
     derive: DeriveSpec | None = None
 
 
@@ -1274,13 +1274,18 @@ async def compare_layers(
     so the returned series are comparable by construction. The response
     carries raw counts only — derived metrics (delta / rate / % of baseline /
     cumulative) are pure frontend transforms, keeping counts the forensic
-    ground truth.
+    ground truth. ``kind="change"`` is the ranked change figure — the union of
+    both windows' top-N values with each value's share of its own window
+    (``EventQueryService.field_change``); it rides on this endpoint because it
+    needs exactly the two-layer resolution done here.
     """
-    if body.kind in ("terms", "numeric") and not body.field:
+    if body.kind in ("terms", "numeric", "change") and not body.field:
         raise HTTPException(status_code=422, detail=f"kind={body.kind!r} requires 'field'")
     if body.derive is not None:
-        if body.kind != "terms":
-            raise HTTPException(status_code=422, detail="derive applies to kind='terms' only")
+        if body.kind not in ("terms", "change"):
+            raise HTTPException(
+                status_code=422, detail="derive applies to kind='terms' and kind='change' only"
+            )
         if body.field and resolve_time_field(body.field) is not None:
             raise HTTPException(
                 status_code=422,
@@ -1382,6 +1387,19 @@ async def compare_layers(
             body.field,
             body.limit,
             baseline_cache_token=baseline_token,
+            derive=body.derive,
+        )
+    if body.kind == "change":
+        from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+        return await _run_regex_guarded(
+            q_regex,
+            service.field_change,
+            primary,
+            comparison,
+            body.field,
+            min(body.limit, ANALYST_CHART_LIMITS.change_top_n[1]),
+            union_cap=ANALYST_CHART_LIMITS.change_union,
             derive=body.derive,
         )
     return await _run_regex_guarded(

@@ -142,6 +142,10 @@ class _FakeCompareService:
         self.calls.append(("numeric", primary, comparison, baseline_cache_token))
         return {"kind": "numeric"}
 
+    def field_change(self, primary, comparison, field, limit, *, union_cap, derive=None):
+        self.calls.append(("change", primary, comparison, (field, limit, union_cap, derive)))
+        return {"kind": "change", "field": field, "top_n": limit, "union_cap": union_cap}
+
 
 async def _fake_id_filters(case_id, source_ids, **_kwargs):
     return None, None, None
@@ -1227,3 +1231,52 @@ async def test_viz_calendar_passes_the_field_and_the_week_cap(monkeypatch):
     assert result == {"kind": "calendar", "field": "attr:user"}
     kind, query, field, max_weeks = svc.calls[0]
     assert (kind, field, max_weeks) == ("calendar", "attr:user", 53)
+
+
+@pytest.mark.asyncio
+async def test_compare_change_pins_the_window_and_passes_top_n_and_the_union_cap(monkeypatch):
+    from datetime import UTC, datetime
+
+    svc = _patch_compare(monkeypatch)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, tzinfo=UTC)
+    body = viz.CompareRequest(
+        kind="change",
+        field="attr:user",
+        primary=viz.CompareFilters(filters='{"attr:phase": "b"}', start=start, end=end),
+        comparison=viz.ComparisonSpec(
+            mode="custom", filters=viz.CompareFilters(filters='{"attr:phase": "a"}')
+        ),
+        limit=7,
+    )
+    result = await viz.compare_layers("c1", "t1", body, case=None)
+    assert result == {"kind": "change", "field": "attr:user", "top_n": 7, "union_cap": 200}
+    kind, primary, comparison, args = svc.calls[0]
+    assert kind == "change"
+    assert primary.field_filters == {"attr:phase": ["b"]}
+    assert comparison.field_filters == {"attr:phase": ["a"]}
+    assert (comparison.start, comparison.end) == (start, end)  # pinned to the primary
+    assert args == ("attr:user", 7, 200, None)
+
+
+@pytest.mark.asyncio
+async def test_compare_change_clamps_top_n_to_the_analyst_ceiling_and_needs_a_field(monkeypatch):
+    from fastapi import HTTPException
+
+    svc = _patch_compare(monkeypatch)
+    body = viz.CompareRequest(
+        kind="change",
+        field="attr:user",
+        comparison=viz.ComparisonSpec(mode="baseline"),
+        limit=500,
+    )
+    await viz.compare_layers("c1", "t1", body, case=None)
+    assert svc.calls[0][3][1] == 100
+    with pytest.raises(HTTPException) as exc:
+        await viz.compare_layers(
+            "c1",
+            "t1",
+            viz.CompareRequest(kind="change", comparison=viz.ComparisonSpec(mode="baseline")),
+            case=None,
+        )
+    assert exc.value.status_code == 422 and "requires 'field'" in str(exc.value.detail)
