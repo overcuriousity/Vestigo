@@ -1472,6 +1472,41 @@ export interface FieldPivotResponse {
   total: number;
 }
 
+export type TableSortColumnWire =
+  | "value"
+  | "count"
+  | "share"
+  | "first_seen"
+  | "last_seen"
+  | "distinct_second";
+
+export interface FieldTableRow {
+  value: string;
+  count: number;
+  /** count / total — the share of the filtered slice's non-empty values. */
+  share: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  /** Distinct non-empty values of `second_field` on this row; null without one. */
+  distinct_second: number | null;
+}
+
+/** `GET …/viz/field-table` — the table figure (`EventQueryService.field_table`). */
+export interface FieldTableResponse {
+  kind: "table";
+  field: string;
+  second_field: string | null;
+  /** Events with a non-empty value — the share denominator. */
+  total: number;
+  /** Distinct non-empty values. */
+  distinct: number;
+  rows: FieldTableRow[];
+  /** Present exactly when values were cut by the top-N. */
+  remainder: { count: number; share: number; distinct_values: number } | null;
+  sort: { by: TableSortColumnWire; dir: "asc" | "desc" };
+  derive?: DeriveEcho | null;
+}
+
 /**
  * Uniform sample of numeric (x, y) pairs from `viz/field-scatter`, drawn in
  * a stable hash order so an identical query redraws identical points.

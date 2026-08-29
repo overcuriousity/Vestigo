@@ -11,6 +11,8 @@ import type {
   FieldNumericGroupedResponse,
   FieldNumericResponse,
   FieldPivotResponse,
+  FieldTableResponse,
+  TableSortColumnWire,
   FieldScatterResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
@@ -158,6 +160,32 @@ export const vizApi = {
       limit_x: limitX,
       limit_y: limitY,
       ...(deriveX ? { derive_x: deriveToParam(deriveX) } : {}),
+    }),
+
+  /** Top-N values of a field as table rows: count, share, first/last seen and,
+   * with `secondField`, the distinct count of that field per row — the table
+   * figure. A `remainder` row is present whenever values were cut. */
+  fieldTable: (
+    caseId: string,
+    timelineId: string,
+    field: string,
+    filters: EventFilters = {},
+    limit = 50,
+    opts: {
+      secondField?: string | null;
+      sortBy?: TableSortColumnWire;
+      sortDir?: "asc" | "desc";
+      derive?: DeriveSpec | null;
+    } = {},
+  ): Promise<FieldTableResponse> =>
+    get<FieldTableResponse>(`/cases/${caseId}/timelines/${timelineId}/viz/field-table`, {
+      ...serializeEventFilterParams(filters),
+      field,
+      limit,
+      ...(opts.secondField ? { second_field: opts.secondField } : {}),
+      ...(opts.sortBy ? { sort_by: opts.sortBy } : {}),
+      ...(opts.sortDir ? { sort_dir: opts.sortDir } : {}),
+      ...(opts.derive ? { derive: deriveToParam(opts.derive) } : {}),
     }),
 
   /** Uniform random sample of numeric (x, y) pairs for the scatter plot. */

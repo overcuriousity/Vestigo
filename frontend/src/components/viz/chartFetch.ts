@@ -20,6 +20,7 @@ import type {
   FieldNumericResponse,
   FieldPivotResponse,
   FieldScatterResponse,
+  FieldTableResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
   HistogramResponse,
@@ -169,9 +170,15 @@ export async function fetchChartData(
         ),
       };
     case "table":
-      // The table aggregation lands with its API wrapper; until then a
-      // table config cannot be fetched.
-      throw new Error("table figure: fetch not wired yet");
+      return {
+        kind: "table" as const,
+        data: await vizApi.fieldTable(caseId, timelineId, config.field!, filters, opts.topN, {
+          secondField: config.fieldY,
+          sortBy: opts.tableSortBy,
+          sortDir: opts.tableSortDir,
+          derive: config.derive,
+        }),
+      };
     case "corr":
       return {
         kind: "corr" as const,
@@ -209,7 +216,8 @@ export type FrozenChartKind =
   | "punchcard"
   | "pivot"
   | "corr"
-  | "scatter";
+  | "scatter"
+  | "table";
 
 /**
  * Rebuild a `ChartResult` from a snapshot's frozen aggregation.
@@ -261,6 +269,8 @@ export function snapshotToChartResult(
       return { kind: "corr", data: frozen as FieldCorrelationResponse };
     case "scatter":
       return { kind: "scatter", data: frozen as FieldScatterResponse };
+    case "table":
+      return { kind: "table", data: frozen as FieldTableResponse };
     default:
       return null;
   }
