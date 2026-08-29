@@ -45,6 +45,16 @@ export interface CaptionFacts {
     dropped: number;
     total: number;
   };
+  /** kind=change: the ranking's inputs and what the union cap dropped. */
+  change?: {
+    topN: number;
+    unionSize: number;
+    rowsShown: number;
+    truncated: boolean;
+    omitted: number;
+    newCount: number;
+    vanishedCount: number;
+  };
   /** kind=terms/timeseries: top-N truthfulness. */
   distinct?: number;
   shownValues?: number;
@@ -177,7 +187,11 @@ export function buildCaptionLines(args: {
   lines.push(
     facts.focusedValue != null && field
       ? `field: ${field} = ${facts.focusedValue}`
-      : chartType === "time"
+      : chartType === "change" && field
+        ? `share-of-window change of ${field}${
+            config.derive ? ` (${scale} → ordered categories)` : ""
+          } between two windows — ${chartLabel}`
+        : chartType === "time"
         ? `event count over time — ${chartLabel}`
         : chartType === "punchcard"
           ? `event count by day-of-week × hour-of-day, UTC — ${chartLabel}`
@@ -235,6 +249,24 @@ export function buildCaptionLines(args: {
     if (filters.q) lines.push(`search: ${filters.q}`);
     if (facts.primaryTotal != null)
       lines.push(`${fmtInt(facts.primaryTotal)} events`);
+  }
+
+  // The ranked change encodes share, never count — say so before any
+  // number, and say what the per-window top-N and the union cap hid.
+  if (facts.change) {
+    const c = facts.change;
+    const nv =
+      c.newCount || c.vanishedCount
+        ? ` — ${fmtInt(c.newCount)} new, ${fmtInt(c.vanishedCount)} vanished`
+        : "";
+    lines.push(
+      `ranked by |Δ share of window|, not by count; top ${fmtInt(c.topN)} values per window, ${fmtInt(c.unionSize)} in the union${nv}`,
+    );
+    if (c.truncated) {
+      lines.push(
+        `union capped at ${fmtInt(c.rowsShown)} of ${fmtInt(c.unionSize)} values; the ${fmtInt(c.omitted)} with the smallest change not drawn`,
+      );
+    }
   }
 
   if (filters.start || filters.end) {

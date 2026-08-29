@@ -589,3 +589,61 @@ describe("buildCaptionLines — cumulative and calendar", () => {
     expect(lines).toContain("latest 53 of 61 weeks drawn; 9 earlier events not drawn");
   });
 });
+
+describe("buildCaptionLines — ranked change", () => {
+  const change = {
+    topN: 10,
+    unionSize: 14,
+    rowsShown: 14,
+    truncated: false,
+    omitted: 0,
+    newCount: 2,
+    vanishedCount: 1,
+  };
+
+  it("names share-of-window, both totals, the per-window top-N, the union and new/vanished", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Ranked change (share of window, two windows)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "change",
+        field: "attr:user",
+        compare: { mode: "baseline" },
+      },
+      facts: { primaryTotal: 20, comparisonTotal: 1000, change },
+    });
+    expect(lines).toContain(
+      "share-of-window change of attr:user between two windows — Ranked change (share of window, two windows)",
+    );
+    expect(lines).toContain("comparison: all timeline events (same time range) — 1,000 events");
+    expect(lines).toContain(
+      "ranked by |Δ share of window|, not by count; top 10 values per window, 14 in the union — 2 new, 1 vanished",
+    );
+    expect(lines.some((l) => l?.startsWith("union capped"))).toBe(false);
+  });
+
+  it("discloses the union cap and what it dropped", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Ranked change",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "change",
+        field: "attr:user",
+        compare: { mode: "custom", filters: { q: "phase-a" } },
+      },
+      facts: {
+        primaryTotal: 20,
+        comparisonTotal: 10,
+        change: { ...change, unionSize: 260, rowsShown: 200, truncated: true, omitted: 60, newCount: 0, vanishedCount: 0 },
+      },
+    });
+    expect(lines).toContain(
+      "ranked by |Δ share of window|, not by count; top 10 values per window, 260 in the union",
+    );
+    expect(lines).toContain(
+      "union capped at 200 of 260 values; the 60 with the smallest change not drawn",
+    );
+  });
+});

@@ -401,3 +401,50 @@ describe("ChartRail — field-optional figures", () => {
     ).toBe("true");
   });
 });
+
+describe("ChartRail — a figure that requires Compare", () => {
+  it("disables Compare's Off for ranked change and says why", () => {
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "change",
+      field: "artifact",
+      compare: { mode: "baseline" },
+    });
+    const off = screen.getByRole("radio", { name: "Off" }) as HTMLInputElement;
+    expect(off.disabled).toBe(true);
+    expect(screen.getByText(/needs two windows/i)).toBeTruthy();
+    expect(
+      (screen.getByRole("radio", { name: "Baseline (all events)" }) as HTMLInputElement).disabled,
+    ).toBe(false);
+  });
+
+  it("switches Compare to Baseline when ranked change is picked with Compare off, and says so", () => {
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "artifact",
+      compare: { mode: "off" },
+    });
+    fireEvent.click(
+      screen.getByRole("radio", { name: CHART_META.change.label }),
+    );
+    expect(updateConfig).toHaveBeenLastCalledWith({
+      chartType: "change",
+      compare: { mode: "baseline" },
+    });
+    expect(setAutoNotice).toHaveBeenLastCalledWith(expect.stringMatching(/Compare set to Baseline/));
+  });
+
+  it("renders the per-window top-N and the layout select under Options", () => {
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "change",
+      field: "artifact",
+      compare: { mode: "baseline" },
+    });
+    fireEvent.click(screen.getByText("Options"));
+    expect(screen.getByText(/Top values per window: 10/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("combobox", { name: "Layout" }));
+    expect(screen.getByRole("option", { name: "Slope (two columns)" })).toBeTruthy();
+  });
+});

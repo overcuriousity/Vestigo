@@ -64,6 +64,7 @@ import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
+import { RankedChange } from "@/components/viz/charts/RankedChange";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -110,6 +111,7 @@ import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
 import { NumericStatStrip } from "@/components/viz/NumericStatStrip";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import type {
+  ChangeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
@@ -387,6 +389,7 @@ export function VisualizePage() {
     bins,
     buckets,
     quantity,
+    layout,
     limitX,
     limitY,
     sampleLimit,
@@ -796,6 +799,30 @@ export function VisualizePage() {
     ...busyRetry,
   });
 
+  const changeQuery = useQuery({
+    queryKey: [
+      "viz-change",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      config.compare,
+      topN,
+      config.derive,
+    ],
+    queryFn: async () =>
+      (await vizApi.compare(caseId!, timelineId!, {
+        kind: "change",
+        field: field!,
+        primary: filters,
+        comparison: compareApiSpec!,
+        limit: topN,
+        derive: config.derive,
+      })) as ChangeResponse,
+    enabled: scopeReady && !!field && dataKind === "change" && compareApiSpec != null,
+    ...busyRetry,
+  });
+
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
   // — switching between those chart types refetches nothing.
   const tableQuery = useQuery({
@@ -885,6 +912,7 @@ export function VisualizePage() {
       compareTermsQuery.data?.derive ??
       timeseriesQuery.data?.derive ??
       pivotQuery.data?.derive_x ??
+      changeQuery.data?.derive ??
       tableQuery.data?.derive ??
       null;
   }
@@ -968,6 +996,19 @@ export function VisualizePage() {
       truncated: d.truncated,
       dropped: d.dropped,
       total: d.total,
+    };
+  } else if (dataKind === "change" && changeQuery.data) {
+    const d = changeQuery.data;
+    facts.primaryTotal = d.primary_total;
+    facts.comparisonTotal = d.comparison_total;
+    facts.change = {
+      topN: d.top_n,
+      unionSize: d.union_size,
+      rowsShown: d.rows_shown,
+      truncated: d.truncated,
+      omitted: d.omitted,
+      newCount: d.rows.filter((r) => r.status === "new").length,
+      vanishedCount: d.rows.filter((r) => r.status === "vanished").length,
     };
   } else if (dataKind === "table" && tableQuery.data) {
     facts.primaryTotal = tableQuery.data.total;
@@ -1092,6 +1133,8 @@ export function VisualizePage() {
                 ? cumulativeQuery
                 : dataKind === "calendar"
                   ? calendarQuery
+                  : dataKind === "change"
+                    ? changeQuery
                   : dataKind === "pivot"
                     ? pivotQuery
                     : dataKind === "table"
@@ -1213,6 +1256,10 @@ export function VisualizePage() {
         {multiField && selectedFields.length < 2 ? (
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
             Pick at least two numeric fields to correlate.
+          </div>
+        ) : dataKind === "change" && !compareOn ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
+            Ranked change needs a second window — turn on Compare (Baseline or Custom filters).
           </div>
         ) : !fieldFree && !fieldOptional && !multiField && !field ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
@@ -1453,6 +1500,9 @@ export function VisualizePage() {
             )}
             {chartType === "calendar" && calendarQuery.data && (
               <CalendarHeatmap data={calendarQuery.data} svgRef={svgRef} />
+            )}
+            {chartType === "change" && changeQuery.data && (
+              <RankedChange data={changeQuery.data} layout={layout} svgRef={svgRef} />
             )}
             {chartType === "table" && tableQuery.data && (
               <TableFigure

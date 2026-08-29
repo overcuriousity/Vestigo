@@ -52,6 +52,7 @@ import {
 } from "./lib/chartMeta";
 import {
   chartTypesForField,
+  clampTopN,
   defaultChartTypeForScale,
   TOPN_MAX,
   TOPN_MIN,
@@ -546,11 +547,13 @@ export function ChartRail({
   const fieldOptional = CHART_META[chartType].inputs.field === "optional";
   const compareOn = config.compare.mode !== "off";
   const compareSupported = CHART_META[chartType].supportsCompare;
+  const compareRequired = CHART_META[chartType].requiresCompare;
   const {
     topN,
     bins,
     buckets,
     quantity,
+    layout,
     limitX,
     limitY,
     sampleLimit,
@@ -955,6 +958,15 @@ export function ChartRail({
                   }
                   onClick={() => {
                     if (legal) {
+                      if (CHART_META[c].requiresCompare && config.compare.mode === "off") {
+                        // The figure is defined by two windows; Baseline is the
+                        // one reference window that always exists.
+                        updateConfig({ chartType: c, compare: { mode: "baseline" } });
+                        setAutoNotice(
+                          `Compare set to Baseline — ${CHART_META[c].label} needs two windows.`,
+                        );
+                        return;
+                      }
                       updateConfig({ chartType: c });
                       setAutoNotice(null);
                       return;
@@ -1190,7 +1202,7 @@ export function ChartRail({
             <label
               key={opt.mode}
               className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm ${
-                !compareSupported
+                !compareSupported || (compareRequired && opt.mode === "off")
                   ? "cursor-not-allowed opacity-50"
                   : config.compare.mode === opt.mode
                     ? "cursor-pointer bg-[var(--color-accent-dim)]"
@@ -1200,7 +1212,7 @@ export function ChartRail({
               <input
                 type="radio"
                 name="compare"
-                disabled={!compareSupported}
+                disabled={!compareSupported || (compareRequired && opt.mode === "off")}
                 checked={compareSupported && config.compare.mode === opt.mode}
                 onChange={() =>
                   updateConfig({
@@ -1219,6 +1231,12 @@ export function ChartRail({
         {!compareSupported && (
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
             {compareUnavailableReason(chartType)}
+          </p>
+        )}
+        {compareRequired && (
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Ranked change needs two windows — Baseline compares the filtered slice with the
+            whole timeline; Custom filters names the reference window.
           </p>
         )}
         {compareSupported && config.compare.mode === "custom" && (
@@ -1290,12 +1308,61 @@ export function ChartRail({
         chartType === "time" ||
         chartType === "line" ||
         chartType === "cumulative" ||
+        chartType === "change" ||
         chartType === "table") && (
         <details className="rounded border border-[var(--color-border)]">
           <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Options
           </summary>
           <div className="space-y-3 px-2 pb-2 pt-1">
+            {chartType === "change" && (
+              <>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Top values per window: {topN}
+                  </label>
+                  <input
+                    type="range"
+                    min={TOPN_MIN}
+                    max={TOPN_SLIDER_MAX.change}
+                    value={Math.min(topN, TOPN_SLIDER_MAX.change)}
+                    onChange={(e) =>
+                      updateConfig({
+                        options: {
+                          ...config.options,
+                          topN: clampTopN(Number(e.target.value), "change"),
+                        },
+                      })
+                    }
+                    className="w-full accent-[var(--color-accent)]"
+                  />
+                  <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+                    Each window's top values are ranked first; the figure shows their union.
+                  </p>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Layout
+                  </label>
+                  <Select
+                    value={layout}
+                    onValueChange={(v) =>
+                      updateConfig({
+                        options: { ...config.options, layout: v as "dumbbell" | "slope" },
+                      })
+                    }
+                  >
+                    <SelectTrigger className="h-7 text-xs" aria-label="Layout">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="dumbbell">Dumbbell (one row per value)</SelectItem>
+                      <SelectItem value="slope">Slope (two columns)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            )}
             {chartType === "cumulative" && (
               <div>
                 <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
