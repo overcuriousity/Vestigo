@@ -808,6 +808,96 @@ async def get_field_pivot(
     )
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-table")
+async def get_field_table(
+    case_id: str,
+    timeline_id: str,
+    field: str = Query(..., description="Field token, e.g. 'attr:username'"),
+    second_field: str | None = Query(
+        default=None,
+        description="Optional second field: each row also counts its distinct values (uniqExact).",
+    ),
+    limit: int = Query(default=50, ge=1, le=500),
+    sort_by: Literal[
+        "value", "count", "share", "first_seen", "last_seen", "distinct_second"
+    ] = Query(
+        default="count",
+        description="Row order. 'share' orders like 'count'; 'distinct_second' needs second_field.",
+    ),
+    sort_dir: Literal["asc", "desc"] = Query(default="desc"),
+    derive: str | None = _derive_query(),  # noqa: B008
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return the top-N values of *field* as table rows (the table figure).
+
+    Count, share of the filtered slice, first/last seen and — with
+    ``second_field`` — the distinct count of that field per row; a
+    ``remainder`` row whenever values were cut. See
+    ``EventQueryService.field_table``.
+    """
+    if second_field is not None and second_field == field:
+        raise HTTPException(status_code=422, detail="second_field must differ from field")
+    if sort_by == "distinct_second" and not second_field:
+        raise HTTPException(status_code=422, detail="sort_by='distinct_second' needs second_field")
+    derive_spec = _parse_derive_param(derive, field)
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_table,
+        query,
+        field,
+        limit,
+        second_field=second_field,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        derive=derive_spec,
+    )
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-scatter")
 async def get_field_scatter(
     case_id: str,

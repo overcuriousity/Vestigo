@@ -277,6 +277,10 @@ class _FakeAggService:
         self.calls.append(("pivot", query, field_x, field_y, limit_x, limit_y))
         return {"kind": "pivot"}
 
+    def field_table(self, query, field, limit, **kw):
+        self.calls.append(("table", query, field, limit, kw))
+        return {"kind": "table"}
+
     def field_scatter(self, query, field_x, field_y, limit):
         self.calls.append(("scatter", query, field_x, field_y, limit))
         return {"kind": "scatter"}
@@ -1001,6 +1005,100 @@ def test_each_derive_parameter_binds_under_its_own_name() -> None:
         (viz.get_field_terms, "derive"),
         (viz.get_field_value_timeseries, "derive"),
         (viz.get_field_pivot, "derive_x"),
+        (viz.get_field_table, "derive"),
     ]:
         default = inspect.signature(endpoint).parameters[name].default
         assert default.alias in (None, name), (endpoint.__name__, default.alias)
+
+
+@pytest.mark.asyncio
+async def test_field_table_passes_field_limit_sort_and_second_field(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_table(
+        "c1",
+        "t1",
+        field="attr:user",
+        second_field="attr:host",
+        limit=25,
+        sort_by="last_seen",
+        sort_dir="asc",
+        derive=None,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "table"}
+    kind, query, field, limit, kw = svc.calls[0]
+    assert (kind, field, limit) == ("table", "attr:user", 25)
+    assert kw == {
+        "second_field": "attr:host",
+        "sort_by": "last_seen",
+        "sort_dir": "asc",
+        "derive": None,
+    }
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_table_rejects_same_second_field_and_distinct_sort_without_one(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as same:
+        await viz.get_field_table(
+            "c1",
+            "t1",
+            field="attr:user",
+            second_field="attr:user",
+            limit=50,
+            sort_by="count",
+            sort_dir="desc",
+            derive=None,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert same.value.status_code == 422
+    with pytest.raises(HTTPException) as no_second:
+        await viz.get_field_table(
+            "c1",
+            "t1",
+            field="attr:user",
+            second_field=None,
+            limit=50,
+            sort_by="distinct_second",
+            sort_dir="desc",
+            derive=None,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert no_second.value.status_code == 422
+    assert "distinct_second" in str(no_second.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_table_takes_a_derive(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    await viz.get_field_table(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        second_field=None,
+        limit=50,
+        sort_by="count",
+        sort_dir="desc",
+        derive='{"kind":"bins","mode":"log","count":4}',
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert svc.calls[0][4]["derive"].count == 4
+
+
+def test_field_table_sort_columns_match_the_service() -> None:
+    import inspect
+    from typing import get_args
+
+    from vestigo.db.queries import TABLE_SORT_COLUMNS
+
+    annotation = (
+        inspect.signature(viz.get_field_table, eval_str=True).parameters["sort_by"].annotation
+    )
+    assert set(get_args(annotation)) == set(TABLE_SORT_COLUMNS)
