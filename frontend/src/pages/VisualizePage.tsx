@@ -196,14 +196,35 @@ function compareUnavailableReason(chartType: ChartType): string {
 }
 
 /**
+ * How long the exact-value box waits after the last keystroke before it
+ * commits. Every commit re-runs a gated ClickHouse foreground scan, and the
+ * digits of "500" are all in range on the way there — undebounced, typing one
+ * number spent three of them (5, 50, 500). Long enough to swallow a multi-digit
+ * entry, short enough that the live preview the box is built around survives.
+ */
+const TOPN_COMMIT_DEBOUNCE_MS = 400;
+
+/** The keys a range input moves on — see the Top-values slider's `onKeyUp`. */
+const SLIDER_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
+
+/**
  * The exact-value box beside the Top-values slider (#297).
  *
  * It keeps its own draft string, because coercing every keystroke through
  * `Number` makes the field impossible to retype: `Number("")` is `0`, which is
  * finite, so the first Backspace committed `topN: 1` and the digits of "300"
  * then landed on top of it. A draft that is empty, or that parses outside
- * `[TOPN_MIN, max]`, is simply not committed — it stays on screen until blur,
- * which snaps back to whatever the chart is actually drawing.
+ * `[TOPN_MIN, max]`, is simply not committed — it stays on screen until blur
+ * or Enter, which clamp to whatever the chart can actually draw.
  */
 function TopNInput({
   value,
@@ -215,11 +236,24 @@ function TopNInput({
   onCommit: (n: number) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPending = () => {
+    if (pending.current != null) {
+      clearTimeout(pending.current);
+      pending.current = null;
+    }
+  };
+  // A commit scheduled by the last keystroke must not outlive the control.
+  useEffect(() => cancelPending, []);
   const parse = (raw: string): number | null => {
     if (raw.trim() === "") return null;
     const n = Number(raw);
     if (!Number.isFinite(n)) return null;
     return Math.round(n);
+  };
+  const commitNow = (n: number) => {
+    cancelPending();
+    onCommit(Math.max(TOPN_MIN, Math.min(n, max)));
   };
   return (
     <input
@@ -231,15 +265,33 @@ function TopNInput({
       onChange={(e) => {
         const raw = e.target.value;
         setDraft(raw);
+        cancelPending();
         const n = parse(raw);
         // Only an in-range number is a finished answer. "3" on the way to
-        // "300" is in range and previews immediately; "900" against a ceiling
-        // of 500 waits for blur rather than snapping mid-keystroke.
-        if (n != null && n >= TOPN_MIN && n <= max) onCommit(n);
+        // "300" is in range and previews once typing pauses; "900" against a
+        // ceiling of 500 waits for blur or Enter rather than snapping
+        // mid-keystroke.
+        if (n != null && n >= TOPN_MIN && n <= max) {
+          pending.current = setTimeout(() => {
+            pending.current = null;
+            onCommit(n);
+          }, TOPN_COMMIT_DEBOUNCE_MS);
+        }
+      }}
+      onKeyDown={(e) => {
+        // Enter is the one gesture that says "I am done typing". Without it an
+        // out-of-range entry sat on screen, uncommitted and unclamped, until
+        // the analyst happened to click elsewhere.
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        const n = parse(draft ?? String(value));
+        if (n != null) commitNow(n);
+        setDraft(null);
       }}
       onBlur={() => {
         const n = parse(draft ?? "");
-        if (n != null) onCommit(Math.max(TOPN_MIN, Math.min(n, max)));
+        if (n != null) commitNow(n);
+        else cancelPending();
         setDraft(null);
       }}
       aria-label="Top values (exact)"
@@ -945,9 +997,13 @@ export function VisualizePage() {
           : (termsQuery.data?.other_count ?? 0) > 0)
           ? 1
           : 0);
+  // Compare mode draws two half-width sub-bars per band, so the rule counts
+  // bars rather than categories — otherwise the threshold silently doubles on
+  // the crowded case, and the warning names half of what is on screen.
+  const barCount = compareTermsOn ? barBands * 2 : barBands;
   const barWarning =
     chartType === "bar" && barTerms
-      ? barReadabilityWarning(barBands, resolved.orientation)
+      ? barReadabilityWarning(barCount, resolved.orientation)
       : null;
   if (barWarning) facts.readabilityWarning = barWarning;
 
@@ -1636,9 +1692,18 @@ export function VisualizePage() {
                   Both share `TOPN_MIN`: a slider whose `min` sat above the
                   box's floor let the two disagree — the DOM clamps the thumb
                   to its own `min`, so a typed 1 showed a slider reading 3, and
-                  dragging to exactly 3 then fired no change event at all. */}
+                  dragging to exactly 3 then fired no change event at all.
+
+                  Clamping the *displayed* value reintroduces that same failure
+                  at the other end: with a typed 300 the thumb already sits at
+                  the slider's 50, so dragging it there changes nothing in the
+                  DOM and fires no change event — the chart went on drawing 300.
+                  Committing on release closes it, since a range input's value
+                  always follows the pointer, so what the thumb reads when the
+                  analyst lets go is the answer they gave. */}
               <input
                 type="range"
+                aria-label="Top values"
                 min={TOPN_MIN}
                 max={TOPN_SLIDER_MAX[chartType]}
                 step={1}
@@ -1646,6 +1711,19 @@ export function VisualizePage() {
                 onChange={(e) =>
                   updateConfig({ options: { ...config.options, topN: Number(e.target.value) } })
                 }
+                onPointerUp={(e) => {
+                  const n = Number(e.currentTarget.value);
+                  if (n !== topN) updateConfig({ options: { ...config.options, topN: n } });
+                }}
+                onKeyUp={(e) => {
+                  // Only the keys that actually move a range input. A bare Tab
+                  // *into* the slider also fires keyup on it, and with a typed
+                  // 300 the clamped thumb reads 50 — committing there would
+                  // rewrite the value for merely focusing the control.
+                  if (!SLIDER_KEYS.has(e.key)) return;
+                  const n = Number(e.currentTarget.value);
+                  if (n !== topN) updateConfig({ options: { ...config.options, topN: n } });
+                }}
                 className="min-w-0 flex-1 accent-[var(--color-accent)]"
               />
               <TopNInput

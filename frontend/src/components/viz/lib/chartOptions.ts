@@ -136,13 +136,31 @@ export function topNMax(chartType: ChartType): number {
   return TOPN_MAX[chartType] ?? 50;
 }
 
+/** Default `topN` when a config does not carry one. */
+const TOPN_DEFAULT = 10;
+
+/**
+ * Coerce an untrusted `topN` into `[TOPN_MIN, topNMax(chartType)]`.
+ *
+ * The ceiling alone is not enough: `c_opts` arrives from the URL as
+ * `JSON.parse`d, unvalidated data (see `chartConfig.ts`), so a shared or
+ * hand-edited link can carry `0` or `"x"`. `0` reached `/viz/field-terms` as
+ * `limit=0`, which the endpoint rejects with a 422 — a permanently blank chart
+ * with nothing on screen to explain it — and `"x"` did the same as `NaN`.
+ */
+export function clampTopN(value: unknown, chartType: ChartType): number {
+  const n = typeof value === "number" ? Math.round(value) : Number.NaN;
+  if (!Number.isFinite(n)) return TOPN_DEFAULT;
+  return Math.max(TOPN_MIN, Math.min(n, topNMax(chartType)));
+}
+
 export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
   const { options } = config;
   return {
     // Per chart type (see TOPN_MAX): a bar axis reaches the backend's 500,
     // while a value-over-time chart draws one line per value and stops at its
-    // endpoint's series ceiling.
-    topN: Math.min(options.topN ?? 10, topNMax(config.chartType)),
+    // endpoint's series ceiling. Floored as well as capped — see `clampTopN`.
+    topN: clampTopN(options.topN, config.chartType),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
     limitX: options.limitX ?? 10,

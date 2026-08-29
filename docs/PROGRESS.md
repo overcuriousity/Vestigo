@@ -61,6 +61,36 @@ surfaces the two issues touched.
   count. `barReadabilityWarning` gives it the advisory pie already had, with a one-click
   switch to horizontal.
 
+**Second review round (same session).** Six more, all in the controls the first round built.
+
+- The slider's `value` was clamped with `Math.min(topN, TOPN_SLIDER_MAX)`, which reintroduced
+  at the ceiling exactly what unifying `TOPN_MIN` had just fixed at the floor: with a typed
+  300 the thumb already sits at bar's 50, so dragging it there changes nothing in the DOM and
+  fires no change event — the chart went on drawing 300. It now also commits on release
+  (`onPointerUp`, and `onKeyUp` for the keys that actually move a range input — a bare Tab
+  into the slider fires keyup on it too), since a range input's value follows the pointer, so
+  what the thumb reads when the analyst lets go is the answer they gave.
+- The vertical-bar readability warning counted *categories*, but compare mode draws two
+  half-width sub-bars per band. The threshold was therefore twice as permissive exactly where
+  the crowding is worst, and the text named half the bars on screen. It counts bars now, and
+  the parameter is named for it.
+- `resolveChartOptions` capped `topN` but never floored it, and `c_opts` arrives from the URL
+  as `JSON.parse`d, unvalidated data. A shared or hand-edited link carrying `{"topN": 0}`
+  resolved to `0`, reached `/viz/field-terms` as `limit=0`, and came back 422 — a permanently
+  blank chart with nothing on screen to explain it; `"x"` did the same as `NaN`. `clampTopN`
+  now floors, caps, rounds, and falls back to the default for anything that is not a number.
+- The exact-value box committed every in-range keystroke, so typing "500" spent three gated
+  ClickHouse scans (5, 50, 500) on the way to one answer. It debounces by 400 ms, which keeps
+  the live preview the control is built around; blur and Enter still commit immediately.
+- Enter did nothing in that box, so an entry above the ceiling sat on screen — uncommitted and
+  unclamped — until the analyst happened to click elsewhere. It now commits with the same
+  clamp as blur.
+- `FieldHistogramModal` kept an expanded `termsLimit` across a Filter IN/OUT, which already
+  blanks the rows on purpose. The first fetch of the new scope then asked for more than 50
+  values, and `merged_field_terms` serves nothing above 50 out of the `field_stats` cache — so
+  the cheap path stayed skipped for as long as the modal was open. A scope change resets to
+  the first page.
+
 ## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
 
 CI on `main` has been green since 1.15.2, but the **Release** workflow has failed on every tag

@@ -84,8 +84,34 @@ describe("resolveChartOptions", () => {
     );
   });
 
-  it("keeps an explicit zero", () => {
-    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 0 } })).topN).toBe(0);
+  it("floors an explicit zero rather than treating it as unset", () => {
+    // Two distinct things are asserted here. `0` is falsy, so a `||` default
+    // would turn it into 10 and hide the analyst's input; and `0` is also not
+    // a drawable answer — it reached `/viz/field-terms` as `limit=0`, which the
+    // endpoint rejects with a 422, leaving a permanently blank chart with
+    // nothing on screen to explain it. It lands on the floor, not the default.
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 0 } })).topN).toBe(
+      TOPN_MIN,
+    );
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: -5 } })).topN).toBe(
+      TOPN_MIN,
+    );
+  });
+
+  it("falls back to the default for a topN that is not a number", () => {
+    // `c_opts` arrives from the URL as `JSON.parse`d, unvalidated data, so a
+    // shared or hand-edited link can carry anything at all. `"x"` used to
+    // resolve to `NaN` and blank the chart the same way `0` did.
+    const opts = (topN: unknown) => ({ topN }) as unknown as ChartConfig["options"];
+    expect(resolveChartOptions(config({ chartType: "bar", options: opts("x") })).topN).toBe(10);
+    expect(resolveChartOptions(config({ chartType: "bar", options: opts(null) })).topN).toBe(10);
+    expect(
+      resolveChartOptions(config({ chartType: "bar", options: opts(Number.NaN) })).topN,
+    ).toBe(10);
+  });
+
+  it("rounds a fractional topN, which the endpoint's integer limit requires", () => {
+    expect(resolveChartOptions(config({ chartType: "bar", options: { topN: 12.6 } })).topN).toBe(13);
   });
 });
 

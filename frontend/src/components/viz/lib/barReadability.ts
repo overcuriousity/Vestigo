@@ -15,16 +15,23 @@
  * lossy one (ask for fewer values).
  */
 
-/** Bands past which a fixed-height vertical bar chart stops being readable. */
+/** Bars past which a fixed-height vertical bar chart stops being readable. */
 export const VERTICAL_BARS_COMFORTABLE_MAX = 40;
 
+/**
+ * @param bars Drawn bars, not categories. Compare mode splits every band into
+ *   two sub-bars (`BarChart.tsx`: `subWidth = bandwidth / 2`), so 40 categories
+ *   are 80 bars at half the width each — counting bands there would double the
+ *   real threshold exactly where the crowding is worst, and then name half the
+ *   bars on screen.
+ */
 export function barReadabilityWarning(
-  bands: number,
+  bars: number,
   orientation: "horizontal" | "vertical",
 ): string | null {
-  if (orientation !== "vertical" || bands <= VERTICAL_BARS_COMFORTABLE_MAX) return null;
+  if (orientation !== "vertical" || bars <= VERTICAL_BARS_COMFORTABLE_MAX) return null;
   return (
-    `${bands} bars in a fixed-height vertical chart — past about ${VERTICAL_BARS_COMFORTABLE_MAX} ` +
+    `${bars} bars in a fixed-height vertical chart — past about ${VERTICAL_BARS_COMFORTABLE_MAX} ` +
     "the bars are a pixel or two wide and the labels overdraw. Switch to horizontal, which grows " +
     "with the value count, or lower Top values."
   );

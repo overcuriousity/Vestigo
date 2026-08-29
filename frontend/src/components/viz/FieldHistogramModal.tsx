@@ -68,12 +68,32 @@ export function FieldHistogramModal({
   const [buckets, setBuckets] = useState<(typeof BUCKET_OPTIONS)[number]>(60);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
+  // The identity of the top-values list: everything in its query key except
+  // the limit. `filters` is part of it because a row's Filter IN/OUT narrows
+  // the Explorer's view without closing this modal.
+  const termsScope = useMemo(
+    () => hashKey(["field-terms", caseId, timelineId, fieldKey, filters]),
+    [caseId, timelineId, fieldKey, filters],
+  );
+
   // Reset the focused value whenever the modal is opened for a new field/value.
   const resetKey = `${fieldKey}:${value}`;
   const lastResetKey = useRef(resetKey);
   if (lastResetKey.current !== resetKey) {
     lastResetKey.current = resetKey;
     setActiveValue(value);
+    setTermsLimit(TERMS_PAGE);
+  }
+
+  // A new scope is a new list, so it starts at the first page. Carrying an
+  // expanded limit across a Filter IN/OUT — which already blanks the rows on
+  // purpose, see `placeholderData` below — made the very first fetch of the
+  // new scope ask for more than 50 values, and `merged_field_terms` serves
+  // nothing above 50 out of the `field_stats` cache: the cheap path this list
+  // is meant to hit stayed skipped for as long as the modal was open.
+  const lastTermsScope = useRef(termsScope);
+  if (lastTermsScope.current !== termsScope) {
+    lastTermsScope.current = termsScope;
     setTermsLimit(TERMS_PAGE);
   }
 
@@ -114,11 +134,6 @@ export function FieldHistogramModal({
     enabled: open && rangeStart != null && rangeEnd != null,
     ...busyRetry,
   });
-
-  const termsScope = useMemo(
-    () => hashKey(["field-terms", caseId, timelineId, fieldKey, filters]),
-    [caseId, timelineId, fieldKey, filters],
-  );
 
   const termsQuery = useQuery({
     queryKey: ["field-terms", caseId, timelineId, fieldKey, filters, termsLimit],
