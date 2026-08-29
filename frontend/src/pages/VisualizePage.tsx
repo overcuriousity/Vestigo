@@ -91,6 +91,7 @@ import {
   defaultChartTypeForScale,
   chartTypesForField,
   TOPN_MAX,
+  TOPN_MIN,
   TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
@@ -99,6 +100,7 @@ import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import { buildCaptionLines, type CaptionFacts } from "@/components/viz/lib/caption";
 import { CHART_PRESETS } from "@/components/viz/lib/presets";
 import { pieReadabilityWarning } from "@/components/viz/lib/pieReadability";
+import { barReadabilityWarning } from "@/components/viz/lib/barReadability";
 import { ChartCaption } from "@/components/viz/primitives/ChartCaption";
 import { ExplainerPopover } from "@/components/viz/primitives/ExplainerPopover";
 import { CHART_HOW_TO_READ } from "@/components/viz/lib/explainers";
@@ -191,6 +193,59 @@ function compareUnavailableReason(chartType: ChartType): string {
     return "Compare isn't supported for this chart type yet.";
   }
   return "This chart type has no honest two-layer encoding — overlaid layers would misrepresent one of them. Use Bar, Histogram, or the Time histogram to compare.";
+}
+
+/**
+ * The exact-value box beside the Top-values slider (#297).
+ *
+ * It keeps its own draft string, because coercing every keystroke through
+ * `Number` makes the field impossible to retype: `Number("")` is `0`, which is
+ * finite, so the first Backspace committed `topN: 1` and the digits of "300"
+ * then landed on top of it. A draft that is empty, or that parses outside
+ * `[TOPN_MIN, max]`, is simply not committed — it stays on screen until blur,
+ * which snaps back to whatever the chart is actually drawing.
+ */
+function TopNInput({
+  value,
+  max,
+  onCommit,
+}: {
+  value: number;
+  max: number;
+  onCommit: (n: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const parse = (raw: string): number | null => {
+    if (raw.trim() === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return Math.round(n);
+  };
+  return (
+    <input
+      type="number"
+      min={TOPN_MIN}
+      max={max}
+      step={1}
+      value={draft ?? String(value)}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        const n = parse(raw);
+        // Only an in-range number is a finished answer. "3" on the way to
+        // "300" is in range and previews immediately; "900" against a ceiling
+        // of 500 waits for blur rather than snapping mid-keystroke.
+        if (n != null && n >= TOPN_MIN && n <= max) onCommit(n);
+      }}
+      onBlur={() => {
+        const n = parse(draft ?? "");
+        if (n != null) onCommit(Math.max(TOPN_MIN, Math.min(n, max)));
+        setDraft(null);
+      }}
+      aria-label="Top values (exact)"
+      className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+    />
+  );
 }
 
 export function VisualizePage() {
@@ -876,6 +931,26 @@ export function VisualizePage() {
     chartType === "pie" && termsQuery.data ? pieReadabilityWarning(termsQuery.data) : null;
   if (pieWarning) facts.readabilityWarning = pieWarning;
 
+  // Same advisory footing for the bar axis, which since #297 reaches 500
+  // values: only the *vertical* orientation has a fixed frame, so that is the
+  // one where a high Top-values renders a texture rather than a chart.
+  const barTerms = compareTermsOn ? compareTermsQuery.data : termsQuery.data;
+  const barBands =
+    barTerms == null
+      ? 0
+      : barTerms.values.length +
+        ((compareTermsOn
+          ? (compareTermsQuery.data?.primary_other ?? 0) > 0 ||
+            (compareTermsQuery.data?.comparison_other ?? 0) > 0
+          : (termsQuery.data?.other_count ?? 0) > 0)
+          ? 1
+          : 0);
+  const barWarning =
+    chartType === "bar" && barTerms
+      ? barReadabilityWarning(barBands, resolved.orientation)
+      : null;
+  if (barWarning) facts.readabilityWarning = barWarning;
+
   const captionLines = buildCaptionLines({
     caseId,
     timelineId,
@@ -1556,10 +1631,15 @@ export function VisualizePage() {
               {/* The slider covers the range most charts want; the number
                   beside it is the escape hatch up to this chart type's
                   ceiling, so asking for 300 bars does not need 300 pixels of
-                  slider travel (#297). */}
+                  slider travel (#297).
+
+                  Both share `TOPN_MIN`: a slider whose `min` sat above the
+                  box's floor let the two disagree — the DOM clamps the thumb
+                  to its own `min`, so a typed 1 showed a slider reading 3, and
+                  dragging to exactly 3 then fired no change event at all. */}
               <input
                 type="range"
-                min={3}
+                min={TOPN_MIN}
                 max={TOPN_SLIDER_MAX[chartType]}
                 step={1}
                 value={Math.min(topN, TOPN_SLIDER_MAX[chartType])}
@@ -1568,30 +1648,23 @@ export function VisualizePage() {
                 }
                 className="min-w-0 flex-1 accent-[var(--color-accent)]"
               />
-              <input
-                type="number"
-                min={1}
-                max={TOPN_MAX[chartType]}
-                step={1}
+              <TopNInput
                 value={topN}
-                onChange={(e) => {
-                  const raw = Number(e.target.value);
-                  if (!Number.isFinite(raw)) return;
-                  updateConfig({
-                    options: {
-                      ...config.options,
-                      topN: Math.max(1, Math.min(Math.round(raw), TOPN_MAX[chartType])),
-                    },
-                  });
-                }}
-                aria-label="Top values (exact)"
-                className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
+                max={TOPN_MAX[chartType]}
+                onCommit={(n) => updateConfig({ options: { ...config.options, topN: n } })}
               />
             </div>
+            {/* The escape hatch has to be named wherever it exists, and the
+                gap is *widest* on the timeseries charts (slider 20, ceiling
+                50) — naming it only on the terms branch left the number box
+                undiscoverable exactly where it matters most. */}
             <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-              {dataKind === "timeseries"
-                ? `Up to ${TOPN_MAX[chartType]} — each value is its own series, so a crowded chart stops being readable well before that.`
-                : `Up to ${TOPN_MAX[chartType]} — past the slider's ${TOPN_SLIDER_MAX[chartType]}, type an exact number.`}
+              {`Up to ${TOPN_MAX[chartType]}`}
+              {TOPN_SLIDER_MAX[chartType] < TOPN_MAX[chartType]
+                ? ` — past the slider's ${TOPN_SLIDER_MAX[chartType]}, type an exact number.`
+                : "."}
+              {dataKind === "timeseries" &&
+                " Each value is its own series, so a crowded chart stops being readable well before that."}
             </p>
           </div>
         )}
@@ -1834,16 +1907,36 @@ export function VisualizePage() {
                 onRangeSelect={(start, end) => updateFilters({ ...urlFilters, start, end })}
               />
             )}
-            {chartType === "bar" && (compareTermsOn ? compareTermsQuery.data : termsQuery.data) && (
-              <BarChart
-                terms={compareTermsOn ? undefined : termsQuery.data}
-                compare={compareTermsOn ? compareTermsQuery.data : undefined}
-                orientation={resolved.orientation}
-                sort={resolved.sort}
-                logScale={resolved.logScale}
-                svgRef={svgRef}
-                onValueClick={handleChartValueClick}
-              />
+            {chartType === "bar" && barTerms && (
+              <>
+                {barWarning && (
+                  <div className="mb-2 rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-3 py-2 text-xs text-[var(--color-fg-secondary)]">
+                    <strong className="text-[var(--color-fg-primary)]">Readability:</strong>{" "}
+                    {barWarning}{" "}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-auto px-0.5 py-0 text-xs font-normal underline hover:text-[var(--color-accent)]"
+                      onClick={() =>
+                        updateConfig({
+                          options: { ...config.options, orientation: "horizontal" },
+                        })
+                      }
+                    >
+                      Switch to horizontal
+                    </Button>
+                  </div>
+                )}
+                <BarChart
+                  terms={compareTermsOn ? undefined : termsQuery.data}
+                  compare={compareTermsOn ? compareTermsQuery.data : undefined}
+                  orientation={resolved.orientation}
+                  sort={resolved.sort}
+                  logScale={resolved.logScale}
+                  svgRef={svgRef}
+                  onValueClick={handleChartValueClick}
+                />
+              </>
             )}
             {chartType === "pie" && termsQuery.data && (
               <>

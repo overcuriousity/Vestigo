@@ -85,9 +85,11 @@ export interface ResolvedChartOptions {
  * while a pie past a few dozen slices is unreadable whatever the slider
  * permits (`pieReadability.ts`) and a waffle only has 100 cells to share out.
  *
- * These match `ANALYST_CHART_LIMITS` in `agent/chart_exec.py`, so an exported
- * chart freezes what the analyst could ask for by hand rather than a smaller
- * subset of it.
+ * These match what `agent/chart_exec.py` applies: `ANALYST_CHART_LIMITS`
+ * carries the endpoint ceiling and `TERMS_TOP_N_BY_CHART` narrows it for the
+ * marks bounded by legibility, so an exported chart freezes what the analyst
+ * could ask for by hand rather than a smaller *or larger* answer than the
+ * card it came from.
  */
 export const TOPN_MAX: Record<ChartType, number> = {
   time: 50,
@@ -106,6 +108,14 @@ export const TOPN_MAX: Record<ChartType, number> = {
   scatter: 50,
   corr: 50,
 };
+
+/**
+ * Floor on `options.topN`, shared by the slider and the exact-value box beside
+ * it. One constant because two different minimums let the controls disagree —
+ * a range input silently clamps to its own `min` while React's state holds the
+ * lower number, and the thumb then reads a value the chart is not drawing.
+ */
+export const TOPN_MIN = 1;
 
 /**
  * Where the *slider* stops. The slider is the fast path over the range an

@@ -636,3 +636,64 @@ async def test_analyst_limits_do_not_clamp_a_normal_saved_chart():
     agent = await _run(AGENT_CHART_LIMITS)
     assert captured["top_n"] == 30
     assert any("agent context budget" in w for w in agent["warnings"])
+
+
+async def test_terms_top_n_narrows_for_the_marks_bounded_by_legibility():
+    """A pie is capped where the *mark* stops working, not where the endpoint does.
+
+    ``field_terms`` backs bar, pie and waffle alike, so ``terms_top_n``'s 500
+    would let an agent-proposed or exported pie carry ten times what the
+    Visualize page clamps the same config to — a snapshot the analyst cannot
+    reproduce or edit back to what it shows.
+    """
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS, execute_chart_spec
+    from vestigo.db.postgres import User as _User
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    from vestigo.agent.tools import AgentScope  # isort: skip
+
+    scope = AgentScope(
+        case_id="c1",
+        timeline_id="t1",
+        user=_User(id="u1", username="alice", is_admin=True, is_active=True),
+        source_ids=["s1"],
+        field_mappings=None,
+        source_offsets=None,
+    )
+    captured: dict[str, int] = {}
+
+    class _Service:
+        def field_terms(self, query, field, top_n):
+            captured["top_n"] = top_n
+            return {"total": 0, "distinct": 0, "values": [], "other_count": 0}
+
+    async def _no_check(token, label):
+        return None
+
+    async def _run(chart_type: str):
+        spec = _stored_chart_to_spec(
+            {
+                "v": 1,
+                "chartType": chart_type,
+                "field": "port",
+                "metric": "count",
+                "options": {"topN": 400},
+            }
+        )
+        return await execute_chart_spec(
+            scope,
+            spec,
+            service=_Service(),
+            validated=lambda f: f,
+            check_field=_no_check,
+            limits=ANALYST_CHART_LIMITS,
+        )
+
+    bar = await _run("bar")
+    assert captured["top_n"] == 400
+    assert bar["warnings"] == []
+
+    for mark in ("pie", "waffle"):
+        result = await _run(mark)
+        assert captured["top_n"] == 50, mark
+        assert any("clamped to 50" in w for w in result["warnings"]), mark

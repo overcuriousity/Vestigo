@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { hashKey, useQuery } from "@tanstack/react-query";
 import { busyMessage, busyRetry } from "@/lib/queryClient";
 import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
@@ -115,6 +115,11 @@ export function FieldHistogramModal({
     ...busyRetry,
   });
 
+  const termsScope = useMemo(
+    () => hashKey(["field-terms", caseId, timelineId, fieldKey, filters]),
+    [caseId, timelineId, fieldKey, filters],
+  );
+
   const termsQuery = useQuery({
     queryKey: ["field-terms", caseId, timelineId, fieldKey, filters, termsLimit],
     queryFn: () => vizApi.fieldTerms(caseId, timelineId, fieldKey, filters, termsLimit),
@@ -124,7 +129,17 @@ export function FieldHistogramModal({
     // answer is in flight — otherwise every click blanks the list. The window
     // aggregation recomputes `other_count` for the new limit, so the tail
     // count stays truthful after each expansion.
-    placeholderData: keepPreviousData,
+    //
+    // Only `termsLimit` may change under a kept list. The rest of the key is
+    // the *scope* — and `filters` changes while this modal is open, because a
+    // row's Filter IN/OUT narrows the Explorer's view without closing it.
+    // Holding the previous rows across that would show pre-filter values,
+    // counts and `distinct` as if they were scoped to the new filter, with
+    // nothing on screen saying otherwise. Blank to the spinner instead.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery && hashKey(previousQuery.queryKey.slice(0, 5)) === termsScope
+        ? previous
+        : undefined,
     ...busyRetry,
   });
   const canExpandTerms = termsLimit < TERMS_MAX;

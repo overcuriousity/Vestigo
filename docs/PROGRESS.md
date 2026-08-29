@@ -35,6 +35,32 @@ beside it reaches the ceiling, with a line naming it — the old behaviour silen
 instead. A test asserts no slider ceiling can exceed the hard one it escapes from, which is
 the exact failure mode the issue was filed for.
 
+**Review follow-ups (same session).** Six findings from the review of #323, all in the
+surfaces the two issues touched.
+
+- `keepPreviousData` was keyed on the whole query key, but the modal's `filters` change
+  *while it stays open* — a row's Filter IN/OUT narrows the Explorer without closing it. The
+  kept rows then showed pre-filter values, counts and `distinct` as if they were scoped to
+  the new filter, with nothing on screen saying otherwise. The placeholder now compares the
+  previous query's key against the current *scope* (everything but `termsLimit`) and blanks
+  to the spinner on anything else.
+- The numeric Top-values box could not be cleared: `Number("")` is `0`, which is finite, so
+  the first Backspace committed `topN: 1` and the digits of "300" landed on top of it —
+  breaking the one thing the control exists for. It is now a small `TopNInput` holding its
+  own draft string; an empty or out-of-range entry stays a draft until blur.
+- Slider `min` (3) and box `min` (1) disagreed, so a typed 1 left the DOM clamping the thumb
+  to 3 while state said 1, and dragging to exactly 3 fired no change event at all. Both read
+  a shared `TOPN_MIN`.
+- The line naming the escape hatch only rendered on the terms branch. The gap is *widest* on
+  heatmap/line (slider 20, ceiling 50), where the number box was therefore undiscoverable.
+- "These match `ANALYST_CHART_LIMITS`" held only for bar: `chart_exec` caps by `data_kind`,
+  so an agent-proposed or exported pie/waffle could carry 500 slices the UI clamps to 50.
+  `TERMS_TOP_N_BY_CHART` now narrows the ceiling per mark (`docs/STORIES.md`).
+- Raising bar to 500 made the *vertical* orientation degenerate — fixed 300px frame, so
+  sub-pixel bands and overdrawn labels — while only the horizontal branch grows with the row
+  count. `barReadabilityWarning` gives it the advisory pie already had, with a one-click
+  switch to horizontal.
+
 ## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
 
 CI on `main` has been green since 1.15.2, but the **Release** workflow has failed on every tag

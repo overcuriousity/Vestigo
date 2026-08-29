@@ -11,6 +11,7 @@ import {
   defaultChartTypeForScale,
   chartTypesForField,
   TOPN_MAX,
+  TOPN_MIN,
   TOPN_SLIDER_MAX,
 } from "@/components/viz/lib/chartOptions";
 import { chartTypesFor, SCALES } from "@/components/viz/lib/chartMeta";
@@ -68,6 +69,13 @@ describe("resolveChartOptions", () => {
     for (const type of Object.keys(TOPN_MAX) as (keyof typeof TOPN_MAX)[]) {
       expect(TOPN_SLIDER_MAX[type]).toBeLessThanOrEqual(TOPN_MAX[type]);
     }
+  });
+
+  it("keeps every slider floor at the shared minimum the number box allows", () => {
+    // A range input clamps to its own `min` while React state holds the lower
+    // number — the slider then reads a value the chart is not drawing. One
+    // constant for both controls is what stops them disagreeing.
+    expect(TOPN_MIN).toBeLessThanOrEqual(Math.min(...Object.values(TOPN_SLIDER_MAX)));
   });
 
   it("keeps a legend explicitly turned off, rather than treating false as unset", () => {
