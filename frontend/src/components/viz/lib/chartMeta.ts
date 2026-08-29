@@ -292,7 +292,7 @@ export const CHART_META: Record<
     scales: ["nominal", "ordinal"],
     dataKind: "table",
     defaultScale: "nominal",
-    inputs: { field: "required", secondField: "optional" },
+    inputs: { field: "required", secondField: "optional", columns: "optional" },
     derives: ["bins", "timePart"],
     readsOptions: ["topN", "tableSortBy", "tableSortDir", "highlight"],
     supportsCompare: false,

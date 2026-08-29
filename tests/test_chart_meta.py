@@ -290,7 +290,7 @@ def test_marks_are_supported_on_the_time_axis_figures_only() -> None:
 #: control for. Grown in the same commit as the renderer — a key declared here
 #: before its control exists would ask the analyst a question with no box to
 #: answer it in.
-RAIL_RENDERED_INPUTS: frozenset[str] = frozenset({"field", "second_field", "fields"})
+RAIL_RENDERED_INPUTS: frozenset[str] = frozenset({"field", "second_field", "fields", "columns"})
 
 
 @pytest.mark.parametrize("chart_type", CHART_TYPES)
@@ -305,6 +305,7 @@ def test_table_row_is_a_terms_shaped_figure_with_its_own_aggregation() -> None:
     assert meta.default_scale == "nominal"
     assert meta.inputs["field"] == "required"
     assert meta.inputs["second_field"] == "optional"
+    assert meta.inputs["columns"] == "optional"
     assert meta.derives == ("bins", "time_part")
     assert set(meta.reads_options) == {"top_n", "table_sort_by", "table_sort_dir", "highlight"}
     assert meta.supports_compare is False and meta.supports_marks is False

@@ -174,8 +174,9 @@ describe("ChartRail", () => {
   it("renders exactly the inputs the registry declares, for every figure", () => {
     const renderers: Record<string, RegExp> = {
       field: /^Field( \(X\))?$/,
-      secondField: /^(Field \(Y\)|Group by \(optional\))$/,
+      secondField: /^(Field \(Y\)|Group by \(optional\)|Count distinct of \(optional\))$/,
       fields: /^Fields to correlate/,
+      columns: /^Columns$/,
     };
     for (const chartType of Object.keys(
       CHART_META,
@@ -292,5 +293,50 @@ describe("ChartRail — Derive", () => {
     });
     fireEvent.click(screen.getByRole("radio", { name: "Categories" }));
     expect(updateConfig).toHaveBeenCalledWith({ scale: "nominal", derive: null });
+  });
+});
+
+describe("ChartRail — table", () => {
+  const table = {
+    ...DEFAULT_CHART_CONFIG,
+    chartType: "table" as const,
+    field: "attr:user",
+    scale: "nominal" as const,
+  };
+
+  it("renders the Columns checklist after the second field, with distinct disabled until a second field is set", () => {
+    renderRail(table);
+    const order = sectionOrder();
+    expect(order.indexOf("columns")).toBe(order.indexOf("secondField") + 1);
+    const group = screen.getByRole("group", { name: "Columns" });
+    const distinct = within(group).getByRole("checkbox", { name: /distinct/ }) as HTMLInputElement;
+    expect(distinct.disabled).toBe(true);
+    expect(
+      (within(group).getByRole("checkbox", { name: "count" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(screen.getByRole("combobox", { name: "Count distinct of (optional)" })).toBeTruthy();
+  });
+
+  it("unticking a column writes the explicit column list", () => {
+    const { updateConfig } = renderRail(table);
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Columns" })).getByRole("checkbox", {
+        name: "first seen",
+      }),
+    );
+    expect(updateConfig).toHaveBeenCalledWith({
+      inputs: { columns: ["count", "share", "last_seen"] },
+    });
+  });
+
+  it("offers sort, direction and highlight options and a Top values control", () => {
+    const { updateConfig } = renderRail({ ...table, fieldY: "attr:host" });
+    expect(screen.getByRole("combobox", { name: "Sort by" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Direction" })).toBeTruthy();
+    expect(screen.getByLabelText("Top values (exact)")).toBeTruthy();
+    const highlight = screen.getByRole("textbox", { name: "Highlight values" });
+    fireEvent.change(highlight, { target: { value: "alice, bob" } });
+    fireEvent.blur(highlight);
+    expect(updateConfig).toHaveBeenCalledWith({ options: { highlight: ["alice", "bob"] } });
   });
 });

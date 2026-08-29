@@ -29,7 +29,16 @@ import { SavedChartsRail } from "./SavedChartsRail";
 import { ExplainerPopover } from "./primitives/ExplainerPopover";
 import { FigureThumbnail } from "./primitives/FigureThumbnail";
 import type { CorrMethod } from "./charts/CorrMatrix";
-import type { ChartConfig, ChartType, DeriveSpec, Scale, TimePart } from "./lib/chartConfig";
+import type {
+  ChartConfig,
+  ChartType,
+  DeriveSpec,
+  Scale,
+  TableColumn,
+  TableSortColumn,
+  TimePart,
+} from "./lib/chartConfig";
+import { DEFAULT_TABLE_COLUMNS, TABLE_COLUMN_LABELS } from "./lib/tableRows";
 import {
   CHART_META,
   SCALES,
@@ -265,6 +274,57 @@ function TopNInput({
 
 /** Comma-separated edges, committed on blur/Enter when they parse as a
  * strictly increasing list; otherwise the draft stays and says why. */
+const TABLE_COLUMN_CHOICES: TableColumn[] = [
+  "count",
+  "share",
+  "first_seen",
+  "last_seen",
+  "distinct_second",
+];
+const TABLE_SORT_CHOICES: TableSortColumn[] = ["value", ...TABLE_COLUMN_CHOICES];
+
+/** Comma-separated values whose rows are highlighted; committed on blur/Enter. */
+function HighlightInput({
+  values,
+  onCommit,
+}: {
+  values: string[];
+  onCommit: (values: string[]) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = draft ?? values.join(", ");
+  const commit = () => {
+    const parsed = shown
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s !== "");
+    setDraft(null);
+    onCommit(parsed);
+  };
+  return (
+    <div>
+      <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+        Highlight values
+      </label>
+      <input
+        type="text"
+        aria-label="Highlight values"
+        value={shown}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        placeholder="alice, bob"
+        className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
+      />
+      <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+        Presentation only — the caption says which rows were highlighted.
+      </p>
+    </div>
+  );
+}
+
 function EdgesInput({
   edges,
   onCommit,
@@ -536,9 +596,12 @@ export function ChartRail({
     ...fields.map(fieldComboOption),
   ];
 
-  const secondFieldLabel = acceptsSecondField
-    ? "Group by (optional)"
-    : "Field (Y)";
+  const secondFieldLabel =
+    chartType === "table"
+      ? "Count distinct of (optional)"
+      : acceptsSecondField
+        ? "Group by (optional)"
+        : "Field (Y)";
 
   return (
     <div className="flex w-72 shrink-0 flex-col gap-4 overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-bg-surface)] p-3">
@@ -982,6 +1045,51 @@ export function ChartRail({
         </div>
       )}
 
+      {"columns" in CHART_META[chartType].inputs && (
+        <fieldset data-rail-section="columns" role="group" aria-label="Columns">
+          <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+            Columns
+          </label>
+          <div className="space-y-1">
+            {TABLE_COLUMN_CHOICES.map((c) => {
+              const current =
+                config.inputs.columns ??
+                (fieldY ? [...DEFAULT_TABLE_COLUMNS, "distinct_second"] : DEFAULT_TABLE_COLUMNS);
+              const checked = current.includes(c);
+              const disabled = c === "distinct_second" && !fieldY;
+              return (
+                <label
+                  key={c}
+                  className={`flex items-center gap-2 text-xs ${
+                    disabled
+                      ? "text-[var(--color-fg-muted)]"
+                      : "cursor-pointer text-[var(--color-fg-secondary)]"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    aria-label={TABLE_COLUMN_LABELS[c]}
+                    checked={checked && !disabled}
+                    disabled={disabled}
+                    onChange={(e) => {
+                      const next = TABLE_COLUMN_CHOICES.filter((k) =>
+                        k === c ? e.target.checked : current.includes(k),
+                      );
+                      updateConfig({ inputs: { ...config.inputs, columns: next } });
+                    }}
+                    className="accent-[var(--color-accent)]"
+                  />
+                  {TABLE_COLUMN_LABELS[c]}
+                  {disabled && (
+                    <span className="text-[var(--color-fg-muted)]">— needs a second field</span>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+        </fieldset>
+      )}
+
       {/* Compare — time histogram, bar (grouped), numeric histogram (overlay).
           Always rendered; disabled (with the reason) for chart types without
           an honest two-layer encoding, instead of silently disappearing. */}
@@ -1092,12 +1200,75 @@ export function ChartRail({
       {(chartType === "bar" ||
         chartType === "histogram" ||
         chartType === "time" ||
-        chartType === "line") && (
+        chartType === "line" ||
+        chartType === "table") && (
         <details className="rounded border border-[var(--color-border)]">
           <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Options
           </summary>
           <div className="space-y-3 px-2 pb-2 pt-1">
+            {chartType === "table" && (
+              <>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Sort by
+                  </label>
+                  <Select
+                    value={config.options.tableSortBy ?? "count"}
+                    onValueChange={(v) =>
+                      updateConfig({
+                        options: { ...config.options, tableSortBy: v as TableSortColumn },
+                      })
+                    }
+                  >
+                    <SelectTrigger className="h-7 text-xs" aria-label="Sort by">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {TABLE_SORT_CHOICES.map((c) => (
+                        <SelectItem
+                          key={c}
+                          value={c}
+                          disabled={c === "distinct_second" && !fieldY}
+                        >
+                          {TABLE_COLUMN_LABELS[c]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                    Direction
+                  </label>
+                  <Select
+                    value={config.options.tableSortDir ?? "desc"}
+                    onValueChange={(v) =>
+                      updateConfig({
+                        options: { ...config.options, tableSortDir: v as "asc" | "desc" },
+                      })
+                    }
+                  >
+                    <SelectTrigger className="h-7 text-xs" aria-label="Direction">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="desc">Descending</SelectItem>
+                      <SelectItem value="asc">Ascending</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <HighlightInput
+                  values={config.options.highlight ?? []}
+                  onCommit={(values) => {
+                    const { highlight: _dropped, ...rest } = config.options;
+                    updateConfig({
+                      options: values.length ? { ...rest, highlight: values } : rest,
+                    });
+                  }}
+                />
+              </>
+            )}
             {chartType === "bar" && (
               <>
                 <div>
@@ -1358,7 +1529,7 @@ export function ChartRail({
           )}
         </div>
       )}
-      {(dataKind === "terms" || dataKind === "timeseries") && (
+      {(dataKind === "terms" || dataKind === "timeseries" || dataKind === "table") && (
         <TopNControl
           chartType={chartType}
           dataKind={dataKind}
