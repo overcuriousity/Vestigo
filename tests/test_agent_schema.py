@@ -310,3 +310,24 @@ async def test_external_mcp_instructions_carry_the_relocated_guidance(store):
     instructions = build_tool_server(_scope()).instructions or ""
     assert SPEC_REFERENCE in instructions
     assert RESULT_FORMAT_NOTE in instructions
+
+
+def test_chart_mark_spec_is_one_shared_def_not_five() -> None:
+    """Five union members would cost ~2,500 chars of `$defs`; one model with a
+    kind-validator costs one."""
+    from vestigo.agent.schema_slim import SHARED_SPEC_NAMES
+    from vestigo.agent.tools import ChartMarkSpec, ChartSpec
+
+    assert "ChartMarkSpec" in SHARED_SPEC_NAMES
+    schema = ChartSpec.model_json_schema()
+    assert "ChartMarkSpec" in schema["$defs"]
+    assert set(ChartMarkSpec.model_fields) == {
+        "kind",
+        "filters",
+        "label",
+        "definition_id",
+        "view_id",
+        "at",
+        "start",
+        "end",
+    }

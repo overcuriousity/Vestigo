@@ -61,6 +61,10 @@ class ChartLimits:
     time_buckets: tuple[int, int]
     pivot_limit: tuple[int, int]
     table_rows: tuple[int, int]
+    #: Instants one mark source may resolve to. ``None`` = the ``viz_marks_max``
+    #: setting (the analyst's ceiling); the agent's is fixed and smaller because
+    #: every resolved mark is summarised into the model's context.
+    marks_per_source: int | None
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -79,6 +83,7 @@ AGENT_CHART_LIMITS = ChartLimits(
     time_buckets=(30, 60),
     pivot_limit=(8, 12),
     table_rows=(20, 30),
+    marks_per_source=20,
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -98,6 +103,7 @@ ANALYST_CHART_LIMITS = ChartLimits(
     time_buckets=(60, 200),
     pivot_limit=(10, 50),
     table_rows=(50, 500),
+    marks_per_source=None,
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,

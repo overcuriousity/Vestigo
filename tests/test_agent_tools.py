@@ -2858,3 +2858,70 @@ async def test_table_takes_a_derivation(store, monkeypatch):
     assert result["ok"] is True
     kw = next(kw for name, _, kw in fake.calls if name == "field_table")
     assert kw["derive"].count == 4 and result["resolved"]["scale"] == "ordinal"
+
+
+# ── marks: the spec ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("mark", "needle"),
+    [
+        ({"kind": "events"}, 'kind="events" needs filters'),
+        ({"kind": "baseline"}, 'kind="baseline" needs definition_id'),
+        ({"kind": "view"}, 'kind="view" needs view_id'),
+        ({"kind": "instant", "at": "2026-03-13T09:41:00Z"}, 'kind="instant" needs at and label'),
+        (
+            {
+                "kind": "range",
+                "start": "2026-03-13T09:41:00Z",
+                "end": "2026-03-13T08:00:00Z",
+                "label": "w",
+            },
+            "start must be before end",
+        ),
+        (
+            {"kind": "instant", "at": "2026-03-13T09:41:00Z", "label": "x", "view_id": "v1"},
+            'kind="instant" does not take view_id',
+        ),
+    ],
+)
+def test_chart_mark_spec_refuses_a_kind_without_its_fields(mark, needle):
+    from vestigo.agent.tools import ChartMarkSpec
+
+    with pytest.raises(ValidationError) as excinfo:
+        ChartMarkSpec.model_validate(mark)
+    assert needle in str(excinfo.value)
+
+
+def test_chart_mark_spec_accepts_each_kind():
+    from vestigo.agent.tools import ChartMarkSpec
+
+    events = ChartMarkSpec.model_validate(
+        {"kind": "events", "filters": {"tags_include": ["exfil"]}}
+    )
+    assert events.filters.tags_include == ["exfil"]
+    assert (
+        ChartMarkSpec.model_validate({"kind": "baseline", "definition_id": "bd1"}).definition_id
+        == "bd1"
+    )
+    assert ChartMarkSpec.model_validate({"kind": "view", "view_id": "v1"}).view_id == "v1"
+    instant = ChartMarkSpec.model_validate(
+        {"kind": "instant", "at": "2026-03-13T09:41:00Z", "label": "beacon"}
+    )
+    assert instant.at.year == 2026
+    r = ChartMarkSpec.model_validate(
+        {
+            "kind": "range",
+            "start": "2026-03-13T09:00:00Z",
+            "end": "2026-03-13T10:00:00Z",
+            "label": "w",
+        }
+    )
+    assert r.start < r.end
+
+
+def test_chart_limits_carry_marks_per_source():
+    from vestigo.agent.chart_exec import AGENT_CHART_LIMITS, ANALYST_CHART_LIMITS
+
+    assert AGENT_CHART_LIMITS.marks_per_source == 20
+    assert ANALYST_CHART_LIMITS.marks_per_source is None  # the viz_marks_max setting

@@ -597,6 +597,72 @@ class ChartInputsSpec(ObjectArgModel):
     )
 
 
+class ChartMarkSpec(ObjectArgModel):
+    """One mark source on a time-axis figure (`docs/VISUALIZE.md` §"Marks").
+
+    One model for five kinds rather than a union: the tool schema is budgeted,
+    and five `$defs` would spend most of a step's headroom on prose the
+    validator below states once.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["events", "baseline", "view", "instant", "range"] = Field(
+        description=(
+            '"events": one instant per event matching `filters` (capped; overflow disclosed). '
+            '"baseline": the definition\'s baseline window and every suspect window as ranges. '
+            '"view": one instant per event of a saved view. "instant"/"range": typed by hand.'
+        )
+    )
+    filters: FilterSpec | None = Field(
+        default=None, description='kind="events" only: the events to mark.'
+    )
+    label: str | None = Field(
+        default=None,
+        max_length=120,
+        description='Label drawn beside the mark. Required for "instant" and "range"; optional otherwise.',
+    )
+    definition_id: str | None = Field(
+        default=None, description='kind="baseline" only: a baseline definition id (list_baselines).'
+    )
+    view_id: str | None = Field(
+        default=None, description='kind="view" only: a saved view id (list_saved_views).'
+    )
+    at: datetime | None = Field(default=None, description='kind="instant" only: the time (ISO).')
+    start: datetime | None = Field(
+        default=None, description='kind="range" only: window start (ISO).'
+    )
+    end: datetime | None = Field(
+        default=None, description='kind="range" only: window end (ISO), after start.'
+    )
+
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> ChartMarkSpec:
+        takes: dict[str, tuple[str, ...]] = {
+            "events": ("filters", "label"),
+            "baseline": ("definition_id", "label"),
+            "view": ("view_id", "label"),
+            "instant": ("at", "label"),
+            "range": ("start", "end", "label"),
+        }
+        needs: dict[str, tuple[str, ...]] = {
+            "events": ("filters",),
+            "baseline": ("definition_id",),
+            "view": ("view_id",),
+            "instant": ("at", "label"),
+            "range": ("start", "end", "label"),
+        }
+        for name in ("filters", "definition_id", "view_id", "at", "start", "end"):
+            if getattr(self, name) is not None and name not in takes[self.kind]:
+                raise ValueError(f'kind="{self.kind}" does not take {name}')
+        missing = [n for n in needs[self.kind] if getattr(self, n) is None]
+        if missing:
+            raise ValueError(f'kind="{self.kind}" needs {" and ".join(needs[self.kind])}')
+        if self.kind == "range" and self.start >= self.end:  # type: ignore[operator]
+            raise ValueError("start must be before end")
+        return self
+
+
 class ChartSpec(ObjectArgModel):
     """A chart, described exactly as the Visualize page describes one.
 
@@ -691,6 +757,14 @@ class ChartSpec(ObjectArgModel):
         default=None,
         description="Figure-specific inputs — today only the table's `columns`.",
     )
+    marks: list[ChartMarkSpec] | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Instants and windows drawn over a time-axis figure (time, line). Each is resolved "
+            "on the server with provenance; an events source is capped per source."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -748,7 +822,15 @@ class ChartSpec(ObjectArgModel):
 # `$defs`, rendered once for the system prompt (A13). Generated from the models
 # above, so it cannot drift from them.
 SPEC_REFERENCE: str = spec_reference_block(
-    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec, ChartDeriveSpec, ChartInputsSpec)
+    (
+        FilterSpec,
+        ChartSpec,
+        ChartCompareSpec,
+        ChartOptionsSpec,
+        ChartDeriveSpec,
+        ChartInputsSpec,
+        ChartMarkSpec,
+    )
 )
 
 # How to read the columnar tool results (A13). Stated once and reused by both

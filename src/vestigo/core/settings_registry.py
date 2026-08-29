@@ -596,6 +596,13 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Bytes after which a heavy GROUP BY spills to disk.",
     ),
     SettingSpec(
+        "viz_marks_max",
+        "scans",
+        "Visualize marks per source",
+        "Instants one mark source (a filter, saved view or baseline definition) may draw on a "
+        "figure. Beyond it the earliest N are drawn and the overflow is stated in the caption.",
+    ),
+    SettingSpec(
         "stat_scan_external_sort_bytes",
         "scans",
         "ORDER BY spill threshold (bytes)",

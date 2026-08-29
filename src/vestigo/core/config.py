@@ -274,6 +274,11 @@ class Settings(BaseSettings):
     # bounded aggregates; freshness is keyed, not TTL'd.
     viz_baseline_cache_entries: int = Field(default=64, ge=0)
 
+    # Marks (Visualize): instants a single mark source may draw. A source is
+    # one filter, saved view or baseline definition; past the cap the figure
+    # draws the first N by time and the caption says how many it did not.
+    viz_marks_max: int = Field(default=50, ge=1, le=500)
+
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP
     # round-trip, so larger batches amortize LAN latency and ClickHouse's
