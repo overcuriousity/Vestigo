@@ -17,8 +17,10 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from vestigo.api.deps import (
+    get_current_user,
     get_store,
     require_case_contribute,
     require_case_read,
@@ -39,6 +41,7 @@ from vestigo.api.routers.events import (
     _validate_field_modes,
     _validate_regex,
 )
+from vestigo.core.config import get_settings
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.derive import DeriveSpec, parse_derive
 from vestigo.db.field_stats import (
@@ -896,6 +899,60 @@ async def get_field_table(
         sort_dir=sort_dir,
         derive=derive_spec,
     )
+
+
+class MarksRequest(BaseModel):
+    """Body for ``POST …/viz/marks``: the chart config's ``marks`` list, verbatim.
+
+    The stored ``MarkSource`` shape (camelCase, ``filters`` as a view payload)
+    — the same bytes the frontend keeps in ``c_marks`` and a saved chart, so
+    the page posts what it holds and nothing is re-encoded on the way.
+    """
+
+    marks: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/marks")
+async def resolve_viz_marks(
+    case_id: str,
+    timeline_id: str,
+    body: MarksRequest,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Resolve mark sources into instants and ranges with provenance.
+
+    See ``agent/marks.py``. Reads only; the per-source cap is the
+    ``viz_marks_max`` setting and is echoed as ``cap``.
+    """
+    from vestigo.agent.marks import resolve_marks
+    from vestigo.agent.tools import AgentScope, ChartMarkSpec
+    from vestigo.stories.export import _stored_marks_to_spec
+
+    try:
+        specs = [ChartMarkSpec.model_validate(m) for m in (_stored_marks_to_spec(body.marks) or [])]
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    scope = AgentScope(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        user=user,
+        source_ids=source_ids,
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
+    )
+    try:
+        return await resolve_marks(
+            scope,
+            specs,
+            service=_get_query_service(),
+            store=get_store(),
+            cap=get_settings().viz_marks_max,
+            run=run_in_threadpool,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-scatter")

@@ -285,6 +285,15 @@ class _FakeAggService:
         self.calls.append(("scatter", query, field_x, field_y, limit))
         return {"kind": "scatter"}
 
+    def mark_instants(self, query, limit):
+        self.calls.append(("marks", query, limit))
+        return {
+            "instants": [{"event_id": "e1", "source_id": "s1", "at": "2026-07-20T01:00:00+00:00"}],
+            "dated": 1,
+            "undated": 0,
+            "overflow": False,
+        }
+
     def field_numeric_stats(self, query, field, bins, points, points_limit):
         self.calls.append(("numeric", query, field, bins, points, points_limit))
         return {"kind": "numeric"}
@@ -1102,3 +1111,74 @@ def test_field_table_sort_columns_match_the_service() -> None:
         inspect.signature(viz.get_field_table, eval_str=True).parameters["sort_by"].annotation
     )
     assert set(get_args(annotation)) == set(TABLE_SORT_COLUMNS)
+
+
+@pytest.mark.asyncio
+async def test_viz_marks_resolves_stored_marks_under_the_setting_cap(monkeypatch):
+    from types import SimpleNamespace
+
+    svc = _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    body = viz.MarksRequest(
+        marks=[
+            {"kind": "events", "filters": {"q": "beacon"}, "label": "beacons"},
+            {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"},
+        ]
+    )
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    result = await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+    assert result["cap"] == 50
+    assert [m["kind"] for m in result["marks"]] == ["instant", "instant"]
+    assert result["marks"][0]["provenance"] == {
+        "kind": "event",
+        "event_id": "e1",
+        "source_id": "s1",
+    }
+    assert result["marks"][1]["provenance"] == {"kind": "analyst"}
+    kind, query, limit = svc.calls[0]
+    assert kind == "marks" and query.q == "beacon" and limit == 50
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_viz_marks_rejects_a_malformed_mark_and_an_unknown_baseline(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as malformed:
+        await viz.resolve_viz_marks(
+            "c1",
+            "t1",
+            viz.MarksRequest(marks=[{"kind": "instant", "at": "2026-07-20T09:41:00Z"}]),
+            case=None,
+            user=user,
+        )
+    assert malformed.value.status_code == 422
+    assert "needs at and label" in str(malformed.value.detail)
+    with pytest.raises(HTTPException) as unknown:
+        await viz.resolve_viz_marks(
+            "c1",
+            "t1",
+            viz.MarksRequest(marks=[{"kind": "baseline", "definitionId": "nope"}]),
+            case=None,
+            user=user,
+        )
+    assert unknown.value.status_code == 422
+    assert 'baseline definition "nope" not found' in str(unknown.value.detail)
