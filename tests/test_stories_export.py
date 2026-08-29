@@ -457,7 +457,7 @@ def test_chart_spec_and_stored_config_round_trip():
     ):
         spec = ChartSpec.model_validate(payload)
         config = spec_to_stored_chart_config(spec)
-        assert config["v"] == 1, config
+        assert config["v"] == 2, config
         assert _stored_chart_to_spec(config) == spec, config
 
 
@@ -697,3 +697,11 @@ async def test_terms_top_n_narrows_for_the_marks_bounded_by_legibility():
         result = await _run(mark)
         assert captured["top_n"] == 50, mark
         assert any("clamped to 50" in w for w in result["warnings"]), mark
+
+
+def test_spec_to_stored_chart_config_writes_the_current_version() -> None:
+    from vestigo.agent.tools import ChartSpec
+    from vestigo.stories.export import CHART_CONFIG_VERSION, spec_to_stored_chart_config
+
+    stored = spec_to_stored_chart_config(ChartSpec(chart_type="bar", field="artifact"))
+    assert stored["v"] == CHART_CONFIG_VERSION == 2

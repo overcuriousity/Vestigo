@@ -215,10 +215,12 @@ _CHART_OPTION_KEYS = {
 }
 
 
-#: Version stamp on a stored ``ChartConfig``. The frontend refuses to draw a
-#: config carrying any other value (``parseStoredChartConfig``), so anything
-#: writing a SavedChart has to set it.
-CHART_CONFIG_VERSION = 1
+#: Version stamp on a stored ``ChartConfig``. The frontend upgrades a ``v: 1``
+#: row on read (``upgradeChartConfig``) and refuses anything else
+#: (``parseStoredChartConfig``), so anything writing a SavedChart has to set
+#: the current value. v2 added ``derive``, ``inputs`` and ``marks``; a v1 row
+#: reads as v2 with all three empty.
+CHART_CONFIG_VERSION = 2
 
 
 def _stored_chart_to_spec(config: dict[str, Any]):
