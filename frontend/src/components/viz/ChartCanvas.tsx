@@ -39,7 +39,8 @@ import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
 import { TableFigure, TableHtml } from "@/components/viz/charts/TableFigure";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import { Spinner } from "@/components/ui/Spinner";
-import type { EventFilters } from "@/api/types";
+import type { EventFilters, ResolvedMark } from "@/api/types";
+import { useResolvedMarks } from "@/components/viz/useResolvedMarks";
 
 interface Props {
   caseId: string;
@@ -81,6 +82,7 @@ export function ChartCanvas({
           ? !!(config.field && config.fieldY)
           : !!config.field;
 
+  const marksQuery = useResolvedMarks(caseId, timelineId, config);
   const chartQuery = useQuery({
     queryKey: ["chart-canvas", caseId, timelineId, config, filters],
     queryFn: () => fetchChartData(caseId, timelineId, config, filters, opts),
@@ -130,6 +132,7 @@ export function ChartCanvas({
             data={chartQuery.data}
             opts={opts}
             compareOn={compareOn}
+            marks={marksQuery.data?.marks}
           />
         </div>
       )}
@@ -150,11 +153,14 @@ export function ChartMarks({
   opts,
   compareOn,
   tableAs = "svg",
+  marks,
 }: {
   config: ChartConfig;
   data: ChartResult;
   opts: ResolvedChartOptions;
   compareOn: boolean;
+  /** Resolved marks for the time-axis figures; the snapshot passes its frozen ones. */
+  marks?: ResolvedMark[];
   /** The table figure is an <svg> on the page (so it exports like every other
    * figure) and a real <table> in a Story snapshot and the HTML export. */
   tableAs?: "svg" | "html";
@@ -218,6 +224,7 @@ export function ChartMarks({
           seriesMode={opts.seriesMode}
           showPoints={config.options.showPoints ?? true}
           showLegend={opts.legend}
+          marks={marks}
         />
       )}
       {data.kind === "timeseries" && config.chartType === "heatmap" && (
@@ -228,6 +235,7 @@ export function ChartMarks({
           data={data.data}
           metric={config.metric}
           hasComparison={compareOn}
+          marks={marks}
         />
       )}
       {data.kind === "punchcard" && <PunchCard data={data.data} />}

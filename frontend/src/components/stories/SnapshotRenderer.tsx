@@ -140,6 +140,7 @@ function ChartSnapshot({ block }: { block: Resolved<"chart_ref"> }) {
         opts={resolveChartOptions(config)}
         compareOn={data.resolved.compare_mode !== "off"}
         tableAs="html"
+        marks={data.marks?.marks}
       />
       {data.warnings?.length > 0 && (
         <ul className="list-disc pl-4 text-[10px] text-[var(--color-fg-muted)]">

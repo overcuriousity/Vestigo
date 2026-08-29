@@ -165,3 +165,34 @@ describe("SnapshotRenderer", () => {
     expect(html).toContain("66.7%");
   });
 });
+
+describe("SnapshotRenderer — marks", () => {
+  it("draws a chart block's frozen marks without any fetch", () => {
+    const timeBlock = snapshot.blocks.find(
+      (b) => b.kind === "chart_ref" && (b.data as { name?: string })?.name === "Events over time",
+    )!;
+    const withMarks = {
+      ...snapshot,
+      blocks: [
+        {
+          ...timeBlock,
+          id: "blk-marks",
+          data: {
+            ...(timeBlock.data as object),
+            marks: {
+              cap: 50,
+              sources: [
+                { index: 0, kind: "instant", label: "first", count: 1, shown: 1, overflow: false, undated: 0 },
+              ],
+              marks: [
+                { kind: "instant", at: "2026-07-20T01:30:00+00:00", label: "first", source: 0, provenance: { kind: "analyst" } },
+              ],
+            },
+          },
+        },
+      ],
+    } as StorySnapshot;
+    const html = renderExportHtml(withMarks, "a".repeat(64));
+    expect(html).toContain("data-mark-instant");
+  });
+});

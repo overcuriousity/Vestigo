@@ -8,10 +8,11 @@ import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
+import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
 import { applyMetric, METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import type { CompareTimeResponse } from "@/api/types";
+import type { CompareTimeResponse, ResolvedMark } from "@/api/types";
 
 const fmtCount = formatNum(",d");
 const fmtMetric = formatNum(",.2~f");
@@ -34,6 +35,8 @@ interface CompareHistogramProps {
   /** Brush-to-zoom: dragging a span reports it (snapped outward to bucket
    * boundaries) so the page can narrow the shared start/end filters. */
   onRangeSelect?: (startIso: string, endIso: string) => void;
+  /** Resolved marks to overlay (see lib/marks.ts); drawn last, above the bars. */
+  marks?: ResolvedMark[];
 }
 
 /**
@@ -56,6 +59,7 @@ export function CompareHistogram({
   svgRef,
   height = 280,
   onRangeSelect,
+  marks = [],
 }: CompareHistogramProps) {
   const [hover, setHover] = useState<{ x: number; y: number; index: number } | null>(null);
   const [brush, setBrush] = useState<{ x0: number; x1: number } | null>(null);
@@ -298,6 +302,12 @@ export function CompareHistogram({
                     if (dragAnchorRef.current != null) endBrush(true);
                     else setHover(null);
                   }}
+                />
+                <MarksOverlay
+                  marks={marks}
+                  x={(d) => x(d)}
+                  innerWidth={innerWidth}
+                  innerHeight={innerHeight}
                 />
               </>
             );

@@ -9,12 +9,13 @@ import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
+import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { buildSeriesColorMap } from "@/components/viz/lib/colors";
 import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
-import type { FieldTimeseriesResponse } from "@/api/types";
+import type { FieldTimeseriesResponse, ResolvedMark } from "@/api/types";
 
 const fmtCount = formatNum(",d");
 // utcFormat, not timeFormat — bucket starts are UTC instants and the tooltip
@@ -37,6 +38,8 @@ interface LineChartProps {
   showPoints?: boolean;
   /** Click-to-filter: clicking a legend entry reports its field=value pair. */
   onValueClick?: ChartValueClickHandler;
+  /** Resolved marks to overlay (see lib/marks.ts); drawn last, above the lines. */
+  marks?: ResolvedMark[];
 }
 
 /**
@@ -53,6 +56,7 @@ export function LineChart({
   showPoints = true,
   showLegend = true,
   onValueClick,
+  marks = [],
 }: LineChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const ref = useChartRef(svgRef);
@@ -210,6 +214,12 @@ export function LineChart({
                   setHoverIdx((prev) => (prev === idx ? prev : idx));
                 }}
                 onMouseLeave={() => setHoverIdx(null)}
+              />
+              <MarksOverlay
+                marks={marks}
+                x={(d) => x(d)}
+                innerWidth={innerWidth}
+                innerHeight={innerHeight}
               />
             </>
           );
