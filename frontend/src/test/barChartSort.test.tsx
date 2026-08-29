@@ -110,3 +110,40 @@ describe("BarChart sort='value' with a labelled time field", () => {
     expect(onValueClick.mock.calls[0][0].entries).toEqual([["time:day_of_week", "1"]]);
   });
 });
+
+describe("BarChart sort='value' with a derived value order", () => {
+  it("with valueOrder, sort=value follows that order rather than the alphabet", () => {
+    const order = ["< 1,024", "1,024 – 10,240", "≥ 10,240"];
+    const { container } = render(
+      <BarChart
+        terms={terms("attr:bytes", [
+          ["≥ 10,240", 1],
+          ["< 1,024", 3],
+          ["1,024 – 10,240", 2],
+        ])}
+        sort="value"
+        valueOrder={order}
+      />,
+    );
+    expect(textsInOrder(container).filter((t) => order.includes(t))).toEqual(order);
+  });
+
+  it("keeps Other last and unknown labels after the known order", () => {
+    const order = ["< 1,024", "≥ 1,024"];
+    const { container } = render(
+      <BarChart
+        terms={terms("attr:bytes", [
+          ["stray", 9],
+          ["≥ 1,024", 1],
+          ["< 1,024", 3],
+        ], 4)}
+        sort="value"
+        valueOrder={order}
+      />,
+    );
+    const shown = textsInOrder(container).filter((t) =>
+      [...order, "stray", "Other"].includes(t),
+    );
+    expect(shown).toEqual(["< 1,024", "≥ 1,024", "stray", "Other"]);
+  });
+});

@@ -529,3 +529,15 @@ describe("specToChartConfig (current shape)", () => {
     expect(config.options.buckets).toBe(20);
   });
 });
+
+describe("specToChartConfig — derive", () => {
+  it("carries the derivation across, in the frontend's casing", () => {
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", derive: { kind: "time_part", part: "weekday" } }).derive,
+    ).toEqual({ kind: "timePart", part: "weekday" });
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", derive: { kind: "bins", mode: "log", count: 8 } }).derive,
+    ).toEqual({ kind: "bins", mode: "log", count: 8 });
+    expect(specToChartConfig({ chart_type: "bar", field: "a", derive: null }).derive).toBeNull();
+  });
+});

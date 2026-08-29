@@ -16,7 +16,7 @@ import type {
   StoryBlock,
   StoryBlockKind,
 } from "./types";
-import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
+import { parseDeriveSpec, type ChartConfig, type ChartType } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { Metric } from "@/components/viz/lib/transforms";
 
@@ -73,6 +73,14 @@ export interface AgentChartSpecV2 {
     groups?: number | null;
     show_points?: boolean | null;
     show_density?: boolean | null;
+  } | null;
+  /** The backend's `DeriveSpec` (snake_case `time_part`); `ChartConfig` spells it `timePart`. */
+  derive?: {
+    kind: "bins" | "time_part";
+    mode?: "width" | "log" | "custom" | null;
+    count?: number | null;
+    edges?: number[] | null;
+    part?: "hour" | "weekday" | "day" | "week" | "month" | null;
   } | null;
 }
 
@@ -167,6 +175,15 @@ const SCALE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartConfig["scale"]> 
  * the far side of that guard: an `ErrorBoundary` showing why one card is
  * missing beats a chart drawn from nothing.
  */
+/** Agent-spec derivation → `ChartConfig.derive`; only `kind`'s casing differs. */
+function specDeriveToConfig(raw: AgentChartSpecV2["derive"] | string): ChartConfig["derive"] {
+  const d = parseToolArgObject<NonNullable<AgentChartSpecV2["derive"]>>(raw);
+  if (!d) return null;
+  const { kind, ...rest } = d;
+  const clean = Object.fromEntries(Object.entries(rest).filter(([, v]) => v != null));
+  return parseDeriveSpec({ ...clean, kind: kind === "time_part" ? "timePart" : kind });
+}
+
 export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   const spec = parseToolArgObject<AgentChartSpec>(raw);
   if (!spec) throw new Error("chart spec is not a JSON object");
@@ -194,7 +211,7 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
   return {
     v: 2,
-    derive: null,
+    derive: specDeriveToConfig(spec.derive),
     inputs: {},
     marks: [],
     field: spec.field ?? null,

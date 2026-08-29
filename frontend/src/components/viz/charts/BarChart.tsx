@@ -40,6 +40,11 @@ interface BarChartProps {
    * order on the canonical value equals chronological order; sorting on the
    * label would silently reorder the axis. Other always stays last. */
   sort?: "count" | "value";
+  /** With `sort="value"`, the canonical value order to follow instead of the
+   * lexical one — a derived field's ranges ("< 1,024" before "≥ 10,240"),
+   * which no string comparison could order. Unknown values sort after the
+   * known ones, lexically; Other still stays last. */
+  valueOrder?: string[];
   /** Log-scaled value axis — zero counts render as zero-length bars. */
   logScale?: boolean;
   /** Click-to-filter: clicking a bar reports its field=value pair (Other is
@@ -67,6 +72,7 @@ export function BarChart({
   rowHeight = 26,
   orientation = "horizontal",
   sort = "count",
+  valueOrder,
   logScale = false,
   onValueClick,
 }: BarChartProps) {
@@ -104,8 +110,14 @@ export function BarChart({
     });
   }
   if (sort === "value") {
+    const rank = new Map((valueOrder ?? []).map((v, i) => [v, i]));
+    const byValue = (a: string, b: string) => {
+      const ra = rank.get(a) ?? Number.POSITIVE_INFINITY;
+      const rb = rank.get(b) ?? Number.POSITIVE_INFINITY;
+      return ra !== rb ? ra - rb : a.localeCompare(b);
+    };
     rows.sort((a, b) =>
-      a.key === OTHER_KEY ? 1 : b.key === OTHER_KEY ? -1 : a.key.localeCompare(b.key),
+      a.key === OTHER_KEY ? 1 : b.key === OTHER_KEY ? -1 : byValue(a.key, b.key),
     );
   }
 

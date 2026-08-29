@@ -5,12 +5,16 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { EventFilters, ScatterStats } from "@/api/types";
+import type { DeriveEcho, EventFilters, ScatterStats } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
+import { describeDerive } from "./derive";
 import { METRIC_INFO } from "./transforms";
 
 /** Data-derived facts the active query contributes to the caption. */
 export interface CaptionFacts {
+  /** A derived field's resolved derivation (the server's echo) — the edges
+   * width/log bins landed on, and whether `≤ 0` got its own range. */
+  derive?: DeriveEcho | null;
   /** kind=time: layer totals + resolved bucket width. */
   primaryTotal?: number;
   comparisonTotal?: number;
@@ -135,10 +139,23 @@ export function buildCaptionLines(args: {
           ? `event count by day-of-week × hour-of-day, UTC — ${chartLabel}`
           : field && config.fieldY
             ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
-            : field
-              ? `field: ${field} (${scale}) — ${chartLabel}`
-              : undefined,
+            : field && config.derive
+              ? `field: ${field} (${scale} → ordered categories) — ${chartLabel}`
+              : field
+                ? `field: ${field} (${scale}) — ${chartLabel}`
+                : undefined,
   );
+  // A derived chart says what it did to the values and what it could not
+  // count — a chart of ranges that did not name its edges is uncheckable.
+  if (config.derive) {
+    lines.push(
+      `derived: ${describeDerive(config.derive, facts.derive)} — ${
+        config.derive.kind === "bins"
+          ? "values that do not parse as numbers are not counted"
+          : "values that do not parse as timestamps are not counted; parts are UTC"
+      }`,
+    );
+  }
 
   // Layer summaries: what each series is, with its total.
   const primaryDesc = describeFilters(filters);

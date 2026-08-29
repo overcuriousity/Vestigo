@@ -517,6 +517,10 @@ export function VisualizePage() {
 
   useEffect(() => {
     if (chartRefLive) return;
+    // A derived chart is the analyst's explicit answer to the question this
+    // probe asks (URL / saved chart): re-picking ratio + histogram here would
+    // silently drop the derivation.
+    if (config.derive) return;
     if (!field || field === autoProbedField.current) return;
     // Inert for time fields anyway (the query is disabled, so `data` stays
     // undefined) — stated explicitly so the intent survives a refactor.
@@ -580,9 +584,9 @@ export function VisualizePage() {
   const compareTermsOn =
     compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({
-    queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN],
+    queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN, config.derive],
     queryFn: () =>
-      vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN),
+      vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN, { derive: config.derive }),
     enabled: scopeReady && !!field && dataKind === "terms" && !compareTermsOn,
     ...busyRetry,
   });
@@ -596,6 +600,7 @@ export function VisualizePage() {
       filters,
       config.compare,
       topN,
+      config.derive,
     ],
     queryFn: async () =>
       (await vizApi.compare(caseId!, timelineId!, {
@@ -604,6 +609,7 @@ export function VisualizePage() {
         primary: filters,
         comparison: compareApiSpec!,
         limit: topN,
+        derive: config.derive,
       })) as CompareTermsResponse,
     enabled: scopeReady && !!field && compareTermsOn,
     ...busyRetry,
@@ -688,6 +694,7 @@ export function VisualizePage() {
       filters,
       buckets,
       topN,
+      config.derive,
     ],
     queryFn: () =>
       vizApi.fieldTimeseries(
@@ -697,6 +704,7 @@ export function VisualizePage() {
         filters,
         buckets,
         topN,
+        config.derive,
       ),
     enabled: scopeReady && !!field && dataKind === "timeseries",
     ...busyRetry,
@@ -749,6 +757,7 @@ export function VisualizePage() {
       filters,
       limitX,
       limitY,
+      config.derive,
     ],
     queryFn: () =>
       vizApi.fieldPivot(
@@ -759,6 +768,7 @@ export function VisualizePage() {
         filters,
         limitX,
         limitY,
+        config.derive,
       ),
     enabled: scopeReady && !!(field && fieldY) && dataKind === "pivot",
     ...busyRetry,
@@ -794,6 +804,14 @@ export function VisualizePage() {
   // Data-derived caption facts for the active query — totals, grid width,
   // and top-N capping feed the truthful caption/export lines.
   const facts: CaptionFacts = {};
+  if (config.derive) {
+    facts.derive =
+      termsQuery.data?.derive ??
+      compareTermsQuery.data?.derive ??
+      timeseriesQuery.data?.derive ??
+      pivotQuery.data?.derive_x ??
+      null;
+  }
   if (dataKind === "time" && timeQuery.data) {
     facts.primaryTotal = timeQuery.data.primary_total;
     if (compareOn) facts.comparisonTotal = timeQuery.data.comparison_total;
@@ -1161,6 +1179,9 @@ export function VisualizePage() {
                   compare={compareTermsOn ? compareTermsQuery.data : undefined}
                   orientation={resolved.orientation}
                   sort={resolved.sort}
+                  valueOrder={
+                    termsQuery.data?.derive?.labels ?? compareTermsQuery.data?.derive?.labels
+                  }
                   logScale={resolved.logScale}
                   svgRef={svgRef}
                   onValueClick={handleChartValueClick}

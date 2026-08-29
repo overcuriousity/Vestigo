@@ -395,3 +395,51 @@ describe("lecture-driven caption lines", () => {
     expect(lines.some((l) => l.startsWith("readability: 6 slices"))).toBe(true);
   });
 });
+
+describe("buildCaptionLines — derivations", () => {
+  it("names the derivation, its edges and the unbinnable count", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Bar",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "bar",
+        field: "attr:bytes",
+        scale: "ratio",
+        derive: { kind: "bins", mode: "log", count: 3 },
+      },
+      filters: {},
+      facts: {
+        derive: { kind: "bins", labels: [], edges: [10, 100], negative_bin: true },
+        distinct: 3,
+        shownValues: 3,
+        otherCount: 0,
+      },
+    });
+    expect(lines).toContain("field: attr:bytes (ratio → ordered categories) — Bar");
+    expect(lines).toContain(
+      "derived: grouped into 3 log-spaced ranges (edges: 10 · 100); values ≤ 0 in their own range — values that do not parse as numbers are not counted",
+    );
+  });
+
+  it("says a calendar part is UTC and drops what does not parse", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Bar",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "bar",
+        field: "attr:logon_at",
+        scale: "interval",
+        derive: { kind: "timePart", part: "weekday" },
+      },
+      filters: {},
+      facts: {},
+    });
+    expect(lines).toContain(
+      "derived: calendar part: day of week (UTC) — values that do not parse as timestamps are not counted; parts are UTC",
+    );
+  });
+});

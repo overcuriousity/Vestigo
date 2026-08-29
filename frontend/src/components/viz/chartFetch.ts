@@ -59,6 +59,7 @@ export async function fetchChartData(
             primary: filters,
             comparison: compareApiSpec,
             limit: opts.topN,
+            derive: config.derive,
           })) as CompareTermsResponse,
         };
       }
@@ -71,6 +72,7 @@ export async function fetchChartData(
           config.field!,
           filters,
           opts.topN,
+          { derive: config.derive },
         ),
       };
     case "numeric":
@@ -126,6 +128,7 @@ export async function fetchChartData(
           filters,
           opts.buckets,
           opts.topN,
+          config.derive,
         ),
       };
     case "time": {
@@ -162,6 +165,7 @@ export async function fetchChartData(
           filters,
           opts.limitX,
           opts.limitY,
+          config.derive,
         ),
       };
     case "corr":
