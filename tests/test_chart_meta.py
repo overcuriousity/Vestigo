@@ -51,7 +51,7 @@ KNOWN_OPTION_KEYS = _known_option_keys()
 
 
 def test_table_covers_every_chart_type_exactly_once() -> None:
-    assert len(CHART_TYPES) == 18
+    assert len(CHART_TYPES) == 19
     assert set(CHART_META) == set(CHART_TYPES)
 
 
@@ -143,8 +143,9 @@ def test_pivot_and_sankey_share_one_aggregation() -> None:
 
 def test_compare_capable_charts() -> None:
     """pie/box/violin/ecdf have no honest two-layer encoding; the newer kinds
-    simply have no compare aggregation yet."""
-    assert compare_capable() == ["time", "bar", "histogram"]
+    simply have no compare aggregation yet; `change` is the one figure that
+    *requires* the layer."""
+    assert compare_capable() == ["time", "bar", "histogram", "change"]
 
 
 # ── metric legality ──────────────────────────────────────────────────────────
@@ -240,6 +241,7 @@ def test_marks_unreachable_through_the_legacy_kind_enum() -> None:
         "table",
         "cumulative",
         "calendar",
+        "change",
     }
 
 
@@ -352,3 +354,23 @@ def test_table_row_is_a_terms_shaped_figure_with_its_own_aggregation() -> None:
     assert meta.derives == ("bins", "time_part")
     assert set(meta.reads_options) == {"top_n", "table_sort_by", "table_sort_dir", "highlight"}
     assert meta.supports_compare is False and meta.supports_marks is False
+
+
+def test_change_row_is_a_compare_required_terms_shaped_figure() -> None:
+    meta = CHART_META["change"]
+    assert meta.data_kind == "change"
+    assert meta.scales == ("nominal", "ordinal")
+    assert meta.inputs == {"field": "required"}
+    assert meta.derives == ("bins", "time_part")
+    assert set(meta.reads_options) == {"top_n", "layout"}
+    assert meta.supports_compare is True and meta.requires_compare is True
+    assert meta.supports_marks is False
+
+
+def test_requires_compare_implies_supports_compare_and_is_only_change() -> None:
+    """A figure cannot require a layer it does not draw; today exactly one requires one."""
+    for chart_type in CHART_TYPES:
+        meta = CHART_META[chart_type]
+        if meta.requires_compare:
+            assert meta.supports_compare, chart_type
+    assert {c for c in CHART_TYPES if CHART_META[c].requires_compare} == {"change"}

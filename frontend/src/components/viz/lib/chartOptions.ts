@@ -63,6 +63,7 @@ export interface ResolvedChartOptions {
   bins: number | null;
   buckets: number;
   quantity: "events" | "sum" | "distinct";
+  layout: "dumbbell" | "slope";
   limitX: number;
   limitY: number;
   sampleLimit: number;
@@ -114,6 +115,7 @@ export const TOPN_MAX: Record<ChartType, number> = {
   punchcard: 50,
   cumulative: 50,
   calendar: 50,
+  change: 100,
   pivot: 50,
   sankey: 50,
   scatter: 50,
@@ -143,6 +145,7 @@ export const TOPN_SLIDER_MAX: Record<ChartType, number> = {
   heatmap: 20,
   line: 20,
   table: 50,
+  change: 20,
 };
 
 export function topNMax(chartType: ChartType): number {
@@ -179,6 +182,7 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     quantity:
       options.quantity ??
       (config.field == null ? "events" : config.scale === "ratio" ? "sum" : "distinct"),
+    layout: options.layout ?? "dumbbell",
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
     sampleLimit: options.sampleLimit ?? 5000,

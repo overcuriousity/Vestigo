@@ -32,6 +32,7 @@ export type ChartType =
   | "punchcard"
   | "cumulative"
   | "calendar"
+  | "change"
   | "pivot"
   | "sankey"
   | "scatter"
@@ -57,6 +58,8 @@ export interface ChartOptions {
   buckets?: number;
   /** cumulative: what accumulates — resolved from field/scale when omitted. */
   quantity?: "events" | "sum" | "distinct";
+  /** change: one row per value (dumbbell) or two columns (slope). Default dumbbell. */
+  layout?: "dumbbell" | "slope";
   /** pivot/sankey: per-axis top-N caps. */
   limitX?: number;
   limitY?: number;
@@ -155,6 +158,7 @@ const CHART_TYPES: ChartType[] = [
   "punchcard",
   "cumulative",
   "calendar",
+  "change",
   "pivot",
   "sankey",
   "scatter",

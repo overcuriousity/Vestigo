@@ -1483,6 +1483,38 @@ export interface CalendarResponse {
   dropped: number;
 }
 
+export type ChangeStatus = "rose" | "fell" | "new" | "vanished" | "same";
+export interface ChangeRow {
+  value: string;
+  primary: number;
+  comparison: number;
+  /** count / that window's non-empty total; 0 when the total is 0. */
+  primary_share: number;
+  comparison_share: number;
+  /** primary_share − comparison_share. */
+  delta_share: number;
+  status: ChangeStatus;
+}
+/**
+ * Ranked change from `viz/compare` (kind=change): the union of both windows'
+ * top-N values, each with its share of its own window, ranked by |Δ share|.
+ * Share, never count — the windows are rarely the same size.
+ */
+export interface ChangeResponse {
+  kind: "change";
+  field: string;
+  derive?: DeriveEcho | null;
+  top_n: number;
+  primary_total: number;
+  comparison_total: number;
+  rows: ChangeRow[];
+  union_size: number;
+  rows_shown: number;
+  union_cap: number;
+  truncated: boolean;
+  omitted: number;
+}
+
 /** One co-occurrence cell; `""` on an axis means "outside that axis's top-N" (Other). */
 export interface FieldPivotCell {
   x: string;

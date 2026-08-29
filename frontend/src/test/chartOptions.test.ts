@@ -32,6 +32,7 @@ describe("resolveChartOptions", () => {
       showPoints: false,
       buckets: 60,
       quantity: "events",
+      layout: "dumbbell",
       limitX: 10,
       limitY: 10,
       sampleLimit: 5000,
@@ -194,5 +195,18 @@ describe("resolveChartOptions — cumulative quantity", () => {
         options: { quantity: "events" },
       }).quantity,
     ).toBe("events");
+  });
+});
+
+describe("resolveChartOptions — ranked change", () => {
+  it("defaults the layout to dumbbell and keeps an explicit slope", () => {
+    const base = { ...DEFAULT_CHART_CONFIG, chartType: "change" as const, field: "artifact" };
+    expect(resolveChartOptions(base).layout).toBe("dumbbell");
+    expect(resolveChartOptions({ ...base, options: { layout: "slope" } }).layout).toBe("slope");
+  });
+
+  it("caps the per-window top-N at 100 with the slider stopping at 20", () => {
+    expect(TOPN_MAX.change).toBe(100);
+    expect(TOPN_SLIDER_MAX.change).toBe(20);
   });
 });

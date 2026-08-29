@@ -535,6 +535,10 @@ class ChartOptionsSpec(ObjectArgModel):
             '"distinct" (values seen so far). Omit to resolve from field and scale.'
         ),
     )
+    layout: Literal["dumbbell", "slope"] | None = Field(
+        default=None,
+        description='change only: "dumbbell" (default, one row per value) or "slope" (two columns).',
+    )
     limit_x: int | None = Field(default=None, ge=1, description="X-axis top-N — pivot/sankey.")
     limit_y: int | None = Field(default=None, ge=1, description="Y-axis top-N — pivot/sankey.")
     sample_limit: int | None = Field(default=None, ge=1, description="Point cap — scatter only.")

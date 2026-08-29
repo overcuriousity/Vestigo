@@ -5,6 +5,7 @@ import { marksToPayload } from "@/components/viz/lib/chartConfig";
 import { serializeEventFilterParams } from "@/lib/queryParams";
 import type {
   CalendarResponse,
+  ChangeResponse,
   CumulativeQuantity,
   CumulativeResponse,
   CompareNumericResponse,
@@ -256,17 +257,19 @@ export const vizApi = {
     caseId: string,
     timelineId: string,
     body: {
-      kind: "time" | "terms" | "numeric";
+      kind: "time" | "terms" | "numeric" | "change";
       field?: string;
       primary: EventFilters;
       comparison: CompareMode;
       buckets?: number;
       bins?: number;
       limit?: number;
-      /** `kind: "terms"` only — both layers are counted on the primary's edges. */
+      /** kinds "terms" and "change" — both layers are counted on the primary's edges. */
       derive?: DeriveSpec | null;
     },
-  ): Promise<CompareTimeResponse | CompareTermsResponse | CompareNumericResponse> =>
+  ): Promise<
+    CompareTimeResponse | CompareTermsResponse | CompareNumericResponse | ChangeResponse
+  > =>
     post(`/cases/${caseId}/timelines/${timelineId}/viz/compare`, {
       kind: body.kind,
       field: body.field,

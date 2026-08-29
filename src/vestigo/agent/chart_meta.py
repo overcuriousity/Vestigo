@@ -53,6 +53,7 @@ ChartType = Literal[
     "punchcard",
     "cumulative",
     "calendar",
+    "change",
     "pivot",
     "sankey",
     "scatter",
@@ -73,6 +74,7 @@ DataKind = Literal[
     "table",
     "cumulative",
     "calendar",
+    "change",
 ]
 
 #: What a figure asks the analyst for, from a fixed vocabulary. The Visualize
@@ -149,6 +151,10 @@ class ChartMeta:
     derives: tuple[Derive, ...] = ()
     reads_options: tuple[str, ...] = ()
     supports_compare: bool = False
+    #: The figure is *defined* by two windows — without a comparison layer
+    #: there is nothing to draw. Implies ``supports_compare``. The rail
+    #: disables Compare's *Off* for it and ``propose_chart`` refuses by name.
+    requires_compare: bool = False
     #: Instants and windows drawn over the figure. Only figures with a time
     #: axis can place a mark honestly.
     supports_marks: bool = False
@@ -327,6 +333,24 @@ CHART_META: dict[ChartType, ChartMeta] = {
             "One cell per UTC day, weeks as columns; with a field, a day counts the "
             "events whose field is non-empty. Capped at 53 weeks, latest kept, "
             "disclosed in the caption."
+        ),
+    ),
+    "change": ChartMeta(
+        label="Ranked change (share of window, two windows)",
+        question="Which values gained or lost share between the reference window and this one — and which appeared or disappeared?",
+        scales=("nominal", "ordinal"),
+        data_kind="change",
+        default_scale="nominal",
+        inputs={"field": "required"},
+        derives=("bins", "time_part"),
+        reads_options=("top_n", "layout"),
+        supports_compare=True,
+        requires_compare=True,
+        note=(
+            "Top-N values of each window, unioned; per value the share of its own "
+            "window in both, ranked by |Δ share|. Share, never count — the windows "
+            "are rarely the same size. Compare is required: baseline (the whole "
+            "timeline) or custom filters name the reference window."
         ),
     ),
     "pivot": ChartMeta(

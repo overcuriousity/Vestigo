@@ -12,6 +12,7 @@ import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { ResolvedChartOptions } from "@/components/viz/lib/chartOptions";
 import type {
   CalendarResponse,
+  ChangeResponse,
   CumulativeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
@@ -171,6 +172,22 @@ export async function fetchChartData(
         kind: "calendar" as const,
         data: await vizApi.calendar(caseId, timelineId, filters, { field: config.field }),
       };
+    case "change": {
+      if (!compareApiSpec) {
+        throw new Error("Ranked change needs a comparison layer — turn on Compare.");
+      }
+      return {
+        kind: "change" as const,
+        data: (await vizApi.compare(caseId, timelineId, {
+          kind: "change",
+          field: config.field!,
+          primary: filters,
+          comparison: compareApiSpec,
+          limit: opts.topN,
+          derive: config.derive,
+        })) as ChangeResponse,
+      };
+    }
     case "pivot":
       return {
         kind: "pivot" as const,
@@ -232,6 +249,7 @@ export type FrozenChartKind =
   | "punchcard"
   | "cumulative"
   | "calendar"
+  | "change"
   | "pivot"
   | "corr"
   | "scatter"
@@ -285,6 +303,8 @@ export function snapshotToChartResult(
       return { kind: "cumulative", data: frozen as CumulativeResponse };
     case "calendar":
       return { kind: "calendar", data: frozen as CalendarResponse };
+    case "change":
+      return { kind: "change", data: frozen as ChangeResponse };
     case "pivot":
       return { kind: "pivot", data: frozen as FieldPivotResponse };
     case "corr":

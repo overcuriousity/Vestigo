@@ -67,6 +67,9 @@ class ChartLimits:
     marks_per_source: int | None
     #: Weeks the calendar heatmap draws (latest kept, earlier disclosed).
     calendar_weeks: int
+    #: Ranked change: top-N per window before the union, and the union's row cap.
+    change_top_n: tuple[int, int]
+    change_union: int
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -87,6 +90,8 @@ AGENT_CHART_LIMITS = ChartLimits(
     table_rows=(20, 30),
     marks_per_source=20,
     calendar_weeks=53,
+    change_top_n=(10, 20),
+    change_union=30,
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -108,6 +113,8 @@ ANALYST_CHART_LIMITS = ChartLimits(
     table_rows=(50, 500),
     marks_per_source=None,
     calendar_weeks=53,
+    change_top_n=(10, 100),
+    change_union=200,
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,

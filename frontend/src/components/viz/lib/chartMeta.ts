@@ -8,7 +8,7 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table" | "cumulative" | "calendar";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table" | "cumulative" | "calendar" | "change";
 export type InputKey = "field" | "secondField" | "fields" | "laneKey" | "startFilter" | "endFilter" | "pairing" | "columns";
 export type Requirement = "required" | "optional";
 export type Derive = "bins" | "timePart";
@@ -32,6 +32,7 @@ export const CHART_META: Record<
     /** ChartOptions keys this type consumes; others are inert for it. */
     readsOptions: string[];
     supportsCompare: boolean;
+    requiresCompare: boolean;
     supportsMarks: boolean;
     /** Two-field charts (pivot/sankey/scatter) need a second field picked. */
     requiresSecondField: boolean;
@@ -54,6 +55,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["buckets"],
     supportsCompare: true,
+    requiresCompare: false,
     supportsMarks: true,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -69,6 +71,7 @@ export const CHART_META: Record<
     derives: ["bins", "timePart"],
     readsOptions: ["topN", "orientation", "sort", "logScale"],
     supportsCompare: true,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -86,6 +89,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["topN"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -103,6 +107,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["topN"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -118,6 +123,7 @@ export const CHART_META: Record<
     derives: ["bins", "timePart"],
     readsOptions: ["topN", "buckets"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -135,6 +141,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["topN", "buckets", "seriesMode", "legend", "showPoints"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: true,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -150,6 +157,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["bins", "logScale", "showDensity"],
     supportsCompare: true,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -167,6 +175,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["bins", "groups", "showPoints"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: true,
@@ -182,6 +191,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["bins", "groups", "showPoints"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: true,
@@ -197,6 +207,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["bins"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -213,6 +224,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: [],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -231,6 +243,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["buckets", "quantity"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: true,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -248,6 +261,26 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: [],
     supportsCompare: false,
+    requiresCompare: false,
+    supportsMarks: false,
+    requiresSecondField: false,
+    acceptsSecondField: false,
+    multiField: false,
+  },
+  // Top-N values of each window, unioned; per value the share of its own window in both, ranked
+  // by |Δ share|. Share, never count — the windows are rarely the same size. Compare is
+  // required: baseline (the whole timeline) or custom filters name the reference window.
+  change: {
+    label: "Ranked change (share of window, two windows)",
+    question: "Which values gained or lost share between the reference window and this one — and which appeared or disappeared?",
+    scales: ["nominal", "ordinal"],
+    dataKind: "change",
+    defaultScale: "nominal",
+    inputs: { field: "required" },
+    derives: ["bins", "timePart"],
+    readsOptions: ["topN", "layout"],
+    supportsCompare: true,
+    requiresCompare: true,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -265,6 +298,7 @@ export const CHART_META: Record<
     derives: ["bins", "timePart"],
     readsOptions: ["limitX", "limitY"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: true,
     acceptsSecondField: false,
@@ -280,6 +314,7 @@ export const CHART_META: Record<
     derives: ["bins", "timePart"],
     readsOptions: ["limitX", "limitY"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: true,
     acceptsSecondField: false,
@@ -295,6 +330,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: ["sampleLimit", "logScale"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: true,
     acceptsSecondField: false,
@@ -313,6 +349,7 @@ export const CHART_META: Record<
     derives: [],
     readsOptions: [],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: false,
@@ -331,6 +368,7 @@ export const CHART_META: Record<
     derives: ["bins", "timePart"],
     readsOptions: ["topN", "tableSortBy", "tableSortDir", "highlight"],
     supportsCompare: false,
+    requiresCompare: false,
     supportsMarks: false,
     requiresSecondField: false,
     acceptsSecondField: true,

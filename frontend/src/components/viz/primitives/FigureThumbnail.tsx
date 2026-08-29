@@ -112,6 +112,21 @@ export const THUMBNAILS: Record<ChartType, () => JSX.Element> = {
       ))}
     </>
   ),
+  change: () => (
+    <>
+      {[
+        [4, 30, 8],
+        [12, 10, 26],
+        [20, 18, 34],
+      ].map(([y, a, b]) => (
+        <g key={y}>
+          <line x1={a} x2={b} y1={y} y2={y} stroke="currentColor" strokeWidth="1.5" />
+          <circle cx={a} cy={y} r={2.5} fill="currentColor" opacity={0.4} />
+          <circle cx={b} cy={y} r={2.5} fill="currentColor" />
+        </g>
+      ))}
+    </>
+  ),
   punchcard: () => (
     <>
       {PUNCH.map((r, i) => (
