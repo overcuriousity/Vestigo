@@ -5,7 +5,12 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { DeriveEcho, EventFilters, ResolvedMarksResponse, ScatterStats } from "@/api/types";
+import type {
+  DeriveEcho,
+  EventFilters,
+  ResolvedMarksResponse,
+  ScatterStats,
+} from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { describeDerive } from "./derive";
 import { markCaptionLines } from "./marks";
@@ -21,6 +26,25 @@ export interface CaptionFacts {
   primaryTotal?: number;
   comparisonTotal?: number;
   intervalSeconds?: number;
+  /** kind=cumulative: what accumulated and what could not be. */
+  cumulative?: {
+    quantity: "events" | "sum" | "distinct";
+    field: string | null;
+    total: number;
+    events: number;
+    unparsed: number;
+  };
+  /** kind=calendar: the shown span and the week cap. */
+  calendar?: {
+    field: string | null;
+    start: string | null;
+    end: string | null;
+    weeks: number;
+    weeksTotal: number;
+    truncated: boolean;
+    dropped: number;
+    total: number;
+  };
   /** kind=terms/timeseries: top-N truthfulness. */
   distinct?: number;
   shownValues?: number;
@@ -135,7 +159,15 @@ export function buildCaptionLines(args: {
    * histogram" for the per-value drill-down modal). */
   headerLabel?: string;
 }): string[] {
-  const { caseId, timelineId, chartLabel, config, filters, facts, headerLabel } = args;
+  const {
+    caseId,
+    timelineId,
+    chartLabel,
+    config,
+    filters,
+    facts,
+    headerLabel,
+  } = args;
   const { field, scale, chartType, metric, compare } = config;
   const lines: (string | undefined)[] = [];
 
@@ -149,13 +181,23 @@ export function buildCaptionLines(args: {
         ? `event count over time — ${chartLabel}`
         : chartType === "punchcard"
           ? `event count by day-of-week × hour-of-day, UTC — ${chartLabel}`
-          : field && config.fieldY
-            ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
-            : field && config.derive
-              ? `field: ${field} (${scale} → ordered categories) — ${chartLabel}`
-              : field
-                ? `field: ${field} (${scale}) — ${chartLabel}`
-                : undefined,
+          : chartType === "cumulative"
+            ? `${
+                facts.cumulative?.quantity === "sum"
+                  ? `cumulative sum of ${field} (measure) over time`
+                  : facts.cumulative?.quantity === "distinct"
+                    ? `distinct values of ${field} seen so far`
+                    : "cumulative event count over time"
+              } — ${chartLabel}`
+            : chartType === "calendar"
+              ? `${field ? `events with a ${field} value` : "event count"} per day, UTC — ${chartLabel}`
+              : field && config.fieldY
+                ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
+                : field && config.derive
+                  ? `field: ${field} (${scale} → ordered categories) — ${chartLabel}`
+                  : field
+                    ? `field: ${field} (${scale}) — ${chartLabel}`
+                    : undefined,
   );
   // A derived chart says what it did to the values and what it could not
   // count — a chart of ranges that did not name its edges is uncheckable.
@@ -174,7 +216,9 @@ export function buildCaptionLines(args: {
   if (compare.mode !== "off") {
     lines.push(
       `primary: ${primaryDesc}` +
-        (facts.primaryTotal != null ? ` — ${fmtInt(facts.primaryTotal)} events` : ""),
+        (facts.primaryTotal != null
+          ? ` — ${fmtInt(facts.primaryTotal)} events`
+          : ""),
     );
     lines.push(
       compare.mode === "baseline"
@@ -189,7 +233,8 @@ export function buildCaptionLines(args: {
     );
   } else {
     if (filters.q) lines.push(`search: ${filters.q}`);
-    if (facts.primaryTotal != null) lines.push(`${fmtInt(facts.primaryTotal)} events`);
+    if (facts.primaryTotal != null)
+      lines.push(`${fmtInt(facts.primaryTotal)} events`);
   }
 
   if (filters.start || filters.end) {
@@ -200,7 +245,44 @@ export function buildCaptionLines(args: {
   if (facts.intervalSeconds != null && facts.intervalSeconds > 0) {
     lines.push(`${describeInterval(facts.intervalSeconds)} buckets, UTC`);
   }
-  if (facts.binCount != null && facts.valueMin != null && facts.valueMax != null) {
+  // A running total says what it reached and what it could not add — a sum
+  // that silently skipped "n/a" is a smaller number than the reader assumes.
+  if (facts.cumulative) {
+    const c = facts.cumulative;
+    const num = (n: number) =>
+      Number.isInteger(n)
+        ? fmtInt(n)
+        : n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    let line =
+      c.quantity === "distinct"
+        ? `${fmtInt(c.total)} distinct values over ${fmtInt(c.events)} events`
+        : `final value ${num(c.total)} over ${fmtInt(c.events)} events`;
+    if (c.unparsed > 0) {
+      const n = `${fmtInt(c.unparsed)} event${c.unparsed === 1 ? "" : "s"}`;
+      line +=
+        c.quantity === "sum"
+          ? `; ${n} with no numeric ${c.field} value not summed`
+          : `; ${n} with an empty ${c.field} not counted`;
+    }
+    lines.push(line);
+  }
+  // The calendar names its day boundary and its cap: a figure that quietly
+  // dropped the first eight weeks would read as "nothing happened then".
+  if (facts.calendar) {
+    const c = facts.calendar;
+    if (c.start && c.end)
+      lines.push(`${c.weeks} weeks, ${c.start} → ${c.end}, day boundaries UTC`);
+    if (c.truncated) {
+      lines.push(
+        `latest ${c.weeks} of ${c.weeksTotal} weeks drawn; ${fmtInt(c.dropped)} earlier events not drawn`,
+      );
+    }
+  }
+  if (
+    facts.binCount != null &&
+    facts.valueMin != null &&
+    facts.valueMax != null
+  ) {
     // Each rule names itself exactly. Crediting Freedman–Diaconis for a fixed
     // fallback, or for a count the clamp overrode, would put a decision in the
     // caption that the data never made.
@@ -233,23 +315,32 @@ export function buildCaptionLines(args: {
   if (chartType === "table") {
     if (facts.tableSort) {
       const label =
-        TABLE_COLUMN_LABELS[facts.tableSort.by as keyof typeof TABLE_COLUMN_LABELS] ??
-        facts.tableSort.by;
+        TABLE_COLUMN_LABELS[
+          facts.tableSort.by as keyof typeof TABLE_COLUMN_LABELS
+        ] ?? facts.tableSort.by;
       lines.push(
         `sorted by ${label} (${facts.tableSort.dir === "asc" ? "ascending" : "descending"})`,
       );
     }
     if (facts.tableTotal != null && field) {
-      lines.push(`share = count / ${fmtInt(facts.tableTotal)} events with a non-empty ${field}`);
+      lines.push(
+        `share = count / ${fmtInt(facts.tableTotal)} events with a non-empty ${field}`,
+      );
     }
-    if (facts.tableRemainder && facts.distinct != null && facts.shownValues != null) {
+    if (
+      facts.tableRemainder &&
+      facts.distinct != null &&
+      facts.shownValues != null
+    ) {
       const more = facts.tableRemainder.distinctValues;
       lines.push(
         `showing top ${fmtInt(facts.shownValues)} of ${fmtInt(facts.distinct)} distinct values; ${fmtInt(facts.tableRemainder.count)} events across ${fmtInt(more)} more value${more === 1 ? "" : "s"} in the remainder row`,
       );
     }
     if (facts.tableHighlight?.length) {
-      lines.push(`highlighted rows: ${facts.tableHighlight.join(" · ")} — presentation only`);
+      lines.push(
+        `highlighted rows: ${facts.tableHighlight.join(" · ")} — presentation only`,
+      );
     }
   }
   if (facts.marks && facts.marks.sources.length > 0) {
@@ -268,12 +359,20 @@ export function buildCaptionLines(args: {
           : ")"),
     );
   }
-  if (facts.xDistinct != null && facts.xShown != null && facts.xDistinct > facts.xShown) {
+  if (
+    facts.xDistinct != null &&
+    facts.xShown != null &&
+    facts.xDistinct > facts.xShown
+  ) {
     lines.push(
       `x-axis: top ${fmtInt(facts.xShown)} of ${fmtInt(facts.xDistinct)} distinct values (rest in "Other")`,
     );
   }
-  if (facts.yDistinct != null && facts.yShown != null && facts.yDistinct > facts.yShown) {
+  if (
+    facts.yDistinct != null &&
+    facts.yShown != null &&
+    facts.yDistinct > facts.yShown
+  ) {
     lines.push(
       `y-axis: top ${fmtInt(facts.yShown)} of ${fmtInt(facts.yDistinct)} distinct values (rest in "Other")`,
     );
@@ -295,7 +394,10 @@ export function buildCaptionLines(args: {
           : "") +
         " — all groups binned over the same value range",
     );
-    if (facts.groupDistinct != null && facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT) {
+    if (
+      facts.groupDistinct != null &&
+      facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT
+    ) {
       lines.push(
         `${facts.groupField} has ${fmtInt(facts.groupDistinct)} distinct values — that is usually an identifier rather than a grouping variable, and only the largest groups are drawn`,
       );
@@ -356,15 +458,23 @@ export function buildCaptionLines(args: {
         `no numeric values under these filters: ${facts.corrDropped.join(", ")} — their cells are empty`,
       );
     }
-    lines.push("correlation is not causation; a coefficient near 0 rules out only the relationship it measures");
+    lines.push(
+      "correlation is not causation; a coefficient near 0 rules out only the relationship it measures",
+    );
   }
-  if (facts.readabilityWarning) lines.push(`readability: ${facts.readabilityWarning}`);
+  if (facts.readabilityWarning)
+    lines.push(`readability: ${facts.readabilityWarning}`);
   if (metric === "delta") lines.push("first bin omitted (Δ undefined)");
-  if (metric === "ratio") lines.push("bins with a zero-count comparison layer omitted (ratio undefined)");
+  if (metric === "ratio")
+    lines.push(
+      "bins with a zero-count comparison layer omitted (ratio undefined)",
+    );
 
   // Metric formula.
   if (metric !== "count") {
-    lines.push(`metric: ${METRIC_INFO[metric].label} = ${METRIC_INFO[metric].formula}`);
+    lines.push(
+      `metric: ${METRIC_INFO[metric].label} = ${METRIC_INFO[metric].formula}`,
+    );
   }
 
   return lines.filter((l): l is string => !!l);

@@ -510,3 +510,82 @@ describe("buildCaptionLines — marks", () => {
     expect(lines).toContain('mark #1: "first" at 2026-07-20 09:41:00Z — analyst-placed');
   });
 });
+
+describe("buildCaptionLines — cumulative and calendar", () => {
+  it("names the quantity, the field, the bucket width and what was not summed", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step (running total over time)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "cumulative",
+        field: "attr:bytes",
+        scale: "ratio",
+      },
+      facts: {
+        intervalSeconds: 3600,
+        cumulative: { quantity: "sum", field: "attr:bytes", total: 40, events: 7, unparsed: 1 },
+      },
+    });
+    expect(lines).toContain(
+      "cumulative sum of attr:bytes (measure) over time — Cumulative step (running total over time)",
+    );
+    expect(lines).toContain("1 h buckets, UTC");
+    expect(lines).toContain(
+      "final value 40 over 7 events; 1 event with no numeric attr:bytes value not summed",
+    );
+  });
+
+  it("says what a distinct count and a plain event count accumulate", () => {
+    const distinct = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "cumulative",
+        field: "attr:user",
+        scale: "nominal",
+      },
+      facts: {
+        cumulative: { quantity: "distinct", field: "attr:user", total: 4, events: 7, unparsed: 1 },
+      },
+    });
+    expect(distinct).toContain("distinct values of attr:user seen so far — Cumulative step");
+    expect(distinct).toContain(
+      "4 distinct values over 7 events; 1 event with an empty attr:user not counted",
+    );
+    const events = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "cumulative" },
+      facts: { cumulative: { quantity: "events", field: null, total: 7, events: 7, unparsed: 0 } },
+    });
+    expect(events).toContain("cumulative event count over time — Cumulative step");
+    expect(events).toContain("final value 7 over 7 events");
+  });
+
+  it("states the calendar's UTC day boundary, its span and the week cap", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Calendar heatmap (events per day)",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "calendar", field: "attr:user" },
+      facts: {
+        calendar: {
+          field: "attr:user",
+          start: "2025-07-21",
+          end: "2026-07-22",
+          weeks: 53,
+          weeksTotal: 61,
+          truncated: true,
+          dropped: 9,
+          total: 400,
+        },
+      },
+    });
+    expect(lines).toContain(
+      "events with a attr:user value per day, UTC — Calendar heatmap (events per day)",
+    );
+    expect(lines).toContain("53 weeks, 2025-07-21 → 2026-07-22, day boundaries UTC");
+    expect(lines).toContain("latest 53 of 61 weeks drawn; 9 earlier events not drawn");
+  });
+});

@@ -363,3 +363,41 @@ describe("ChartRail — marks", () => {
     expect(sectionOrder()).not.toContain("marks");
   });
 });
+
+describe("ChartRail — field-optional figures", () => {
+  it("offers 'No field' on a cumulative and keeps the figure when a field is picked", () => {
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative",
+      field: null,
+    });
+    // The optional hint, not the field-free reason.
+    expect(screen.getByText(/without a field this figure counts every event/i)).toBeTruthy();
+    const combo = screen.getByRole("combobox", { name: "Field" });
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(screen.getByRole("option", { name: /^artifact/ }));
+    expect(updateConfig).toHaveBeenLastCalledWith(expect.objectContaining({ field: "artifact" }));
+    expect(updateConfig).not.toHaveBeenCalledWith(
+      expect.objectContaining({ chartType: expect.anything() }),
+    );
+  });
+
+  it("renders the Quantity select for cumulative and greys the dishonest choices", () => {
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative",
+      field: "artifact",
+      scale: "nominal",
+    });
+    fireEvent.click(screen.getByText("Options"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Quantity" }));
+    expect(
+      screen
+        .getByRole("option", { name: "Distinct values seen so far" })
+        .getAttribute("aria-disabled"),
+    ).not.toBe("true");
+    expect(
+      screen.getByRole("option", { name: "Running sum (measure)" }).getAttribute("aria-disabled"),
+    ).toBe("true");
+  });
+});

@@ -22,7 +22,11 @@ import {
   SelectValue,
 } from "@/components/ui/Select";
 import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
-import type { EventFilters, ResolvedMarksResponse, VizFieldInfo } from "@/api/types";
+import type {
+  EventFilters,
+  ResolvedMarksResponse,
+  VizFieldInfo,
+} from "@/api/types";
 import { ExportControls } from "./ExportControls";
 import { CompareFilterEditor } from "./CompareFilterEditor";
 import { MarksEditor } from "./MarksEditor";
@@ -286,7 +290,10 @@ const TABLE_COLUMN_CHOICES: TableColumn[] = [
   "last_seen",
   "distinct_second",
 ];
-const TABLE_SORT_CHOICES: TableSortColumn[] = ["value", ...TABLE_COLUMN_CHOICES];
+const TABLE_SORT_CHOICES: TableSortColumn[] = [
+  "value",
+  ...TABLE_COLUMN_CHOICES,
+];
 
 /** Comma-separated values whose rows are highlighted; committed on blur/Enter. */
 function HighlightInput({
@@ -348,9 +355,13 @@ function EdgesInput({
       .map(Number);
     const ok =
       parsed.length > 0 &&
-      parsed.every((n, i) => Number.isFinite(n) && (i === 0 || n > parsed[i - 1]));
+      parsed.every(
+        (n, i) => Number.isFinite(n) && (i === 0 || n > parsed[i - 1]),
+      );
     if (!ok) {
-      setProblem("Edges must be numbers in increasing order, e.g. 0, 1024, 10240");
+      setProblem(
+        "Edges must be numbers in increasing order, e.g. 0, 1024, 10240",
+      );
       return;
     }
     setProblem(null);
@@ -359,7 +370,9 @@ function EdgesInput({
   };
   return (
     <div>
-      <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">Edges</label>
+      <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+        Edges
+      </label>
       <input
         type="text"
         aria-label="Range edges"
@@ -371,7 +384,9 @@ function EdgesInput({
         }}
         className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
       />
-      {problem && <p className="mt-1 text-xs text-[var(--color-warning)]">{problem}</p>}
+      {problem && (
+        <p className="mt-1 text-xs text-[var(--color-warning)]">{problem}</p>
+      )}
     </div>
   );
 }
@@ -526,12 +541,16 @@ export function ChartRail({
   const selectedFields = config.fields ?? [];
   const groupedOn = acceptsSecondField && !!fieldY;
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
+  // A third state: the figure charts every event without a field and the
+  // field's values with one. "No field" is selectable and keeps the figure.
+  const fieldOptional = CHART_META[chartType].inputs.field === "optional";
   const compareOn = config.compare.mode !== "off";
   const compareSupported = CHART_META[chartType].supportsCompare;
   const {
     topN,
     bins,
     buckets,
+    quantity,
     limitX,
     limitY,
     sampleLimit,
@@ -555,7 +574,10 @@ export function ChartRail({
   // render with an inconsistent scale/chartType pair.
   const handleScaleChange = (s: Scale) => {
     // A derivation the new treat-as no longer offers is dropped with it.
-    const nextDerive = derive && deriveOptionsFor(s, field).includes(derive.kind) ? derive : null;
+    const nextDerive =
+      derive && deriveOptionsFor(s, field).includes(derive.kind)
+        ? derive
+        : null;
     const eff = effectiveScale(s, nextDerive);
     const patch: Partial<ChartConfig> = { scale: s };
     if (nextDerive !== derive) patch.derive = nextDerive;
@@ -588,7 +610,11 @@ export function ChartRail({
     } else if (chartOverride) {
       patch.chartType = chartOverride;
     }
-    if (next && (patch.chartType ?? chartType) === "bar" && config.options.sort == null) {
+    if (
+      next &&
+      (patch.chartType ?? chartType) === "bar" &&
+      config.options.sort == null
+    ) {
       patch.options = { ...config.options, sort: "value" };
     }
     updateConfig(patch);
@@ -598,7 +624,7 @@ export function ChartRail({
     {
       value: NO_FIELD,
       label: "No field — count every event",
-      hint: "(events over time, punch card)",
+      hint: "(events over time, punch card, cumulative, calendar)",
     },
     ...fields.map(fieldComboOption),
   ];
@@ -666,10 +692,14 @@ export function ChartRail({
           aria-label={requiresSecondField ? "Field (X)" : "Field"}
           placeholder="Choose a field…"
           options={fieldOptions}
-          value={fieldFree ? NO_FIELD : (field ?? "")}
+          value={
+            fieldFree || (fieldOptional && !field) ? NO_FIELD : (field ?? "")
+          }
           onChange={(v) => {
             if (v === NO_FIELD) {
-              if (!fieldFree) updateConfig({ field: null, chartType: "time" });
+              if (fieldOptional) updateConfig({ field: null, derive: null });
+              else if (!fieldFree)
+                updateConfig({ field: null, chartType: "time" });
               setAutoNotice(null);
               return;
             }
@@ -682,7 +712,8 @@ export function ChartRail({
               ? { field: v, fieldY: null }
               : { field: v };
             // A derivation the new field does not offer goes with the old one.
-            if (derive && !deriveOptionsFor(scale, v).includes(derive.kind)) patch.derive = null;
+            if (derive && !deriveOptionsFor(scale, v).includes(derive.kind))
+              patch.derive = null;
             if (fieldFree) {
               // Leaving a field-free figure: land on the first figure that
               // charts a field, and say so — the analyst picked a field, not
@@ -703,6 +734,11 @@ export function ChartRail({
         {fieldFree && (
           <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
             {fieldFreeReason(chartType)}
+          </p>
+        )}
+        {fieldOptional && (
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Optional — without a field this figure counts every event.
           </p>
         )}
       </div>
@@ -785,7 +821,9 @@ export function ChartRail({
                   name="derive"
                   aria-label={opt.label}
                   checked={(derive?.kind ?? null) === opt.key}
-                  onChange={() => applyDerive(opt.key ? defaultDerive(opt.key, scale) : null)}
+                  onChange={() =>
+                    applyDerive(opt.key ? defaultDerive(opt.key, scale) : null)
+                  }
                   className="accent-[var(--color-accent)]"
                 />
                 {opt.label}
@@ -808,12 +846,17 @@ export function ChartRail({
                   )
                 }
               >
-                <SelectTrigger className="h-7 text-xs" aria-label="Range spacing">
+                <SelectTrigger
+                  className="h-7 text-xs"
+                  aria-label="Range spacing"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="width">Equal-width ranges</SelectItem>
-                  <SelectItem value="log">Log-spaced ranges (bytes, durations)</SelectItem>
+                  <SelectItem value="log">
+                    Log-spaced ranges (bytes, durations)
+                  </SelectItem>
                   <SelectItem value="custom">My own edges</SelectItem>
                 </SelectContent>
               </Select>
@@ -830,7 +873,11 @@ export function ChartRail({
                     step={1}
                     value={derive.count}
                     onChange={(e) =>
-                      applyDerive({ kind: "bins", mode: derive.mode, count: Number(e.target.value) })
+                      applyDerive({
+                        kind: "bins",
+                        mode: derive.mode,
+                        count: Number(e.target.value),
+                      })
                     }
                     className="w-full accent-[var(--color-accent)]"
                   />
@@ -838,7 +885,9 @@ export function ChartRail({
               ) : (
                 <EdgesInput
                   edges={derive.edges}
-                  onCommit={(edges) => applyDerive({ kind: "bins", mode: "custom", edges })}
+                  onCommit={(edges) =>
+                    applyDerive({ kind: "bins", mode: "custom", edges })
+                  }
                 />
               )}
             </div>
@@ -846,9 +895,14 @@ export function ChartRail({
           {derive?.kind === "timePart" && (
             <Select
               value={derive.part}
-              onValueChange={(v) => applyDerive({ kind: "timePart", part: v as TimePart })}
+              onValueChange={(v) =>
+                applyDerive({ kind: "timePart", part: v as TimePart })
+              }
             >
-              <SelectTrigger className="mt-2 h-7 text-xs" aria-label="Calendar part">
+              <SelectTrigger
+                className="mt-2 h-7 text-xs"
+                aria-label="Calendar part"
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -879,58 +933,63 @@ export function ChartRail({
           aria-label="Figure"
           className="grid grid-cols-3 gap-1"
         >
-          {galleryEntries(effScale, field).map(({ chartType: c, legal, reason }) => {
-            // A greyed figure that exactly one derivation would light applies
-            // it on click and says so; two candidates would be a guess, so
-            // the tile stays inert and its tooltip stays the reason.
-            const fix = legal ? null : singleFixFor(c, scale, field);
-            return (
-              <Button
-                key={c}
-                variant="ghost"
-                size="sm"
-                role="radio"
-                aria-checked={chartType === c}
-                aria-disabled={!legal}
-                aria-label={CHART_META[c].label}
-                title={
-                  fix && reason
-                    ? `${reason} Click to ${describeDerive(fix)}.`
-                    : (reason ?? CHART_META[c].question)
-                }
-                onClick={() => {
-                  if (legal) {
-                    updateConfig({ chartType: c });
-                    setAutoNotice(null);
-                    return;
+          {galleryEntries(effScale, field).map(
+            ({ chartType: c, legal, reason }) => {
+              // A greyed figure that exactly one derivation would light applies
+              // it on click and says so; two candidates would be a guess, so
+              // the tile stays inert and its tooltip stays the reason.
+              const fix = legal ? null : singleFixFor(c, scale, field);
+              return (
+                <Button
+                  key={c}
+                  variant="ghost"
+                  size="sm"
+                  role="radio"
+                  aria-checked={chartType === c}
+                  aria-disabled={!legal}
+                  aria-label={CHART_META[c].label}
+                  title={
+                    fix && reason
+                      ? `${reason} Click to ${describeDerive(fix)}.`
+                      : (reason ?? CHART_META[c].question)
                   }
-                  if (!fix || !field) return;
-                  applyDerive(fix, c);
-                  setAutoNotice(
-                    `${CHART_META[c].label} needs categories — ${
-                      fix.kind === "timePart"
-                        ? `took the ${TIME_PART_LABELS[fix.part]} (UTC) of ${fieldTokenLabel(field)}`
-                        : describeDerive(fix).replace(/^grouped/, `grouped ${fieldTokenLabel(field)}`)
-                    }.`,
-                  );
-                }}
-                className={`flex h-auto flex-col items-center gap-0.5 rounded border px-1 py-1.5 ${
-                  chartType === c
-                    ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-fg-primary)]"
-                    : legal
-                      ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
-                      : fix
-                        ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40 hover:opacity-70"
-                        : "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40"
-                }`}
-              >
-                <FigureThumbnail chartType={c} />
-                <span className="w-full truncate text-center text-xs leading-tight">
-                  {shortLabel(c)}
-                </span>
-              </Button>
-            );
-          })}
+                  onClick={() => {
+                    if (legal) {
+                      updateConfig({ chartType: c });
+                      setAutoNotice(null);
+                      return;
+                    }
+                    if (!fix || !field) return;
+                    applyDerive(fix, c);
+                    setAutoNotice(
+                      `${CHART_META[c].label} needs categories — ${
+                        fix.kind === "timePart"
+                          ? `took the ${TIME_PART_LABELS[fix.part]} (UTC) of ${fieldTokenLabel(field)}`
+                          : describeDerive(fix).replace(
+                              /^grouped/,
+                              `grouped ${fieldTokenLabel(field)}`,
+                            )
+                      }.`,
+                    );
+                  }}
+                  className={`flex h-auto flex-col items-center gap-0.5 rounded border px-1 py-1.5 ${
+                    chartType === c
+                      ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-fg-primary)]"
+                      : legal
+                        ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-accent)]"
+                        : fix
+                          ? "border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40 hover:opacity-70"
+                          : "cursor-not-allowed border-[var(--color-border)] text-[var(--color-fg-secondary)] opacity-40"
+                  }`}
+                >
+                  <FigureThumbnail chartType={c} />
+                  <span className="w-full truncate text-center text-xs leading-tight">
+                    {shortLabel(c)}
+                  </span>
+                </Button>
+              );
+            },
+          )}
         </div>
         <p className="mt-1 text-xs text-[var(--color-fg-secondary)]">
           {CHART_META[chartType].question}
@@ -1061,7 +1120,9 @@ export function ChartRail({
             {TABLE_COLUMN_CHOICES.map((c) => {
               const current =
                 config.inputs.columns ??
-                (fieldY ? [...DEFAULT_TABLE_COLUMNS, "distinct_second"] : DEFAULT_TABLE_COLUMNS);
+                (fieldY
+                  ? [...DEFAULT_TABLE_COLUMNS, "distinct_second"]
+                  : DEFAULT_TABLE_COLUMNS);
               const checked = current.includes(c);
               const disabled = c === "distinct_second" && !fieldY;
               return (
@@ -1082,13 +1143,17 @@ export function ChartRail({
                       const next = TABLE_COLUMN_CHOICES.filter((k) =>
                         k === c ? e.target.checked : current.includes(k),
                       );
-                      updateConfig({ inputs: { ...config.inputs, columns: next } });
+                      updateConfig({
+                        inputs: { ...config.inputs, columns: next },
+                      });
                     }}
                     className="accent-[var(--color-accent)]"
                   />
                   {TABLE_COLUMN_LABELS[c]}
                   {disabled && (
-                    <span className="text-[var(--color-fg-muted)]">— needs a second field</span>
+                    <span className="text-[var(--color-fg-muted)]">
+                      — needs a second field
+                    </span>
                   )}
                 </label>
               );
@@ -1224,12 +1289,56 @@ export function ChartRail({
         chartType === "histogram" ||
         chartType === "time" ||
         chartType === "line" ||
+        chartType === "cumulative" ||
         chartType === "table") && (
         <details className="rounded border border-[var(--color-border)]">
           <summary className="cursor-pointer px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
             Options
           </summary>
           <div className="space-y-3 px-2 pb-2 pt-1">
+            {chartType === "cumulative" && (
+              <div>
+                <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
+                  Quantity
+                </label>
+                <Select
+                  value={quantity}
+                  onValueChange={(v) =>
+                    updateConfig({
+                      options: {
+                        ...config.options,
+                        quantity: v as "events" | "sum" | "distinct",
+                      },
+                    })
+                  }
+                >
+                  <SelectTrigger className="h-7 text-xs" aria-label="Quantity">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="events">Running event count</SelectItem>
+                    <SelectItem
+                      value="sum"
+                      disabled={!field || scale !== "ratio"}
+                    >
+                      Running sum (measure)
+                    </SelectItem>
+                    <SelectItem
+                      value="distinct"
+                      disabled={
+                        !field || (scale !== "nominal" && scale !== "ordinal")
+                      }
+                    >
+                      Distinct values seen so far
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+                  Sum needs a field treated as Measure; distinct needs
+                  Categories or Ordered categories.
+                </p>
+              </div>
+            )}
             {chartType === "table" && (
               <>
                 <div>
@@ -1240,7 +1349,10 @@ export function ChartRail({
                     value={config.options.tableSortBy ?? "count"}
                     onValueChange={(v) =>
                       updateConfig({
-                        options: { ...config.options, tableSortBy: v as TableSortColumn },
+                        options: {
+                          ...config.options,
+                          tableSortBy: v as TableSortColumn,
+                        },
                       })
                     }
                   >
@@ -1268,11 +1380,17 @@ export function ChartRail({
                     value={config.options.tableSortDir ?? "desc"}
                     onValueChange={(v) =>
                       updateConfig({
-                        options: { ...config.options, tableSortDir: v as "asc" | "desc" },
+                        options: {
+                          ...config.options,
+                          tableSortDir: v as "asc" | "desc",
+                        },
                       })
                     }
                   >
-                    <SelectTrigger className="h-7 text-xs" aria-label="Direction">
+                    <SelectTrigger
+                      className="h-7 text-xs"
+                      aria-label="Direction"
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1286,7 +1404,9 @@ export function ChartRail({
                   onCommit={(values) => {
                     const { highlight: _dropped, ...rest } = config.options;
                     updateConfig({
-                      options: values.length ? { ...rest, highlight: values } : rest,
+                      options: values.length
+                        ? { ...rest, highlight: values }
+                        : rest,
                     });
                   }}
                 />
@@ -1364,7 +1484,7 @@ export function ChartRail({
                 Log-scale count axis
               </label>
             )}
-            {chartType === "time" && (
+            {(chartType === "time" || chartType === "cumulative") && (
               <div>
                 <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
                   Buckets: {buckets}
@@ -1552,7 +1672,9 @@ export function ChartRail({
           )}
         </div>
       )}
-      {(dataKind === "terms" || dataKind === "timeseries" || dataKind === "table") && (
+      {(dataKind === "terms" ||
+        dataKind === "timeseries" ||
+        dataKind === "table") && (
         <TopNControl
           chartType={chartType}
           dataKind={dataKind}

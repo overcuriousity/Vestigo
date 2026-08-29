@@ -62,6 +62,8 @@ import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
+import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -366,6 +368,9 @@ export function VisualizePage() {
   const groupedOn = acceptsSecondField && !!fieldY;
   // "time" and "punchcard" chart the whole event count — no field involved.
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
+  // "cumulative" and "calendar" take an optional field: every event without
+  // one, the field's values with one. Probed like a bar when a field is set.
+  const fieldOptional = CHART_META[chartType].inputs.field === "optional";
   const compareOn = config.compare.mode !== "off";
   const compareApiSpec: CompareMode | null =
     config.compare.mode === "baseline"
@@ -381,6 +386,7 @@ export function VisualizePage() {
     topN,
     bins,
     buckets,
+    quantity,
     limitX,
     limitY,
     sampleLimit,
@@ -536,7 +542,8 @@ export function VisualizePage() {
     // punchcard) or a deliberately-picked two-field chart.
     // The table is legal at nominal and ordinal only, and the analyst chose a
     // table: a numeric probe must not re-pick the figure out from under it.
-    if (fieldFree || requiresSecondField || multiField || chartType === "table") return;
+    if (fieldFree || requiresSecondField || multiField || chartType === "table")
+      return;
     const isNumeric = numericQuery.data.count > 0;
     const nextScale: Scale = isNumeric ? "ratio" : "nominal";
     const nextType: ChartType = isNumeric ? "histogram" : "bar";
@@ -591,9 +598,19 @@ export function VisualizePage() {
   const compareTermsOn =
     compareOn && chartType === "bar" && compareApiSpec != null;
   const termsQuery = useQuery({
-    queryKey: ["viz-field-terms", caseId, timelineId, field, filters, topN, config.derive],
+    queryKey: [
+      "viz-field-terms",
+      caseId,
+      timelineId,
+      field,
+      filters,
+      topN,
+      config.derive,
+    ],
     queryFn: () =>
-      vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN, { derive: config.derive }),
+      vizApi.fieldTerms(caseId!, timelineId!, field!, filters, topN, {
+        derive: config.derive,
+      }),
     enabled: scopeReady && !!field && dataKind === "terms" && !compareTermsOn,
     ...busyRetry,
   });
@@ -752,6 +769,33 @@ export function VisualizePage() {
     ...busyRetry,
   });
 
+  const cumulativeQuery = useQuery({
+    queryKey: [
+      "viz-cumulative",
+      caseId,
+      timelineId,
+      filters,
+      field,
+      quantity,
+      buckets,
+    ],
+    queryFn: () =>
+      vizApi.cumulative(caseId!, timelineId!, filters, {
+        field,
+        quantity,
+        buckets,
+      }),
+    enabled: scopeReady && dataKind === "cumulative",
+    ...busyRetry,
+  });
+
+  const calendarQuery = useQuery({
+    queryKey: ["viz-calendar", caseId, timelineId, filters, field],
+    queryFn: () => vizApi.calendar(caseId!, timelineId!, filters, { field }),
+    enabled: scopeReady && dataKind === "calendar",
+    ...busyRetry,
+  });
+
   // Shared by the pivot heatmap AND the sankey (same aggregation, two marks)
   // — switching between those chart types refetches nothing.
   const tableQuery = useQuery({
@@ -901,6 +945,30 @@ export function VisualizePage() {
     facts.intervalSeconds = timeseriesQuery.data.interval_seconds;
   } else if (dataKind === "punchcard" && punchcardQuery.data) {
     facts.primaryTotal = punchcardQuery.data.total;
+  } else if (dataKind === "cumulative" && cumulativeQuery.data) {
+    const d = cumulativeQuery.data;
+    facts.primaryTotal = d.events;
+    if (d.interval_seconds > 0) facts.intervalSeconds = d.interval_seconds;
+    facts.cumulative = {
+      quantity: d.quantity,
+      field: d.field,
+      total: d.total,
+      events: d.events,
+      unparsed: d.unparsed,
+    };
+  } else if (dataKind === "calendar" && calendarQuery.data) {
+    const d = calendarQuery.data;
+    facts.primaryTotal = d.total;
+    facts.calendar = {
+      field: d.field,
+      start: d.start,
+      end: d.end,
+      weeks: d.weeks,
+      weeksTotal: d.weeks_total,
+      truncated: d.truncated,
+      dropped: d.dropped,
+      total: d.total,
+    };
   } else if (dataKind === "table" && tableQuery.data) {
     facts.primaryTotal = tableQuery.data.total;
     facts.tableTotal = tableQuery.data.total;
@@ -994,7 +1062,9 @@ export function VisualizePage() {
   // The table's CSV is built from the response the figure already holds, under
   // the same caption lines the image export carries.
   const csvText =
-    chartType === "table" && tableQuery.data ? tableCsv(tableQuery.data, config, captionLines) : null;
+    chartType === "table" && tableQuery.data
+      ? tableCsv(tableQuery.data, config, captionLines)
+      : null;
 
   // The one query behind the chart on screen. Named once rather than
   // re-derived per state, so the spinner, the busy-lane badge and any future
@@ -1018,15 +1088,19 @@ export function VisualizePage() {
             ? timeseriesQuery
             : dataKind === "punchcard"
               ? punchcardQuery
-              : dataKind === "pivot"
-                ? pivotQuery
-                : dataKind === "table"
-                  ? tableQuery
-                  : dataKind === "scatter"
-                    ? scatterQuery
-                    : dataKind === "corr"
-                      ? correlationQuery
-                      : null;
+              : dataKind === "cumulative"
+                ? cumulativeQuery
+                : dataKind === "calendar"
+                  ? calendarQuery
+                  : dataKind === "pivot"
+                    ? pivotQuery
+                    : dataKind === "table"
+                      ? tableQuery
+                      : dataKind === "scatter"
+                        ? scatterQuery
+                        : dataKind === "corr"
+                          ? correlationQuery
+                          : null;
 
   const loading = activeQuery?.isLoading ?? false;
 
@@ -1140,7 +1214,7 @@ export function VisualizePage() {
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-[var(--color-fg-muted)]">
             Pick at least two numeric fields to correlate.
           </div>
-        ) : !fieldFree && !multiField && !field ? (
+        ) : !fieldFree && !fieldOptional && !multiField && !field ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-[var(--color-fg-muted)]">
             {fieldsQuery.isLoading ? (
               <>
@@ -1235,7 +1309,8 @@ export function VisualizePage() {
                   orientation={resolved.orientation}
                   sort={resolved.sort}
                   valueOrder={
-                    termsQuery.data?.derive?.labels ?? compareTermsQuery.data?.derive?.labels
+                    termsQuery.data?.derive?.labels ??
+                    compareTermsQuery.data?.derive?.labels
                   }
                   logScale={resolved.logScale}
                   svgRef={svgRef}
@@ -1368,6 +1443,16 @@ export function VisualizePage() {
             )}
             {chartType === "punchcard" && punchcardQuery.data && (
               <PunchCard data={punchcardQuery.data} svgRef={svgRef} />
+            )}
+            {chartType === "cumulative" && cumulativeQuery.data && (
+              <CumulativeStep
+                data={cumulativeQuery.data}
+                svgRef={svgRef}
+                marks={marksQuery.data?.marks}
+              />
+            )}
+            {chartType === "calendar" && calendarQuery.data && (
+              <CalendarHeatmap data={calendarQuery.data} svgRef={svgRef} />
             )}
             {chartType === "table" && tableQuery.data && (
               <TableFigure
