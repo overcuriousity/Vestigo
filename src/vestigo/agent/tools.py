@@ -546,6 +546,25 @@ class ChartOptionsSpec(ObjectArgModel):
             "(jittered strip) and line (markers at real data points)."
         ),
     )
+    table_sort_by: (
+        Literal["value", "count", "share", "first_seen", "last_seen", "distinct_second"] | None
+    ) = Field(
+        default=None,
+        description=(
+            'Table row order — table only. Default "count". "distinct_second" needs field_y; '
+            '"share" orders like "count".'
+        ),
+    )
+    table_sort_dir: Literal["asc", "desc"] | None = Field(
+        default=None, description='Table sort direction — table only. Default "desc".'
+    )
+    highlight: list[str] | None = Field(
+        default=None,
+        description=(
+            "Values whose table rows are highlighted — table only. Presentation only, and "
+            "disclosed in the caption."
+        ),
+    )
 
 
 class ChartDeriveSpec(ObjectArgModel, DeriveSpec):

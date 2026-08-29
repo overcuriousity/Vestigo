@@ -50,7 +50,7 @@ KNOWN_OPTION_KEYS = _known_option_keys()
 
 
 def test_table_covers_every_chart_type_exactly_once() -> None:
-    assert len(CHART_TYPES) == 15
+    assert len(CHART_TYPES) == 16
     assert set(CHART_META) == set(CHART_TYPES)
 
 
@@ -202,6 +202,7 @@ def test_marks_unreachable_through_the_legacy_kind_enum() -> None:
         "violin",
         "ecdf",
         "sankey",
+        "table",
     }
 
 
@@ -260,7 +261,11 @@ def test_second_field_flags_derive_from_inputs() -> None:
         "sankey",
         "scatter",
     }
-    assert {c for c in CHART_TYPES if CHART_META[c].accepts_second_field} == {"box", "violin"}
+    assert {c for c in CHART_TYPES if CHART_META[c].accepts_second_field} == {
+        "box",
+        "violin",
+        "table",
+    }
     assert {c for c in CHART_TYPES if CHART_META[c].multi_field} == {"corr"}
     assert input_requirement("pivot", "second_field") == "required"
     assert input_requirement("box", "second_field") == "optional"
@@ -291,3 +296,15 @@ RAIL_RENDERED_INPUTS: frozenset[str] = frozenset({"field", "second_field", "fiel
 @pytest.mark.parametrize("chart_type", CHART_TYPES)
 def test_declared_inputs_have_a_rail_renderer(chart_type: str) -> None:
     assert set(CHART_META[chart_type].inputs) <= RAIL_RENDERED_INPUTS
+
+
+def test_table_row_is_a_terms_shaped_figure_with_its_own_aggregation() -> None:
+    meta = CHART_META["table"]
+    assert meta.data_kind == "table"
+    assert meta.scales == ("nominal", "ordinal")
+    assert meta.default_scale == "nominal"
+    assert meta.inputs["field"] == "required"
+    assert meta.inputs["second_field"] == "optional"
+    assert meta.derives == ("bins", "time_part")
+    assert set(meta.reads_options) == {"top_n", "table_sort_by", "table_sort_dir", "highlight"}
+    assert meta.supports_compare is False and meta.supports_marks is False

@@ -33,7 +33,8 @@ export type ChartType =
   | "pivot"
   | "sankey"
   | "scatter"
-  | "corr";
+  | "corr"
+  | "table";
 
 export type CompareSpec =
   | { mode: "off" }
@@ -61,6 +62,11 @@ export interface ChartOptions {
   groups?: number;
   /** box/violin: jittered raw-value strip overlay; line: point markers. */
   showPoints?: boolean;
+  /** table: row order and direction. Default count / desc. */
+  tableSortBy?: TableSortColumn;
+  tableSortDir?: "asc" | "desc";
+  /** table: values whose rows are highlighted — presentation only, captioned. */
+  highlight?: string[];
 }
 
 export type DeriveSpec =
@@ -70,6 +76,7 @@ export type DeriveSpec =
 export type TimePart = "hour" | "weekday" | "day" | "week" | "month";
 
 export type TableColumn = "count" | "share" | "first_seen" | "last_seen" | "distinct_second";
+export type TableSortColumn = "value" | TableColumn;
 
 /** Figure-specific inputs declared by the registry (`CHART_META[c].inputs`).
  * Only the keys the current figure declares are meaningful; the rest are

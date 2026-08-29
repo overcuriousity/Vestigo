@@ -168,6 +168,10 @@ export async function fetchChartData(
           config.derive,
         ),
       };
+    case "table":
+      // The table aggregation lands with its API wrapper; until then a
+      // table config cannot be fetched.
+      throw new Error("table figure: fetch not wired yet");
     case "corr":
       return {
         kind: "corr" as const,

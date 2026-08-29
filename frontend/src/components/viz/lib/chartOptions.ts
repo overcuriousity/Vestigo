@@ -15,7 +15,7 @@
  */
 import { CHART_META, chartTypesFor } from "./chartMeta";
 import { isTimeField } from "./timeFields";
-import type { ChartConfig, ChartOptions, ChartType, Scale } from "./chartConfig";
+import type { ChartConfig, ChartOptions, ChartType, Scale, TableSortColumn } from "./chartConfig";
 
 /**
  * Preference order for "the chart type to land on for this scale".
@@ -73,6 +73,9 @@ export interface ResolvedChartOptions {
   showDensity: boolean;
   groups: number;
   showPoints: boolean;
+  tableSortBy: TableSortColumn;
+  tableSortDir: "asc" | "desc";
+  highlight: string[];
 }
 
 /**
@@ -112,6 +115,7 @@ export const TOPN_MAX: Record<ChartType, number> = {
   sankey: 50,
   scatter: 50,
   corr: 50,
+  table: 500,
 };
 
 /**
@@ -135,6 +139,7 @@ export const TOPN_SLIDER_MAX: Record<ChartType, number> = {
   waffle: 25,
   heatmap: 20,
   line: 20,
+  table: 50,
 };
 
 export function topNMax(chartType: ChartType): number {
@@ -180,5 +185,8 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     groups: Math.min(options.groups ?? 6, 8),
     showDensity: options.showDensity ?? true,
     showPoints: options.showPoints ?? false,
+    tableSortBy: options.tableSortBy ?? "count",
+    tableSortDir: options.tableSortDir ?? "desc",
+    highlight: options.highlight ?? [],
   };
 }

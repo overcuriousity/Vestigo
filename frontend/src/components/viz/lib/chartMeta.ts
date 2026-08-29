@@ -8,7 +8,7 @@
  */
 import type { ChartType, Scale } from "./chartConfig";
 
-export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr";
+export type DataKind = "time" | "terms" | "numeric" | "timeseries" | "punchcard" | "pivot" | "scatter" | "corr" | "table";
 export type InputKey = "field" | "secondField" | "fields" | "laneKey" | "startFilter" | "endFilter" | "pairing" | "columns";
 export type Requirement = "required" | "optional";
 export type Derive = "bins" | "timePart";
@@ -282,6 +282,24 @@ export const CHART_META: Record<
     requiresSecondField: false,
     acceptsSecondField: false,
     multiField: true,
+  },
+  // The one figure that is a table: top-N values with count, share, first/last seen and, given
+  // field_y, the number of distinct field_y values per row. A remainder row is always present
+  // when values were cut. Exports as CSV too.
+  table: {
+    label: "Table (values with counts)",
+    question: "Which values occur, how often, what share is that, and when were they first and last seen?",
+    scales: ["nominal", "ordinal"],
+    dataKind: "table",
+    defaultScale: "nominal",
+    inputs: { field: "required", secondField: "optional" },
+    derives: ["bins", "timePart"],
+    readsOptions: ["topN", "tableSortBy", "tableSortDir", "highlight"],
+    supportsCompare: false,
+    supportsMarks: false,
+    requiresSecondField: false,
+    acceptsSecondField: true,
+    multiField: false,
   },
 };
 

@@ -235,4 +235,6 @@ export const CHART_HOW_TO_READ: Record<ChartType, string> = {
   sankey: "Ribbon width = events flowing from the left value to the right value.",
   corr: "One cell per field pair; colour and number give the correlation (−1…+1). Click a cell to see the scatter behind it.",
   scatter: "One dot per event pair — patterns (lines, clusters, outliers) mean the two fields are related.",
+  table:
+    "One row per value: how often it occurred, its share of the filtered events, and when it was first and last seen. The last row is everything the top-N cut off.",
 };

@@ -55,11 +55,12 @@ ChartType = Literal[
     "sankey",
     "scatter",
     "corr",
+    "table",
 ]
 Scale = Literal["nominal", "ordinal", "interval", "ratio"]
 Metric = Literal["count", "delta", "rate", "ratio", "cumulative"]
 DataKind = Literal[
-    "time", "terms", "numeric", "timeseries", "punchcard", "pivot", "scatter", "corr"
+    "time", "terms", "numeric", "timeseries", "punchcard", "pivot", "scatter", "corr", "table"
 ]
 
 #: What a figure asks the analyst for, from a fixed vocabulary. The Visualize
@@ -330,6 +331,21 @@ CHART_META: dict[ChartType, ChartMeta] = {
             "one mark that charts more than two fields at once. Preferred over "
             "reading scatter plots one pair at a time past three or four "
             "quantitative variables."
+        ),
+    ),
+    "table": ChartMeta(
+        label="Table (values with counts)",
+        question="Which values occur, how often, what share is that, and when were they first and last seen?",
+        scales=("nominal", "ordinal"),
+        data_kind="table",
+        default_scale="nominal",
+        inputs={"field": "required", "second_field": "optional"},
+        derives=("bins", "time_part"),
+        reads_options=("top_n", "table_sort_by", "table_sort_dir", "highlight"),
+        note=(
+            "The one figure that is a table: top-N values with count, share, first/last "
+            "seen and, given field_y, the number of distinct field_y values per row. A "
+            "remainder row is always present when values were cut. Exports as CSV too."
         ),
     ),
 }

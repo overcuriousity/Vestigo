@@ -153,6 +153,23 @@ export const THUMBNAILS: Record<ChartType, () => JSX.Element> = {
       ))}
     </>
   ),
+  table: () => (
+    <>
+      {[0, 1, 2].map((r) => (
+        <g key={r}>
+          <rect x={0} y={r * 8} width={14} height={6} fill="currentColor" opacity={0.9} />
+          <rect
+            x={17}
+            y={r * 8 + 1}
+            width={[20, 12, 6][r]}
+            height={4}
+            fill="currentColor"
+            opacity={0.5}
+          />
+        </g>
+      ))}
+    </>
+  ),
 };
 
 export function FigureThumbnail({

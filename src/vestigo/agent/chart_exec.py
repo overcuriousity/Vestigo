@@ -60,6 +60,7 @@ class ChartLimits:
     series_top_n: tuple[int, int]
     time_buckets: tuple[int, int]
     pivot_limit: tuple[int, int]
+    table_rows: tuple[int, int]
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -77,6 +78,7 @@ AGENT_CHART_LIMITS = ChartLimits(
     series_top_n=(6, 8),
     time_buckets=(30, 60),
     pivot_limit=(8, 12),
+    table_rows=(20, 30),
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -95,6 +97,7 @@ ANALYST_CHART_LIMITS = ChartLimits(
     series_top_n=(12, 50),
     time_buckets=(60, 200),
     pivot_limit=(10, 50),
+    table_rows=(50, 500),
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,
