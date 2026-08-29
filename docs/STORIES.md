@@ -440,7 +440,11 @@ Per kind, `data` is:
   `snapshotToChartResult` names both (`FrozenChartKind`). A `change` block
   freezes its `ChangeResponse` (both window totals, the ranked share-of-window
   rows, the union cap facts) as `chart`; `snapshotToChartResult` names it too,
-  and `RankedChange` redraws it without recounting either window.
+  and `RankedChange` redraws it without recounting either window. A `lanes`
+  block freezes its `LanesResponse` (the ranked, capped lanes with their paired
+  intervals, and every cap and count) as `chart` beside its resolved `marks`
+  — it is a time-axis figure — and `snapshotToChartResult` names it;
+  `IntervalLanes` redraws it without re-pairing a row.
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in

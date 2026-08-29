@@ -321,6 +321,24 @@ list used only by the correlation matrix.
   `primary_total`, `comparison_total`, `union_size`, `rows_shown` and the first five
   `top_rows` (`{value, status, delta_share}`). The encoded quantity is share of window,
   never count — `delta_share` is `primary_share − comparison_share`.
+- **Interval lanes.** `chart_type="lanes"` (`docs/VISUALIZE.md` §"Interval lanes") charts
+  one lane per value of `field` with a bar per interval. `inputs.pairing` is `first_last`
+  (default; one bar per lane, first to last event) or `next_end`, under which
+  `inputs.start_filter` and `inputs.end_filter` (each a `FilterSpec`, ANDed with `filters`
+  and pinned to its time window) name the events that open and close an interval, and an
+  end closes the most recent open start in its lane. Three refusals name themselves:
+  `pairing="next_end" needs inputs.start_filter and inputs.end_filter — the events that
+  open and close an interval; pairing="first_last" needs neither.`; `inputs.pairing /
+  start_filter / end_filter are chart_type="lanes" only.`; and the registry's scale check
+  (nominal or ordinal). Filters under `first_last` are a warning (`inputs.start_filter/
+  end_filter ignored under pairing="first_last".`), not a refusal. `options.limit_y` is the
+  lane cap, clamped to `ChartLimits.lanes` (10 default, 20 max for the agent; 100 for the
+  analyst); the ordered start/end scan the pairing runs over is capped at
+  `ChartLimits.lanes_rows` (2,000 for the agent, 50,000 for the analyst) and
+  `summary.rows_truncated` says when it bit. The summary carries `pairing`, `lanes_shown`,
+  `lanes_total`, `lane_cap_hit`, `intervals`, `unpaired_starts` (open-ended, drawn to the
+  slice end), `orphan_ends` (counted, not drawn), `undated` and the first five `top_lanes`
+  (`{key, count, intervals}`). `supports_marks` is true: marks draw across every lane.
 - **`open_url`.** Every `propose_chart` result carries the Visualize page link for that
   exact figure, so an external `/mcp` client — which gets no card — can hand a human the
   chart. `agent/deep_link.py::visualize_url` mirrors the page's own URL codec
@@ -600,8 +618,9 @@ guard (serialized tool list < 42,500 chars; `ChartSpec.derive` measured 39,382 �
 table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks` and the
 `open_url` docstring took it to 41,947, and the ceiling moved to 42,000;
 `ChartOptionsSpec.quantity` took it to 42,044 and the ceiling to 42,500;
-`ChartOptionsSpec.layout` took it to 42,115, ceiling unchanged) — if a change trips it,
-re-measure rather than raising the ceiling.
+`ChartOptionsSpec.layout` took it to 42,115, ceiling unchanged;
+`ChartInputsSpec.pairing` / `start_filter` / `end_filter` took it to 42,285 on 2026-08-30,
+ceiling unchanged) — if a change trips it, re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

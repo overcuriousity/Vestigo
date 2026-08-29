@@ -42,7 +42,7 @@ current. Each figure (`ChartType`) is one `ChartMeta` row:
 | `scales` | which "treat as" values the primary field may have for this figure to be legal |
 | `data_kind` | which backend aggregation feeds it; pivot and sankey share one, so switching refetches nothing |
 | `default_scale` | scale assumed when a request states none (mirrors the page's numeric probe) |
-| `inputs` | what the figure asks for, from the fixed vocabulary `INPUT_KEYS` — `field`, `second_field`, `fields`, `lane_key`, `start_filter`, `end_filter`, `pairing`, `columns` — each `required` or `optional` |
+| `inputs` | what the figure asks for, from the fixed vocabulary `INPUT_KEYS` — `field`, `second_field`, `fields`, `pairing`, `start_filter`, `end_filter`, `columns` — each `required` or `optional` |
 | `derives` | derivations admitted on the primary field: `bins`, `time_part` (§4); only figures that admit the ordinal scale may declare one |
 | `reads_options` | the `ChartOptionsSpec` keys the figure consumes; an unread option is a warning |
 | `supports_compare`, `supports_marks` | whether a second layer / instants-and-windows can be drawn honestly |
@@ -55,8 +55,10 @@ The rail renders **one control per declared input key and nothing else**. Two te
 two sides together: `tests/test_chart_meta.py::test_declared_inputs_have_a_rail_renderer`
 (a row may only declare keys the rail renders — `RAIL_RENDERED_INPUTS`) and
 `frontend/src/test/chartRail.test.tsx` (for every figure, exactly the declared inputs
-appear). Keys in the vocabulary that no shipped figure declares yet belong to figures listed
-in §6.
+appear). Every key is declared by a shipped figure —
+`tests/test_chart_meta.py::test_every_input_key_is_declared_by_some_shipped_figure` keeps it
+so (`lane_key` left the vocabulary when the lane key became the charted `field`,
+§"Interval lanes").
 
 ## 3. `ChartConfig` v2
 
@@ -133,11 +135,16 @@ Read top-down, in dependency order:
    Measure."), plus "Click to …" when a single derivation would light it. The selected
    figure's `question` and "how to read" line sit under the gallery.
 5. **The figure's inputs** — one block per declared key: `secondField` (Field (Y) / Group by;
-   on the table, *Count distinct of (optional)*), `fields` (the correlation list), and
+   on the table, *Count distinct of (optional)*), `fields` (the correlation list),
    `columns` (the table's checklist: count, share, first seen, last seen, distinct <second
-   field>). With nothing ticked the table shows count, share, first seen and last seen, plus
-   *distinct* whenever a second field is set; *distinct* is disabled until one is, and a
-   stored choice that names it without a second field is drawn without it.
+   field>), and the interval lanes' three: `pairing` (two radios, *First to last* / *Start →
+   next end*, each with its one-sentence rule under it), `startFilter` and `endFilter`
+   (*Start events* / *End events* — a `CompareFilterEditor` each under *Start → next end*,
+   and the note "Not used — first-to-last pairing needs no filters." under *First to
+   last*, so the sections never disappear and reappear as the pairing flips). With nothing
+   ticked the table shows count, share, first seen and last seen, plus *distinct* whenever
+   a second field is set; *distinct* is disabled until one is, and a stored choice that
+   names it without a second field is drawn without it.
 6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
    reason when a figure has no honest two-layer encoding. Compare has a third state beside
    supported and unsupported — **required** (`requiresCompare`, the ranked change): *Off*
@@ -147,10 +154,11 @@ Read top-down, in dependency order:
    cumulative step adds **Quantity** (running event count · running sum (measure) · distinct
    values seen so far) beside *Buckets*; the dishonest choices are greyed with the reason
    (sum needs *Measure*, distinct needs *Categories* or *Ordered categories*). The ranked
-   change adds *Top values per window* and *Layout* (dumbbell · slope). The calendar has no
+   change adds *Top values per window* and *Layout* (dumbbell · slope). The interval lanes
+   add *Lanes* (the lane cap, bound to `options.limitY`; slider to 50). The calendar has no
    options.
 7. **Marks** — only on figures whose registry row says `supportsMarks` (events over time,
-   value over time): the chart's mark sources, each with the status the server resolved it
+   value over time, the cumulative step, the interval lanes): the chart's mark sources, each with the status the server resolved it
    to (`N drawn`, `N of M drawn — capped at C`, `; U undated not drawn`; a baseline names
    its windows), a remove button per source, and an eight-entry **Add mark** menu — event
    id · tag · confirmed findings · custom filter · baseline definition · saved view ·
@@ -471,6 +479,96 @@ and both shares, and the empty state "No values in either window". No marks, no 
 not by count; top N values per window, U in the union — X new, Y vanished`, and when the
 cap bit `union capped at S of U values; the O with the smallest change not drawn`.
 
+## Interval lanes
+
+`chart_type="lanes"` (`data_kind="lanes"`, `EventQueryService.field_lanes`,
+`charts/IntervalLanes.tsx`) answers "how long did each value's activity run — which runs
+overlap, which never ended, which ended without a start?" for one categorical field
+(nominal or ordinal). One **lane** per value of the field; each **interval** is one bar
+from its start to its end.
+
+**The lane key is `field`.** The design listed a `laneKey` input beside a field-free
+figure. On the field-first rail that would have meant a top *Field* control reading "No
+field — count every event" over a second "Lane key" picker, with the treat-as chips, the
+field probe and the gallery legality applying to nothing. Declaring `inputs={"field":
+"required", …}` gives the lane key the scale check, the probe and the greyed-tile reasons
+for free, exactly like the bar. `lane_key` left `INPUT_KEYS` with it, so no dead
+vocabulary survives (§2).
+
+**Two pairings, one rule.** `pairing="first_last"` (the default): one bar per lane from
+its first to its last dated event under the current filters. `pairing="next_end"`:
+`start_filter` and `end_filter` name the events that open and close an interval, and **an
+end closes the most recent open start in its lane** — the rule the caption prints
+verbatim. The design's two sentences ("each start pairs with the next end after it" and
+"an end claims the most recent unclaimed start") disagree when two starts precede one end;
+the second is the rule shipped, because it draws nested activity as nested bars rather than
+crossing ones. A start never closed is **open-ended** — drawn to the slice end under an
+arrowhead, muted, so "still open" never reads as "ended at the edge"; an end with no open
+start before it in its lane is an **orphan** — counted, never drawn. An interval never
+crosses a lane: the stack is per lane.
+
+**Start and end filters are ANDed with the current filters**, never a separate window — an
+analyst filtering to one host expects the start events to be that host's. That needs
+`_build_where` to build a second and a third clause whose parameter names cannot collide
+with the first: `param_prefix` on `_ParameterizedQueryBuilder` (`s_p0…`, `e_p0…`), one line
+each, unit-tested for disjointness; the fixed names (the offset arrays, `field_key`) are
+bound once with the same values by every clause.
+
+**The scans.** `first_last` is one grouped scan — `argMin`/`argMax` of the event id by
+time plus `count()` per lane, `ORDER BY count DESC, lane ASC LIMIT lane_cap` — in parallel
+with the whole's counts (distinct lanes, undated rows, the earliest and latest dated
+instant). `next_end` builds one parameterised subquery, the `UNION ALL` of the
+start-matching rows (`primary ∧ start`, `is_start = 1`) and the end-matching rows
+(`primary ∧ end`, `is_start = 0`); two parallel scans rank the lanes by their row count
+and count the whole (distinct lanes, starts, ends, undated); then one ordered scan fetches
+the kept lanes' rows (`has(Array(String))`) `ORDER BY ts, is_start DESC, event_id LIMIT
+rows_cap + 1` — a start before an end at the same instant — and the pure, unit-tested
+`pair_intervals` turns them into intervals with one stack per lane. **The pairing runs in
+Python, not in a window function**: LIFO matching where orphans consume nothing is a stack,
+and a stack is not a running sum — expressing it in SQL needs a self-join on a derived
+depth, and the one-sentence rule would be buried in it. The scan is capped instead
+(`ChartLimits.lanes_rows`: 2,000 for the agent, 50,000 for the analyst), and when the cap
+bites the response says so (`rows_truncated`, `rows_paired`) and the caption prints "first
+N start/end events (by time) paired — the row cap; later ones not drawn". The lane cap is
+`options.limit_y`, clamped to `ChartLimits.lanes` (agent 10 default / 20 max; analyst 10 /
+100, slider to 50). Undated rows never feed a bar and are counted.
+
+**Every cap and count is in the response** (`LanesResponse`): `lanes[{key, count,
+intervals[{start, end | null, start_event_id, end_event_id | null}]}]` ranked by event
+count then key, `lane_cap`, `lanes_total`, `lane_cap_hit`, `other_lanes`, `starts`, `ends`
+(the whole, before the caps; `0, 0` under `first_last`), `unpaired_starts`, `orphan_ends`
+(over the rows that were paired), `rows_cap`, `rows_truncated`, `rows_paired`, `undated`,
+and `slice_start` / `slice_end` — the query's own bounds when it has them, else the
+earliest and latest dated row; open-ended bars run to `slice_end`.
+
+**`POST …/viz/lanes`, not the design's `GET …/viz/field-lanes`.** Three filter sets do not
+fit query params — the same reason Compare and `viz/marks` are POSTs. `LanesRequest` is
+`{field, pairing, primary, start_filter, end_filter, limit_y}` with the three layers as
+`CompareFilters`; the start and end layers are resolved by the same `_resolve_body_query`
+and pinned to the primary's time window exactly as a custom Compare layer is. `next_end`
+without both filters is a 422 that names them; the lane cap is clamped to the analyst
+ceiling and the row cap is the analyst's, both echoed.
+
+**Drawing.** A `scaleBand` of the kept lanes down the left with the value's label, a
+dashed lane line, and a `scaleTime` of `[slice_start, slice_end]` along the bottom. A
+closed interval is a solid accent bar (at least 2 px wide); an open-ended one is muted and
+runs to the right edge under an arrowhead; nested intervals in one lane are both drawn.
+The legend names both ("interval" / "no end seen — runs to the slice end"); the tooltip
+carries the lane, the start and its event id, and the end and its event id or "no end
+seen". Marks draw across every lane (`MarksOverlay`, the same primitive the time figures
+use). The empty state is "No intervals to draw." with a pairing-specific hint. No Compare,
+no metric.
+
+**Caption.** The header is `intervals of <field> over time — <label>`. Beneath the usual
+layer lines: the pairing rule verbatim (`pairing: start → next end — an end closes the most
+recent open start in its lane; an open start runs to the slice end; an end with no open
+start before it is an orphan, counted and not drawn`, or `pairing: first to last — one bar
+per lane, from its first event to its last`); `lanes: N shown of M (top by event count); K
+more not drawn` when the cap bit, else `lanes: N`; under `next_end` `starts: S · ends: E —
+U open-ended (no end seen, drawn to <slice end>), O orphan ends not drawn` and, when the
+row cap bit, the `first N start/end events (by time) paired` line; and `U undated events
+not drawn` whenever any were.
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -499,6 +597,16 @@ cap bit `union capped at S of U values; the O with the smallest change not drawn
   "custom".`); `resolved.options` carries `top_n` (clamped to `change_top_n`) and `layout`;
   the summary carries both totals, `union_size`, `rows_shown`, `truncated` and the first
   five `top_rows` (`{value, status, delta_share}`).
+  For the interval lanes `propose_chart` resolves `inputs.pairing` (default `first_last`),
+  refuses `next_end` without both filters by name (`pairing="next_end" needs
+  inputs.start_filter and inputs.end_filter — the events that open and close an interval;
+  pairing="first_last" needs neither.`), refuses `inputs.pairing` / `start_filter` /
+  `end_filter` on any other figure (`… are chart_type="lanes" only.`), and warns when
+  `first_last` carries filters it will not read; `options.limit_y` is clamped to
+  `ChartLimits.lanes`, the start and end layers are pinned to the primary's window as the
+  endpoint pins them, and the summary carries `pairing`, `lanes_shown`, `lanes_total`,
+  `lane_cap_hit`, `intervals`, `unpaired_starts`, `orphan_ends`, `rows_truncated`,
+  `undated` and the first five `top_lanes` (`{key, count, intervals}`). Marks draw on it.
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
   the schema an external client sees is the in-app one. Every `propose_chart` result also
   carries `open_url`, the Visualize page link for that exact figure
@@ -517,9 +625,34 @@ cap bit `union capped at S of U values; the O with the smallest change not drawn
   both without a fetch. A ranked-change block freezes the `ChangeResponse` as `chart` and
   is redrawn the same way — the shares are in the response, so the snapshot never recounts
   a window.
+  An interval-lanes block freezes the `LanesResponse` as `chart` beside its resolved
+  `marks` (it is a time-axis figure) and `snapshotToChartResult` rebuilds it; the casing
+  boundary crosses `inputs.pairing` (`nextEnd` ↔ `next_end`) and `inputs.startFilter` /
+  `endFilter` (view payloads ↔ `FilterSpec`s) through the same two helpers the compare
+  filters use, tested as a round trip.
 
-## 6. Not yet shipped
+## 6. Out of scope, by decision
 
-Designed in the 2026-08-29 round and tracked as a follow-up step: interval lanes.
-Until it lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
-describe it. Geo/choropleth remains its own roadmap round.
+Every figure the 2026-08-29 round designed has shipped; what it deliberately left out:
+
+- **Small multiples / facets and shared axes** — rejected outright in the round. A figure
+  answers one question over one slice; a grid of them is a Story, and Stories already hold
+  many charts under one set of filters.
+- **Geo / choropleth** — its own round (`docs/ROADMAP.md` Milestone 2): the offline
+  basemap, the projection and the count-vs-rate rule are a design problem this round did
+  not take on.
+- **A `db/viz_aggregations.py` module** — the design named one; the aggregations live on
+  `EventQueryService` (settled in step 1), where the WHERE builder, the field-column
+  resolution, the scan gate and the parallel-scan helper already are.
+- **A demo-case chart-coverage test** — none exists for any figure. A sibling of
+  `tests/test_demo_detector_coverage_clickhouse.py` asserting `execute_chart_spec` draws
+  every figure over the demo case is the natural follow-up and is listed in `ROADMAP.md`.
+
+## History
+
+This document is the durable form of the 2026-08-29 Visualize round, which landed as nine
+steps in a stacked series of PRs: the figure registry and the field-first rail (#324),
+derivations (#325), the table figure (#326), marks and `open_url` (plan A, #327), the
+cumulative step and the calendar heatmap (plan B, #328), ranked change (plan C, #329), and
+interval lanes with this consolidation (plan D). Each step's decisions and the reasons for
+deviating from the design's letter are in the section that describes the figure.

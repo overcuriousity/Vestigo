@@ -47,6 +47,8 @@ from vestigo.db.postgres import User
 # moved to the next 500.
 # 2026-08-29: 42,044 → 42,115 with ChartOptionsSpec.layout (viz plan C); ceiling unchanged
 # at 42,500.
+# 2026-08-30: 42,115 → 42,285 with ChartInputsSpec.pairing/start_filter/end_filter (viz
+# plan D); ceiling unchanged at 42,500.
 SCHEMA_BUDGET_CHARS = 42_500
 
 

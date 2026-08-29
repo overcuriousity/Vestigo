@@ -4,7 +4,44 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 206 — ranked change).
+Last updated: 2026-08-30 (session 207 — interval lanes and the docs consolidation).
+
+## Session 207 — 2026-08-30: interval lanes and the docs consolidation (viz plan D)
+
+Plan D of the Visualize design round (steps 8 and 9 of the original nine, the last); the
+reference is `docs/VISUALIZE.md` §"Interval lanes", and that document is now the durable
+form of the whole round (§"History"). Stacked on ranked change (#329).
+
+**The lane key is `field`.** The design listed a `laneKey` input beside a field-free
+figure; on the field-first rail that would have put a "No field" control over a second
+"Lane key" picker with the treat-as chips and the field probe applying to nothing.
+Declaring `inputs={"field": "required", …}` gives the lane key the scale check, the probe
+and the greyed-tile reasons for free, exactly like the bar — and `lane_key` left
+`INPUT_KEYS`, so a new test pins that every key in the vocabulary is declared by a shipped
+figure.
+
+**One pairing rule, stated as the rule.** The design's two sentences about `next_end`
+disagree when two starts precede one end; the shipped rule is *an end closes the most
+recent open start in its lane* — nested activity draws as nested bars — and the caption
+prints it verbatim. An open start runs to the slice end under an arrowhead; an orphan end
+is counted, never drawn. `first_last` is one `argMin`/`argMax` scan per lane.
+
+**Python pairing over a capped, ordered scan.** LIFO matching where orphans consume nothing
+is a stack, not a running sum, so it is the pure, unit-tested `pair_intervals` over a
+`ORDER BY ts, is_start DESC, event_id LIMIT rows_cap + 1` scan of the kept lanes rather
+than a window function; the cap (`ChartLimits.lanes_rows`, 2,000 agent / 50,000 analyst)
+is disclosed in the response and the caption, as are the lane cap (`ChartLimits.lanes`, 10
+default; 20 agent / 100 analyst), the starts and ends, the open-ended and orphan counts and
+the undated rows.
+
+**`POST …/viz/lanes`.** The design named a GET; three filter sets do not fit query params.
+The start and end layers are resolved as Compare layers are and pinned to the primary's
+window; both are **ANDed with the current filters** — an analyst filtering to one host
+expects that host's starts — which needed a `param_prefix` on `_build_where` so three
+clauses can share one statement without their `p0…` colliding.
+
+**Schema budget.** `ChartInputsSpec.pairing` / `start_filter` / `end_filter` took the tool
+schemas from 42,115 to 42,285 chars; the ceiling stays at 42,500 (`docs/AGENT.md`).
 
 ## Session 206 — 2026-08-29: ranked change (viz plan C)
 

@@ -28,6 +28,10 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   Earth is public domain), the projection, and the count-vs-rate normalization rule — count
   per country is a choropleth, count per city is a proportional-symbol map, and the wrong
   one misleads by area.
+- [ ] **Demo-case chart coverage test.** A sibling of
+  `tests/test_demo_detector_coverage_clickhouse.py` asserting `execute_chart_spec` draws every
+  figure over the demo case with at least one row/bar/interval — deferred through the
+  2026-08-29 Visualize round.
 ## Milestone 3 — polish
 
 - [ ] **Make `VESTIGO_STAT_SCAN_CONCURRENCY` live.** Every other `stat_scan_*` value now
