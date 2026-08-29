@@ -25,6 +25,7 @@ import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
 import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
+import { RankedChange } from "@/components/viz/charts/RankedChange";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
@@ -215,6 +216,30 @@ describe("chart smoke render", () => {
           weeks_total: 1,
           truncated: false,
           dropped: 0,
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("RankedChange renders with change data", () => {
+    const { container } = render(
+      <RankedChange
+        data={{
+          kind: "change",
+          field: "attr:user",
+          derive: null,
+          top_n: 2,
+          primary_total: 3,
+          comparison_total: 2,
+          rows: [
+            { value: "a", primary: 3, comparison: 1, primary_share: 1, comparison_share: 0.5, delta_share: 0.5, status: "rose" },
+          ],
+          union_size: 1,
+          rows_shown: 1,
+          union_cap: 200,
+          truncated: false,
+          omitted: 0,
         }}
       />,
     );
