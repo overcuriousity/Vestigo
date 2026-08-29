@@ -1964,6 +1964,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # The full aggregation payload is for server-side consumers (Stories
         # export resolver); the model gets the compressed summary only.
         payload.pop("result", None)
+        # The card resolves its own marks through POST …/viz/marks from the
+        # same config; the summary carries what the model needs.
+        payload.pop("marks", None)
         return payload
 
     if scope.conversation_id is not None:

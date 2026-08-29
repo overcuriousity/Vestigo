@@ -827,3 +827,58 @@ def test_stored_config_without_marks_yields_none() -> None:
     )
     assert spec.marks is None
     assert "marks" not in spec_to_stored_chart_config(spec)
+
+
+async def test_chart_block_freezes_resolved_marks_beside_the_aggregation(store):
+    case, story, blocks = await _case_with_story(
+        store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
+    )
+    await store.create_saved_chart(
+        case.id,
+        "t1",
+        "ch1",
+        "Beacons over time",
+        {
+            "v": 2,
+            "chartType": "time",
+            "scale": "interval",
+            "field": None,
+            "options": {},
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00+00:00", "label": "first"}],
+        },
+    )
+
+    async def fake_chart(scope, spec):
+        assert spec.marks and spec.marks[0].kind == "instant"
+        return {
+            "ok": True,
+            "resolved": {"chart_type": "time"},
+            "warnings": [],
+            "summary": {},
+            "result": {"buckets": []},
+            "marks": {
+                "marks": [
+                    {
+                        "kind": "instant",
+                        "at": "2026-07-20T09:41:00+00:00",
+                        "label": "first",
+                        "source": 0,
+                        "provenance": {"kind": "analyst"},
+                    }
+                ],
+                "sources": [],
+                "cap": 50,
+            },
+        }
+
+    snapshot = await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_chart=fake_chart,
+        resolve_scope=lambda case_id, timeline_id: (["src1"], None, None),
+        now=lambda: FROZEN_NOW,
+    )
+    blk = snapshot["blocks"][0]
+    assert blk["data"]["marks"]["marks"][0]["label"] == "first"

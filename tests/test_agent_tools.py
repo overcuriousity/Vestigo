@@ -959,6 +959,15 @@ class _FakeChartService(_FakeVizService):
             "points": None,
         }
 
+    def mark_instants(self, query, limit):
+        self.calls.append(("mark_instants", (limit,), {"q": query.q}))
+        return {
+            "instants": [{"event_id": "e1", "source_id": "s1", "at": "2026-07-20T01:00:00+00:00"}],
+            "dated": 1,
+            "undated": 0,
+            "overflow": False,
+        }
+
     def field_table(self, query, field, limit, **kw):
         self.calls.append(("field_table", (field, limit), kw))
         return {
@@ -1134,6 +1143,7 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "options": {"top_n": 30},
         "derive": None,
         "inputs": None,
+        "marks": None,
     }
     assert result["warnings"] == []
 
@@ -2925,3 +2935,79 @@ def test_chart_limits_carry_marks_per_source():
 
     assert AGENT_CHART_LIMITS.marks_per_source == 20
     assert ANALYST_CHART_LIMITS.marks_per_source is None  # the viz_marks_max setting
+
+
+# ── marks: execution ─────────────────────────────────────────────────────────
+
+
+async def test_marks_resolve_into_the_envelope_and_the_tool_result_keeps_only_the_summary(
+    store, monkeypatch
+):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "time",
+                "marks": [
+                    {"kind": "events", "filters": {"q": "beacon"}, "label": "beacons"},
+                    {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"},
+                ],
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert "marks" not in result and "result" not in result
+    assert result["summary"]["marks"]["shown"] == 2
+    assert [s["kind"] for s in result["summary"]["marks"]["sources"]] == ["events", "instant"]
+    assert result["resolved"]["marks"][0]["kind"] == "events"
+    limit_args, kw = next((a, k) for n, a, k in fake.calls if n == "mark_instants")
+    assert limit_args == (20,) and kw == {"q": "beacon"}  # AGENT_CHART_LIMITS.marks_per_source
+
+
+async def test_marks_on_a_figure_without_them_are_refused(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "user",
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="bar" takes no marks' in message and "time, line" in message
+
+
+async def test_execute_chart_spec_carries_resolved_marks_for_the_export(store, monkeypatch):
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS, execute_chart_spec
+    from vestigo.agent.tools import ChartSpec
+
+    fake = _patch_chart_service(monkeypatch)
+    spec = ChartSpec.model_validate(
+        {
+            "chart_type": "time",
+            "marks": [
+                {
+                    "kind": "range",
+                    "start": "2026-07-20T09:00:00Z",
+                    "end": "2026-07-20T10:00:00Z",
+                    "label": "w",
+                }
+            ],
+        }
+    )
+    envelope = await execute_chart_spec(
+        _scope("c1", "t1", source_ids=["s1"]), spec, service=fake, limits=ANALYST_CHART_LIMITS
+    )
+    assert envelope["marks"]["marks"][0] == {
+        "kind": "range",
+        "start": "2026-07-20T09:00:00+00:00",
+        "end": "2026-07-20T10:00:00+00:00",
+        "label": "w",
+        "source": 0,
+        "provenance": {"kind": "analyst"},
+    }
+    assert envelope["marks"]["cap"] == 50  # viz_marks_max default under the analyst limits

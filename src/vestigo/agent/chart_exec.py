@@ -249,6 +249,11 @@ async def execute_chart_spec(
         raise ValueError(
             "distinct_second needs field_y — the second field whose distinct values each row counts."
         )
+    if spec.marks and not meta.supports_marks:
+        takers = [c for c in CHART_META if CHART_META[c].supports_marks]
+        raise ValueError(
+            f'chart_type="{chart_type}" takes no marks — figures that draw them: {", ".join(takers)}.'
+        )
     if scale not in meta.scales:
         raise ValueError(
             f'chart_type="{chart_type}" requires scale in '
@@ -370,6 +375,21 @@ async def execute_chart_spec(
             spec.compare.filters if spec.compare.mode == "custom" else FilterSpec()
         )
         comparison_query = await _build_query(scope, comparison_filters)
+
+    resolved_marks: dict[str, Any] | None = None
+    if spec.marks:
+        from vestigo.agent.marks import resolve_marks
+        from vestigo.api.deps import get_store
+        from vestigo.core.config import get_settings
+
+        resolved_marks = await resolve_marks(
+            scope,
+            spec.marks,
+            service=service,
+            store=get_store(),
+            cap=limits.marks_per_source or get_settings().viz_marks_max,
+            validated=validated,
+        )
 
     applied: dict[str, Any] = {}
     #: Passed only when set, so a positional fake service keeps working and an
@@ -687,6 +707,12 @@ async def execute_chart_spec(
         if value is not None:
             applied[key] = value
 
+    if resolved_marks is not None:
+        summary = dict(summary)
+        summary["marks"] = {
+            "shown": len(resolved_marks["marks"]),
+            "sources": resolved_marks["sources"],
+        }
     return {
         "ok": True,
         "resolved": {
@@ -701,8 +727,14 @@ async def execute_chart_spec(
             "options": applied,
             "derive": spec.derive.model_dump(exclude_none=True) if spec.derive else None,
             "inputs": spec.inputs.model_dump(exclude_none=True) if spec.inputs else None,
+            "marks": (
+                [m.model_dump(exclude_none=True, mode="json") for m in spec.marks]
+                if spec.marks
+                else None
+            ),
         },
         "warnings": warnings,
         "summary": summary,
         "result": result,
+        "marks": resolved_marks,
     }

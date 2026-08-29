@@ -593,6 +593,7 @@ async def resolve_story_snapshot(
             "resolved": envelope.get("resolved"),
             "warnings": envelope.get("warnings", []),
             "chart": envelope.get("result"),
+            "marks": envelope.get("marks"),
         }
         return data, {"timeline_id": content["timeline_id"], "ref_extra": {"name": chart.name}}
 
