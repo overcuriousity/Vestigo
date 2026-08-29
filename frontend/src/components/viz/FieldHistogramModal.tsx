@@ -5,7 +5,6 @@ import { BarChart2, Filter, FilterX } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
-import { Tooltip } from "@/components/ui/Tooltip";
 import {
   Select,
   SelectContent,
@@ -92,9 +91,13 @@ export function FieldHistogramModal({
   // nothing above 50 out of the `field_stats` cache: the cheap path this list
   // is meant to hit stayed skipped for as long as the modal was open.
   const lastTermsScope = useRef(termsScope);
+  // Whether this scope has ever been answered out of the `field_stats` cache.
+  // Reset with the scope: a new list has its own provenance.
+  const sawCachedTerms = useRef(false);
   if (lastTermsScope.current !== termsScope) {
     lastTermsScope.current = termsScope;
     setTermsLimit(TERMS_PAGE);
+    sawCachedTerms.current = false;
   }
 
   const totalHistogramQuery = useQuery({
@@ -158,6 +161,19 @@ export function FieldHistogramModal({
     ...busyRetry,
   });
   const canExpandTerms = termsLimit < TERMS_MAX;
+  // Expanding crosses a computation boundary, and the analyst has to be told.
+  // An unfiltered first page is served from the per-source `field_stats` cache
+  // (`merged_field_terms`), whose per-value counts are exact sums but whose
+  // cross-source top-N merge is approximate and whose `distinct` is a
+  // max-across-sources. That cache answers nothing above 50, so the first
+  // "+ N more" click falls through to an exact live scan — which on a
+  // multi-source timeline may reorder or replace values inside the 50 already
+  // on screen, and change their counts, `other_count` and the distinct total.
+  // Two rows changing under an analyst with nothing saying why is not
+  // something a forensic tool may do silently.
+  const termsCached = termsQuery.data?.cached === true;
+  if (termsCached) sawCachedTerms.current = true;
+  const termsRescanned = termsQuery.data != null && !termsCached && sawCachedTerms.current;
   // In-flight busy-lane signals (#300): shown beside the spinner while retrying.
   const histogramWaiting = busyMessage(
     histogramQuery.failureReason ?? totalHistogramQuery.failureReason,
@@ -271,8 +287,16 @@ export function FieldHistogramModal({
             <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
               Top values
               {termsQuery.data && (
-                <span className="ml-1.5 normal-case font-normal text-[var(--color-fg-muted)]">
-                  ({termsQuery.data.distinct} distinct)
+                <span
+                  className="ml-1.5 normal-case font-normal text-[var(--color-fg-muted)]"
+                  title={
+                    termsCached
+                      ? "From the per-source summary cache — the highest count any single source reported, not a cross-source distinct count."
+                      : "Exact, over the current filtered view."
+                  }
+                >
+                  ({termsCached ? "≈" : ""}
+                  {termsQuery.data.distinct} distinct)
                 </span>
               )}
             </p>
@@ -318,32 +342,41 @@ export function FieldHistogramModal({
                         className="h-1.5 w-8 shrink-0 rounded-sm bg-[var(--color-accent)]"
                         style={{ opacity: Math.max(0.15, v.count / maxTermCount) }}
                       />
-                      <Tooltip content="Focus histogram" side="top">
-                        <button
-                          className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
-                          onClick={() => setActiveValue(v.value)}
-                        >
-                          <BarChart2 size={11} />
-                        </button>
-                      </Tooltip>
+                      {/* Native `title`, not our Radix `Tooltip`, and only
+                          here: this list is a plain `<ul>` that renders every
+                          row it has been asked for, and #296 raised that to
+                          500. Two tooltip roots per row is a thousand of them
+                          mounted and subscribed for the fourteen rows the
+                          scroll container actually shows, which is felt as
+                          jank on the last expansions. The row's focus button
+                          above already carries a `title`, so the affordance
+                          was mixed in this list either way. */}
+                      <button
+                        className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
+                        onClick={() => setActiveValue(v.value)}
+                        title="Focus histogram"
+                        aria-label={`Focus histogram on ${v.value}`}
+                      >
+                        <BarChart2 size={11} />
+                      </button>
                       {onAddFilter && (
                         <>
-                          <Tooltip content={`Filter IN: ${fieldKey} = ${v.value}`} side="top">
-                            <button
-                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
-                              onClick={() => onAddFilter(fieldKey, v.value, true)}
-                            >
-                              <Filter size={11} />
-                            </button>
-                          </Tooltip>
-                          <Tooltip content={`Filter OUT: ${fieldKey} ≠ ${v.value}`} side="top">
-                            <button
-                              className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)]"
-                              onClick={() => onAddFilter(fieldKey, v.value, false)}
-                            >
-                              <FilterX size={11} />
-                            </button>
-                          </Tooltip>
+                          <button
+                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-info)] hover:bg-[var(--color-info-dim)]"
+                            onClick={() => onAddFilter(fieldKey, v.value, true)}
+                            title={`Filter IN: ${fieldKey} = ${v.value}`}
+                            aria-label={`Filter IN: ${fieldKey} = ${v.value}`}
+                          >
+                            <Filter size={11} />
+                          </button>
+                          <button
+                            className="shrink-0 rounded p-0.5 opacity-0 group-hover:opacity-100 text-[var(--color-danger)] hover:bg-[var(--color-danger-dim)]"
+                            onClick={() => onAddFilter(fieldKey, v.value, false)}
+                            title={`Filter OUT: ${fieldKey} ≠ ${v.value}`}
+                            aria-label={`Filter OUT: ${fieldKey} ≠ ${v.value}`}
+                          >
+                            <FilterX size={11} />
+                          </button>
                         </>
                       )}
                     </li>
@@ -377,6 +410,19 @@ export function FieldHistogramModal({
                 </ul>
               )}
             </div>
+            {termsCached && (
+              <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+                From the per-source summary cache — counts are exact, the ranking across sources
+                and the distinct total are approximate. Showing more re-reads the events and can
+                reorder these rows.
+              </p>
+            )}
+            {termsRescanned && (
+              <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+                Re-read from the events — the ranking, counts and distinct total are exact and may
+                differ from the cached first page shown a moment ago.
+              </p>
+            )}
           </div>
         </div>
       </DialogContent>

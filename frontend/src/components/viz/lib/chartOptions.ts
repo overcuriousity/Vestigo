@@ -85,6 +85,11 @@ export interface ResolvedChartOptions {
  * while a pie past a few dozen slices is unreadable whatever the slider
  * permits (`pieReadability.ts`) and a waffle only has 100 cells to share out.
  *
+ * A raised ceiling is also a taller chart: a horizontal bar frame grows with
+ * its row count, so PNG export clamps its own resolution to what a canvas may
+ * be (`lib/export.ts`) rather than failing on the charts these numbers make
+ * reachable.
+ *
  * These match what `agent/chart_exec.py` applies: `ANALYST_CHART_LIMITS`
  * carries the endpoint ceiling and `TERMS_TOP_N_BY_CHART` narrows it for the
  * marks bounded by legibility, so an exported chart freezes what the analyst

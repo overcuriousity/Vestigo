@@ -100,16 +100,33 @@ const slider = () => screen.getByRole("slider", { name: "Top values" });
 const exactBox = () => screen.getByRole("spinbutton", { name: /top values \(exact\)/i });
 
 describe("Top-values slider above its own ceiling", () => {
-  it("commits the ceiling when the thumb is released there", async () => {
-    // With a typed 300 the thumb already sits at the slider's 50, so dragging
-    // it to 50 changes nothing in the DOM and fires no `change` event at all.
-    // The release is what says "this is my answer".
+  it("commits a drag that ends on the ceiling", async () => {
+    // With a typed 300 the thumb already sits at the slider's 50, so a drag
+    // that ends there changes nothing in the DOM by the time it is released.
+    // The release is what says "this is my answer" — and the movement on the
+    // way to it is what makes the release a gesture rather than a click.
     renderPage(entryWithTopN(300));
     await waitFor(() => expect(screen.getByText("Top values: 300")).toBeTruthy());
     expect((slider() as HTMLInputElement).value).toBe("50");
 
+    fireEvent.pointerDown(slider());
+    fireEvent.change(slider(), { target: { value: "30" } });
+    fireEvent.change(slider(), { target: { value: "50" } });
     fireEvent.pointerUp(slider());
     await waitFor(() => expect(screen.getByText("Top values: 50")).toBeTruthy());
+  });
+
+  it("leaves the value alone when the pinned thumb is clicked but not moved", async () => {
+    // A press and release on the pinned thumb moved nothing: no `change` event
+    // fired. Committing the thumb's clamped 50 there would rewrite a typed 300
+    // — and spend a gated ClickHouse scan — for a gesture that expressed
+    // nothing.
+    renderPage(entryWithTopN(300));
+    await waitFor(() => expect(screen.getByText("Top values: 300")).toBeTruthy());
+
+    fireEvent.pointerDown(slider());
+    fireEvent.pointerUp(slider());
+    expect(screen.getByText("Top values: 300")).toBeTruthy();
   });
 
   it("commits the ceiling when a movement key lands there", async () => {
@@ -130,6 +147,32 @@ describe("Top-values slider above its own ceiling", () => {
     fireEvent.keyUp(slider(), { key: "Tab" });
     fireEvent.focus(slider());
     expect(screen.getByText("Top values: 300")).toBeTruthy();
+  });
+});
+
+describe("Top-values slider cost", () => {
+  it("spends one request on a drag, not one per step it passes through", async () => {
+    // Same reason the box beside it debounces: every commit re-runs a gated
+    // ClickHouse foreground scan. Committing on `change` made one drag across
+    // the slider's travel dozens of them.
+    renderPage(entryWithTopN(40));
+    await waitFor(() =>
+      expect([...new Set(fieldTermsMock.mock.calls.map((c) => c[4]))]).toEqual([40]),
+    );
+
+    fireEvent.pointerDown(slider());
+    for (const n of ["30", "20", "12", "10"]) {
+      fireEvent.change(slider(), { target: { value: n } });
+    }
+    // The label tracks the thumb the whole way — the draft is live, only the
+    // commit waits.
+    expect(screen.getByText("Top values: 10")).toBeTruthy();
+    expect([...new Set(fieldTermsMock.mock.calls.map((c) => c[4]))]).toEqual([40]);
+
+    fireEvent.pointerUp(slider());
+    await waitFor(() =>
+      expect([...new Set(fieldTermsMock.mock.calls.map((c) => c[4]))]).toEqual([40, 10]),
+    );
   });
 });
 

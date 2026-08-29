@@ -91,6 +91,37 @@ surfaces the two issues touched.
   the cheap path stayed skipped for as long as the modal was open. A scope change resets to
   the first page.
 
+**Third review round (same session).** Five more, all downstream of the raised ceiling.
+
+- PNG export failed on exactly the charts the 500 ceiling makes reachable. A horizontal bar
+  chart sizes itself to its row count, so 500 rows is a ~13,000px `<svg>` (~21,000px in
+  compare mode) and `downloadChartPng` rasterized at `height * scale` — past the 16,384px a
+  canvas may be at *any* resolution, at which point `toBlob` yields `null` and the analyst
+  reads "PNG export failed", or worse gets a blank image. `effectiveExportScale` now lowers
+  the requested scale to what the canvas limits allow (dimension *and* Chrome's 2^28-pixel
+  area cap), and `ExportControls` says which scale it actually used and points at SVG for
+  full detail. A silently downscaled export would make the resolution picker lie.
+- Expanding the top-values list crosses a computation boundary the analyst could not see. An
+  unfiltered first page comes from the `field_stats` cache, whose per-value counts are exact
+  but whose cross-source top-N merge is approximate and whose `distinct` is a
+  max-across-sources; the cache answers nothing above 50, so the first "+ N more" click falls
+  through to an exact live scan that may reorder or replace values *inside* the 50 already on
+  screen. The response has carried a `cached` flag all along and the modal ignored it. It now
+  names the cache while it is serving, marks the approximate distinct count with `≈`, and
+  says the list was re-read once the answer becomes live.
+- The Top-values slider committed on every intermediate step while the box beside it
+  debounced for the very same reason — dragging a bar chart's full travel was ~50 gated
+  ClickHouse scans and ~50 history entries for one gesture. The slider now keeps a live draft
+  (the label still tracks the thumb) and commits once, on release.
+- Committing on release also meant a press-and-release on the *pinned* thumb — no drag, no
+  change event, nothing moved — rewrote a typed 500 down to the slider's 50. A release now
+  only commits if something moved on the way to it; above the slider's range the label and
+  the exact box stay authoritative.
+- The expanded list renders every row it is given, and each carried two Radix `Tooltip`
+  roots: ~1,000 of them mounted for the ~14 rows the scroll container shows. The three
+  per-row icon buttons use native `title` (plus `aria-label`) now, which is what the row's
+  focus button already did.
+
 ## Session 199 — 2026-08-28: the release workflow could never reach ClickHouse
 
 CI on `main` has been green since 1.15.2, but the **Release** workflow has failed on every tag

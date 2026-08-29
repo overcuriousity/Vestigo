@@ -85,7 +85,7 @@ import {
   type Scale,
 } from "@/components/viz/lib/chartConfig";
 import { METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import { CHART_META, SCALES, chartTypesFor } from "@/components/viz/lib/chartMeta";
+import { CHART_META, SCALES, chartTypesFor, type DataKind } from "@/components/viz/lib/chartMeta";
 import {
   resolveChartOptions,
   defaultChartTypeForScale,
@@ -297,6 +297,110 @@ function TopNInput({
       aria-label="Top values (exact)"
       className="w-16 shrink-0 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] tabular-nums focus:border-[var(--color-accent)] focus:outline-none"
     />
+  );
+}
+
+/**
+ * The Top-values control: a slider over the range most charts want, the exact
+ * box beside it as the escape hatch to the chart type's ceiling (#297), and
+ * the sentence naming that escape hatch.
+ *
+ * The slider keeps a draft while the analyst is interacting and commits once,
+ * on release, for two reasons that pull the same way.
+ *
+ * Cost: every commit re-runs a gated ClickHouse foreground scan, the same
+ * reason the box beside it debounces. Committing on `change` spent one per
+ * intermediate step — dragging across a bar chart's full travel was fifty
+ * scans and fifty history entries for one gesture.
+ *
+ * Truth: `topN` may sit above the slider's own maximum, so the thumb is
+ * pinned and reads a smaller number than the label by design. A drag that
+ * ends there reports its answer only through the release — but a release is
+ * an answer only if something moved. A click that lands on the pinned thumb
+ * and lets go moved nothing, and must not silently rewrite a typed 500 down
+ * to 50. `moved` is that distinction: a drag away from the pinned position
+ * and back fires `change` events on the way, so it commits; a press that
+ * never leaves it is indistinguishable from a click and does not. Above the
+ * slider's range the label and the exact box stay authoritative.
+ */
+function TopNControl({
+  chartType,
+  dataKind,
+  value,
+  onCommit,
+}: {
+  chartType: ChartType;
+  dataKind: DataKind;
+  value: number;
+  onCommit: (n: number) => void;
+}) {
+  const sliderMax = TOPN_SLIDER_MAX[chartType];
+  const [draft, setDraft] = useState<number | null>(null);
+  const moved = useRef(false);
+  const shown = draft ?? Math.min(value, sliderMax);
+  const commit = (n: number) => {
+    setDraft(null);
+    moved.current = false;
+    if (n !== value) onCommit(n);
+  };
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
+        Top values: {draft ?? value}
+      </label>
+      <div className="flex items-center gap-2">
+        <input
+          type="range"
+          aria-label="Top values"
+          min={TOPN_MIN}
+          max={sliderMax}
+          step={1}
+          value={shown}
+          onChange={(e) => {
+            moved.current = true;
+            setDraft(Number(e.target.value));
+          }}
+          onPointerDown={() => {
+            moved.current = false;
+          }}
+          onPointerUp={(e) => {
+            if (moved.current) commit(Number(e.currentTarget.value));
+            else setDraft(null);
+          }}
+          onPointerCancel={() => {
+            setDraft(null);
+            moved.current = false;
+          }}
+          onKeyUp={(e) => {
+            // Only the keys that actually move a range input. A bare Tab
+            // *into* the slider also fires keyup on it, and with a typed 500
+            // the clamped thumb reads 50 — committing there would rewrite the
+            // value for merely focusing the control.
+            if (!SLIDER_KEYS.has(e.key)) return;
+            commit(Number(e.currentTarget.value));
+          }}
+          onBlur={() => {
+            // A gesture that ended without its own release event (a keypress
+            // interrupted by a click elsewhere) still has an answer on screen.
+            if (draft != null) commit(draft);
+          }}
+          className="min-w-0 flex-1 accent-[var(--color-accent)]"
+        />
+        <TopNInput value={value} max={TOPN_MAX[chartType]} onCommit={onCommit} />
+      </div>
+      {/* The escape hatch has to be named wherever it exists, and the gap is
+          *widest* on the timeseries charts (slider 20, ceiling 50) — naming it
+          only on the terms branch left the number box undiscoverable exactly
+          where it matters most. */}
+      <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+        {`Up to ${TOPN_MAX[chartType]}`}
+        {sliderMax < TOPN_MAX[chartType]
+          ? ` — past the slider's ${sliderMax}, type an exact number.`
+          : "."}
+        {dataKind === "timeseries" &&
+          " Each value is its own series, so a crowded chart stops being readable well before that."}
+      </p>
+    </div>
   );
 }
 
@@ -1679,72 +1783,12 @@ export function VisualizePage() {
           </div>
         )}
         {(dataKind === "terms" || dataKind === "timeseries") && (
-          <div>
-            <label className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--color-fg-secondary)]">
-              Top values: {topN}
-            </label>
-            <div className="flex items-center gap-2">
-              {/* The slider covers the range most charts want; the number
-                  beside it is the escape hatch up to this chart type's
-                  ceiling, so asking for 300 bars does not need 300 pixels of
-                  slider travel (#297).
-
-                  Both share `TOPN_MIN`: a slider whose `min` sat above the
-                  box's floor let the two disagree — the DOM clamps the thumb
-                  to its own `min`, so a typed 1 showed a slider reading 3, and
-                  dragging to exactly 3 then fired no change event at all.
-
-                  Clamping the *displayed* value reintroduces that same failure
-                  at the other end: with a typed 300 the thumb already sits at
-                  the slider's 50, so dragging it there changes nothing in the
-                  DOM and fires no change event — the chart went on drawing 300.
-                  Committing on release closes it, since a range input's value
-                  always follows the pointer, so what the thumb reads when the
-                  analyst lets go is the answer they gave. */}
-              <input
-                type="range"
-                aria-label="Top values"
-                min={TOPN_MIN}
-                max={TOPN_SLIDER_MAX[chartType]}
-                step={1}
-                value={Math.min(topN, TOPN_SLIDER_MAX[chartType])}
-                onChange={(e) =>
-                  updateConfig({ options: { ...config.options, topN: Number(e.target.value) } })
-                }
-                onPointerUp={(e) => {
-                  const n = Number(e.currentTarget.value);
-                  if (n !== topN) updateConfig({ options: { ...config.options, topN: n } });
-                }}
-                onKeyUp={(e) => {
-                  // Only the keys that actually move a range input. A bare Tab
-                  // *into* the slider also fires keyup on it, and with a typed
-                  // 300 the clamped thumb reads 50 — committing there would
-                  // rewrite the value for merely focusing the control.
-                  if (!SLIDER_KEYS.has(e.key)) return;
-                  const n = Number(e.currentTarget.value);
-                  if (n !== topN) updateConfig({ options: { ...config.options, topN: n } });
-                }}
-                className="min-w-0 flex-1 accent-[var(--color-accent)]"
-              />
-              <TopNInput
-                value={topN}
-                max={TOPN_MAX[chartType]}
-                onCommit={(n) => updateConfig({ options: { ...config.options, topN: n } })}
-              />
-            </div>
-            {/* The escape hatch has to be named wherever it exists, and the
-                gap is *widest* on the timeseries charts (slider 20, ceiling
-                50) — naming it only on the terms branch left the number box
-                undiscoverable exactly where it matters most. */}
-            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-              {`Up to ${TOPN_MAX[chartType]}`}
-              {TOPN_SLIDER_MAX[chartType] < TOPN_MAX[chartType]
-                ? ` — past the slider's ${TOPN_SLIDER_MAX[chartType]}, type an exact number.`
-                : "."}
-              {dataKind === "timeseries" &&
-                " Each value is its own series, so a crowded chart stops being readable well before that."}
-            </p>
-          </div>
+          <TopNControl
+            chartType={chartType}
+            dataKind={dataKind}
+            value={topN}
+            onCommit={(n) => updateConfig({ options: { ...config.options, topN: n } })}
+          />
         )}
         {dataKind === "pivot" && (
           <>

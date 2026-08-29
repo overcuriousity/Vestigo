@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { downloadChartSvg } from "@/components/viz/lib/export";
+import {
+  downloadChartSvg,
+  effectiveExportScale,
+  MAX_CANVAS_AREA,
+  MAX_CANVAS_DIM,
+} from "@/components/viz/lib/export";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -67,5 +72,47 @@ describe("downloadChartSvg", () => {
     const heightMatch = text.match(/height="(\d+)"/);
     expect(heightMatch).not.toBeNull();
     expect(Number(heightMatch![1])).toBeGreaterThan(100);
+  });
+});
+
+/**
+ * A horizontal bar chart sizes itself to its row count, so the 500-value
+ * ceiling (#296) puts the `<svg>` past what any canvas may be — long before
+ * the resolution picker multiplies it. An unclamped export failed with "PNG
+ * export failed" on exactly those charts.
+ */
+describe("effectiveExportScale", () => {
+  it("leaves an ordinary chart at the requested resolution", () => {
+    expect(effectiveExportScale(800, 400, 4)).toBe(4);
+  });
+
+  it("never raises the requested resolution", () => {
+    expect(effectiveExportScale(10, 10, 1)).toBe(1);
+  });
+
+  it("keeps a tall chart inside the canvas dimension limit", () => {
+    // 500 rows x 26px + 40 = 13,040px tall: already 26,080px at the default 2x.
+    const scale = effectiveExportScale(900, 13040, 2);
+    expect(scale).toBeLessThan(2);
+    expect(13040 * scale).toBeLessThanOrEqual(MAX_CANVAS_DIM);
+  });
+
+  it("drops below 1x for a chart that overruns a canvas at its natural size", () => {
+    // Compare mode gives each row 41.6px: 500 rows is ~21,000px, past the
+    // limit before any multiplier at all.
+    const scale = effectiveExportScale(900, 20840, 1);
+    expect(scale).toBeLessThan(1);
+    expect(20840 * scale).toBeLessThanOrEqual(MAX_CANVAS_DIM);
+  });
+
+  it("respects the total-area limit, not only the longest side", () => {
+    const w = 12000;
+    const h = 12000;
+    const scale = effectiveExportScale(w, h, 1);
+    expect(w * scale * h * scale).toBeLessThanOrEqual(MAX_CANVAS_AREA + 1);
+  });
+
+  it("passes a degenerate size through rather than dividing by zero", () => {
+    expect(effectiveExportScale(0, 0, 3)).toBe(3);
   });
 });

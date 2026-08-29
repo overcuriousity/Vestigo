@@ -12,6 +12,12 @@
  * SVG is attached to this document — a rasterized/standalone copy has no
  * access to `index.css`'s `[data-theme]` rules, so every `var(--x)` is
  * inlined to its live computed value before serialization.
+ *
+ * PNG is additionally bounded by what a browser canvas can be: a horizontal
+ * bar chart sizes itself to its row count, so at the 500-value ceiling the
+ * `<svg>` is already taller than any canvas may be, and the requested scale
+ * is lowered to fit rather than handing back a failed (or blank) export.
+ * SVG has no such limit and is never downscaled.
  */
 
 import { triggerDownload } from "@/lib/download";
@@ -114,6 +120,39 @@ export function downloadChartSvg(
   triggerDownload(blob, withExt(filename, "svg"));
 }
 
+/**
+ * The largest side, and the largest area, a `<canvas>` may have.
+ *
+ * Both are browser limits, not ours, and every engine we target sits at or
+ * above these: Chrome and Firefox refuse a dimension past 16,384px, and
+ * Chrome caps the total bitmap at 2^28 pixels. Past either, `toBlob` yields
+ * `null` — or, worse on some builds, a blank bitmap — so an unclamped export
+ * fails with "PNG export failed" on exactly the charts a high `topN` makes
+ * reachable (a 500-row horizontal bar is ~13,000px tall before the caption,
+ * and ~21,000px in compare mode, so even 1× overruns it).
+ */
+export const MAX_CANVAS_DIM = 16384;
+export const MAX_CANVAS_AREA = 268_435_456;
+
+/**
+ * The scale a chart this size can actually be rasterized at.
+ *
+ * Never raises the requested scale, and may drop below 1× for a chart that
+ * exceeds a canvas at its natural size — a downscaled PNG is a worse image
+ * than the analyst asked for, but it is an image, and `ExportControls`
+ * discloses the number it was lowered to. For a very tall chart, SVG is the
+ * lossless way out.
+ */
+export function effectiveExportScale(width: number, height: number, scale: number): number {
+  if (!(width > 0) || !(height > 0)) return scale;
+  return Math.min(
+    scale,
+    MAX_CANVAS_DIM / width,
+    MAX_CANVAS_DIM / height,
+    Math.sqrt(MAX_CANVAS_AREA / (width * height)),
+  );
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -126,30 +165,37 @@ function loadImage(url: string): Promise<HTMLImageElement> {
 /**
  * Rasterize the chart to a PNG at `width * scale` resolution — `scale` is
  * the export-resolution knob surfaced in `ExportControls` (e.g. 1x/2x/3x/4x).
+ *
+ * Returns the scale actually used, which is the requested one unless the
+ * canvas limits forced it down (`effectiveExportScale`). The caller discloses
+ * the difference; silently shipping a lower-resolution image than the picker
+ * reads would make the knob lie.
  */
 export async function downloadChartPng(
   svg: SVGSVGElement,
   filename: string,
   scale: number,
   captionLines: string[] = [],
-): Promise<void> {
+): Promise<number> {
   const { svgEl, width, height } = cloneWithCaption(svg, captionLines);
+  const usedScale = effectiveExportScale(width, height, scale);
   const svgString = serialize(svgEl);
   const svgBlob = new Blob([svgString], { type: "image/svg+xml" });
   const url = URL.createObjectURL(svgBlob);
   try {
     const img = await loadImage(url);
     const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(width * scale));
-    canvas.height = Math.max(1, Math.round(height * scale));
+    canvas.width = Math.max(1, Math.round(width * usedScale));
+    canvas.height = Math.max(1, Math.round(height * usedScale));
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("Canvas 2D context unavailable");
-    ctx.scale(scale, scale);
+    ctx.scale(usedScale, usedScale);
     ctx.drawImage(img, 0, 0, width, height);
     const pngBlob = await new Promise<Blob>((resolve, reject) => {
       canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("PNG export failed"))), "image/png");
     });
     triggerDownload(pngBlob, withExt(filename, "png"));
+    return usedScale;
   } finally {
     URL.revokeObjectURL(url);
   }
