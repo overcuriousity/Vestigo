@@ -4,7 +4,38 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 205 — cumulative step and calendar heatmap).
+Last updated: 2026-08-29 (session 206 — ranked change).
+
+## Session 206 — 2026-08-29: ranked change (viz plan C)
+
+Plan C of the Visualize design round (step 6 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Ranked change". Stacked on the time figures (#328).
+
+**The first figure that requires Compare.** `change` is *defined* by two windows, so the
+registry row gains `requires_compare=True` (generated as `requiresCompare`) with three
+consequences: the rail disables Compare's *Off* and says why, picking the figure with
+Compare off switches Compare to Baseline together with the figure and says so in
+`autoNotice`, and `propose_chart` refuses a `change` without a comparison layer by name.
+A config that still arrives without one (a URL, a saved chart) gets an empty state that
+names the fix rather than a blank chart.
+
+**Share of window, never count.** The two windows are rarely the same size, so the encoded
+quantity is each value's share of its own window; the pure `rank_change_rows` turns two
+count maps and two totals into `rose | fell | new | vanished | same` rows ranked by |Δ
+share|, and the live test pins the case the figure exists for — the same count in both
+windows *fell* when the second window doubled. `field_change` is four scans in two
+parallel pairs: top-N per window (both on the primary's derived expression, as
+`compare_field_terms` does), the union, and one count scan per window over the union that
+also yields the window's non-empty total. The union is capped (`ChartLimits.change_union`,
+30 agent / 200 analyst) and the omitted count is a caption line, like every other honesty
+disclosure here (both totals, the per-window top-N, the union size, new/vanished counts).
+
+**Endpoint decision.** The design named `GET …/viz/field-change`; it ships as
+`kind="change"` on `POST …/viz/compare`, because two filter sets do not fit query params
+and the two-layer resolution, window pinning and derive rule already live there.
+
+**Schema budget.** `ChartOptionsSpec.layout` took the tool schemas from 42,044 to 42,115
+chars; the ceiling stays at 42,500 (`docs/AGENT.md`).
 
 ## Session 205 — 2026-08-29: cumulative step and calendar heatmap (viz plan B)
 

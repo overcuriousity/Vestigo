@@ -139,10 +139,16 @@ Read top-down, in dependency order:
    *distinct* whenever a second field is set; *distinct* is disabled until one is, and a
    stored choice that names it without a second field is drawn without it.
 6. **Compare · Metric · Options** — as before; Compare is always rendered and states its
-   reason when a figure has no honest two-layer encoding. The cumulative step adds
-   **Quantity** (running event count · running sum (measure) · distinct values seen so far)
-   beside *Buckets*; the dishonest choices are greyed with the reason (sum needs *Measure*,
-   distinct needs *Categories* or *Ordered categories*). The calendar has no options.
+   reason when a figure has no honest two-layer encoding. Compare has a third state beside
+   supported and unsupported — **required** (`requiresCompare`, the ranked change): *Off*
+   is disabled with the reason under the radios, and picking the figure from the gallery
+   while Compare is off switches Compare to *Baseline* together with the figure and says so
+   in `autoNotice` ("Compare set to Baseline — Ranked change … needs two windows."). The
+   cumulative step adds **Quantity** (running event count · running sum (measure) · distinct
+   values seen so far) beside *Buckets*; the dishonest choices are greyed with the reason
+   (sum needs *Measure*, distinct needs *Categories* or *Ordered categories*). The ranked
+   change adds *Top values per window* and *Layout* (dumbbell · slope). The calendar has no
+   options.
 7. **Marks** — only on figures whose registry row says `supportsMarks` (events over time,
    value over time): the chart's mark sources, each with the status the server resolved it
    to (`N drawn`, `N of M drawn — capped at C`, `; U undated not drawn`; a baseline names
@@ -402,6 +408,69 @@ never look alike; month labels above the first column of each month, every other
 label on the left, and the tooltip names the weekday, the date and the count. No marks, no
 Compare, no options.
 
+## Ranked change
+
+`chart_type="change"` (`data_kind="change"`, `EventQueryService.field_change`) answers
+"which values gained or lost share between the reference window and this one — and which
+appeared or disappeared?" for one categorical field (nominal or ordinal; a numeric or time
+field reaches it through a derivation, bins or a calendar part, exactly as the bar does).
+
+**Two windows, fixed vocabulary.** The *primary* window is the current filters — the suspect
+slice, drawn in the accent colour; the *comparison* window is the Compare layer — Baseline
+(the whole timeline over the same time range) or Custom filters (the time range pinned to
+the primary's, as every Compare kind does) — the reference, drawn grey. The pair is the
+one the grouped bar already uses, so a reader moving between figures never relearns which
+layer is which. The figure is the first with `requires_compare=True` (generated as
+`requiresCompare`): it is *defined* by two windows, so the rail disables Compare's *Off*
+and says why, picking it with Compare off switches Compare to Baseline and says so, and
+`propose_chart` refuses a `change` without a comparison layer by name (§5). The page shows
+"Ranked change needs a second window — turn on Compare" rather than an empty chart if the
+config ever arrives in that state (a URL, a saved chart).
+
+**The scans.** Both windows are resolved by `POST …/viz/compare` with `kind="change"`;
+`field_change` then runs four scans in two parallel pairs under one foreground gate slot:
+the top-N values of each window (`GROUP BY … ORDER BY count() DESC, val ASC LIMIT n`, both
+on the **primary's** derived expression — the comparison layer never resolves edges of its
+own, or the two windows would be counted on different bins), the union of the two lists
+(primary order first, duplicates dropped), and one count scan per window restricted to the
+union (`has(Array(String))`) that also yields the window's non-empty total. The pure,
+unit-tested `rank_change_rows` turns the counts into the rows.
+
+**Share of window, never count.** Each row carries `primary_share = primary /
+primary_total` and `comparison_share` (0.0 when that window's total is 0), `delta_share =
+primary_share − comparison_share`, and a status: `new` (present in the primary window only),
+`vanished` (comparison only), else `rose` / `fell` / `same` by share. The windows are rarely
+the same size, so a count comparison would mostly measure the window sizes: a value with
+the same count in both windows *fell* when the second window is twice the size, and the
+live test pins exactly that. Rows are ranked by |Δ share| descending, ties by value, and
+capped at `ChartLimits.change_union` — 30 for the agent, 200 for the analyst — with
+`truncated`, `rows_shown`, `omitted` (the smallest changes) and `union_size` in the
+response. The per-window top-N is `options.top_n`, clamped to `ChartLimits.change_top_n`
+(agent 10 default / 20 max; analyst 10 / 100, slider to 20).
+
+**Why not `GET …/viz/field-change`.** The design named a GET; it ships as a kind on the
+existing Compare POST because two filter sets do not fit query params — the same reason
+Compare is a POST — and because the two-layer resolution, the window pinning, the baseline
+token and the derive rule already live in that handler. The baseline cache token is not
+passed: `field_change` has no cache path, and the token's superset invariant belongs to
+the terms and time kinds.
+
+**Drawing** (`charts/RankedChange.tsx`). *Dumbbell* (default, `options.layout`): one row per
+value, ranked; the grey dot at the comparison share, the accent dot at the primary share,
+a link between them on a shared 0…max-share axis in percent; the value at the left, the
+status at the right in words (`new`, `vanished`, `same`) or percentage points (`+30.0 pp`,
+`−40.0 pp`, a real minus sign). *Slope*: two columns, reference left and this window
+right, one line per value from its comparison share to its primary share, labelled at both
+ends, accent when it rose or is new and muted otherwise. Both carry the legend ("Reference
+window (comparison)" / "This window (primary)"), a tooltip with both counts, both totals
+and both shares, and the empty state "No values in either window". No marks, no metric.
+
+**Caption.** The header is `share-of-window change of <field> between two windows — <label>`
+(with `(<scale> → ordered categories)` after the field when derived). Beneath the usual
+`primary:` / `comparison:` lines with both window totals: `ranked by |Δ share of window|,
+not by count; top N values per window, U in the union — X new, Y vanished`, and when the
+cap bit `union capped at S of U values; the O with the smallest change not drawn`.
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -424,7 +493,12 @@ Compare, no options.
   For the cumulative step `options.quantity` is resolved by the same field-and-scale rule as
   the rail and echoed in `resolved.options`; the summary carries `total`, `events`,
   `unparsed`, `buckets` and `interval_seconds`. For the calendar the summary carries
-  `total`, `max_count`, `weeks`, `weeks_total`, `truncated` and `dropped`.
+  `total`, `max_count`, `weeks`, `weeks_total`, `truncated` and `dropped`. For the ranked
+  change `propose_chart` refuses a `change` without a comparison layer by name
+  (`chart_type="change" needs a comparison layer — … set compare.mode to "baseline" or
+  "custom".`); `resolved.options` carries `top_n` (clamped to `change_top_n`) and `layout`;
+  the summary carries both totals, `union_size`, `rows_shown`, `truncated` and the first
+  five `top_rows` (`{value, status, delta_share}`).
 - **External MCP.** The tool server is one FastMCP instance served in-app and on `/mcp`, so
   the schema an external client sees is the in-app one. Every `propose_chart` result also
   carries `open_url`, the Visualize page link for that exact figure
@@ -440,11 +514,12 @@ Compare, no options.
   (`{marks, sources, cap}`, provenance included) beside `chart`, and the snapshot draws
   them without re-resolving. A cumulative or calendar block freezes the `CumulativeResponse`
   / `CalendarResponse` as `chart` like every other kind, and `snapshotToChartResult` rebuilds
-  both without a fetch.
+  both without a fetch. A ranked-change block freezes the `ChangeResponse` as `chart` and
+  is redrawn the same way — the shares are in the response, so the snapshot never recounts
+  a window.
 
 ## 6. Not yet shipped
 
-Designed in the 2026-08-29 round and tracked as follow-up steps, in this order: ranked
-change between two windows; interval lanes.
-Until each lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
+Designed in the 2026-08-29 round and tracked as a follow-up step: interval lanes.
+Until it lands, its `INPUT_KEYS` entries are vocabulary only, and this document does not
 describe it. Geo/choropleth remains its own roadmap round.

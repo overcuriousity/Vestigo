@@ -45,6 +45,8 @@ from vestigo.db.postgres import User
 # (viz plan A); ceiling moved by that delta.
 # 2026-08-29: 41,947 → 42,044 with ChartOptionsSpec.quantity (viz plan B); ceiling
 # moved to the next 500.
+# 2026-08-29: 42,044 → 42,115 with ChartOptionsSpec.layout (viz plan C); ceiling unchanged
+# at 42,500.
 SCHEMA_BUDGET_CHARS = 42_500
 
 

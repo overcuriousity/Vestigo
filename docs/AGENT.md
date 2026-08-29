@@ -308,6 +308,19 @@ list used only by the correlation matrix.
   part is always present) and keeps the latest `ChartLimits.calendar_weeks` = 53 weeks —
   the same number for the agent and the analyst, since the cap is a display truth rather
   than a context budget; `summary` carries `weeks`, `weeks_total`, `truncated`, `dropped`.
+- **Ranked change.** `chart_type="change"` (`docs/VISUALIZE.md` §"Ranked change") is the
+  first figure whose registry row says `requires_compare`: without a comparison layer there
+  is nothing to draw, so a spec with `compare.mode="off"` is refused by name
+  (`chart_type="change" needs a comparison layer — it ranks how each value's share of the
+  window moved between two windows; set compare.mode to "baseline" or "custom".`).
+  `options.top_n` is the per-window top-N before the union, clamped to
+  `ChartLimits.change_top_n` (10 default, 20 max for the agent); `options.layout`
+  (`dumbbell` default / `slope`) is echoed in `resolved.options`. The union of the two
+  top-N lists is capped at `ChartLimits.change_union` (30 for the agent, 200 for the
+  analyst) and `summary.truncated` says when it bit; the summary also carries
+  `primary_total`, `comparison_total`, `union_size`, `rows_shown` and the first five
+  `top_rows` (`{value, status, delta_share}`). The encoded quantity is share of window,
+  never count — `delta_share` is `primary_share − comparison_share`.
 - **`open_url`.** Every `propose_chart` result carries the Visualize page link for that
   exact figure, so an external `/mcp` client — which gets no card — can hand a human the
   chart. `agent/deep_link.py::visualize_url` mirrors the page's own URL codec
@@ -586,8 +599,9 @@ guard (serialized tool list < 42,500 chars; `ChartSpec.derive` measured 39,382 �
 40,213 on 2026-08-29 and the ceiling moved by that delta; `ChartSpec.inputs` and the
 table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks` and the
 `open_url` docstring took it to 41,947, and the ceiling moved to 42,000;
-`ChartOptionsSpec.quantity` took it to 42,044 and the ceiling to 42,500) — if a change
-trips it, re-measure rather than raising the ceiling.
+`ChartOptionsSpec.quantity` took it to 42,044 and the ceiling to 42,500;
+`ChartOptionsSpec.layout` took it to 42,115, ceiling unchanged) — if a change trips it,
+re-measure rather than raising the ceiling.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

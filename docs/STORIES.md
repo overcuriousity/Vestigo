@@ -437,7 +437,10 @@ Per kind, `data` is:
   `SnapshotRenderer` draws them from the snapshot, never re-resolving. A
   `cumulative` or `calendar` block freezes its `CumulativeResponse` /
   `CalendarResponse` as `chart` like every other kind, and
-  `snapshotToChartResult` names both (`FrozenChartKind`).
+  `snapshotToChartResult` names both (`FrozenChartKind`). A `change` block
+  freezes its `ChangeResponse` (both window totals, the ranked share-of-window
+  rows, the union cap facts) as `chart`; `snapshotToChartResult` names it too,
+  and `RankedChange` redraws it without recounting either window.
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in
