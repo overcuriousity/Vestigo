@@ -279,3 +279,15 @@ def test_derives_only_where_the_field_is_categorical_after_derivation(chart_type
 
 def test_marks_are_supported_on_the_time_axis_figures_only() -> None:
     assert {c for c in CHART_TYPES if CHART_META[c].supports_marks} == {"time", "line"}
+
+
+#: Input keys the Visualize rail (`components/viz/ChartRail.tsx`) renders a
+#: control for. Grown in the same commit as the renderer — a key declared here
+#: before its control exists would ask the analyst a question with no box to
+#: answer it in.
+RAIL_RENDERED_INPUTS: frozenset[str] = frozenset({"field", "second_field", "fields"})
+
+
+@pytest.mark.parametrize("chart_type", CHART_TYPES)
+def test_declared_inputs_have_a_rail_renderer(chart_type: str) -> None:
+    assert set(CHART_META[chart_type].inputs) <= RAIL_RENDERED_INPUTS
