@@ -2,6 +2,7 @@ import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { casesApi } from "@/api/cases";
 import { sourcesApi } from "@/api/sources";
+import { useCapabilities } from "@/api/health";
 import { TimelineList } from "@/components/timelines/TimelineList";
 import { SourceList } from "@/components/sources/SourceList";
 import { StoriesPanel } from "@/components/stories/StoriesPanel";
@@ -15,6 +16,7 @@ import { fmtRelative } from "@/lib/time";
 import { FolderOpen, Cpu } from "lucide-react";
 
 function EmbeddingStatusBadge({ caseId }: { caseId: string }) {
+  const { embeddings: embeddingsAvailable } = useCapabilities();
   const { data: sources } = useQuery({
     queryKey: ["sources", caseId],
     queryFn: () => sourcesApi.list(caseId),
@@ -23,11 +25,16 @@ function EmbeddingStatusBadge({ caseId }: { caseId: string }) {
     // invalidates ["sources", caseId] and restarts the interval.
     refetchInterval: (query) => {
       const data = query.state.data;
+      if (!embeddingsAvailable) return false;
       if (!data || data.length === 0) return false;
       return data.every((s) => s.vector_count > 0) ? false : 15_000;
     },
   });
 
+  // Nothing here can embed: the count would sit at 0/N for the life of the
+  // case and read as work still pending. An unconfigured subsystem shows no
+  // entry point at all (core/capabilities.py).
+  if (!embeddingsAvailable) return null;
   if (!sources || sources.length === 0) return null;
   const embedded = sources.filter((s) => s.vector_count > 0).length;
   const allEmbedded = embedded === sources.length;

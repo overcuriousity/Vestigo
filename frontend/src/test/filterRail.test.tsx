@@ -3,7 +3,7 @@
  * keyword is the default mode, semantic is an explicit opt-in gated on
  * embeddings existing, and the regex toggle only applies to keyword search.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 // AddToStoryButton navigates client-side on its success toast, so this
@@ -12,6 +12,14 @@ import { MemoryRouter } from "react-router-dom";
 import { FilterRail } from "@/components/explorer/FilterRail";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 import type { EventFilters } from "@/api/types";
+
+// Capability gate: an instance with no embedding backend renders no search-mode
+// switch at all, rather than a Semantic segment disabled forever.
+const capabilities = { current: { embeddings: true } as Record<string, boolean> };
+vi.mock("@/api/health", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/api/health")>()),
+  useCapabilities: () => capabilities.current,
+}));
 
 function renderRail(
   filters: EventFilters = {},
@@ -40,6 +48,21 @@ function renderRail(
 }
 
 describe("FilterRail search mode control", () => {
+  beforeEach(() => {
+    capabilities.current = { embeddings: true };
+  });
+
+  it("hides the whole search-mode switch when embeddings are unconfigured", () => {
+    capabilities.current = { embeddings: false };
+    renderRail({}, { hasVectors: false });
+    expect(screen.queryByText("Semantic")).not.toBeInTheDocument();
+    expect(screen.queryByText("Keyword")).not.toBeInTheDocument();
+    // The regex toggle belongs to keyword search and must survive.
+    expect(
+      screen.getByRole("button", { name: /regular expression/i }),
+    ).toBeInTheDocument();
+  });
+
   it("defaults to keyword mode with the regex toggle visible", () => {
     renderRail();
     expect(screen.getByText("Keyword")).toBeInTheDocument();

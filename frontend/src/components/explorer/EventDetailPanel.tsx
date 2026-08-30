@@ -23,6 +23,7 @@ import { TagInput } from "@/components/explorer/TagInput";
 import type { AnomalyMarker, Event, Annotation, DispositionKind } from "@/api/types";
 import { isAnalystAnnotation } from "@/api/types";
 import { useUserNames } from "@/hooks/useUserNames";
+import { useCapabilities } from "@/api/health";
 
 interface Props {
   event: Event;
@@ -402,6 +403,7 @@ export function EventDetailPanel({
   }, [setDetailPanelWidth]);
 
   const userName = useUserNames();
+  const { embeddings: embeddingsAvailable } = useCapabilities();
   const userAnnotations = annotations.filter(isAnalystAnnotation);
   const systemAnnotations = annotations.filter((a) => a.origin === "system");
   const persistedAnomalies = systemAnnotations.filter((a) => a.annotation_type === "anomaly");
@@ -523,11 +525,16 @@ export function EventDetailPanel({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Tooltip content="Find similar events (vector search)">
-          <Button variant="ghost" size="icon" onClick={() => onFindSimilar(event)}>
-            <Search size={14} />
-          </Button>
-        </Tooltip>
+        {/* Vector search only exists where embeddings are configured; without
+            them the button can only ever answer with an error the analyst
+            cannot fix, so it is absent rather than disabled. */}
+        {embeddingsAvailable && (
+          <Tooltip content="Find similar events (vector search)">
+            <Button variant="ghost" size="icon" onClick={() => onFindSimilar(event)}>
+              <Search size={14} />
+            </Button>
+          </Tooltip>
+        )}
         <Button variant="ghost" size="icon" onClick={onClose}>
           <X size={14} />
         </Button>

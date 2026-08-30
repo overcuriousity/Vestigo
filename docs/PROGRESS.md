@@ -4,7 +4,30 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-29 (session 200 — Top-values ceilings and a pageable top-list).
+Last updated: 2026-08-30 (session 202 — embeddings UI is absent, not disabled, where nothing can embed).
+
+## Session 202 — 2026-08-30: every embeddings entry point is gated on the capability
+
+`EmbedWizard` and `ToolsSheet` already hid themselves where `capabilities.embeddings` is
+false; five other surfaces did not, and on an instance with no embedding backend they each
+described a subsystem that does not exist there:
+
+- `TimelineList` — the per-row badge read `Embedding 0/N` forever (vector counts never move),
+  as if a job were still running, plus the staleness hint telling the analyst to re-embed.
+- `CaseOverviewPage` — the `0/N sources embedded` header badge, which also kept a 15 s
+  `["sources"]` poll alive waiting for a count that can never change.
+- `FilterRail` — the Keyword/Semantic switch, with Semantic permanently disabled behind a
+  "No embeddings for this timeline **yet**" tooltip. The whole switch is gone now; the regex
+  toggle beside it (keyword-only) stays.
+- `EventDetailPanel` — the find-similar (vector search) icon, which could only ever answer
+  with an error.
+- `lib/guidance.tsx` — the "Optionally: embeddings" workflow step. `CASE_OVERVIEW_STEPS`
+  entries now carry an optional `capability`, and the list renders through a small
+  `CaseOverviewSteps` component so the remaining steps renumber themselves.
+
+All of them gate on `useCapabilities()` — the same `GET /api/health` answer, one place — per
+`core/capabilities.py`: an unconfigured subsystem shows no entry point at all, and every
+endpoint still refuses on its own, so hiding is never the only enforcement.
 
 ## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
 

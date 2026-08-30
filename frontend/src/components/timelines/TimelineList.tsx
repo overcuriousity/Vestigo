@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, Cpu, Merge } from "lucide-react";
 import { timelinesApi } from "@/api/timelines";
 import { sourcesApi } from "@/api/sources";
-import { useHealth } from "@/api/health";
+import { useCapabilities, useHealth } from "@/api/health";
 import { fmtRelative } from "@/lib/time";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Spinner";
@@ -28,10 +28,16 @@ interface Props {
 function EmbeddingBadge({
   tl,
   sourcesById,
+  embeddingsAvailable,
 }: {
   tl: Timeline;
   sourcesById: Map<string, Source>;
+  embeddingsAvailable: boolean;
 }) {
+  // No embedding backend configured: every source sits at zero vectors
+  // forever, so the badge would read "Embedding 0/N" as if a job were still
+  // running. An unconfigured subsystem shows nothing at all.
+  if (!embeddingsAvailable) return null;
   if (tl.source_ids.length === 0) return null;
 
   const embeddedCount = tl.source_ids.filter(
@@ -59,6 +65,7 @@ function TimelineRow({
   sourcesById,
   mcpEnabled,
   enrichersAvailable,
+  embeddingsAvailable,
 }: {
   caseId: string;
   tl: Timeline;
@@ -67,6 +74,9 @@ function TimelineRow({
   /** No enricher has its data asset installed — the dialog would list nothing
    * actionable, so it is absent rather than empty. */
   enrichersAvailable: boolean;
+  /** Nothing on this instance can embed — the badge, the staleness hint and
+   * the wizard all describe a subsystem that does not exist here. */
+  embeddingsAvailable: boolean;
 }) {
   return (
     <div
@@ -94,17 +104,21 @@ function TimelineRow({
               </Badge>
             </span>
           )}
-          <EmbeddingBadge tl={tl} sourcesById={sourcesById} />
+          <EmbeddingBadge
+            tl={tl}
+            sourcesById={sourcesById}
+            embeddingsAvailable={embeddingsAvailable}
+          />
         </div>
         <div className="mt-1 flex items-center gap-3 text-xs text-[var(--color-fg-muted)]">
           <span>{tl.source_ids.length} source{tl.source_ids.length !== 1 ? "s" : ""}</span>
-          {tl.is_stale && (
+          {embeddingsAvailable && tl.is_stale && (
             <span className="text-[var(--color-warning)]">
               New sources aren't covered by the curated embedding — re-embed
               to include them
             </span>
           )}
-          {!tl.is_stale && tl.embedded_at && (
+          {embeddingsAvailable && !tl.is_stale && tl.embedded_at && (
             <span>Curated embed applied {fmtRelative(tl.embedded_at)}</span>
           )}
           <span>Updated {fmtRelative(tl.updated_at)}</span>
@@ -142,6 +156,7 @@ export function TimelineList({ caseId }: Props) {
   });
   const sourcesById = new Map((sources ?? []).map((s) => [s.id, s]));
   const { data: health } = useHealth();
+  const { embeddings: embeddingsAvailable } = useCapabilities();
 
   return (
     <div>
@@ -176,6 +191,7 @@ export function TimelineList({ caseId }: Props) {
               sourcesById={sourcesById}
               mcpEnabled={health?.capabilities?.mcp ?? false}
               enrichersAvailable={health?.capabilities?.enrichers ?? true}
+              embeddingsAvailable={embeddingsAvailable}
             />
           ))}
         </div>

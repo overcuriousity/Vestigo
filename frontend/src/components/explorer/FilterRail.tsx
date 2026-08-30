@@ -13,6 +13,7 @@ import { TagInput } from "@/components/explorer/TagInput";
 import { TagFacetPanel } from "@/components/explorer/TagFacetPanel";
 import { vizApi } from "@/api/viz";
 import { viewsApi } from "@/api/views";
+import { useCapabilities } from "@/api/health";
 import { Dialog, DialogContent, DialogClose } from "@/components/ui/Dialog";
 import { toast } from "@/stores/toasts";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -227,6 +228,7 @@ export function FilterRail({
   const fieldValueSuggestions = useFieldValueSuggestions(caseId, timelineId, fieldKey);
   const excludeValueSuggestions = useFieldValueSuggestions(caseId, timelineId, excludeKey);
 
+  const { embeddings: embeddingsAvailable } = useCapabilities();
   const semanticMode = filters.qMode === "semantic";
   const setSearchMode = (mode: "keyword" | "semantic") => {
     if ((mode === "semantic") === semanticMode) return;
@@ -447,6 +449,10 @@ export function FilterRail({
           {/* Search-mode control: keyword (default) vs semantic is a deliberate
               analyst choice — never auto-switched. */}
           <div className="mt-1.5 flex items-center gap-1">
+            {/* Nothing on this instance can embed, so there is no second mode
+                to pick: the switch is absent rather than permanently disabled
+                behind a "not yet" tooltip that will never come true. */}
+            {embeddingsAvailable && (
             <div className="flex overflow-hidden rounded border border-[var(--color-border-strong)] text-xs">
               <button
                 type="button"
@@ -482,6 +488,7 @@ export function FilterRail({
                 </button>
               </Tooltip>
             </div>
+            )}
             {!semanticMode && (
               <Tooltip content="Treat search as RE2 regular expression">
                 <button
