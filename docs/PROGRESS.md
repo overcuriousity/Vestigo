@@ -4,7 +4,80 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 210 — third review round on #332).
+Last updated: 2026-08-30 (session 211 — the converter sample is small on purpose, and whole records).
+
+## Session 211 — 2026-08-30: the converter excerpt shrinks to a few dozen records
+
+A converter generation over a 348 KB / 3006-line nginx access log failed four times in a
+row with `TimeoutError`, then `502 ... upstream command exited prematurely`. The llama.cpp
+logs name it precisely: the prompt was **50,039 tokens**, prefill took 91 s at ~546 tok/s,
+generation ran at ~18.8 tok/s, and the process was killed at exactly `4.00.000` —
+`srv operator(): cleaning up before exit...` — on all three server-side attempts. A 240 s
+cap upstream (not ours: `converter_generation_timeout_seconds` is 180 and the client's read
+timeout was 300) that the request could never fit inside.
+
+The prompt was that big because the excerpt was 64 KiB of a log that says the same thing
+3000 times. A first cut of this fix condensed the excerpt to distinct line *shapes* (masked
+quoted runs / hex / digits, five lines per shape per block). Review found eight defects in
+that machinery — a clamp that produced a phantom empty line for files just over budget, a
+tail walk that orphaned stack-trace continuations, per-line request ids defeating the
+masking entirely, quoted delimiters and apostrophes confusing the shape, a sample-run input
+skewed toward unparseable lines, and two tests that never exercised the path they named —
+and the conclusion was that the cleverness was the problem. Generated converters are best
+effort by design: a frictionless start on a standard log, or a first try at a format nothing
+else covers, and if that fails the analyst takes the longer route anyway.
+
+**So the fix is a smaller sample.** `converter_sample_bytes` defaults to **4 KiB** (also the
+floor, as before) — split 70/15/15 across the head, a middle window and the tail so the newest
+timestamps are in it. The system message says the excerpt is deliberately short and that the
+converter is for the whole file (`SYSTEM_PROMPT_VERSION` → `"4"`), and `sample_as_file` writes
+**every** block rather than the head alone, so the guarded sample run sees the middle and the
+tail too. On the offending log the task message drops from ~23k tokens to ~1.4k (35 lines).
+
+Review of that cut found the byte split had no notion of a record: at 4 KiB the blocks are
+2867/614/615 bytes, so a 1.5 KB JSONL line came out as a fragment with an absolute line number
+and no marker, a 3 KB line made even the head a fragment (0/2 valid records — no converter
+could ever pass the 50 % floor), a last line longer than 615 bytes meant no tail at all, and a
+middle block could start inside a quoted multi-line CSV field. **The budget now bounds what is
+shown, not what a block may hold.** `converters/sample.py` reads whole *records* — a marker
+(`\n`; `\n<indent>{` for pretty-printed JSON objects and array elements; a quote-parity-aware
+newline when the probe shows multi-line quoted fields) found at C speed in the same O(1)
+streaming scan — at least one per block however long, with the last record as the tail
+fallback, and a one-line `[{…},{…}]` array yields a head of decoded elements. `Sample.raw_blocks`
+are those records (the sample-run input, a top-level array written back as one);
+`Sample.blocks` are what the model sees: a JSON record with every key but long strings and
+arrays cut as `…[N more chars]` / `…[N more items]`, any other line cut at its block's share.
+The task header names the real block line ranges and that rule instead of a literal in the
+system message. Measured on an 85-record Claude session transcript (2.8 KB median, 20 KB max
+line): head/middle/tail all whole records, prompt ~4k tokens.
+
+Docs and copy followed: `INPUT_FORMATS.md` §"The loop" steps 1 and 4 state the size, the
+record rule and that the sample run sees the whole excerpt; `DEPLOYMENT.md` and the setting
+help say "small on purpose"; the upload dialog's disclosure waits for the server's
+`sample_bytes` (submit is disabled until then) instead of rendering a guessed default.
+
+**Not fixed here:** the 240 s cap that killed the requests is in the llama.cpp/llama-swap
+deployment, not in this repo; a file of very wide lines (minified JSON) can still be a large
+prompt at 4 KiB, and the setting cannot go below it — 4 KiB is both the default and the floor,
+because below it the 70/15/15 split cannot hold a whole ordinary line per block, and a block
+holds at least one record however long. Such a file is what the longer route is for.
+
+A second review of the excerpt found three more defects, all in how a leading `[` was read.
+`_detect_layout` treated *any* file whose first non-space byte was `[` as a JSON array, so a
+bracket-prefixed plain log — Apache `error_log`, `[2026-03-01T10:00:00Z] INFO …`, the
+commonest shape there is — had `raw_decode` called at the byte after it, which happily read
+`2026` as the array's first element: the whole excerpt became five numbers and the sample run
+got `[2026,-0,3,-0,1]`, so generation could never succeed and it *looked* like it had sampled
+the file. A leading `[` is now only an array when the next non-space character opens a
+container; anything else is lines, which is what it is. When nothing decodes after that (a
+truncated export), the head is raw text, and `sample_as_file` no longer wraps it in a second
+pair of brackets the file never had. And `record_lines` assumed shown line *j* was raw line
+*j*, which is false for a pretty-printed record re-dumped with its arrays and strings
+shortened: every line after the first shortening carried a number pointing at unrelated text,
+under a header that promised the numbers were absolute. A re-formatted record now numbers only
+its own first line and leaves the rest of the gutter blank, the elements of a multi-line array
+carry their own line numbers, and the header states the file lines each block spans
+(`Sample.line_spans`) rather than counting shown lines against file lines.
 
 ## Session 210 — 2026-08-30: twelve review findings on the Visualize round (#332)
 
