@@ -40,9 +40,10 @@ const dispositionsMock = vi.fn();
 // Every chart query waits on the disposition set (`scopeReady`), so the
 // numeric probe never fires without it — which is what these tests read.
 vi.mock("@/api/dispositions", async () => {
-  const actual = await vi.importActual<typeof import("@/api/dispositions")>(
-    "@/api/dispositions",
-  );
+  const actual =
+    await vi.importActual<typeof import("@/api/dispositions")>(
+      "@/api/dispositions",
+    );
   return {
     ...actual,
     dispositionsApi: {
@@ -86,7 +87,8 @@ const FIELDS: VizFieldsResponse = {
 
 // Start on a chart type that needs a field, so the picker is rendered at all
 // — the default `time` histogram shows "— event count —" instead.
-const START = "/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact";
+const START =
+  "/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact";
 
 /** MemoryRouter never touches window.location — capture its search string. */
 let lastSearch = "";
@@ -152,14 +154,18 @@ const openFieldPicker = async () => {
 /** Commit a row — the list commits on mousedown, so focus never leaves the
  * input and the blur handler cannot drop the pick first. */
 const pickField = async (label: string) =>
-  fireEvent.mouseDown(await screen.findByRole("option", { name: new RegExp(label) }));
+  fireEvent.mouseDown(
+    await screen.findByRole("option", { name: new RegExp(label) }),
+  );
 
 describe("VisualizePage field picker", () => {
   it("names a virtual field by its label and marks it as a time field", async () => {
     renderPage();
     await openFieldPicker();
     await waitFor(() => {
-      expect(screen.getAllByText("Hour of day (UTC)").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("Hour of day (UTC)").length).toBeGreaterThan(
+        0,
+      );
     });
     // The raw token is never shown for a virtual field.
     expect(screen.queryByText("time:hour_of_day")).toBeNull();
@@ -169,7 +175,9 @@ describe("VisualizePage field picker", () => {
   it("renders no distinct count for a field whose count is null", async () => {
     renderPage();
     await openFieldPicker();
-    await waitFor(() => expect(screen.getAllByText("Date (UTC)").length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(screen.getAllByText("Date (UTC)").length).toBeGreaterThan(0),
+    );
     // Never "(null distinct)" — the virtual branch wins before the guard.
     expect(screen.queryByText(/null distinct/)).toBeNull();
   });
@@ -193,7 +201,8 @@ describe("VisualizePage time-field auto-probe bypass", () => {
     // the list row, and the token is what `c_field` carries.
     await waitFor(() =>
       expect(
-        (screen.getByRole("combobox", { name: /^Field/ }) as HTMLInputElement).value,
+        (screen.getByRole("combobox", { name: /^Field/ }) as HTMLInputElement)
+          .value,
       ).toBe("time:hour_of_day"),
     );
     // The assertion that matters: no field_numeric_stats scan was issued for
@@ -209,7 +218,9 @@ describe("VisualizePage time-field auto-probe bypass", () => {
     await openFieldPicker();
     await pickField("Hour of day \\(UTC\\)");
     await waitFor(() => {
-      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("time:hour_of_day");
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe(
+        "time:hour_of_day",
+      );
     });
     await waitFor(() => {
       // Scale comes from TIME_FIELDS, not from a probe.
@@ -233,7 +244,9 @@ describe("VisualizePage auto-change notices", () => {
     );
 
     fireEvent.focus(await screen.findByRole("combobox", { name: "Field (X)" }));
-    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+    fireEvent.mouseDown(
+      await screen.findByRole("option", { name: /data_type/ }),
+    );
 
     // X and Y must differ and the Y list drops whatever X holds, so leaving
     // `data_type` in Y left it unreachable — and disclosed as "not in this
@@ -243,13 +256,17 @@ describe("VisualizePage auto-change notices", () => {
     expect(screen.queryByText(/not in this timeline/i)).toBeNull();
   });
 
-  it("names the scale in the article the scale actually takes", async () => {
+  it("names what the field is now treated as, in plain words", async () => {
     renderPage();
-    fireEvent.click(await screen.findByRole("radio", { name: /Interval/ }));
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Number or time" }),
+    );
 
-    // Bar is nominal/ordinal only, so the switch is a genuine scale clamp —
-    // and "on a interval scale" is not English.
-    expect(await screen.findByText(/on an interval scale/)).toBeInTheDocument();
+    // Bar is categories-only, so the switch is a genuine clamp — said in the
+    // rail's own vocabulary, not in the Stevens term the tooltip keeps.
+    expect(
+      await screen.findByText(/treated as number or time/),
+    ).toBeInTheDocument();
   });
 
   it("refuses a second field the primary already holds, and says why there", async () => {
@@ -267,11 +284,15 @@ describe("VisualizePage auto-change notices", () => {
     fireEvent.change(y, { target: { value: "artifact" } });
     fireEvent.keyDown(y, { key: "Enter" });
 
-    expect(await screen.findByText(/artifact is already the X field/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/artifact is already the X field/),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/not in this timeline/i)).toBeNull();
     // Y is left exactly as it was: X is the axis the chart is built on, so
     // there is no mirror of the X→Y takeover to make here.
-    expect(new URLSearchParams(lastSearch).get("c_field_y") ?? "data_type").toBe("data_type");
+    expect(
+      new URLSearchParams(lastSearch).get("c_field_y") ?? "data_type",
+    ).toBe("data_type");
   });
 
   it("names the re-pick when a field turns out to have no numeric values", async () => {
@@ -282,7 +303,9 @@ describe("VisualizePage auto-change notices", () => {
     // Box takes an *optional* second field, so its primary picker is labelled
     // "Field", not "Field (X)".
     fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
-    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+    fireEvent.mouseDown(
+      await screen.findByRole("option", { name: /data_type/ }),
+    );
 
     // Two controls the analyst never touched move here — the probe comes back
     // empty, so a ratio Box plot becomes a nominal Bar. It used to move both
@@ -290,10 +313,12 @@ describe("VisualizePage auto-change notices", () => {
     // analyst's own edit had put there a moment earlier.
     expect(
       await screen.findByText(
-        /data_type has no numeric values — scale set to nominal, chart set to Bar/,
+        /data_type has no numeric values — treating it as categories; figure set to Bar/,
       ),
     ).toBeInTheDocument();
-    await waitFor(() => expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar"));
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar"),
+    );
     expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
   });
 
@@ -301,7 +326,9 @@ describe("VisualizePage auto-change notices", () => {
     renderPage();
 
     fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
-    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+    fireEvent.mouseDown(
+      await screen.findByRole("option", { name: /data_type/ }),
+    );
 
     await waitFor(() =>
       expect(new URLSearchParams(lastSearch).get("c_field")).toBe("data_type"),
@@ -311,7 +338,7 @@ describe("VisualizePage auto-change notices", () => {
     // it would be a false statement about the chart on screen. (The same early
     // return is what leaves a standing notice from the analyst's own edit
     // alone.)
-    expect(screen.queryByText(/scale set to/)).toBeNull();
+    expect(screen.queryByText(/treating it as/)).toBeNull();
     expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
     expect(new URLSearchParams(lastSearch).get("c_type")).toBe("bar");
   });
@@ -322,20 +349,86 @@ describe("VisualizePage auto-change notices", () => {
         {
           id: "ch1",
           name: "Saved bar",
-          config: { v: 1, chartType: "bar", scale: "nominal", field: "data_type" },
+          config: {
+            v: 1,
+            chartType: "bar",
+            scale: "nominal",
+            field: "data_type",
+          },
         },
       ],
     });
     renderPage();
 
-    fireEvent.click(await screen.findByRole("radio", { name: /Interval/ }));
-    expect(await screen.findByText(/on an interval scale/)).toBeInTheDocument();
+    fireEvent.click(
+      await screen.findByRole("radio", { name: "Number or time" }),
+    );
+    expect(
+      await screen.findByText(/treated as number or time/),
+    ).toBeInTheDocument();
 
     // The page does not remount for a saved chart — `c_chart` is a param on
     // the same route — so the notice used to survive onto a stored chart the
     // rail re-picked nothing for, claiming a move that never happened to it.
     fireEvent.click(await screen.findByRole("button", { name: "Saved bar" }));
 
-    await waitFor(() => expect(screen.queryByText(/on an interval scale/)).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryByText(/treated as number or time/)).toBeNull(),
+    );
+  });
+});
+
+describe("the numeric probe and the figures chosen before the field", () => {
+  const numeric = {
+    field: "artifact",
+    count: 5,
+    min: 1,
+    max: 9,
+    mean: 5,
+    stddev: 2,
+    quantiles: {},
+    bins: [],
+  };
+
+  it("keeps the cumulative step and only moves the treat-as when the field looks numeric", async () => {
+    fieldNumericMock.mockResolvedValue(numeric);
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=cumulative&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /^artifact/ }));
+    expect(
+      await screen.findByText(/artifact looks numeric — treating it as a measure/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("ratio"),
+    );
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("cumulative");
+    expect(screen.queryByText(/figure set to/)).toBeNull();
+  });
+
+  it("keeps interval lanes as categories when the lane key looks numeric, and says so", async () => {
+    fieldNumericMock.mockResolvedValue(numeric);
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=lanes&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /^artifact/ }));
+    expect(
+      await screen.findByText(/artifact looks numeric — Interval lanes .* charts it as categories/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("artifact"),
+    );
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("lanes");
+    expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
+  });
+
+  it("says nothing on interval lanes when the lane key is categorical", async () => {
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=lanes&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("data_type"),
+    );
+    await waitFor(() => expect(fieldNumericMock).toHaveBeenCalled());
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("lanes");
+    expect(screen.queryByText(/figure set to|has no numeric values/)).toBeNull();
   });
 });

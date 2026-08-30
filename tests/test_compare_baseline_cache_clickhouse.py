@@ -126,3 +126,28 @@ def test_field_numeric_token_equivalent_and_warm_identical(service):
     assert cold == oracle
     assert warm == oracle
     assert oracle["comparison_total"] == 40
+
+
+def test_derived_compare_resolves_the_edges_once(service, monkeypatch):
+    """Width/log bins cost a min/max pre-flight scan; the comparison reuses the
+    primary's resolution rather than paying for it a second time."""
+    from vestigo.db.derive import DeriveSpec
+
+    primary, comparison = _layers()
+    calls: list[str] = []
+    original = service._resolve_derive
+
+    def counting(query, field_token, derive, **kw):
+        calls.append(field_token)
+        return original(query, field_token, derive, **kw)
+
+    monkeypatch.setattr(service, "_resolve_derive", counting)
+    result = service.compare_field_terms(
+        primary,
+        comparison,
+        "attr:bytes",
+        derive=DeriveSpec(kind="bins", mode="width", count=4),
+    )
+    assert calls == ["attr:bytes"]
+    assert result["derive"]["kind"] == "bins"
+    assert sum(v["comparison"] for v in result["values"]) > 0

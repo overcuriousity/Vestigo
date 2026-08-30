@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vestigo.agent.chart_exec import execute_chart_spec, run_gated_scan
 from vestigo.agent.chart_meta import (
+    CHART_META,
     LEGACY_KIND_MAP,
     PIE_COMFORTABLE_MAX,
     ChartType,
@@ -42,6 +43,7 @@ from vestigo.agent.encoding import columnar, columnar_auto
 from vestigo.agent.fidelity import DEFAULT_FIDELITY, Fidelity
 from vestigo.agent.schema_slim import slim_tool_schema, spec_reference_block
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
+from vestigo.db.derive import DeriveSpec
 from vestigo.db.postgres import User
 from vestigo.db.queries import EventQuery, TagFilter
 from vestigo.models.embeddings import embeddings_available
@@ -527,6 +529,17 @@ class ChartOptionsSpec(ObjectArgModel):
     buckets: int | None = Field(
         default=None, ge=4, description="Time bucket count — time and timeseries charts."
     )
+    quantity: Literal["events", "sum", "distinct"] | None = Field(
+        default=None,
+        description=(
+            'cumulative only: "events" (no field), "sum" (field as measure, scale ratio) or '
+            '"distinct" (values seen so far). Omit to resolve from field and scale.'
+        ),
+    )
+    layout: Literal["dumbbell", "slope"] | None = Field(
+        default=None,
+        description='change only: "dumbbell" (default, one row per value) or "slope" (two columns).',
+    )
     limit_x: int | None = Field(default=None, ge=1, description="X-axis top-N — pivot/sankey.")
     limit_y: int | None = Field(default=None, ge=1, description="Y-axis top-N — pivot/sankey.")
     sample_limit: int | None = Field(default=None, ge=1, description="Point cap — scatter only.")
@@ -545,6 +558,143 @@ class ChartOptionsSpec(ObjectArgModel):
             "(jittered strip) and line (markers at real data points)."
         ),
     )
+    table_sort_by: (
+        Literal["value", "count", "share", "first_seen", "last_seen", "distinct_second"] | None
+    ) = Field(
+        default=None,
+        description=(
+            'Table row order — table only. Default "count". "distinct_second" needs field_y; '
+            '"share" orders like "count".'
+        ),
+    )
+    table_sort_dir: Literal["asc", "desc"] | None = Field(
+        default=None, description='Table sort direction — table only. Default "desc".'
+    )
+    highlight: list[str] | None = Field(
+        default=None,
+        description=(
+            "Values whose table rows are highlighted — table only. Presentation only, and "
+            "disclosed in the caption."
+        ),
+    )
+
+
+class ChartDeriveSpec(ObjectArgModel, DeriveSpec):
+    """`DeriveSpec` in nested-argument position.
+
+    The wire shape and every validation rule are `vestigo.db.derive.DeriveSpec`'s
+    — the same model the viz endpoints parse — plus `ObjectArgModel`'s
+    tolerance of a stringified object, which every nested tool argument
+    carries. Nothing is redefined here, so the two can never disagree.
+    """
+
+
+# The prose the model reads for `derive` and `marks` names the figures that
+# take them, from the registry itself — a hand-kept list drifted the first
+# time a figure was added.
+_DERIVE_TAKERS = ", ".join(c for c in CHART_META if CHART_META[c].derives)
+_MARK_TAKERS = ", ".join(c for c in CHART_META if CHART_META[c].supports_marks)
+
+
+class ChartInputsSpec(ObjectArgModel):
+    """Figure-specific inputs, mirroring the frontend's `ChartConfig.inputs`.
+
+    Only the keys a shipped figure declares in `agent/chart_meta.py` exist
+    here; the rest of the vocabulary lands with its figures.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    columns: (
+        list[Literal["count", "share", "first_seen", "last_seen", "distinct_second"]] | None
+    ) = Field(
+        default=None,
+        description=(
+            'chart_type="table" only: which columns to show beside the value. Omit for '
+            "count, share, first_seen, last_seen (plus distinct_second when field_y is set)."
+        ),
+    )
+    pairing: Literal["first_last", "next_end"] | None = Field(
+        default=None,
+        description=(
+            'lanes only: "first_last" (default; one bar per lane, first to last event) or '
+            '"next_end" (needs start_filter and end_filter).'
+        ),
+    )
+    start_filter: FilterSpec | None = Field(
+        default=None,
+        description='lanes, pairing="next_end": events that open an interval, ANDed with filters.',
+    )
+    end_filter: FilterSpec | None = Field(
+        default=None,
+        description='lanes, pairing="next_end": events that close an interval, ANDed with filters.',
+    )
+
+
+class ChartMarkSpec(ObjectArgModel):
+    """One mark source on a time-axis figure (`docs/VISUALIZE.md` §"Marks").
+
+    One model for five kinds rather than a union: the tool schema is budgeted,
+    and five `$defs` would spend most of a step's headroom on prose the
+    validator below states once.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["events", "baseline", "view", "instant", "range"] = Field(
+        description=(
+            '"events": one instant per event matching `filters` (capped; overflow disclosed). '
+            '"baseline": the definition\'s baseline window and every suspect window as ranges. '
+            '"view": one instant per event of a saved view. "instant"/"range": typed by hand.'
+        )
+    )
+    filters: FilterSpec | None = Field(
+        default=None, description='kind="events" only: the events to mark.'
+    )
+    label: str | None = Field(
+        default=None,
+        max_length=120,
+        description='Label drawn beside the mark. Required for "instant" and "range"; optional otherwise.',
+    )
+    definition_id: str | None = Field(
+        default=None, description='kind="baseline" only: a baseline definition id (list_baselines).'
+    )
+    view_id: str | None = Field(
+        default=None, description='kind="view" only: a saved view id (list_saved_views).'
+    )
+    at: datetime | None = Field(default=None, description='kind="instant" only: the time (ISO).')
+    start: datetime | None = Field(
+        default=None, description='kind="range" only: window start (ISO).'
+    )
+    end: datetime | None = Field(
+        default=None, description='kind="range" only: window end (ISO), after start.'
+    )
+
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> ChartMarkSpec:
+        takes: dict[str, tuple[str, ...]] = {
+            "events": ("filters", "label"),
+            "baseline": ("definition_id", "label"),
+            "view": ("view_id", "label"),
+            "instant": ("at", "label"),
+            "range": ("start", "end", "label"),
+        }
+        needs: dict[str, tuple[str, ...]] = {
+            "events": ("filters",),
+            "baseline": ("definition_id",),
+            "view": ("view_id",),
+            "instant": ("at", "label"),
+            "range": ("start", "end", "label"),
+        }
+        for name in ("filters", "definition_id", "view_id", "at", "start", "end"):
+            if getattr(self, name) is not None and name not in takes[self.kind]:
+                raise ValueError(f'kind="{self.kind}" does not take {name}')
+        missing = [n for n in needs[self.kind] if getattr(self, n) is None]
+        if missing:
+            raise ValueError(f'kind="{self.kind}" needs {" and ".join(needs[self.kind])}')
+        if self.kind == "range" and self.start >= self.end:  # type: ignore[operator]
+            raise ValueError("start must be before end")
+        return self
 
 
 class ChartSpec(ObjectArgModel):
@@ -567,15 +717,18 @@ class ChartSpec(ObjectArgModel):
     chart_type: ChartType = Field(
         description=(
             "The visual mark to draw. Field-free: "
-            '"time" (events over time), "punchcard" (day x hour). One field: '
-            '"bar", "pie", "waffle" (shares of a whole as a 10x10 cell grid — '
+            '"time" (events over time), "punchcard" (day x hour). Optional field: '
+            '"cumulative" (running total over time), "calendar" (day-of-year grid). '
+            'One field: "bar", "pie", "waffle" (shares of a whole as a 10x10 cell grid — '
             'prefer it over "pie" past four categories), "histogram", "box", '
             '"violin", "ecdf" (numeric), "line", "heatmap" (one field over time '
-            "— NOT field x field). "
+            '— NOT field x field), "change" (values ranked by change against the '
+            'comparison layer), "lanes" (one interval bar per value), "table" (one '
+            "row per value with count, share, first/last seen). "
             'Two fields: "pivot" (the field x field heatmap grid), "sankey" (flow), '
-            '"scatter" (numeric x numeric). "box"/"violin" additionally take an '
-            "OPTIONAL categorical field_y to split the distribution into one "
-            "box/violin per group."
+            '"scatter" (numeric x numeric). Field list: "corr" (correlation matrix). '
+            '"box"/"violin"/"table" additionally take an OPTIONAL categorical field_y '
+            "(a grouping variable; the table counts its distinct values per row)."
         )
     )
     scale: Scale | None = Field(
@@ -625,6 +778,34 @@ class ChartSpec(ObjectArgModel):
     )
     options: ChartOptionsSpec = Field(
         default_factory=ChartOptionsSpec, description="Presentation and sizing options."
+    )
+    derive: ChartDeriveSpec | None = Field(
+        default=None,
+        description=(
+            "Optional change of scale applied to `field` before aggregation, making it "
+            'ordered categories: {"kind":"bins","mode":"width"|"log","count":N} groups a '
+            'number into N ranges; {"kind":"bins","mode":"custom","edges":[…]} uses your '
+            'edges; {"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"} takes '
+            "a calendar part (UTC) of a timestamp-valued field. Figures that admit one: "
+            f"{_DERIVE_TAKERS}; a virtual time: field never needs one. `scale` is then what "
+            "the field is treated as BEFORE the derivation — ratio or interval for bins, "
+            "interval for time_part — or omitted."
+        ),
+    )
+    inputs: ChartInputsSpec | None = Field(
+        default=None,
+        description=(
+            "Figure-specific inputs: the table's `columns`; the lanes' `pairing`, "
+            "`start_filter`, `end_filter`."
+        ),
+    )
+    marks: list[ChartMarkSpec] | None = Field(
+        default=None,
+        max_length=20,
+        description=(
+            f"Instants and windows drawn over a time-axis figure ({_MARK_TAKERS}). Each is "
+            "resolved on the server with provenance; an events source is capped per source."
+        ),
     )
 
     @model_validator(mode="before")
@@ -683,7 +864,15 @@ class ChartSpec(ObjectArgModel):
 # `$defs`, rendered once for the system prompt (A13). Generated from the models
 # above, so it cannot drift from them.
 SPEC_REFERENCE: str = spec_reference_block(
-    (FilterSpec, ChartSpec, ChartCompareSpec, ChartOptionsSpec)
+    (
+        FilterSpec,
+        ChartSpec,
+        ChartCompareSpec,
+        ChartOptionsSpec,
+        ChartDeriveSpec,
+        ChartInputsSpec,
+        ChartMarkSpec,
+    )
 )
 
 # How to read the columnar tool results (A13). Stated once and reused by both
@@ -702,6 +891,13 @@ array lines up with it index by index.
 A list result reports both `total` (how many exist) and `returned` (how many
 are in this payload). When they differ the list was capped — say so rather
 than reasoning as if you had seen all of them.
+"""
+
+SCALE_VOCABULARY_NOTE = """## Scale vocabulary
+
+The analyst's Visualize page calls `scale` "treat as": nominal = *Categories*, ordinal =
+*Ordered categories*, interval = *Number or time*, ratio = *Measure*. The wire format is
+the Stevens term; use the plain phrase only when speaking to the analyst.
 """
 
 
@@ -1188,7 +1384,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "Read-only forensic log investigation tools, scoped to one case "
             "timeline. Iterate: inspect fields, search, aggregate, then "
             "return refined filters as findings.\n\n"
-            f"{RESULT_FORMAT_NOTE}\n{SPEC_REFERENCE}"
+            f"{RESULT_FORMAT_NOTE}\n{SCALE_VOCABULARY_NOTE}\n{SPEC_REFERENCE}"
         ),
     )
     service = _get_query_service()
@@ -1376,6 +1572,8 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "top_values": domain[:10],
                 "suggested_scale": time_spec.scale,
                 "suggested_chart_types": chart_types_for(time_spec.scale),
+                # Already a calendar part: nothing to derive.
+                "derivations": [],
                 "notes": [
                     "Virtual time field: defined for every dated event, extracted in UTC. "
                     "Undated (sentinel-timestamp) events are excluded."
@@ -1418,6 +1616,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                 "Values do not parse as numbers, so numeric charts "
                 "(histogram/box/violin/ecdf/scatter) would render empty."
             )
+        # Which `propose_chart.derive` kinds make sense here: bins need a
+        # number; a calendar part needs a timestamp-valued attribute, which
+        # nothing here probes — offered, and empty if the values don't parse.
+        derivations = (["bins"] if is_numeric else []) + ["time_part"]
+        if is_numeric:
+            notes.append('Group into ranges with derive={"kind":"bins",…} to chart it as bars.')
         return {
             "field": field,
             "exists": True,
@@ -1437,6 +1641,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             "top_values": terms["values"],
             "suggested_scale": scale,
             "suggested_chart_types": chart_types_for(scale),
+            "derivations": derivations,
             "notes": notes,
         }
 
@@ -1801,6 +2006,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         any limit clamped for the validation query. Those clamps bound *this*
         call's result size for your context only — the analyst's card is drawn
         at the full size you asked for.
+
+        `open_url` is the Visualize page link for this exact figure — hand it
+        to a human when you are not running inside the app.
         """
         payload = await execute_chart_spec(
             scope, spec, service=service, validated=_validated, check_field=_check_chart_field
@@ -1808,6 +2016,30 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # The full aggregation payload is for server-side consumers (Stories
         # export resolver); the model gets the compressed summary only.
         payload.pop("result", None)
+        # The card resolves its own marks through POST …/viz/marks from the
+        # same config; the summary carries what the model needs.
+        payload.pop("marks", None)
+
+        from vestigo.agent.deep_link import unrepresentable_filter_members, visualize_url
+        from vestigo.stories.export import _spec_filters_to_payload, spec_to_stored_chart_config
+
+        # External /mcp clients get no card: this is the figure, as a link —
+        # except that three filter members have no URL form, and each only
+        # narrows, so a link that lost one would draw a wider chart than the
+        # summary above describes, with nothing on the page to say so.
+        payload["open_url"] = visualize_url(
+            scope.case_id,
+            scope.timeline_id,
+            spec_to_stored_chart_config(spec),
+            _spec_filters_to_payload(spec.filters),
+        )
+        dropped = unrepresentable_filter_members(spec.filters)
+        if dropped:
+            payload.setdefault("warnings", []).append(
+                f"open_url cannot carry {', '.join(dropped)}: the link draws this chart "
+                "over the whole slice, wider than the result here. In the app, the "
+                "card's Open and Save keep the full scope."
+            )
         return payload
 
     if scope.conversation_id is not None:

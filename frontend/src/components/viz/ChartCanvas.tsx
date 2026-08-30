@@ -32,13 +32,19 @@ import { LineChart } from "@/components/viz/charts/LineChart";
 import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { CompareHistogram } from "@/components/viz/charts/CompareHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
+import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
+import { RankedChange } from "@/components/viz/charts/RankedChange";
+import { IntervalLanes } from "@/components/viz/charts/IntervalLanes";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
+import { TableFigure, TableHtml } from "@/components/viz/charts/TableFigure";
 import { ScatterStatsPanel } from "@/components/viz/ScatterStatsPanel";
 import { Spinner } from "@/components/ui/Spinner";
-import type { EventFilters } from "@/api/types";
+import type { EventFilters, ResolvedMark } from "@/api/types";
+import { useResolvedMarks } from "@/components/viz/useResolvedMarks";
 
 interface Props {
   caseId: string;
@@ -66,20 +72,27 @@ export function ChartCanvas({
   // the analyst gets from "Open in Visualize" are drawn from identical values.
   const opts = useMemo(() => resolveChartOptions(config), [config]);
 
-  // Every kind but time/punchcard needs a field, and pivot/scatter need two.
   // Callers normally validate before rendering (`propose_chart` rejects an
   // incomplete spec; a saved chart was legal when saved), but an un-run query
   // renders as neither loading nor error — i.e. a silently blank chart box —
   // so say so explicitly rather than leave the analyst looking at nothing.
+  //
+  // Read off CHART_META rather than listing the field-free kinds by hand: the
+  // hardcoded time/punchcard pair did not grow when Cumulative and Calendar
+  // arrived with `field: "optional"`, so a legitimately fieldless one of those
+  // fell through to `!!config.field`, never ran its query, and rendered the
+  // "missing a field" message in the agent card and in every Story snapshot —
+  // while the Visualize page drew it correctly.
+  const fieldRequired =
+    CHART_META[config.chartType].inputs.field === "required";
   const specComplete =
-    dataKind === "time" || dataKind === "punchcard"
-      ? true
-      : dataKind === "corr"
-        ? (config.fields?.length ?? 0) >= 2
-        : dataKind === "pivot" || dataKind === "scatter"
-          ? !!(config.field && config.fieldY)
-          : !!config.field;
+    dataKind === "corr"
+      ? (config.fields?.length ?? 0) >= 2
+      : dataKind === "pivot" || dataKind === "scatter"
+        ? !!(config.field && config.fieldY)
+        : !fieldRequired || !!config.field;
 
+  const marksQuery = useResolvedMarks(caseId, timelineId, config);
   const chartQuery = useQuery({
     queryKey: ["chart-canvas", caseId, timelineId, config, filters],
     queryFn: () => fetchChartData(caseId, timelineId, config, filters, opts),
@@ -129,6 +142,7 @@ export function ChartCanvas({
             data={chartQuery.data}
             opts={opts}
             compareOn={compareOn}
+            marks={marksQuery.data?.marks}
           />
         </div>
       )}
@@ -148,11 +162,18 @@ export function ChartMarks({
   data,
   opts,
   compareOn,
+  tableAs = "svg",
+  marks,
 }: {
   config: ChartConfig;
   data: ChartResult;
   opts: ResolvedChartOptions;
   compareOn: boolean;
+  /** Resolved marks for the time-axis figures; the snapshot passes its frozen ones. */
+  marks?: ResolvedMark[];
+  /** The table figure is an <svg> on the page (so it exports like every other
+   * figure) and a real <table> in a Story snapshot and the HTML export. */
+  tableAs?: "svg" | "html";
 }) {
   return (
     <>
@@ -168,6 +189,14 @@ export function ChartMarks({
           compare={data.compare ? data.data : undefined}
           orientation={opts.orientation}
           sort={opts.sort}
+          // A derived axis has no lexical order — "< 1,024" and "≥ 10,240"
+          // sort as strings before every digit — which is why `BarChart` takes
+          // an explicit order and why `resolveChartOptions` resolves `sort` to
+          // "value" for every derived bar chart, whether or not the config
+          // carries one. Omitting either half made the snapshot, the HTML
+          // export and the agent card disagree with the live page about the
+          // order of the same ranges.
+          valueOrder={data.data.derive?.labels}
           logScale={opts.logScale}
         />
       )}
@@ -213,6 +242,7 @@ export function ChartMarks({
           seriesMode={opts.seriesMode}
           showPoints={config.options.showPoints ?? true}
           showLegend={opts.legend}
+          marks={marks}
         />
       )}
       {data.kind === "timeseries" && config.chartType === "heatmap" && (
@@ -223,8 +253,13 @@ export function ChartMarks({
           data={data.data}
           metric={config.metric}
           hasComparison={compareOn}
+          marks={marks}
         />
       )}
+      {data.kind === "cumulative" && <CumulativeStep data={data.data} marks={marks} />}
+      {data.kind === "calendar" && <CalendarHeatmap data={data.data} />}
+      {data.kind === "change" && <RankedChange data={data.data} layout={opts.layout} />}
+      {data.kind === "lanes" && <IntervalLanes data={data.data} marks={marks} />}
       {data.kind === "punchcard" && <PunchCard data={data.data} />}
       {data.kind === "pivot" && config.chartType === "pivot" && (
         <PivotHeatmap data={data.data} />
@@ -232,6 +267,12 @@ export function ChartMarks({
       {data.kind === "pivot" && config.chartType === "sankey" && (
         <SankeyFlow data={data.data} />
       )}
+      {data.kind === "table" &&
+        (tableAs === "html" ? (
+          <TableHtml data={data.data} config={config} highlight={opts.highlight} />
+        ) : (
+          <TableFigure data={data.data} config={config} highlight={opts.highlight} />
+        ))}
       {data.kind === "corr" && <CorrMatrix data={data.data} />}
       {data.kind === "scatter" && (
         <>

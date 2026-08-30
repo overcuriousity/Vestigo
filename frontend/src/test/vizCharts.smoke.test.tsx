@@ -23,12 +23,18 @@ import { Heatmap } from "@/components/viz/charts/Heatmap";
 import { EcdfChart } from "@/components/viz/charts/EcdfChart";
 import { TimeHistogram } from "@/components/viz/charts/TimeHistogram";
 import { PunchCard } from "@/components/viz/charts/PunchCard";
+import { CumulativeStep } from "@/components/viz/charts/CumulativeStep";
+import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
+import { RankedChange } from "@/components/viz/charts/RankedChange";
+import { IntervalLanes } from "@/components/viz/charts/IntervalLanes";
 import { PivotHeatmap } from "@/components/viz/charts/PivotHeatmap";
 import { SankeyFlow } from "@/components/viz/charts/SankeyFlow";
 import { ScatterChart } from "@/components/viz/charts/ScatterChart";
 import { WaffleChart } from "@/components/viz/charts/WaffleChart";
 import { CorrMatrix } from "@/components/viz/charts/CorrMatrix";
 import { GroupedDistribution } from "@/components/viz/charts/GroupedDistribution";
+import { TableFigure } from "@/components/viz/charts/TableFigure";
+import { DEFAULT_CHART_CONFIG } from "@/components/viz/lib/chartConfig";
 import type {
   FieldCorrelationResponse,
   FieldNumericGroupedResponse,
@@ -81,6 +87,9 @@ const HIST_BUCKETS: HistogramBucket[] = [
 const TIMESERIES: FieldTimeseriesResponse = {
   field: "attr:status_code",
   interval_seconds: 3600,
+  distinct: 2,
+  other_count: 0,
+  series_truncated: false,
   min: "2024-01-01T00:00:00Z",
   max: "2024-01-01T01:00:00Z",
   series: [
@@ -169,6 +178,117 @@ describe("chart smoke render", () => {
       <BarChart terms={{ ...TERMS, values: [], other_count: 0 }} />,
     );
     getByText(/no values/i);
+  });
+
+  it("CumulativeStep renders with cumulative data", () => {
+    const { container } = render(
+      <CumulativeStep
+        data={{
+          kind: "cumulative",
+          quantity: "sum",
+          field: "attr:bytes",
+          interval_seconds: 60,
+          min: "2026-07-20T00:00:00+00:00",
+          max: "2026-07-20T00:02:00+00:00",
+          buckets: [
+            { start: "2026-07-20T00:00:00+00:00", delta: 1.5, value: 1.5 },
+            { start: "2026-07-20T00:01:00+00:00", delta: 0, value: 1.5 },
+            { start: "2026-07-20T00:02:00+00:00", delta: 2, value: 3.5 },
+          ],
+          total: 3.5,
+          events: 3,
+          unparsed: 1,
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("CalendarHeatmap renders with calendar data", () => {
+    const { container } = render(
+      <CalendarHeatmap
+        data={{
+          kind: "calendar",
+          field: "attr:user",
+          timezone: "UTC",
+          start: "2026-07-20",
+          end: "2026-07-20",
+          days: [{ date: "2026-07-20", count: 1 }],
+          total: 1,
+          max_count: 1,
+          weeks: 1,
+          weeks_total: 1,
+          truncated: false,
+          dropped: 0,
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("IntervalLanes renders with lanes data", () => {
+    const { container } = render(
+      <IntervalLanes
+        data={{
+          kind: "lanes",
+          field: "attr:host",
+          pairing: "first_last",
+          lanes: [
+            {
+              key: "h1",
+              count: 2,
+              intervals: [
+                {
+                  start: "2026-07-20T09:00:00+00:00",
+                  end: "2026-07-20T10:00:00+00:00",
+                  start_event_id: "e1",
+                  end_event_id: "e2",
+                },
+              ],
+            },
+          ],
+          lane_cap: 10,
+          lanes_total: 1,
+          lane_cap_hit: false,
+          other_lanes: 0,
+          starts: 0,
+          ends: 0,
+          unpaired_starts: 0,
+          orphan_ends: 0,
+          rows_cap: 50000,
+          rows_truncated: false,
+          rows_paired: 0,
+          undated: 0,
+          slice_start: "2026-07-20T09:00:00+00:00",
+          slice_end: "2026-07-20T10:00:00+00:00",
+        }}
+      />,
+    );
+    expectSvg(container);
+  });
+
+  it("RankedChange renders with change data", () => {
+    const { container } = render(
+      <RankedChange
+        data={{
+          kind: "change",
+          field: "attr:user",
+          derive: null,
+          top_n: 2,
+          primary_total: 3,
+          comparison_total: 2,
+          rows: [
+            { value: "a", primary: 3, comparison: 1, primary_share: 1, comparison_share: 0.5, delta_share: 0.5, status: "rose" },
+          ],
+          union_size: 1,
+          rows_shown: 1,
+          union_cap: 200,
+          truncated: false,
+          omitted: 0,
+        }}
+      />,
+    );
+    expectSvg(container);
   });
 
   it("PieChart renders with terms data", () => {
@@ -363,6 +483,9 @@ describe("time-field labelling", () => {
   const DOW_TIMESERIES: FieldTimeseriesResponse = {
     field: "time:day_of_week",
     interval_seconds: 3600,
+    distinct: 2,
+    other_count: 0,
+    series_truncated: false,
     min: "2024-01-01T00:00:00Z",
     max: "2024-01-01T01:00:00Z",
     series: [
@@ -653,5 +776,36 @@ describe("correlation matrix", () => {
     // frame's margin <g>.
     fireEvent.click(container.querySelector("svg rect")!.parentElement!);
     expect(opened).toEqual([["attr:bytes", "attr:latency"]]);
+  });
+});
+
+describe("TableFigure", () => {
+  it("renders an svg", () => {
+    const { container } = render(
+      <TableFigure
+        data={{
+          kind: "table",
+          field: "attr:user",
+          second_field: null,
+          total: 1,
+          distinct: 1,
+          rows: [
+            {
+              value: "a",
+              count: 1,
+              share: 1,
+              first_seen: null,
+              last_seen: null,
+              distinct_second: null,
+            },
+          ],
+          remainder: null,
+          sort: { by: "count", dir: "desc" },
+        }}
+        config={{ ...DEFAULT_CHART_CONFIG, chartType: "table", field: "attr:user" }}
+        highlight={[]}
+      />,
+    );
+    expect(container.querySelector("svg")).not.toBeNull();
   });
 });

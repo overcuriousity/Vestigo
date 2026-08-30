@@ -129,7 +129,17 @@ export function dispositionStatsToTimeseries(
 ): FieldTimeseriesResponse {
   const kinds: DispositionKind[] = ["normal", "dismissed", "confirmed", "routine"];
   if (stats.days.length === 0) {
-    return { field: "verdict", interval_seconds: 86_400, min: null, max: null, series: [] };
+    return {
+      field: "verdict",
+      interval_seconds: 86_400,
+      min: null,
+      max: null,
+      series: [],
+      // Four fixed verdict kinds, all of them drawn: nothing is ever cut here.
+      distinct: 0,
+      other_count: 0,
+      series_truncated: false,
+    };
   }
   const first = Date.parse(`${stats.days[0].date}T00:00:00Z`);
   const last = Date.parse(`${stats.days[stats.days.length - 1].date}T00:00:00Z`);
@@ -159,6 +169,9 @@ export function dispositionStatsToTimeseries(
     min: buckets[0],
     max: buckets[buckets.length - 1],
     series,
+    distinct: series.length,
+    other_count: 0,
+    series_truncated: false,
   };
 }
 

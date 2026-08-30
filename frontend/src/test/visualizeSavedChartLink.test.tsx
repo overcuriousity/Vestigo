@@ -214,7 +214,7 @@ describe("VisualizePage ?c_chart=", () => {
     renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1");
     // Let the field list *land* and its effects run — releasing the charts any
     // earlier would close the window this test exists to hold open.
-    await waitFor(() => expect(screen.getByText(/Chart type/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/^Treat as$/)).toBeTruthy());
     await act(async () => {
       await Promise.resolve();
     });
@@ -299,7 +299,7 @@ describe("VisualizePage ?c_chart=", () => {
     renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1&tour=viz");
     await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("radio", { name: /Ordinal/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Ordered categories" }));
 
     await waitFor(() => expect(lastSearch).not.toContain("c_chart"));
     expect(new URLSearchParams(lastSearch).get("tour")).toBe("viz");
@@ -309,7 +309,7 @@ describe("VisualizePage ?c_chart=", () => {
     renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-1");
     await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("radio", { name: /Ordinal/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Ordered categories" }));
 
     await waitFor(() => expect(lastSearch).not.toContain("c_chart"));
     const params = new URLSearchParams(lastSearch);
@@ -358,7 +358,7 @@ describe("VisualizePage ?c_chart=", () => {
     renderPage("/cases/c1/timelines/t1/visualize?c_chart=chart-2");
     await waitFor(() => expect(fieldTermsMock).toHaveBeenCalled());
 
-    fireEvent.click(screen.getByRole("radio", { name: /Ordinal/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Ordered categories" }));
 
     await waitFor(() => expect(lastSearch).not.toContain("c_chart"));
     expect(screen.queryByText(/dropped/i)).toBeNull();

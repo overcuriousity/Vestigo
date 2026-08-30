@@ -16,6 +16,7 @@ field-vocabulary cache), the export resolver uses the defaults.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from vestigo.agent.chart_meta import (
     CHART_META,
+    DERIVE_SOURCE_SCALES,
     METRIC_INFO,
     chart_types_for,
     compare_capable,
@@ -59,6 +61,20 @@ class ChartLimits:
     series_top_n: tuple[int, int]
     time_buckets: tuple[int, int]
     pivot_limit: tuple[int, int]
+    table_rows: tuple[int, int]
+    #: Instants one mark source may resolve to. ``None`` = the ``viz_marks_max``
+    #: setting (the analyst's ceiling); the agent's is fixed and smaller because
+    #: every resolved mark is summarised into the model's context.
+    marks_per_source: int | None
+    #: Weeks the calendar heatmap draws (latest kept, earlier disclosed).
+    calendar_weeks: int
+    #: Ranked change: top-N per window before the union, and the union's row cap.
+    change_top_n: tuple[int, int]
+    change_union: int
+    #: Interval lanes: the lane cap (by event count) and the row cap of the
+    #: ordered start/end scan the pairing runs over.
+    lanes: tuple[int, int]
+    lanes_rows: int
     scatter_sample: tuple[int, int]
     corr_max_fields: int
     points_overlay_max: int
@@ -76,6 +92,13 @@ AGENT_CHART_LIMITS = ChartLimits(
     series_top_n=(6, 8),
     time_buckets=(30, 60),
     pivot_limit=(8, 12),
+    table_rows=(20, 30),
+    marks_per_source=20,
+    calendar_weeks=53,
+    change_top_n=(10, 20),
+    change_union=30,
+    lanes=(10, 20),
+    lanes_rows=2_000,
     scatter_sample=(300, 1000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -94,6 +117,13 @@ ANALYST_CHART_LIMITS = ChartLimits(
     series_top_n=(12, 50),
     time_buckets=(60, 200),
     pivot_limit=(10, 50),
+    table_rows=(50, 500),
+    marks_per_source=None,
+    calendar_weeks=53,
+    change_top_n=(10, 100),
+    change_union=200,
+    lanes=(10, 100),
+    lanes_rows=50_000,
     scatter_sample=(5000, 20000),
     corr_max_fields=8,
     points_overlay_max=1000,
@@ -205,6 +235,61 @@ async def execute_chart_spec(
 
     # ── legality, before any query ───────────────────────────────────────
     scale = spec.scale or meta.default_scale
+    if spec.derive is not None:
+        # A derivation is validated from the registry, like everything else
+        # here: only figures whose `derives` lists its kind admit one, a
+        # virtual time: field is already a calendar part, and the result is
+        # ordered categories whatever the field was — so an omitted scale
+        # resolves to ordinal before the legality check below.
+        if spec.derive.kind not in meta.derives:
+            takers = [c for c in CHART_META if spec.derive.kind in CHART_META[c].derives]
+            raise ValueError(
+                f'chart_type="{chart_type}" admits no derivation. Figures that take '
+                f"{spec.derive.kind}: {', '.join(takers)}."
+            )
+        if spec.field and resolve_time_field(spec.field) is not None:
+            raise ValueError(
+                f"{spec.field} is already a calendar part — chart it directly, without derive."
+            )
+        # `scale` is the treat-as the derivation is computed from (the page's
+        # "Number or time" / "Measure"), never the categories it yields — the
+        # effective scale is ordinal whatever the field was. "ordinal" itself
+        # is still accepted: it was the only legal value for a while.
+        admitted = DERIVE_SOURCE_SCALES[spec.derive.kind]
+        if spec.scale is not None and spec.scale != "ordinal" and spec.scale not in admitted:
+            raise ValueError(
+                f"a {spec.derive.kind} derivation is computed from a field treated as "
+                f"{' or '.join(admitted)}: set scale to that, or omit it."
+            )
+        scale = "ordinal"
+    if spec.inputs is not None and spec.inputs.columns is not None and chart_type != "table":
+        raise ValueError(
+            f'chart_type="{chart_type}" takes no inputs.columns — only the table figure has columns.'
+        )
+    wants_distinct_second = (
+        spec.inputs is not None
+        and spec.inputs.columns is not None
+        and "distinct_second" in spec.inputs.columns
+    ) or opts.table_sort_by == "distinct_second"
+    if chart_type == "table" and wants_distinct_second and not spec.field_y:
+        raise ValueError(
+            "distinct_second needs field_y — the second field whose distinct values each row counts."
+        )
+    if spec.marks and not meta.supports_marks:
+        takers = [c for c in CHART_META if CHART_META[c].supports_marks]
+        raise ValueError(
+            f'chart_type="{chart_type}" takes no marks — figures that draw them: {", ".join(takers)}.'
+        )
+    lane_inputs = spec.inputs is not None and any(
+        getattr(spec.inputs, key) is not None for key in ("pairing", "start_filter", "end_filter")
+    )
+    if lane_inputs and chart_type != "lanes":
+        raise ValueError('inputs.pairing / start_filter / end_filter are chart_type="lanes" only.')
+    # Before the per-figure rules below, not after: those are stated in terms
+    # of the scale ("quantity=\"sum\" needs scale=\"ratio\""), so on a scale the
+    # figure does not admit at all they send the model round a loop of
+    # refusals that cannot be satisfied — which is exactly what cumulative at
+    # scale="interval" did. Naming the illegal scale once ends it.
     if scale not in meta.scales:
         raise ValueError(
             f'chart_type="{chart_type}" requires scale in '
@@ -212,11 +297,53 @@ async def execute_chart_spec(
             f'got "{scale}". Chart types legal for scale="{scale}": '
             f"{', '.join(chart_types_for(scale))}."
         )
+    pairing: str | None = None
+    if data_kind == "lanes":
+        pairing = (spec.inputs.pairing if spec.inputs else None) or "first_last"
+        has_start = spec.inputs is not None and spec.inputs.start_filter is not None
+        has_end = spec.inputs is not None and spec.inputs.end_filter is not None
+        if pairing == "next_end" and not (has_start and has_end):
+            raise ValueError(
+                'pairing="next_end" needs inputs.start_filter and inputs.end_filter — the '
+                'events that open and close an interval; pairing="first_last" needs neither.'
+            )
+        if pairing == "first_last" and (has_start or has_end):
+            warnings.append('inputs.start_filter/end_filter ignored under pairing="first_last".')
+    quantity: str | None = None
+    if data_kind == "cumulative":
+        quantity = opts.quantity or (
+            "events" if not spec.field else "sum" if scale == "ratio" else "distinct"
+        )
+        if quantity != "events" and not spec.field:
+            raise ValueError(
+                f'quantity="{quantity}" needs field — only quantity="events" counts without one.'
+            )
+        if quantity == "sum" and scale != "ratio":
+            raise ValueError(
+                'quantity="sum" needs scale="ratio" — a running sum over anything but a '
+                'measure is not a quantity; use "distinct" (values seen so far) or "events".'
+            )
+        if quantity == "distinct" and scale not in ("nominal", "ordinal"):
+            raise ValueError(
+                'quantity="distinct" needs scale="nominal" or "ordinal" — distinct values of a '
+                'measure are not a count of anything; use "sum" or "events".'
+            )
+        if quantity == "events" and spec.field:
+            warnings.append(
+                f'field is ignored — quantity="events" counts every event, not '
+                f'field="{spec.field}"; use "sum" or "distinct" to accumulate the field.'
+            )
+    if data_kind == "calendar" and spec.field and resolve_time_field(spec.field) is not None:
+        raise ValueError(
+            f"{spec.field}: a calendar part is always present — a calendar over it counts "
+            "every event; omit field."
+        )
 
     if requires_field(chart_type) and not meta.multi_field and not spec.field:
         raise ValueError(
             f'chart_type="{chart_type}" requires field. Only chart_type="time" and '
-            '"punchcard" chart the whole event count with no field.'
+            '"punchcard" chart every event with no field; "cumulative" and "calendar" '
+            "take an optional one."
         )
     if meta.requires_second_field and not spec.field_y:
         raise ValueError(
@@ -239,6 +366,19 @@ async def execute_chart_spec(
         raise ValueError(
             f'chart_type="{chart_type}" takes no field_y. '
             f"Two-field chart types: {', '.join(two_field)}.{hint}"
+        )
+    if spec.field_y is not None and spec.field_y == spec.field:
+        # Every HTTP endpoint that takes a second field refuses this (422:
+        # "field_x and field_y must differ", "second_field must differ from
+        # field", "field and group_field must differ for a grouped chart"),
+        # and the rail refuses it at the picker — but this function calls the
+        # query service directly, so nothing stopped a spec that names one
+        # field twice. It does not fail: it draws a diagonal pivot, a y=x
+        # scatter, one group per value, or a table whose "distinct field_y"
+        # column is 1 on every row — each presented as a real answer.
+        raise ValueError(
+            f'field_y must differ from field — "{spec.field}" against itself charts '
+            "nothing a single-field figure does not already show."
         )
 
     if meta.multi_field:
@@ -276,6 +416,12 @@ async def execute_chart_spec(
         raise ValueError(
             'compare.mode="custom" needs compare.filters. Use mode="baseline" to '
             "compare against this timeline's whole unfiltered event set."
+        )
+    if meta.requires_compare and not compare_on:
+        raise ValueError(
+            f'chart_type="{chart_type}" needs a comparison layer — it ranks how each '
+            "value's share of the window moved between two windows; set compare.mode "
+            'to "baseline" or "custom".'
         )
     if not metric_available(spec.metric, chart_type, compare_on):
         info = METRIC_INFO[spec.metric]
@@ -327,7 +473,25 @@ async def execute_chart_spec(
         )
         comparison_query = await _build_query(scope, comparison_filters)
 
+    resolved_marks: dict[str, Any] | None = None
+    if spec.marks:
+        from vestigo.agent.marks import resolve_marks
+        from vestigo.api.deps import get_store
+        from vestigo.core.config import get_settings
+
+        resolved_marks = await resolve_marks(
+            scope,
+            spec.marks,
+            service=service,
+            store=get_store(),
+            cap=limits.marks_per_source or get_settings().viz_marks_max,
+            validated=validated,
+        )
+
     applied: dict[str, Any] = {}
+    #: Passed only when set, so a positional fake service keeps working and an
+    #: underived request is byte-for-byte the call it always was.
+    derive_kw: dict[str, Any] = {"derive": spec.derive} if spec.derive is not None else {}
     #: Options this chart type nominally reads but that this *particular*
     #: spec made inert (a bounded time axis ignores its limit). Kept out
     #: of the `resolved` echo below, which otherwise re-adds them.
@@ -340,7 +504,7 @@ async def execute_chart_spec(
         applied["top_n"] = _capped(opts.top_n, (min(terms_default, terms_cap), terms_cap), "top_n")
         if comparison_query is not None:
             result = await run_gated_scan(
-                service.compare_field_terms,
+                functools.partial(service.compare_field_terms, **derive_kw),
                 primary_query,
                 comparison_query,
                 spec.field,
@@ -353,8 +517,16 @@ async def execute_chart_spec(
             }
         else:
             result = await run_gated_scan(
-                service.field_terms, primary_query, spec.field, applied["top_n"]
+                functools.partial(service.field_terms, **derive_kw),
+                primary_query,
+                spec.field,
+                applied["top_n"],
             )
+            if spec.derive is not None and spec.derive.kind == "bins" and not result["total"]:
+                raise ValueError(
+                    f'field "{spec.field}" has no numeric values under these filters, so '
+                    "bins would be empty — treat it as categories instead."
+                )
             summary = {
                 "total": result["total"],
                 "distinct": result["distinct"],
@@ -455,16 +627,28 @@ async def execute_chart_spec(
         applied["buckets"] = _capped(opts.buckets, limits.series_buckets, "buckets", floor=4)
         applied["top_n"] = _capped(opts.top_n, limits.series_top_n, "top_n")
         result = await run_gated_scan(
-            service.field_value_timeseries,
+            functools.partial(service.field_value_timeseries, **derive_kw),
             primary_query,
             spec.field,
             applied["buckets"],
             applied["top_n"],
         )
+        # `distinct`/`other_count` like every other top-N figure here: the
+        # endpoint pays an extra aggregate to report the series cut, and a
+        # model reasoning over twelve drawn series has to know whether that
+        # was all of them or the visible slice of fifty-three.
         summary = {
             "series_count": len(result["series"]),
             "interval_seconds": result["interval_seconds"],
+            "distinct": result["distinct"],
+            "other_count": result["other_count"],
         }
+        if result["series_truncated"]:
+            warnings.append(
+                f"showing the top {len(result['series'])} of {result['distinct']} distinct "
+                f"values of {spec.field}; {result['other_count']} events fall in values the "
+                'chart does not draw (there is no "Other" series).'
+            )
     elif data_kind == "time":
         applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
         if comparison_query is not None:
@@ -487,11 +671,110 @@ async def execute_chart_spec(
     elif data_kind == "punchcard":
         result = await run_gated_scan(service.time_punchcard, primary_query)
         summary = {"total": result["total"], "max_count": result["max_count"]}
+    elif data_kind == "cumulative":
+        applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
+        applied["quantity"] = quantity
+        result = await run_gated_scan(
+            functools.partial(
+                service.cumulative,
+                field=spec.field,
+                quantity=quantity,
+                buckets=applied["buckets"],
+            ),
+            primary_query,
+        )
+        summary = {
+            "total": result["total"],
+            "events": result["events"],
+            "unparsed": result["unparsed"],
+            "buckets": len(result["buckets"]),
+            "interval_seconds": result["interval_seconds"],
+        }
+    elif data_kind == "calendar":
+        result = await run_gated_scan(
+            functools.partial(service.calendar, field=spec.field, max_weeks=limits.calendar_weeks),
+            primary_query,
+        )
+        summary = {
+            "total": result["total"],
+            "max_count": result["max_count"],
+            "weeks": result["weeks"],
+            "weeks_total": result["weeks_total"],
+            "truncated": result["truncated"],
+            "dropped": result["dropped"],
+        }
+    elif data_kind == "change":
+        if comparison_query is None:  # unreachable: the requires_compare refusal above
+            raise RuntimeError("change chart reached execution without a comparison layer")
+        applied["top_n"] = _capped(opts.top_n, limits.change_top_n, "top_n")
+        applied["layout"] = opts.layout or "dumbbell"
+        result = await run_gated_scan(
+            functools.partial(service.field_change, union_cap=limits.change_union, **derive_kw),
+            primary_query,
+            comparison_query,
+            spec.field,
+            applied["top_n"],
+        )
+        summary = {
+            "primary_total": result["primary_total"],
+            "comparison_total": result["comparison_total"],
+            "union_size": result["union_size"],
+            "rows_shown": result["rows_shown"],
+            "truncated": result["truncated"],
+            "top_rows": [
+                {
+                    "value": r["value"],
+                    "status": r["status"],
+                    "delta_share": round(r["delta_share"], 4),
+                }
+                for r in result["rows"][:5]
+            ],
+        }
+    elif data_kind == "lanes":
+        from dataclasses import replace
+
+        if pairing is None:  # unreachable: resolved in the legality block above
+            raise RuntimeError("lanes reached execution without a resolved pairing")
+        applied["limit_y"] = _capped(opts.limit_y, limits.lanes, "limit_y")
+        lanes_kw: dict[str, Any] = {
+            "pairing": pairing,
+            "limit_y": applied["limit_y"],
+            "rows_cap": limits.lanes_rows,
+        }
+        if pairing == "next_end" and spec.inputs is not None:
+            start_query = await _build_query(scope, validated(spec.inputs.start_filter))
+            end_query = await _build_query(scope, validated(spec.inputs.end_filter))
+            # Pinned to the primary's window, as the endpoint pins them.
+            lanes_kw["start"] = replace(
+                start_query, start=primary_query.start, end=primary_query.end
+            )
+            lanes_kw["end"] = replace(end_query, start=primary_query.start, end=primary_query.end)
+        result = await run_gated_scan(
+            functools.partial(service.field_lanes, **lanes_kw), primary_query, spec.field
+        )
+        summary = {
+            "pairing": result["pairing"],
+            "lanes_shown": len(result["lanes"]),
+            "lanes_total": result["lanes_total"],
+            "lane_cap_hit": result["lane_cap_hit"],
+            "intervals": sum(len(lane["intervals"]) for lane in result["lanes"]),
+            "unpaired_starts": result["unpaired_starts"],
+            "orphan_ends": result["orphan_ends"],
+            "rows_truncated": result["rows_truncated"],
+            "undated": result["undated"],
+            "top_lanes": [
+                {"key": lane["key"], "count": lane["count"], "intervals": len(lane["intervals"])}
+                for lane in result["lanes"][:5]
+            ],
+        }
     elif data_kind == "pivot":
         applied["limit_x"] = _capped(opts.limit_x, limits.pivot_limit, "limit_x")
         applied["limit_y"] = _capped(opts.limit_y, limits.pivot_limit, "limit_y")
         result = await run_gated_scan(
-            service.field_pivot,
+            functools.partial(
+                service.field_pivot,
+                **({"derive_x": spec.derive} if spec.derive is not None else {}),
+            ),
             primary_query,
             spec.field,
             spec.field_y,
@@ -529,6 +812,40 @@ async def execute_chart_spec(
             # time axis is its whole domain rather than a limit.
             "matrix_size": len(result["x_values"]) * len(result["y_values"]),
         }
+    elif data_kind == "table":
+        applied["top_n"] = _capped(opts.top_n, limits.table_rows, "top_n")
+        sort_by = opts.table_sort_by or "count"
+        sort_dir = opts.table_sort_dir or "desc"
+        applied["table_sort_by"] = sort_by
+        applied["table_sort_dir"] = sort_dir
+        result = await run_gated_scan(
+            functools.partial(
+                service.field_table,
+                second_field=spec.field_y,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+                **derive_kw,
+            ),
+            primary_query,
+            spec.field,
+            applied["top_n"],
+        )
+        summary = {
+            "total": result["total"],
+            "distinct": result["distinct"],
+            "rows": [
+                {"value": r["value"], "count": r["count"], "share": r["share"]}
+                for r in result["rows"][:5]
+            ],
+            "remainder": result["remainder"],
+        }
+        if opts.highlight:
+            shown = {r["value"] for r in result["rows"]}
+            missing = [v for v in opts.highlight if v not in shown]
+            if missing:
+                warnings.append(
+                    f"options.highlight names value(s) not among the shown rows: {', '.join(missing)}."
+                )
     elif data_kind == "corr":
         # `fields` is already validated (2–limits.corr_max_fields, distinct)
         # by the multi_field guard above, so no capping happens here.
@@ -595,6 +912,12 @@ async def execute_chart_spec(
         if value is not None:
             applied[key] = value
 
+    if resolved_marks is not None:
+        summary = dict(summary)
+        summary["marks"] = {
+            "shown": len(resolved_marks["marks"]),
+            "sources": resolved_marks["sources"],
+        }
     return {
         "ok": True,
         "resolved": {
@@ -607,8 +930,16 @@ async def execute_chart_spec(
             "field_y": spec.field_y,
             "fields": spec.fields,
             "options": applied,
+            "derive": spec.derive.model_dump(exclude_none=True) if spec.derive else None,
+            "inputs": spec.inputs.model_dump(exclude_none=True) if spec.inputs else None,
+            "marks": (
+                [m.model_dump(exclude_none=True, mode="json") for m in spec.marks]
+                if spec.marks
+                else None
+            ),
         },
         "warnings": warnings,
         "summary": summary,
         "result": result,
+        "marks": resolved_marks,
     }

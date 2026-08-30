@@ -59,6 +59,26 @@ describe("buildCaptionLines", () => {
     );
   });
 
+  it("says the values a value-over-time chart cut are not drawn, not in an \"Other\"", () => {
+    // One series per value, so there is nowhere to roll the rest into — and
+    // the cut is routine on a derived axis (53 ISO weeks against a cap of 12)
+    // where `derive` echoes all 53 labels (#332).
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "heatmap",
+      field: "attr:src_ip",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Heatmap",
+      config,
+      facts: { distinct: 53, shownValues: 12, otherCount: 4120, otherDrawn: false },
+    });
+    expect(lines).toContain(
+      "showing top 12 of 53 distinct values (capped; 4,120 events across the 41 values not drawn)",
+    );
+  });
+
   it("states the metric formula and undefined-bin caveats", () => {
     const config: ChartConfig = {
       ...DEFAULT_CHART_CONFIG,
@@ -393,5 +413,410 @@ describe("lecture-driven caption lines", () => {
       facts: { readabilityWarning: "6 slices — past about 4, judging angles gets unreliable." },
     });
     expect(lines.some((l) => l.startsWith("readability: 6 slices"))).toBe(true);
+  });
+});
+
+describe("buildCaptionLines — derivations", () => {
+  it("names the derivation, its edges and the unbinnable count", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Bar",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "bar",
+        field: "attr:bytes",
+        scale: "ratio",
+        derive: { kind: "bins", mode: "log", count: 3 },
+      },
+      filters: {},
+      facts: {
+        derive: { kind: "bins", labels: [], edges: [10, 100], negative_bin: true },
+        distinct: 3,
+        shownValues: 3,
+        otherCount: 0,
+      },
+    });
+    expect(lines).toContain("field: attr:bytes (ratio → ordered categories) — Bar");
+    expect(lines).toContain(
+      "derived: grouped into 3 log-spaced ranges (edges: 10 · 100); values ≤ 0 in their own range — values that do not parse as numbers are not counted",
+    );
+  });
+
+  it("says a calendar part is UTC and drops what does not parse", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Bar",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "bar",
+        field: "attr:logon_at",
+        scale: "interval",
+        derive: { kind: "timePart", part: "weekday" },
+      },
+      filters: {},
+      facts: {},
+    });
+    expect(lines).toContain(
+      "derived: calendar part: day of week (UTC) — values that do not parse as timestamps are not counted; parts are UTC",
+    );
+  });
+});
+
+describe("buildCaptionLines — table", () => {
+  it("names the sort, the share denominator, the remainder and the highlighted rows", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Table (values with counts)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "table",
+        field: "attr:user",
+        scale: "nominal",
+        options: { tableSortBy: "last_seen", tableSortDir: "asc", highlight: ["alice", "bob"] },
+      },
+      filters: {},
+      facts: {
+        tableTotal: 11,
+        distinct: 4,
+        shownValues: 2,
+        tableSort: { by: "last_seen", dir: "asc" },
+        tableHighlight: ["alice", "bob"],
+        tableRemainder: { count: 3, distinctValues: 2 },
+      },
+    });
+    expect(lines).toContain("sorted by last seen (ascending)");
+    expect(lines).toContain("share = count / 11 events with a non-empty attr:user");
+    // Not "top": the facts sort by last seen ascending, and the server applies
+    // that sort before the LIMIT — so these are the first two rows in the
+    // analyst's order, not the two largest (#332).
+    expect(lines).toContain(
+      "showing the first 2 in this order of 4 distinct values; 3 events across 2 more values in the remainder row",
+    );
+    expect(lines).toContain("highlighted rows: alice · bob — presentation only");
+    expect(lines.some((l) => l.includes("(capped"))).toBe(false);
+  });
+
+  it("says \"top\" only when count-descending actually makes these the top rows", () => {
+    const facts = {
+      tableTotal: 11,
+      distinct: 4,
+      shownValues: 2,
+      tableRemainder: { count: 3, distinctValues: 2 },
+    };
+    const base = {
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Table (values with counts)",
+      filters: {},
+    };
+    const chart = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      field: "attr:user",
+      scale: "nominal" as const,
+    };
+    const ranked = buildCaptionLines({
+      ...base,
+      config: { ...chart, options: { tableSortBy: "count", tableSortDir: "desc" } },
+      facts: { ...facts, tableSort: { by: "count", dir: "desc" } },
+    });
+    expect(ranked).toContain(
+      "showing top 2 of 4 distinct values; 3 events across 2 more values in the remainder row",
+    );
+    // Count *ascending* keeps the two rarest values, and the remainder then
+    // holds nearly every event — "top" would be plainly false.
+    const rarest = buildCaptionLines({
+      ...base,
+      config: { ...chart, options: { tableSortBy: "count", tableSortDir: "asc" } },
+      facts: { ...facts, tableSort: { by: "count", dir: "asc" } },
+    });
+    expect(rarest.some((l) => l.includes("showing top"))).toBe(false);
+    expect(rarest.some((l) => l.includes("showing the first 2 in this order"))).toBe(true);
+  });
+});
+
+describe("buildCaptionLines — marks", () => {
+  it("appends one line per mark source with provenance", () => {
+    const lines = buildCaptionLines({
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Events over time",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "time",
+        marks: [{ kind: "instant", at: "2026-07-20T09:41:00Z", label: "first" }],
+      },
+      filters: {},
+      facts: {
+        marks: {
+          cap: 50,
+          marks: [
+            {
+              kind: "instant",
+              at: "2026-07-20T09:41:00+00:00",
+              label: "first",
+              source: 0,
+              provenance: { kind: "analyst" },
+            },
+          ],
+          sources: [
+            { index: 0, kind: "instant", label: "first", count: 1, shown: 1, overflow: false, undated: 0 },
+          ],
+        },
+      },
+    });
+    expect(lines).toContain('mark #1: "first" at 2026-07-20 09:41:00Z — analyst-placed');
+  });
+});
+
+describe("buildCaptionLines — cumulative and calendar", () => {
+  it("names the quantity, the field, the bucket width and what was not summed", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step (running total over time)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "cumulative",
+        field: "attr:bytes",
+        scale: "ratio",
+      },
+      facts: {
+        intervalSeconds: 3600,
+        cumulative: { quantity: "sum", field: "attr:bytes", total: 40, events: 7, unparsed: 1 },
+      },
+    });
+    expect(lines).toContain(
+      "cumulative sum of attr:bytes (measure) over time — Cumulative step (running total over time)",
+    );
+    expect(lines).toContain("1 h buckets, UTC");
+    expect(lines).toContain(
+      "final value 40 over 7 events; 1 event with no numeric attr:bytes value not summed",
+    );
+  });
+
+  it("says what a distinct count and a plain event count accumulate", () => {
+    const distinct = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "cumulative",
+        field: "attr:user",
+        scale: "nominal",
+      },
+      facts: {
+        cumulative: { quantity: "distinct", field: "attr:user", total: 4, events: 7, unparsed: 1 },
+      },
+    });
+    expect(distinct).toContain("distinct values of attr:user seen so far — Cumulative step");
+    expect(distinct).toContain(
+      "4 distinct values over 7 events; 1 event with an empty attr:user not counted",
+    );
+    const events = buildCaptionLines({
+      ...base,
+      chartLabel: "Cumulative step",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "cumulative" },
+      facts: { cumulative: { quantity: "events", field: null, total: 7, events: 7, unparsed: 0 } },
+    });
+    expect(events).toContain("cumulative event count over time — Cumulative step");
+    expect(events).toContain("final value 7 over 7 events");
+  });
+
+  it("states the calendar's UTC day boundary, its span and the week cap", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Calendar heatmap (events per day)",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "calendar", field: "attr:user" },
+      facts: {
+        calendar: {
+          field: "attr:user",
+          start: "2025-07-21",
+          end: "2026-07-22",
+          weeks: 53,
+          weeksTotal: 61,
+          truncated: true,
+          dropped: 9,
+          total: 400,
+        },
+      },
+    });
+    expect(lines).toContain(
+      "events with a attr:user value per day, UTC — Calendar heatmap (events per day)",
+    );
+    expect(lines).toContain("53 weeks, 2025-07-21 → 2026-07-22, day boundaries UTC");
+    expect(lines).toContain("latest 53 of 61 weeks drawn; 9 earlier events not drawn");
+  });
+});
+
+describe("buildCaptionLines — ranked change", () => {
+  const change = {
+    topN: 10,
+    unionSize: 14,
+    rowsShown: 14,
+    truncated: false,
+    omitted: 0,
+    newCount: 2,
+    vanishedCount: 1,
+  };
+
+  it("names share-of-window, both totals, the per-window top-N, the union and new/vanished", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Ranked change (share of window, two windows)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "change",
+        field: "attr:user",
+        compare: { mode: "baseline" },
+      },
+      facts: { primaryTotal: 20, comparisonTotal: 1000, change },
+    });
+    expect(lines).toContain(
+      "share-of-window change of attr:user between two windows — Ranked change (share of window, two windows)",
+    );
+    expect(lines).toContain("comparison: all timeline events (same time range) — 1,000 events");
+    expect(lines).toContain(
+      "ranked by |Δ share of window|, not by count; top 10 values per window, 14 in the union — 2 new, 1 vanished",
+    );
+    expect(lines.some((l) => l?.startsWith("union capped"))).toBe(false);
+  });
+
+  it("discloses the union cap and what it dropped", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Ranked change",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "change",
+        field: "attr:user",
+        compare: { mode: "custom", filters: { q: "phase-a" } },
+      },
+      facts: {
+        primaryTotal: 20,
+        comparisonTotal: 10,
+        change: { ...change, unionSize: 260, rowsShown: 200, truncated: true, omitted: 60, newCount: 0, vanishedCount: 0 },
+      },
+    });
+    expect(lines).toContain(
+      "ranked by |Δ share of window|, not by count; top 10 values per window, 260 in the union",
+    );
+    expect(lines).toContain(
+      "union capped at 200 of 260 values; the 60 with the smallest change not drawn",
+    );
+  });
+});
+
+describe("buildCaptionLines — interval lanes", () => {
+  const lanes = {
+    pairing: "next_end" as const,
+    lanesShown: 2,
+    lanesEmpty: 0,
+    lanesTotal: 3,
+    laneCapHit: true,
+    otherLanes: 1,
+    starts: 4,
+    ends: 3,
+    unpairedStarts: 1,
+    orphanEnds: 1,
+    rowsTruncated: false,
+    rowsPaired: 7,
+    rowsCap: 50000,
+    undated: 1,
+    sliceEnd: "2026-07-20T14:00:00+00:00",
+  };
+
+  it("states the pairing rule, the lane cap, the open and orphan counts and the undated", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes (one lane per value, bars from start to end)",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes },
+    });
+    expect(lines).toContain(
+      "intervals of attr:host over time — Interval lanes (one lane per value, bars from start to end)",
+    );
+    expect(lines).toContain(
+      "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn",
+    );
+    expect(lines).toContain("lanes: 2 shown of 3 (top by event count); 1 more not drawn");
+    // Two scopes, two sentences: the start/end counts are the whole union,
+    // the open/orphan counts belong to the lanes that survived the cap.
+    expect(lines).toContain("starts: 4 · ends: 3 — matched across all 3 lanes, before the caps");
+    expect(lines).toContain(
+      "paired over the 2 lanes kept: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+    );
+    expect(lines).toContain("1 undated event not drawn");
+    expect(lines.some((l) => l?.startsWith("first "))).toBe(false);
+  });
+
+  it("counts the lanes drawn, not the lanes returned, and discloses the difference", () => {
+    // Under `next_end` a lane whose events are all orphan ends pairs nothing
+    // and `IntervalLanes` filters it out, so counting the response's lanes
+    // named more rows than the canvas has (#332).
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes: { ...lanes, lanesShown: 4, lanesEmpty: 1, lanesTotal: 5, laneCapHit: false } },
+    });
+    expect(lines).toContain("lanes: 4; 1 lane with no interval to draw");
+    // The pairing still ran over all five: the orphan end in the empty lane is
+    // counted there and nowhere on screen.
+    expect(lines).toContain(
+      "paired over the 5 lanes kept: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+    );
+  });
+
+  it("first-to-last states its own rule and skips the start/end line; the row cap is disclosed", () => {
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: { ...DEFAULT_CHART_CONFIG, chartType: "lanes", field: "attr:host" },
+      facts: {
+        lanes: {
+          ...lanes,
+          pairing: "first_last",
+          lanesShown: 3,
+          laneCapHit: false,
+          otherLanes: 0,
+          starts: 0,
+          ends: 0,
+          unpairedStarts: 0,
+          orphanEnds: 0,
+          undated: 0,
+        },
+      },
+    });
+    expect(lines).toContain("pairing: first to last — one bar per lane, from its first event to its last");
+    expect(lines).toContain("lanes: 3");
+    expect(lines.some((l) => l?.startsWith("starts:"))).toBe(false);
+    expect(lines.some((l) => l?.includes("undated"))).toBe(false);
+    const truncated = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes: { ...lanes, rowsTruncated: true, rowsPaired: 50000, rowsCap: 50000 } },
+    });
+    expect(truncated).toContain(
+      "first 50,000 start/end events (by time) paired — the row cap; later ones not drawn",
+    );
   });
 });

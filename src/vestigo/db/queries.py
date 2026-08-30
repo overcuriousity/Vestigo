@@ -55,8 +55,18 @@ from vestigo.db._scan import (
     heavy_scan_settings,
     scan_fanout,
 )
-from vestigo.db._time_fields import TimeFieldSpec, resolve_time_field
+from vestigo.db._time_fields import TIME_FIELD_SPECS, TimeFieldSpec, resolve_time_field
 from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.derive import (
+    TIME_PART_TOKENS,
+    DeriveSpec,
+    ResolvedDerive,
+    bin_edges,
+    bin_labels,
+    bins_expr,
+    label_order_expr,
+    time_part_expr,
+)
 from vestigo.db.field_mappings import (
     apply_mappings_to_attribute_keys,
     mapping_coalesce_expr,
@@ -724,6 +734,7 @@ class _ParameterizedQueryBuilder:
         source_offsets: dict[str, int] | None = None,
         search_blob_ready: bool = False,
         external_tables: _ExternalTables | None = None,
+        param_prefix: str = "",
     ) -> None:
         self.conditions: list[str] = []
         self.parameters: QueryParameters = QueryParameters()
@@ -732,6 +743,7 @@ class _ParameterizedQueryBuilder:
         # and uploaded once. A fresh registry per builder is the default.
         self._external = external_tables if external_tables is not None else _ExternalTables()
         self._counter = 0
+        self._param_prefix = param_prefix
         self._field_mappings = field_mappings
         # Only `time:` tokens read this — they bucket the offset-corrected
         # timestamp, so filtering "hour 02" means the corrected hour, matching
@@ -744,7 +756,7 @@ class _ParameterizedQueryBuilder:
         self._search_blob_ready = search_blob_ready
 
     def _param_name(self) -> str:
-        name = f"p{self._counter}"
+        name = f"{self._param_prefix}p{self._counter}"
         self._counter += 1
         return name
 
@@ -1142,6 +1154,43 @@ class _ParameterizedQueryBuilder:
 FOREGROUND_WAIT_SECONDS = 5.0
 
 
+#: Columns a table figure can be sorted by. `share` is `count / total`, so it
+#: orders exactly as `count`; `distinct_second` needs a second field.
+TABLE_SORT_COLUMNS: tuple[str, ...] = (
+    "value",
+    "count",
+    "share",
+    "first_seen",
+    "last_seen",
+    "distinct_second",
+)
+
+#: Sort key per table column — the same expressions the inventory orders by,
+#: so a table and an inventory of one field agree row for row.
+_TABLE_SORT_SQL: dict[str, str] = {
+    "value": "val",
+    "count": "c",
+    "share": "c",
+    "first_seen": "first_seen",
+    "last_seen": "last_seen",
+    "distinct_second": "distinct_second",
+}
+
+
+def _inventory_select_core(col_expr: str, dated_expr: str, *, extra: str = "") -> str:
+    """The SELECT list the value inventory and the table figure share.
+
+    ``value, count, first_seen, last_seen`` over one ``GROUP BY val`` — lifted
+    out so the streamed inventory (#295) and the bounded table can never
+    disagree about what a row's count or seen range means. *extra* appends
+    further aggregates (the table's ``distinct_second``).
+    """
+    return (
+        f"SELECT {col_expr} AS val, count() AS c, "
+        f"min({dated_expr}) AS first_seen, max({dated_expr}) AS last_seen{extra}"
+    )
+
+
 def _foreground_scan(fn):
     """Admit at most ``_FOREGROUND_CONCURRENCY`` chart aggregations at once.
 
@@ -1166,6 +1215,96 @@ def _foreground_scan(fn):
 
     wrapper._scan_class = "foreground"  # type: ignore[attr-defined]
     return wrapper
+
+
+def rank_change_rows(
+    values: Sequence[str],
+    primary_counts: Mapping[str, int],
+    comparison_counts: Mapping[str, int],
+    primary_total: int,
+    comparison_total: int,
+    union_cap: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Turn two windows' per-value counts into ranked share-of-window rows.
+
+    Pure so the ranking is unit-testable without ClickHouse. ``share`` is
+    ``count / that window's non-empty total`` (0.0 when the total is 0), Δ is
+    primary − comparison, and the status names the direction: ``new`` /
+    ``vanished`` when the value is in one window only, else ``rose`` /
+    ``fell`` / ``same`` by share. Rows are ranked by |Δ| descending, ties by
+    value, and capped at *union_cap*; the second return value is how many
+    (the smallest changes) were dropped, for the caption.
+    """
+    rows: list[dict[str, Any]] = []
+    for value in values:
+        p = int(primary_counts.get(value, 0))
+        c = int(comparison_counts.get(value, 0))
+        ps = p / primary_total if primary_total else 0.0
+        cs = c / comparison_total if comparison_total else 0.0
+        if p and not c:
+            status = "new"
+        elif c and not p:
+            status = "vanished"
+        elif ps > cs:
+            status = "rose"
+        elif ps < cs:
+            status = "fell"
+        else:
+            status = "same"
+        rows.append(
+            {
+                "value": value,
+                "primary": p,
+                "comparison": c,
+                "primary_share": ps,
+                "comparison_share": cs,
+                "delta_share": ps - cs,
+                "status": status,
+            }
+        )
+    rows.sort(key=lambda r: (-abs(r["delta_share"]), r["value"]))
+    cap = max(1, int(union_cap))
+    omitted = max(0, len(rows) - cap)
+    return rows[:cap], omitted
+
+
+def pair_intervals(
+    rows: Sequence[tuple[str, str, str, int]],
+) -> tuple[dict[str, list[dict[str, Any]]], int, int]:
+    """Pair ordered start/end rows into intervals, one stack per lane.
+
+    Pure so the rule is unit-testable without ClickHouse, and one sentence
+    long so the caption can print it: **an end closes the most recent open
+    start in its lane**; a start that is never closed stays open-ended
+    (``end`` None); an end with no open start before it is an orphan —
+    counted, never drawn. *rows* are ``(lane, ts_iso, event_id, is_start)``
+    already ordered by time (a start before an end at the same instant).
+    Returns the intervals per lane in start order, the count of open-ended
+    starts and the count of orphan ends.
+    """
+    open_by_lane: dict[str, list[dict[str, Any]]] = {}
+    intervals: dict[str, list[dict[str, Any]]] = {}
+    orphans = 0
+    for lane, ts, event_id, is_start in rows:
+        if is_start:
+            interval = {
+                "start": ts,
+                "end": None,
+                "start_event_id": event_id,
+                "end_event_id": None,
+            }
+            intervals.setdefault(lane, []).append(interval)
+            open_by_lane.setdefault(lane, []).append(interval)
+            continue
+        stack = open_by_lane.get(lane)
+        if not stack:
+            orphans += 1
+            continue
+        interval = stack.pop()
+        interval["end"] = ts
+        interval["end_event_id"] = event_id
+    unpaired = sum(len(stack) for stack in open_by_lane.values())
+    return intervals, unpaired, orphans
 
 
 class EventQueryService:
@@ -1255,7 +1394,11 @@ class EventQueryService:
             raise
 
     def _build_where(
-        self, query: EventQuery, *, external_tables: _ExternalTables | None = None
+        self,
+        query: EventQuery,
+        *,
+        external_tables: _ExternalTables | None = None,
+        param_prefix: str = "",
     ) -> tuple[str, QueryParameters]:
         """Build the parameterized WHERE clause for *query*.
 
@@ -1269,12 +1412,20 @@ class EventQueryService:
         *external_tables* lets a caller that rebuilds the clause many times
         for one logical read reuse the already-serialized payloads — see
         :class:`_ExternalTables`. Leave it unset for a one-shot read.
+
+        *param_prefix* prefixes every generated parameter name, so two
+        clauses built for two queries can be ANDed in one statement (the
+        interval lanes' start and end layers) without their ``p0``…
+        colliding. The fixed names — the offset arrays and ``field_key`` —
+        are not prefixed: they are bound once with the same values by every
+        clause.
         """
         builder = _ParameterizedQueryBuilder(
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
             search_blob_ready=self.store.search_blob_ready() if query.q else False,
             external_tables=external_tables,
+            param_prefix=param_prefix,
         )
         builder.add_param("case_id = :name", query.case_id)
 
@@ -2160,7 +2311,13 @@ class EventQueryService:
 
     @_foreground_scan
     def field_terms(
-        self, query: EventQuery, field_token: str, limit: int = 50, *, totals: bool = True
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        totals: bool = True,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return a top-N terms aggregation (value → count) for *field_token*.
 
@@ -2178,8 +2335,108 @@ class EventQueryService:
         ``total``/``distinct`` from the returned rows, which is exact when
         the field has no tail and an undercount when it does. Nothing that
         renders an "Other" slice may use it.
+
+        ``derive`` groups a *derived* field instead (:mod:`vestigo.db.derive`):
+        the same scans over the bins / calendar-part expression, and the
+        response carries a ``derive`` echo naming the resolved edges.
         """
-        return self._field_terms_impl(query, field_token, limit=limit, totals=totals)
+        return self._field_terms_impl(query, field_token, limit=limit, totals=totals, derive=derive)
+
+    def _resolve_derive(
+        self,
+        query: EventQuery,
+        field_token: str,
+        derive: DeriveSpec | None,
+        *,
+        param_name: str = "field_key",
+        prebuilt: tuple[str, dict[str, Any]] | None = None,
+    ) -> tuple[str, ResolvedDerive | None]:
+        """Resolve *field_token* to its SQL, derived if *derive* says so.
+
+        ``width``/``log`` bins need the slice's actual value range, which is one
+        cheap scan here (``min``/``max``/``minIf(>0)`` over the float-cast
+        column under the same WHERE as the aggregation that follows). The
+        result carries the edges so the caption can print them — a derived
+        chart that did not say where its bins are would be a chart nobody
+        could check.
+
+        *prebuilt* is the caller's own ``(where, parameters)`` from
+        :meth:`_build_where`; the field key is bound into that dict so the
+        returned expression is valid in the caller's query. Without it the
+        pair is built here.
+        """
+        where, parameters = prebuilt if prebuilt is not None else self._build_where(query)
+        base = _field_column_expr(
+            field_token,
+            parameters,
+            param_name,
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        if derive is None:
+            return base, None
+        if resolve_time_field(field_token) is not None:
+            raise ValueError(
+                f"{field_token} is already a calendar part — chart it directly, without derive"
+            )
+        if derive.kind == "time_part":
+            part = derive.part or "hour"
+            spec = TIME_FIELD_SPECS[TIME_PART_TOKENS[part]]
+            # Deriving a calendar part *from the timestamp column* is the same
+            # question `time:hour_of_day` answers, and must give the same answer:
+            # build it the same way. `time_part_expr` parses a string, which the
+            # year-2299 null sentinel parses into perfectly well — every undated
+            # event piling into hour 23 / weekday 5 / month 12 — and it reads the
+            # raw column, ignoring per-source clock skew. `TimeFieldSpec.sql`
+            # blanks the sentinel and `effective_ts_sql` applies the offsets.
+            #
+            # Scoped to the timestamp column on purpose: the sentinel predicate
+            # names that column, so applying it to an *attribute* that happens to
+            # hold a timestamp would blank values the attribute genuinely carries
+            # merely because the event around it is undated.
+            column, _attr = resolve_column_token(field_token)
+            if column == "timestamp":
+                expr = spec.sql(effective_ts_sql(query.source_offsets))
+            else:
+                expr = time_part_expr(base, part)
+            labels = list(spec.domain or [])
+            return expr, ResolvedDerive(
+                spec=derive, expr=expr, labels=labels, edges=None, negative_bin=False
+            )
+        value = _finite_float_cast(base)
+        if derive.mode == "custom":
+            edges = [float(e) for e in derive.edges or []]
+            negative = False
+        else:
+            row = self._select(
+                f"""
+                SELECT min(v), max(v), minIf(v, v > 0)
+                FROM (SELECT {value} AS v FROM {self.store.database}.events WHERE {where}) AS t
+                WHERE v IS NOT NULL
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            ).result_rows
+            lo, hi, min_pos = row[0] if row else (None, None, None)
+            count = derive.count or 8
+            if lo is None or hi is None:
+                edges, negative = [], False
+            elif derive.mode == "log":
+                # log10 cannot place a value <= 0, so those get their own,
+                # disclosed bin and the edges span the *positive* range.
+                negative = lo <= 0
+                edges = bin_edges("log", count, float(min_pos), float(hi)) if min_pos else []
+            else:
+                negative = False
+                edges = bin_edges("width", count, float(lo), float(hi))
+        expr = bins_expr(value, edges, negative_bin=negative)
+        return expr, ResolvedDerive(
+            spec=derive,
+            expr=expr,
+            labels=bin_labels(edges, negative_bin=negative),
+            edges=edges,
+            negative_bin=negative,
+        )
 
     def _field_terms_impl(
         self,
@@ -2189,8 +2446,29 @@ class EventQueryService:
         *,
         parallel: bool = True,
         totals: bool = True,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
-        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate.
+        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate."""
+        result, _ = self._field_terms_resolved(
+            query, field_token, limit, parallel=parallel, totals=totals, derive=derive
+        )
+        return result
+
+    def _field_terms_resolved(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        parallel: bool = True,
+        totals: bool = True,
+        derive: DeriveSpec | None = None,
+    ) -> tuple[dict[str, Any], ResolvedDerive | None]:
+        """:py:meth:`_field_terms_impl` plus the derivation it resolved.
+
+        A width/log derivation costs a min/max pre-flight scan; a caller that
+        counts a second layer on the same bins (``compare_field_terms``) takes
+        the resolution from here rather than resolving — and scanning — again.
 
         ``parallel=False`` runs the two scans one after the other, for a
         caller that is *itself* fanning out (the pivot's two axes) — see
@@ -2206,13 +2484,10 @@ class EventQueryService:
         self.store.init_schema()
         where, parameters = self._build_where(query)
         database = self.store.database
-        col_expr = _field_column_expr(
-            field_token,
-            parameters,
-            "field_key",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
         )
+        echo = resolved.echo() if resolved is not None else None
 
         scope = f"WHERE {where} AND {col_expr} != ''"
 
@@ -2270,7 +2545,8 @@ class EventQueryService:
                 "distinct": len(values),
                 "values": values,
                 "other_count": 0,
-            }
+                "derive": echo,
+            }, resolved
 
         run = self._run_parallel if parallel else self._run_serial
         result, totals_result = run(top_n, all_groups)
@@ -2282,7 +2558,8 @@ class EventQueryService:
                 "distinct": 0,
                 "values": [],
                 "other_count": 0,
-            }
+                "derive": echo,
+            }, resolved
 
         totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
         total, distinct = int(totals_row[0] or 0), int(totals_row[1] or 0)
@@ -2294,7 +2571,8 @@ class EventQueryService:
             "distinct": distinct,
             "values": values,
             "other_count": max(0, other_count),
-        }
+            "derive": echo,
+        }, resolved
 
     # ── Field value inventory (#295) ─────────────────────────────────────────
 
@@ -2429,8 +2707,7 @@ class EventQueryService:
         dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
         tie_break = "" if order_sql.startswith("val ") else ", val ASC"
         sql = (
-            f"SELECT {col_expr} AS val, count() AS c, "
-            f"min({dated}) AS first_seen, max({dated}) AS last_seen "
+            f"{_inventory_select_core(col_expr, dated)} "
             f"FROM {self.store.database}.events "
             f"WHERE {where} "
             f"GROUP BY val "
@@ -2983,14 +3260,16 @@ class EventQueryService:
         field_token: str,
         buckets: int = 60,
         series_limit: int = 12,
+        *,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return per-value event counts bucketed over time for *field_token*.
 
         Restricts to the top *series_limit* values by overall count so a
-        high-cardinality field doesn't explode into hundreds of series — the
-        Visualization page surfaces ``field_terms``' ``other_count``/
-        ``distinct`` alongside this so the analyst knows series were capped.
-        Powers the multi-series line chart and the value×time heatmap.
+        high-cardinality field doesn't explode into hundreds of series, and
+        reports the cut as ``distinct``/``other_count``/``series_truncated``
+        so the analyst knows series were capped. Powers the multi-series line
+        chart and the value×time heatmap.
 
         Top-value selection and per-bucket counting are fused into one scan
         (M24b): the inner aggregate groups by (sentinel-flag, bucket, value),
@@ -3030,24 +3309,25 @@ class EventQueryService:
                 settings=foreground_scan_settings(),
             )
 
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
+        )
+        echo = resolved.echo() if resolved is not None else None
         empty: dict[str, Any] = {
             "field": field_token,
             "interval_seconds": 0,
             "min": None,
             "max": None,
             "series": [],
+            "derive": echo,
+            "distinct": 0,
+            "other_count": 0,
+            "series_truncated": False,
         }
         if min_ts is None or max_ts is None:
             return empty
 
         interval = bucket_interval_seconds(min_ts, max_ts, buckets)
-        col_expr = _field_column_expr(
-            field_token,
-            parameters,
-            "field_key",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
-        )
 
         fused_result = self._select(
             f"""
@@ -3065,7 +3345,7 @@ class EventQueryService:
             )
             GROUP BY val
             ORDER BY total DESC, val ASC
-            LIMIT {int(series_limit)}
+            LIMIT {int(series_limit) + 1}
             {foreground_scan_settings()}
             """,
             parameters=parameters,
@@ -3078,6 +3358,37 @@ class EventQueryService:
                 "min": min_ts.isoformat(),
                 "max": max_ts.isoformat(),
             }
+
+        # One row past the cap is the probe: `series_limit` series can be all
+        # there is, or the visible slice of many. A derived field makes this
+        # routine rather than exotic — 49 custom edges are 51 bin labels and a
+        # `week` time part is 53, both past the ceiling of 50 — and `derive`
+        # echoes the full label list, so an undisclosed cut leaves the caption
+        # naming series the chart does not draw. Every other figure in this
+        # module reports `distinct`/`other_count`; this one now does too.
+        series_truncated = len(rows) > series_limit
+        rows = rows[:series_limit]
+        distinct = len(rows)
+        other_count = 0
+        if series_truncated:
+            # Only now is a second aggregate worth its scan: the untruncated
+            # case (the overwhelmingly common one) already knows both answers
+            # from the rows it holds.
+            totals = self._select(
+                f"""
+                SELECT count() AS n_groups, sum(c) AS total FROM (
+                    SELECT {col_expr} AS val, count() AS c
+                    FROM {database}.events
+                    WHERE {where} AND {col_expr} != ''
+                    GROUP BY val
+                )
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            ).result_rows
+            if totals:
+                distinct = int(totals[0][0])
+                other_count = max(0, int(totals[0][1]) - sum(int(row[1]) for row in rows))
 
         # Pivot into one bucket-list per value, in the same top-N order the
         # ranking produced, filling buckets with zero rows so every series
@@ -3109,6 +3420,10 @@ class EventQueryService:
             "min": min_ts.isoformat(),
             "max": max_ts.isoformat(),
             "series": series,
+            "derive": echo,
+            "distinct": distinct,
+            "other_count": other_count,
+            "series_truncated": series_truncated,
         }
 
     def _union_timestamp_range(
@@ -3254,9 +3569,20 @@ class EventQueryService:
         }
 
     def _terms_counts_for_values(
-        self, query: EventQuery, field_token: str, values: list[str]
+        self,
+        query: EventQuery,
+        field_token: str,
+        values: list[str],
+        *,
+        derived_expr: str | None = None,
     ) -> tuple[dict[str, int], int]:
-        """Return per-value counts restricted to *values*, plus the layer's non-empty total."""
+        """Return per-value counts restricted to *values*, plus the layer's non-empty total.
+
+        *derived_expr* is the **primary** layer's resolved derivation
+        expression (bound to ``field_key``): both layers must share bins, or
+        the comparison is meaningless, so the comparison layer never resolves
+        edges of its own.
+        """
         where, parameters = self._build_where(query)
         col_expr = _field_column_expr(
             field_token,
@@ -3265,6 +3591,8 @@ class EventQueryService:
             field_mappings=query.field_mappings,
             source_offsets=query.source_offsets,
         )
+        if derived_expr is not None:
+            col_expr = derived_expr
         parameters["cmp_values"] = values
         result = self._select(
             f"""
@@ -3293,6 +3621,8 @@ class EventQueryService:
         field_token: str,
         limit: int = 50,
         baseline_cache_token: tuple | None = None,
+        *,
+        derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return top-N term counts for two layers over one shared category list.
 
@@ -3306,11 +3636,18 @@ class EventQueryService:
         includes it — hits happen only on re-renders whose primary top-N is
         unchanged (option toggles, tab switches, repeat renders), a
         deliberately narrower win than the time/numeric kinds.
+
+        ``derive``: both layers are counted on the **primary's** resolved
+        expression (its edges, its part), and that expression is part of the
+        cache key, so a derived request never reads an underived layer.
         """
         self.store.init_schema()
-        terms = self._field_terms_impl(primary, field_token, limit=limit)
+        terms, resolved = self._field_terms_resolved(
+            primary, field_token, limit=limit, derive=derive
+        )
         top_values = [v["value"] for v in terms["values"]]
         primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
+        derived_expr = resolved.expr if resolved is not None else None
 
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
@@ -3318,8 +3655,17 @@ class EventQueryService:
             window = (primary.start, primary.end)
             comparison_by_value, comparison_total = self._baseline_cached(
                 baseline_cache_token,
-                ("terms_counts", baseline_cache_token, window, field_token, tuple(top_values)),
-                lambda: self._terms_counts_for_values(comparison, field_token, top_values),
+                (
+                    "terms_counts",
+                    baseline_cache_token,
+                    window,
+                    field_token,
+                    tuple(top_values),
+                    derived_expr,
+                ),
+                lambda: self._terms_counts_for_values(
+                    comparison, field_token, top_values, derived_expr=derived_expr
+                ),
             )
 
         values = [
@@ -3339,7 +3685,349 @@ class EventQueryService:
             "comparison_total": comparison_total,
             "primary_other": terms["other_count"],
             "comparison_other": max(0, comparison_total - sum(v["comparison"] for v in values)),
+            "derive": terms.get("derive"),
         }
+
+    def _terms_top_for_expr(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int,
+        *,
+        derived_expr: str | None = None,
+    ) -> list[str]:
+        """Return one layer's top-*limit* values (count desc, value asc), optionally on a derived expression.
+
+        *derived_expr* is the **primary** layer's resolved derivation bound to
+        ``field_key`` — the comparison layer never resolves edges of its own,
+        or the two windows would be counted on different bins.
+        """
+        where, parameters = self._build_where(query)
+        col_expr = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=query.field_mappings,
+            source_offsets=query.source_offsets,
+        )
+        if derived_expr is not None:
+            col_expr = derived_expr
+        result = self._select(
+            f"""
+            SELECT {col_expr} AS val, count() AS c
+            FROM {self.store.database}.events
+            WHERE {where} AND {col_expr} != ''
+            GROUP BY val
+            ORDER BY c DESC, val ASC
+            LIMIT {int(limit)}
+            {foreground_scan_settings()}
+            """,
+            parameters=parameters,
+        )
+        return [row[0] for row in result.result_rows]
+
+    @_foreground_scan
+    def field_change(
+        self,
+        primary: EventQuery,
+        comparison: EventQuery,
+        field_token: str,
+        limit: int = 10,
+        *,
+        union_cap: int = 200,
+        derive: DeriveSpec | None = None,
+    ) -> dict[str, Any]:
+        """Return the ranked share-of-window change of *field_token* between two windows.
+
+        The top-*limit* values of each window (both counted on the primary's
+        resolved derivation, as :py:meth:`compare_field_terms` does) are
+        unioned; then each window is counted over that union in one scan
+        that also yields the window's non-empty total, and
+        :func:`rank_change_rows` turns the counts into shares, statuses and
+        the ranked, capped row list. Four scans, two parallel pairs, under
+        one gate slot. Share rather than count is the encoded quantity
+        because the two windows are rarely the same size.
+        """
+        self.store.init_schema()
+        derived_expr: str | None = None
+        echo: dict[str, Any] | None = None
+        if derive is not None:
+            _, resolved = self._resolve_derive(primary, field_token, derive)
+            if resolved is not None:
+                derived_expr = resolved.expr
+                echo = resolved.echo()
+        primary_top, comparison_top = self._run_parallel(
+            lambda: self._terms_top_for_expr(
+                primary, field_token, limit, derived_expr=derived_expr
+            ),
+            lambda: self._terms_top_for_expr(
+                comparison, field_token, limit, derived_expr=derived_expr
+            ),
+        )
+        union = list(dict.fromkeys([*primary_top, *comparison_top]))
+        base = {
+            "kind": "change",
+            "field": field_token,
+            "derive": echo,
+            "top_n": int(limit),
+            "union_cap": int(union_cap),
+        }
+        if not union:
+            return {
+                **base,
+                "primary_total": 0,
+                "comparison_total": 0,
+                "rows": [],
+                "union_size": 0,
+                "rows_shown": 0,
+                "truncated": False,
+                "omitted": 0,
+            }
+        (primary_counts, primary_total), (comparison_counts, comparison_total) = self._run_parallel(
+            lambda: self._terms_counts_for_values(
+                primary, field_token, union, derived_expr=derived_expr
+            ),
+            lambda: self._terms_counts_for_values(
+                comparison, field_token, union, derived_expr=derived_expr
+            ),
+        )
+        rows, omitted = rank_change_rows(
+            union, primary_counts, comparison_counts, primary_total, comparison_total, union_cap
+        )
+        return {
+            **base,
+            "primary_total": int(primary_total),
+            "comparison_total": int(comparison_total),
+            "rows": rows,
+            "union_size": len(union),
+            "rows_shown": len(rows),
+            "truncated": omitted > 0,
+            "omitted": omitted,
+        }
+
+    @_foreground_scan
+    def field_lanes(
+        self,
+        primary: EventQuery,
+        field_token: str,
+        *,
+        pairing: str = "first_last",
+        start: EventQuery | None = None,
+        end: EventQuery | None = None,
+        limit_y: int = 10,
+        rows_cap: int = 50_000,
+    ) -> dict[str, Any]:
+        """Return interval lanes: one lane per value of *field_token*, bars from start to end.
+
+        ``first_last``: one interval per lane from its first to its last
+        dated event under *primary* (``argMin``/``argMax`` in one grouped
+        scan). ``next_end``: the start-matching rows (``primary ∧ start``)
+        and the end-matching rows (``primary ∧ end``) are unioned — the two
+        extra WHERE clauses carry prefixed parameter names so the three can
+        share one statement — the lanes are ranked by their row count, and
+        the kept lanes' rows are fetched in time order under *rows_cap* and
+        paired by :func:`pair_intervals`. Two parallel scans (the lane
+        ranking and the whole's counts) then, for ``next_end``, one ordered
+        scan; every cap is in the response. Undated rows never feed a bar.
+        """
+        if pairing not in ("first_last", "next_end"):
+            raise ValueError(f'pairing must be "first_last" or "next_end", got "{pairing}"')
+        if pairing == "next_end" and (start is None or end is None):
+            raise ValueError('pairing="next_end" needs both a start and an end query')
+        self.store.init_schema()
+        database = self.store.database
+        settings = foreground_scan_settings()
+        ext = _ExternalTables()
+        where, parameters = self._build_where(primary, external_tables=ext)
+        lane = _field_column_expr(
+            field_token,
+            parameters,
+            "field_key",
+            field_mappings=primary.field_mappings,
+            source_offsets=primary.source_offsets,
+        )
+        eff = effective_ts_sql(primary.source_offsets)
+        base = {
+            "kind": "lanes",
+            "field": field_token,
+            "pairing": pairing,
+            "lane_cap": int(limit_y),
+            "rows_cap": int(rows_cap),
+        }
+
+        if pairing == "first_last":
+            rows_src = f"""
+                SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                       {VESTIGO_NOT_SENTINEL_SQL} AS dated
+                FROM {database}.events
+                WHERE {where} AND {lane} != ''
+            """
+            ranked, whole = self._run_parallel(
+                lambda: (
+                    self._select(
+                        f"""
+                    SELECT lane, count() AS c,
+                           argMin(eid, ts) AS first_id, min(ts) AS first_ts,
+                           argMax(eid, ts) AS last_id, max(ts) AS last_ts
+                    FROM ({rows_src}) WHERE dated
+                    GROUP BY lane ORDER BY c DESC, lane ASC LIMIT {int(limit_y)}
+                    {settings}
+                    """,
+                        parameters=parameters,
+                    ).result_rows
+                ),
+                lambda: (
+                    self._select(
+                        f"""
+                    SELECT uniqExactIf(lane, dated), countIf(NOT dated),
+                           minIf(ts, dated), maxIf(ts, dated)
+                    FROM ({rows_src})
+                    {settings}
+                    """,
+                        parameters=parameters,
+                    ).result_rows
+                ),
+            )
+            lanes_total, undated, min_ts, max_ts = whole[0] if whole else (0, 0, None, None)
+            lanes = [
+                {
+                    "key": key,
+                    "count": int(c),
+                    "intervals": [
+                        {
+                            "start": ensure_utc_iso(first_ts),
+                            "end": ensure_utc_iso(last_ts),
+                            "start_event_id": first_id,
+                            "end_event_id": last_id,
+                        }
+                    ],
+                }
+                for key, c, first_id, first_ts, last_id, last_ts in ranked
+            ]
+            return {
+                **base,
+                "lanes": lanes,
+                "lanes_total": int(lanes_total),
+                "lane_cap_hit": int(lanes_total) > len(lanes),
+                "other_lanes": max(0, int(lanes_total) - len(lanes)),
+                "starts": 0,
+                "ends": 0,
+                "unpaired_starts": 0,
+                "orphan_ends": 0,
+                "rows_truncated": False,
+                "rows_paired": 0,
+                "undated": int(undated),
+                "slice_start": self._slice_edge(primary.start, min_ts, lanes_total),
+                "slice_end": self._slice_edge(primary.end, max_ts, lanes_total),
+            }
+
+        if start is None or end is None:  # unreachable: checked above
+            raise RuntimeError("next_end pairing reached the scan without both layers")
+        start_where, start_params = self._build_where(start, external_tables=ext, param_prefix="s_")
+        end_where, end_params = self._build_where(end, external_tables=ext, param_prefix="e_")
+        # Merged as one dict, never as `**start_params, **end_params`: the
+        # prefix covers the generated `p0..pN` but deliberately *not* the fixed
+        # names, so both layers bind `clk_off_src`/`clk_off_val` whenever any
+        # in-scope source carries a clock offset (`bind_offset_params`) — and a
+        # duplicate keyword is a `TypeError`, not a silent overwrite. The values
+        # are equal by construction (all three queries share the timeline's
+        # offsets), so last-wins is the same answer, but the merge has to be the
+        # kind that permits a duplicate at all.
+        parameters = _with_params(parameters, **{**start_params, **end_params})
+        # The three builders share one registry, but `_with_params` copies only
+        # the primary's `.external` and `**start_params` splats dict keys alone —
+        # a >512-id list on the start or end layer registered `vestigo_ext_N`
+        # and then shipped no table for it. The registry is the source of truth.
+        parameters.external = ext.data
+        rows_src = f"""
+            SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                   {VESTIGO_NOT_SENTINEL_SQL} AS dated, 1 AS is_start
+            FROM {database}.events
+            WHERE {where} AND ({start_where}) AND {lane} != ''
+            UNION ALL
+            SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
+                   {VESTIGO_NOT_SENTINEL_SQL} AS dated, 0 AS is_start
+            FROM {database}.events
+            WHERE {where} AND ({end_where}) AND {lane} != ''
+        """
+        ranked, whole = self._run_parallel(
+            lambda: (
+                self._select(
+                    f"""
+                SELECT lane, count() AS c FROM ({rows_src}) WHERE dated
+                GROUP BY lane ORDER BY c DESC, lane ASC LIMIT {int(limit_y)}
+                {settings}
+                """,
+                    parameters=parameters,
+                ).result_rows
+            ),
+            lambda: (
+                self._select(
+                    f"""
+                SELECT uniqExactIf(lane, dated), countIf(NOT dated),
+                       countIf(dated AND is_start = 1), countIf(dated AND is_start = 0),
+                       minIf(ts, dated), maxIf(ts, dated)
+                FROM ({rows_src})
+                {settings}
+                """,
+                    parameters=parameters,
+                ).result_rows
+            ),
+        )
+        lanes_total, undated, starts, ends, min_ts, max_ts = (
+            whole[0] if whole else (0, 0, 0, 0, None, None)
+        )
+        kept = [key for key, _ in ranked]
+        count_by_lane = {key: int(c) for key, c in ranked}
+        rows: list[tuple[str, str, str, int]] = []
+        truncated = False
+        if kept:
+            parameters = _with_params(parameters, lane_keys=kept)
+            fetched = self._select(
+                f"""
+                SELECT lane, ts, eid, is_start FROM ({rows_src})
+                WHERE dated AND has({{lane_keys:Array(String)}}, lane)
+                ORDER BY ts ASC, is_start DESC, eid ASC
+                LIMIT {int(rows_cap) + 1}
+                {settings}
+                """,
+                parameters=parameters,
+            ).result_rows
+            truncated = len(fetched) > rows_cap
+            rows = [
+                (str(lane_key), ensure_utc_iso(ts), str(eid), int(is_start))
+                for lane_key, ts, eid, is_start in fetched[:rows_cap]
+            ]
+        intervals, unpaired, orphans = pair_intervals(rows)
+        lanes = [
+            {"key": key, "count": count_by_lane[key], "intervals": intervals.get(key, [])}
+            for key in kept
+        ]
+        return {
+            **base,
+            "lanes": lanes,
+            "lanes_total": int(lanes_total),
+            "lane_cap_hit": int(lanes_total) > len(lanes),
+            "other_lanes": max(0, int(lanes_total) - len(lanes)),
+            "starts": int(starts),
+            "ends": int(ends),
+            "unpaired_starts": unpaired,
+            "orphan_ends": orphans,
+            "rows_truncated": truncated,
+            "rows_paired": len(rows),
+            "undated": int(undated),
+            "slice_start": self._slice_edge(primary.start, min_ts, lanes_total),
+            "slice_end": self._slice_edge(primary.end, max_ts, lanes_total),
+        }
+
+    @staticmethod
+    def _slice_edge(explicit: datetime | None, observed: Any, lanes_total: int) -> str | None:
+        """The window edge open-ended bars run to: the query's own bound, else the data's."""
+        if explicit is not None:
+            return ensure_utc(explicit).isoformat()
+        if not lanes_total or observed is None:
+            return None
+        return ensure_utc_iso(observed)
 
     def _numeric_layer_stats(
         self, query: EventQuery, field_token: str
@@ -3527,6 +4215,8 @@ class EventQueryService:
         field_y: str,
         limit_x: int = 10,
         limit_y: int = 10,
+        *,
+        derive_x: DeriveSpec | None = None,
     ) -> dict[str, Any]:
         """Return a top-X × top-Y co-occurrence count matrix for two fields.
 
@@ -3553,15 +4243,26 @@ class EventQueryService:
         charted whole. A caller comparing "values shown" against "distinct" to
         caption a truncation has to know the difference — for a bounded axis
         the two are equal by construction, and nothing was cut off.
+
+        A **derived** x axis (``derive_x``, :mod:`vestigo.db.derive`) is a
+        bounded domain in exactly the same sense: its label list is known
+        before any row is read, so the axis is charted whole and in order —
+        an empty range is a finding, like an empty hour.
         """
         self.store.init_schema()
         spec_x = resolve_time_field(field_x)
         spec_y = resolve_time_field(field_y)
+        where, parameters = self._build_where(query)
+        col_x, resolved_x = self._resolve_derive(
+            query, field_x, derive_x, param_name="field_key_x", prebuilt=(where, parameters)
+        )
 
         def _axis(
             field_token: str, spec: TimeFieldSpec | None, limit: int
         ) -> tuple[list[str], int, bool]:
             """One axis's ``(values, distinct, bounded)`` — domain, or top-N by count."""
+            if field_token == field_x and resolved_x is not None:
+                return list(resolved_x.labels), len(resolved_x.labels), True
             if spec is not None and spec.domain is not None:
                 return list(spec.domain), len(spec.domain), True
             # Serial: this helper is one arm of a two-way fan-out already.
@@ -3582,18 +4283,11 @@ class EventQueryService:
             "y_distinct": y_distinct,
             "x_bounded": x_bounded,
             "y_bounded": y_bounded,
+            "derive_x": resolved_x.echo() if resolved_x is not None else None,
         }
         if not x_values or not y_values:
             return {**base, "cells": [], "total": 0}
 
-        where, parameters = self._build_where(query)
-        col_x = _field_column_expr(
-            field_x,
-            parameters,
-            "field_key_x",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
-        )
         col_y = _field_column_expr(
             field_y,
             parameters,
@@ -3617,6 +4311,408 @@ class EventQueryService:
         )
         cells = [{"x": row[0], "y": row[1], "count": int(row[2])} for row in result.result_rows]
         return {**base, "cells": cells, "total": sum(c["count"] for c in cells)}
+
+    @_foreground_scan
+    def field_table(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        second_field: str | None = None,
+        sort_by: str = "count",
+        sort_dir: str = "desc",
+        derive: DeriveSpec | None = None,
+    ) -> dict[str, Any]:
+        """Return the top-*limit* values of *field_token* as table rows.
+
+        The value inventory (#295) made bounded: the same SELECT core
+        (:func:`_inventory_select_core`) so a row's count and first/last seen
+        mean exactly what the streamed inventory's do, plus ``share`` against
+        the slice's non-empty total and, given *second_field*, ``uniqExact``
+        of its non-empty values per row.
+
+        Two scans in parallel, as :py:meth:`field_terms`: the sorted top-N and
+        a spillable totals grouping that yields the remainder — ``total -
+        shown``, ``distinct - len(rows)`` — which is reported as a row of its
+        own whenever anything was cut, never silently dropped. The remainder
+        carries count and share only: its seen range and distinct-second
+        count would be a third scan for a row that exists to say "there is
+        more", and the caption names it as such.
+
+        Undated events (sentinel timestamp) contribute to counts but not to
+        the seen range — ``first_seen``/``last_seen`` are None for a value seen
+        only on undated events, never the year-2299 sentinel.
+        """
+        if sort_by not in TABLE_SORT_COLUMNS:
+            raise ValueError(f"unknown table sort column {sort_by!r}")
+        if sort_dir not in ("asc", "desc"):
+            raise ValueError(f"unknown table sort direction {sort_dir!r}")
+        if sort_by == "distinct_second" and not second_field:
+            raise ValueError("sorting by distinct_second needs a second field")
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        col_expr, resolved = self._resolve_derive(
+            query, field_token, derive, prebuilt=(where, parameters)
+        )
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
+        extra = ""
+        if second_field:
+            col_y = _field_column_expr(
+                second_field,
+                parameters,
+                "field_key_y",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            extra = f", uniqExactIf({col_y}, {col_y} != '') AS distinct_second"
+        scope = f"WHERE {where} AND {col_expr} != ''"
+        direction = "ASC" if sort_dir == "asc" else "DESC"
+        key = _TABLE_SORT_SQL[sort_by]
+        # "By value" on a derived field means *value order*, not lexical order:
+        # a bin label starts with "<", "≥" or "≤", which all sort after the
+        # digits, so the string order interleaves the ranges. The rank in the
+        # derivation's own label list is the order — and it has to be in SQL,
+        # since it also decides which rows the LIMIT keeps.
+        if sort_by == "value" and resolved is not None:
+            key = label_order_expr("val", resolved.labels)
+        nulls = " NULLS LAST" if sort_by in ("first_seen", "last_seen") else ""
+        tie_break = "" if key == "val" else ", val ASC"
+        order_sql = f"{key} {direction}{nulls}{tie_break}"
+
+        def top_n() -> Any:
+            return self._select(
+                f"""
+                {_inventory_select_core(col_expr, dated, extra=extra)}
+                FROM {database}.events
+                {scope}
+                GROUP BY val
+                ORDER BY {order_sql}
+                LIMIT {int(limit)}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        def all_groups() -> Any:
+            return self._select(
+                f"""
+                SELECT sum(c) AS total, count() AS n_groups FROM (
+                    SELECT {col_expr} AS val, count() AS c
+                    FROM {database}.events
+                    {scope}
+                    GROUP BY val
+                ) AS t
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        result, totals_result = self._run_parallel(top_n, all_groups)
+        totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        total, distinct = int(totals_row[0] or 0), int(totals_row[1] or 0)
+        rows: list[dict[str, Any]] = []
+        for row in result.result_rows:
+            value, count, first_seen, last_seen = row[0], int(row[1]), row[2], row[3]
+            rows.append(
+                {
+                    "value": value,
+                    "count": count,
+                    "share": (count / total) if total else 0.0,
+                    "first_seen": ensure_utc_iso(first_seen) if first_seen is not None else None,
+                    "last_seen": ensure_utc_iso(last_seen) if last_seen is not None else None,
+                    "distinct_second": int(row[4]) if second_field else None,
+                }
+            )
+        shown = sum(r["count"] for r in rows)
+        cut = distinct - len(rows)
+        remainder = (
+            {
+                "count": total - shown,
+                "share": ((total - shown) / total) if total else 0.0,
+                "distinct_values": cut,
+            }
+            if cut > 0
+            else None
+        )
+        return {
+            "kind": "table",
+            "field": field_token,
+            "second_field": second_field,
+            "total": total,
+            "distinct": distinct,
+            "rows": rows,
+            "remainder": remainder,
+            "sort": {"by": sort_by, "dir": sort_dir},
+            "derive": resolved.echo() if resolved is not None else None,
+        }
+
+    @_foreground_scan
+    def mark_instants(self, query: EventQuery, limit: int = 50) -> dict[str, Any]:
+        """Return the earliest *limit* dated events under *query* as mark instants.
+
+        The aggregation behind an ``events`` mark source (Visualize marks): a
+        filter becomes instants on a time axis. Two scans in parallel under
+        one slot — the ordered head, and a ``countIf`` pair that says how many
+        events matched with and without a real timestamp — so the caption can
+        state both the cap and the undated events the figure cannot place.
+        Ascending by the offset-corrected timestamp, then ``event_id``, so a
+        re-run over unchanged sources draws the same instants.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+
+        def head() -> Any:
+            return self._select(
+                f"""
+                SELECT event_id, source_id, {eff} AS ts
+                FROM {database}.events
+                WHERE {where} AND {VESTIGO_NOT_SENTINEL_SQL}
+                ORDER BY ts ASC, event_id ASC
+                LIMIT {int(limit) + 1}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        def totals() -> Any:
+            return self._select(
+                f"""
+                SELECT countIf({VESTIGO_NOT_SENTINEL_SQL}) AS dated,
+                       countIf(NOT ({VESTIGO_NOT_SENTINEL_SQL})) AS undated
+                FROM {database}.events
+                WHERE {where}
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            )
+
+        result, totals_result = self._run_parallel(head, totals)
+        rows = result.result_rows
+        totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        return {
+            "instants": [
+                {"event_id": str(row[0]), "source_id": row[1], "at": ensure_utc_iso(row[2])}
+                for row in rows[: int(limit)]
+            ],
+            "dated": int(totals_row[0] or 0),
+            "undated": int(totals_row[1] or 0),
+            "overflow": len(rows) > int(limit),
+        }
+
+    @_foreground_scan
+    def cumulative(
+        self,
+        query: EventQuery,
+        *,
+        field: str | None = None,
+        quantity: str = "events",
+        buckets: int = 60,
+    ) -> dict[str, Any]:
+        """Return a running total over time — the cumulative step figure.
+
+        ``quantity``: ``events`` (a running event count, no field), ``sum``
+        (a running ``sum()`` of *field* parsed as a number; values that do not
+        parse are skipped and counted in ``unparsed``) or ``distinct`` (the
+        number of distinct *field* values seen so far — per-bucket
+        ``uniqExactState`` merged cumulatively by ``uniqExactMerge`` over a
+        window, never a sum of per-bucket distinct counts, which would count a
+        value once per bucket it appears in; empty values are skipped and
+        counted).
+
+        Buckets are epoch-aligned like ``histogram``; the range is the query's
+        explicit ``start``/``end`` or the dated events' min/max. The result is
+        zero-filled so every bucket is present and a flat step is a flat step.
+        Two scans in parallel under one slot: the bucketed running total and
+        the totals (dated events, unparsed).
+        """
+        if quantity not in ("events", "sum", "distinct"):
+            raise ValueError(f'quantity must be "events", "sum" or "distinct", got "{quantity}"')
+        if quantity != "events" and not field:
+            raise ValueError(f'quantity="{quantity}" needs a field')
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"{where} AND {VESTIGO_NOT_SENTINEL_SQL}"
+        settings = foreground_scan_settings()
+
+        if query.start is not None and query.end is not None:
+            min_ts, max_ts = ensure_utc(query.start), ensure_utc(query.end)
+        else:
+            rng = self._select(
+                f"SELECT minOrNull({eff}), maxOrNull({eff}) FROM {database}.events WHERE {dated} {settings}",
+                parameters=parameters,
+            ).result_rows
+            if not rng or rng[0][0] is None:
+                return self._empty_cumulative(quantity, field)
+            min_ts, max_ts = ensure_utc(rng[0][0]), ensure_utc(rng[0][1])
+        interval = bucket_interval_seconds(min_ts, max_ts, buckets)
+        bucket_expr = f"toStartOfInterval({eff}, INTERVAL {interval} second)"
+        running = "OVER (ORDER BY bucket ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+
+        col = (
+            _field_column_expr(
+                field,
+                parameters,
+                "cum_field",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            if field
+            else None
+        )
+        if quantity == "events":
+            inner = f"SELECT {bucket_expr} AS bucket, count() AS delta FROM {database}.events WHERE {dated} GROUP BY bucket"
+            outer = f"SELECT bucket, delta, sum(delta) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = "0"
+        elif quantity == "sum":
+            num = f"toFloat64OrNull({col})"
+            inner = f"SELECT {bucket_expr} AS bucket, sum({num}) AS delta FROM {database}.events WHERE {dated} AND {num} IS NOT NULL GROUP BY bucket"
+            outer = f"SELECT bucket, delta, sum(delta) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = f"countIf({num} IS NULL)"
+        else:  # distinct
+            inner = f"SELECT {bucket_expr} AS bucket, uniqExactState({col}) AS st FROM {database}.events WHERE {dated} AND {col} != '' GROUP BY bucket"
+            outer = f"SELECT bucket, 0, uniqExactMerge(st) {running} AS value FROM ({inner}) ORDER BY bucket"
+            unparsed_sql = f"countIf({col} = '')"
+
+        def steps() -> Any:
+            return self._select(f"{outer} {settings}", parameters=parameters)
+
+        def totals() -> Any:
+            return self._select(
+                f"SELECT count(), {unparsed_sql} FROM {database}.events WHERE {dated} {settings}",
+                parameters=parameters,
+            )
+
+        step_result, totals_result = self._run_parallel(steps, totals)
+        by_start: dict[str, tuple[float, float]] = {
+            ensure_utc_iso(row[0]): (row[1], row[2]) for row in step_result.result_rows
+        }
+        cast = float if quantity == "sum" else int
+        out: list[dict[str, Any]] = []
+        prev: float = 0
+        for start in aligned_bucket_starts(min_ts, max_ts, interval):
+            if start in by_start:
+                delta, value = by_start[start]
+                value = cast(value)
+                delta = value - prev if quantity == "distinct" else cast(delta)
+            else:
+                delta, value = cast(0), cast(prev)
+            out.append({"start": start, "delta": delta, "value": value})
+            prev = value
+        trow = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": interval,
+            "min": min_ts.isoformat(),
+            "max": max_ts.isoformat(),
+            "buckets": out,
+            "total": out[-1]["value"] if out else cast(0),
+            "events": int(trow[0] or 0),
+            "unparsed": int(trow[1] or 0),
+        }
+
+    @staticmethod
+    def _empty_cumulative(quantity: str, field: str | None) -> dict[str, Any]:
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": 0,
+            "min": None,
+            "max": None,
+            "buckets": [],
+            "total": 0,
+            "events": 0,
+            "unparsed": 0,
+        }
+
+    @_foreground_scan
+    def calendar(
+        self, query: EventQuery, *, field: str | None = None, max_weeks: int = 53
+    ) -> dict[str, Any]:
+        """Return event counts per UTC day — the calendar heatmap.
+
+        One scan grouped by ``toDate(ts, 'UTC')``; with *field*, a day counts
+        the events whose field is non-empty. Day boundaries are UTC on
+        purpose (the same rule as ``time_punchcard``): no timeline or user
+        carries a display timezone, and a boundary that moved with the
+        viewer would redraw the figure between two analysts. The figure
+        keeps the latest *max_weeks* ISO weeks (Monday-start); earlier days
+        are dropped and their events counted in ``dropped`` so the caption
+        can say what is not drawn.
+        """
+        self.store.init_schema()
+        where, parameters = self._build_where(query)
+        database = self.store.database
+        eff = effective_ts_sql(query.source_offsets)
+        dated = f"{where} AND {VESTIGO_NOT_SENTINEL_SQL}"
+        if field:
+            col = _field_column_expr(
+                field,
+                parameters,
+                "cal_field",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            count_expr = f"countIf({col} != '')"
+        else:
+            count_expr = "count()"
+        result = self._select(
+            f"""
+            SELECT toDate({eff}, 'UTC') AS day, {count_expr} AS c
+            FROM {database}.events
+            WHERE {dated}
+            GROUP BY day
+            ORDER BY day
+            {foreground_scan_settings()}
+            """,
+            parameters=parameters,
+        )
+        days = [(row[0], int(row[1])) for row in result.result_rows if int(row[1]) > 0]
+        empty = {
+            "kind": "calendar",
+            "field": field,
+            "timezone": "UTC",
+            "start": None,
+            "end": None,
+            "days": [],
+            "total": 0,
+            "max_count": 0,
+            "weeks": 0,
+            "weeks_total": 0,
+            "truncated": False,
+            "dropped": 0,
+        }
+        if not days:
+            return empty
+        first_day, last_day = days[0][0], days[-1][0]
+        first_monday = first_day - timedelta(days=first_day.isoweekday() - 1)
+        last_monday = last_day - timedelta(days=last_day.isoweekday() - 1)
+        weeks_total = (last_monday - first_monday).days // 7 + 1
+        weeks = min(weeks_total, max(1, int(max_weeks)))
+        start = last_monday - timedelta(weeks=weeks - 1)
+        shown = [(d, c) for d, c in days if d >= start]
+        dropped = sum(c for d, c in days if d < start)
+        return {
+            **empty,
+            "start": start.isoformat(),
+            "end": last_day.isoformat(),
+            "days": [{"date": d.isoformat(), "count": c} for d, c in shown],
+            "total": sum(c for _, c in shown),
+            "max_count": max((c for _, c in shown), default=0),
+            "weeks": weeks,
+            "weeks_total": weeks_total,
+            "truncated": weeks_total > weeks,
+            "dropped": dropped,
+        }
 
     @_foreground_scan
     def field_scatter(

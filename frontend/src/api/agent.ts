@@ -16,8 +16,16 @@ import type {
   StoryBlock,
   StoryBlockKind,
 } from "./types";
-import type { ChartConfig, ChartType } from "@/components/viz/lib/chartConfig";
+import {
+  parseChartInputs,
+  parseDeriveSpec,
+  type ChartConfig,
+  type ChartType,
+  type MarkSource,
+  type TableColumn,
+} from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
+import { deriveSourceScale } from "@/components/viz/lib/derive";
 import type { Metric } from "@/components/viz/lib/transforms";
 
 /** Backend FilterSpec shape (snake_case) — what agent tool calls carry. */
@@ -73,7 +81,34 @@ export interface AgentChartSpecV2 {
     groups?: number | null;
     show_points?: boolean | null;
     show_density?: boolean | null;
+    table_sort_by?: ChartConfig["options"]["tableSortBy"] | null;
+    table_sort_dir?: "asc" | "desc" | null;
+    highlight?: string[] | null;
   } | null;
+  /** The backend's `DeriveSpec` (snake_case `time_part`); `ChartConfig` spells it `timePart`. */
+  derive?: {
+    kind: "bins" | "time_part";
+    mode?: "width" | "log" | "custom" | null;
+    count?: number | null;
+    edges?: number[] | null;
+    part?: "hour" | "weekday" | "day" | "week" | "month" | null;
+  } | null;
+  /** Figure-specific inputs — today only the table's `columns`. */
+  inputs?: { columns?: TableColumn[] | null } | null;
+  /** Mark sources (`docs/VISUALIZE.md` §"Marks"); `ChartConfig` spells the ids camelCase. */
+  marks?: AgentMarkSpec[] | null;
+}
+
+/** Backend `ChartMarkSpec` (snake_case): one model for the five mark kinds. */
+export interface AgentMarkSpec {
+  kind: "events" | "baseline" | "view" | "instant" | "range";
+  filters?: AgentFilterSpec | null;
+  label?: string | null;
+  definition_id?: string | null;
+  view_id?: string | null;
+  at?: string | null;
+  start?: string | null;
+  end?: string | null;
 }
 
 /**
@@ -167,6 +202,63 @@ const SCALE_BY_KIND: Record<AgentChartSpecLegacy["kind"], ChartConfig["scale"]> 
  * the far side of that guard: an `ErrorBoundary` showing why one card is
  * missing beats a chart drawn from nothing.
  */
+/** Agent-spec derivation → `ChartConfig.derive`; only `kind`'s casing differs. */
+function specDeriveToConfig(raw: AgentChartSpecV2["derive"] | string): ChartConfig["derive"] {
+  const d = parseToolArgObject<NonNullable<AgentChartSpecV2["derive"]>>(raw);
+  if (!d) return null;
+  const { kind, ...rest } = d;
+  const clean = Object.fromEntries(Object.entries(rest).filter(([, v]) => v != null));
+  return parseDeriveSpec({ ...clean, kind: kind === "time_part" ? "timePart" : kind });
+}
+
+/** Agent-spec inputs → `ChartConfig.inputs`; unknown columns are dropped. */
+function specInputsToConfig(raw: AgentChartSpecV2["inputs"] | string): ChartConfig["inputs"] {
+  const d = parseToolArgObject<NonNullable<AgentChartSpecV2["inputs"]>>(raw);
+  return parseChartInputs(d ?? {});
+}
+
+/** Agent-spec marks → `MarkSource[]`; an entry without its kind's fields is dropped. */
+function specMarksToConfig(raw: AgentChartSpecV2["marks"] | string): MarkSource[] {
+  let list: unknown = raw;
+  if (typeof list === "string") {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  const out: MarkSource[] = [];
+  for (const m of list as AgentMarkSpec[]) {
+    if (!m || typeof m !== "object") continue;
+    const label = typeof m.label === "string" ? m.label : undefined;
+    switch (m.kind) {
+      case "events":
+        if (m.filters)
+          out.push({
+            kind: "events",
+            filters: specToEventFilters(m.filters),
+            ...(label !== undefined ? { label } : {}),
+          });
+        break;
+      case "baseline":
+        if (m.definition_id) out.push({ kind: "baseline", definitionId: m.definition_id });
+        break;
+      case "view":
+        if (m.view_id) out.push({ kind: "view", viewId: m.view_id });
+        break;
+      case "instant":
+        if (m.at && label !== undefined) out.push({ kind: "instant", at: m.at, label });
+        break;
+      case "range":
+        if (m.start && m.end && label !== undefined)
+          out.push({ kind: "range", start: m.start, end: m.end, label });
+        break;
+    }
+  }
+  return out;
+}
+
 export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   const spec = parseToolArgObject<AgentChartSpec>(raw);
   if (!spec) throw new Error("chart spec is not a JSON object");
@@ -190,16 +282,27 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   if (o.groups != null) options.groups = o.groups;
   if (o.show_points != null) options.showPoints = o.show_points;
   if (o.show_density != null) options.showDensity = o.show_density;
+  if (o.table_sort_by != null) options.tableSortBy = o.table_sort_by;
+  if (o.table_sort_dir != null) options.tableSortDir = o.table_sort_dir;
+  if (o.highlight != null && o.highlight.length) options.highlight = o.highlight;
 
   const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
+  const derive = specDeriveToConfig(spec.derive);
   return {
-    v: 1,
+    v: 2,
+    derive,
+    inputs: specInputsToConfig(spec.inputs),
+    marks: specMarksToConfig(spec.marks),
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     fields: spec.fields ?? null,
     // An omitted scale takes the chart type's default — the same value the
-    // backend resolved and echoed in `resolved.scale`.
-    scale: spec.scale ?? CHART_META[spec.chart_type].defaultScale,
+    // backend resolved and echoed in `resolved.scale`. A derived spec is the
+    // exception: its effective scale is ordinal, but the page's `scale` is the
+    // treat-as the derivation was computed from (`deriveSourceScale`).
+    scale: derive
+      ? deriveSourceScale(derive.kind, spec.scale)
+      : (spec.scale ?? CHART_META[spec.chart_type].defaultScale),
     chartType: spec.chart_type,
     metric: spec.metric ?? "count",
     compare:
@@ -241,7 +344,10 @@ function specToChartConfigLegacy(spec: AgentChartSpecLegacy): ChartConfig {
     options.topN = spec.limit;
   }
   return {
-    v: 1,
+    v: 2,
+    derive: null,
+    inputs: {},
+    marks: [],
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     // The retired shape had no multi-field chart.

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import get_args
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -31,9 +32,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from vestigo.agent.chart_meta import (  # noqa: E402
     CHART_META,
     CHART_TYPES,
+    INPUT_KEYS,
     PIE_COMFORTABLE_MAX,
     SCALES,
     DataKind,
+    Derive,
 )
 from vestigo.db._time_fields import TIME_FIELD_SPECS  # noqa: E402
 
@@ -91,24 +94,36 @@ def render_chart_meta() -> str:
     out = [
         BANNER,
         "/**\n"
-        " * Chart-type metadata: which scales of measurement each chart type suits,\n"
-        " * which aggregation feeds it, and which options it actually reads. Shared by\n"
-        " * the Visualize page's rail, the task presets, and the agent's chart\n"
+        " * Figure registry: which scales of measurement each figure suits, which\n"
+        " * aggregation feeds it, what it asks the analyst for, and which options it\n"
+        " * reads. Shared by the Visualize page's rail and the agent's chart\n"
         " * proposals — so an analyst and the agent are held to the same rules.\n"
         " */\n",
         'import type { ChartType, Scale } from "./chartConfig";\n\n',
-        f"export type DataKind = {_ts_union(_data_kinds())};\n\n",
+        f"export type DataKind = {_ts_union(_data_kinds())};\n",
+        f"export type InputKey = {_ts_union(tuple(_camel(k) for k in INPUT_KEYS))};\n",
+        'export type Requirement = "required" | "optional";\n',
+        f"export type Derive = {_ts_union(tuple(_camel(d) for d in get_args(Derive)))};\n\n",
+        f"export const INPUT_KEYS: InputKey[] = {_ts_string_array([_camel(k) for k in INPUT_KEYS])};\n\n",
         "export const CHART_META: Record<\n"
         "  ChartType,\n"
         "  {\n"
         "    label: string;\n"
+        "    /** The forensic question this figure answers — shown on hover in the gallery. */\n"
+        "    question: string;\n"
         "    scales: Scale[];\n"
         "    dataKind: DataKind;\n"
         "    /** Scale assumed when a chart request does not state one. */\n"
         "    defaultScale: Scale;\n"
+        "    /** What the figure asks for; the rail renders one control per key. */\n"
+        "    inputs: Partial<Record<InputKey, Requirement>>;\n"
+        "    /** Derivations admitted on the primary field (a change of scale). */\n"
+        "    derives: Derive[];\n"
         "    /** ChartOptions keys this type consumes; others are inert for it. */\n"
         "    readsOptions: string[];\n"
         "    supportsCompare: boolean;\n"
+        "    requiresCompare: boolean;\n"
+        "    supportsMarks: boolean;\n"
         "    /** Two-field charts (pivot/sankey/scatter) need a second field picked. */\n"
         "    requiresSecondField: boolean;\n"
         "    /** Single-field charts that ALSO accept an optional grouping field\n"
@@ -123,14 +138,20 @@ def render_chart_meta() -> str:
         meta = CHART_META[chart_type]
         if meta.note:
             out.append(_wrap_comment(meta.note, "  "))
+        inputs = ", ".join(f"{_camel(k)}: {_ts_string(v)}" for k, v in meta.inputs.items())
         out.append(
             f"  {chart_type}: {{\n"
             f"    label: {_ts_string(meta.label)},\n"
+            f"    question: {_ts_string(meta.question)},\n"
             f"    scales: {_ts_string_array(meta.scales)},\n"
             f"    dataKind: {_ts_string(meta.data_kind)},\n"
             f"    defaultScale: {_ts_string(meta.default_scale)},\n"
+            f"    inputs: {{{(' ' + inputs + ' ') if inputs else ''}}},\n"
+            f"    derives: {_ts_string_array([_camel(d) for d in meta.derives])},\n"
             f"    readsOptions: {_ts_string_array([_camel(o) for o in meta.reads_options])},\n"
             f"    supportsCompare: {str(meta.supports_compare).lower()},\n"
+            f"    requiresCompare: {str(meta.requires_compare).lower()},\n"
+            f"    supportsMarks: {str(meta.supports_marks).lower()},\n"
             f"    requiresSecondField: {str(meta.requires_second_field).lower()},\n"
             f"    acceptsSecondField: {str(meta.accepts_second_field).lower()},\n"
             f"    multiField: {str(meta.multi_field).lower()},\n"
@@ -158,8 +179,6 @@ def render_chart_meta() -> str:
 
 def _data_kinds() -> tuple[str, ...]:
     """DataKind values in declaration order, deduped across chart types."""
-    from typing import get_args
-
     return get_args(DataKind)
 
 

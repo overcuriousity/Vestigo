@@ -8,10 +8,12 @@ import { ChartEmptyState } from "@/components/viz/primitives/ChartEmptyState";
 import { ChartFrame } from "@/components/viz/primitives/ChartFrame";
 import { ChartTooltip } from "@/components/viz/primitives/ChartTooltip";
 import { Legend } from "@/components/viz/primitives/Legend";
+import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
+import { timeChartDomain } from "@/components/viz/lib/timeDomain";
 import { applyMetric, METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
-import type { CompareTimeResponse } from "@/api/types";
+import type { CompareTimeResponse, ResolvedMark } from "@/api/types";
 
 const fmtCount = formatNum(",d");
 const fmtMetric = formatNum(",.2~f");
@@ -34,6 +36,8 @@ interface CompareHistogramProps {
   /** Brush-to-zoom: dragging a span reports it (snapped outward to bucket
    * boundaries) so the page can narrow the shared start/end filters. */
   onRangeSelect?: (startIso: string, endIso: string) => void;
+  /** Resolved marks to overlay (see lib/marks.ts); drawn last, above the bars. */
+  marks?: ResolvedMark[];
 }
 
 /**
@@ -56,6 +60,7 @@ export function CompareHistogram({
   svgRef,
   height = 280,
   onRangeSelect,
+  marks = [],
 }: CompareHistogramProps) {
   const [hover, setHover] = useState<{ x: number; y: number; index: number } | null>(null);
   const [brush, setBrush] = useState<{ x0: number; x1: number } | null>(null);
@@ -98,7 +103,7 @@ export function CompareHistogram({
   const dataMax = isRatio ? Math.max(100, ...allValues, 0) : Math.max(1, ...allValues);
 
   const dates = buckets.map((b) => new Date(b.start));
-  const domainMax = dates.length > 1 ? dates[dates.length - 1] : dates[0];
+  const domain = timeChartDomain(data)!;
 
   /** Snap a dragged [t0, t1] outward to the epoch-aligned bucket grid the
    * server used, so the zoomed range never cuts a bucket in half. */
@@ -127,7 +132,7 @@ export function CompareHistogram({
       <div className="relative">
         <ChartFrame height={height} svgRef={ref}>
           {({ innerWidth, innerHeight, margin }) => {
-            const x = scaleTime().domain([dates[0], domainMax]).range([0, innerWidth]);
+            const x = scaleTime().domain(domain).range([0, innerWidth]);
             const y = scaleLinear().domain([dataMin, dataMax]).nice().range([innerHeight, 0]);
             const barWidth = Math.max(1, innerWidth / buckets.length - 1);
             const yZero = y(0);
@@ -298,6 +303,12 @@ export function CompareHistogram({
                     if (dragAnchorRef.current != null) endBrush(true);
                     else setHover(null);
                   }}
+                />
+                <MarksOverlay
+                  marks={marks}
+                  x={(d) => x(d)}
+                  innerWidth={innerWidth}
+                  innerHeight={innerHeight}
                 />
               </>
             );

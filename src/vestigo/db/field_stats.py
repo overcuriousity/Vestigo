@@ -439,8 +439,17 @@ def merged_field_terms(
         for val, cnt in values:
             counts[val] = counts.get(val, 0) + int(cnt)
 
+    # ``derive`` is part of the live response's shape; the cache holds raw
+    # values and is never consulted for a derived request, so it is None here.
     if total_cov == 0:
-        return {"field": field_token, "total": 0, "distinct": 0, "values": [], "other_count": 0}
+        return {
+            "field": field_token,
+            "total": 0,
+            "distinct": 0,
+            "values": [],
+            "other_count": 0,
+            "derive": None,
+        }
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
     top = [{"value": val, "count": cnt} for val, cnt in ranked]
     other = total_cov - sum(cnt for _, cnt in ranked)
@@ -450,6 +459,7 @@ def merged_field_terms(
         "distinct": distinct,
         "values": top,
         "other_count": max(0, other),
+        "derive": None,
     }
 
 

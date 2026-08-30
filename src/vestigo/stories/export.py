@@ -207,18 +207,134 @@ _CHART_OPTION_KEYS = {
     "bins": "bins",
     "showDensity": "show_density",
     "buckets": "buckets",
+    "quantity": "quantity",
+    "layout": "layout",
     "limitX": "limit_x",
     "limitY": "limit_y",
     "sampleLimit": "sample_limit",
     "groups": "groups",
     "showPoints": "show_points",
+    "tableSortBy": "table_sort_by",
+    "tableSortDir": "table_sort_dir",
+    "highlight": "highlight",
 }
 
 
-#: Version stamp on a stored ``ChartConfig``. The frontend refuses to draw a
-#: config carrying any other value (``parseStoredChartConfig``), so anything
-#: writing a SavedChart has to set it.
-CHART_CONFIG_VERSION = 1
+#: Version stamp on a stored ``ChartConfig``. The frontend upgrades a ``v: 1``
+#: row on read (``upgradeChartConfig``) and refuses anything else
+#: (``parseStoredChartConfig``), so anything writing a SavedChart has to set
+#: the current value. v2 added ``derive``, ``inputs`` and ``marks``; a v1 row
+#: reads as v2 with all three empty.
+CHART_CONFIG_VERSION = 2
+
+
+#: Stored ``ChartConfig.derive.kind`` (camelCase) ↔ ``DeriveSpec.kind``. Only
+#: ``kind`` differs in casing; ``mode``/``count``/``edges``/``part`` are shared.
+_DERIVE_KIND_TO_SPEC = {"bins": "bins", "timePart": "time_part"}
+_DERIVE_KIND_TO_STORED = {v: k for k, v in _DERIVE_KIND_TO_SPEC.items()}
+
+
+def _stored_derive_to_spec(raw: Any) -> dict[str, Any] | None:
+    """Stored derivation → ``ChartSpec.derive`` payload; an unknown shape is none."""
+    if not isinstance(raw, dict) or raw.get("kind") not in _DERIVE_KIND_TO_SPEC:
+        return None
+    out = {k: v for k, v in raw.items() if v is not None}
+    out["kind"] = _DERIVE_KIND_TO_SPEC[raw["kind"]]
+    return out
+
+
+def _spec_derive_to_stored(derive: Any) -> dict[str, Any] | None:
+    """Inverse of ``_stored_derive_to_spec``."""
+    if derive is None:
+        return None
+    out = derive.model_dump(exclude_none=True)
+    out["kind"] = _DERIVE_KIND_TO_STORED[out["kind"]]
+    return out
+
+
+#: Stored ``MarkSource`` keys (camelCase) ↔ ``ChartMarkSpec`` fields.
+_MARK_KEYS = {"definitionId": "definition_id", "viewId": "view_id"}
+
+
+def _mark_key(item: dict[str, Any], key: str, kind: type, *, index: int, strict: bool) -> bool:
+    """Whether *item* carries *key* with the right type — raising under ``strict``.
+
+    An absent key is not a defect at either strictness; a present one of the
+    wrong type is, and only ``strict`` says so out loud.
+    """
+    value = item.get(key)
+    if isinstance(value, kind):
+        return True
+    if value is not None and strict:
+        raise ValueError(f"mark {index}: `{key}` must be a {kind.__name__}")
+    return False
+
+
+def _stored_marks_to_spec(raw: Any, *, strict: bool = False) -> list[dict[str, Any]] | None:
+    """Stored ``marks`` (the frontend's ``MarkSource[]``) → ``ChartSpec.marks`` payload.
+
+    A malformed entry — or a malformed key within one — is dropped rather than
+    failing the whole chart; the spec's own validator refuses anything that
+    survives without its fields. That is right for *reading stored state*: a
+    chart saved by an older build should still render what it can.
+
+    ``strict`` raises :class:`ValueError` instead, naming the entry and the key.
+    A request body is not stored state: silently drawing fewer marks than the
+    caller asked for, with nothing in ``sources`` or the caption to say so,
+    is exactly the undisclosed answer this subsystem exists not to give.
+    """
+    if not isinstance(raw, list):
+        if strict:
+            raise ValueError("marks must be a list")
+        return None
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+            if strict:
+                raise ValueError(f"mark {index}: not an object with a string `kind`")
+            continue
+
+        spec: dict[str, Any] = {"kind": item["kind"]}
+        if _mark_key(item, "label", str, index=index, strict=strict):
+            spec["label"] = item["label"]
+        for stored_key, spec_key in _MARK_KEYS.items():
+            if _mark_key(item, stored_key, str, index=index, strict=strict):
+                spec[spec_key] = item[stored_key]
+        for key in ("at", "start", "end"):
+            if _mark_key(item, key, str, index=index, strict=strict):
+                spec[key] = item[key]
+        if _mark_key(item, "filters", dict, index=index, strict=strict):
+            spec["filters"] = _filter_payload_to_spec(item["filters"]).model_dump(exclude_none=True)
+        out.append(spec)
+    return out or None
+
+
+def _spec_marks_to_stored(marks: Any) -> list[dict[str, Any]] | None:
+    """Inverse of ``_stored_marks_to_spec``."""
+    if not marks:
+        return None
+    out: list[dict[str, Any]] = []
+    for mark in marks:
+        stored: dict[str, Any] = {"kind": mark.kind}
+        if mark.kind == "events":
+            stored["filters"] = _spec_filters_to_payload(mark.filters)
+        for stored_key, spec_key in _MARK_KEYS.items():
+            value = getattr(mark, spec_key, None)
+            if value is not None:
+                stored[stored_key] = value
+        for key in ("at", "start", "end"):
+            value = getattr(mark, key, None)
+            if value is not None:
+                stored[key] = value.isoformat()
+        if mark.label is not None:
+            stored["label"] = mark.label
+        out.append(stored)
+    return out
+
+
+#: `inputs.pairing` crosses the casing boundary like `derive.kind` does.
+_PAIRING_TO_SPEC = {"nextEnd": "next_end", "firstLast": "first_last"}
+_PAIRING_TO_STORED = {v: k for k, v in _PAIRING_TO_SPEC.items()}
 
 
 def _stored_chart_to_spec(config: dict[str, Any]):
@@ -231,6 +347,7 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     round trip, because a config written in the wrong shape produces a chart
     that is silently undrawable in every consumer rather than an error.
     """
+    from vestigo.agent.chart_meta import CHART_META
     from vestigo.agent.tools import ChartSpec
 
     spec: dict[str, Any] = {}
@@ -247,6 +364,43 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     }
     if spec_options:
         spec["options"] = spec_options
+
+    derive = _stored_derive_to_spec(config.get("derive"))
+    if derive:
+        spec["derive"] = derive
+
+    # The figure the stored config names, when it names one this build knows.
+    # Both blocks below drop what it cannot honour: `ChartInputs` and `marks`
+    # are deliberately carried across a figure switch on the Visualize page
+    # (see its `ChartInputs`), and a chart saved before that carry was cleaned
+    # up at the storage boundary holds inputs and marks for a figure it is no
+    # longer set to. `execute_chart_spec` refuses those by name, so the chart
+    # drew on the page and then failed to resolve here — as a Story block, or
+    # re-run through the agent — naming a control the analyst cannot see. A
+    # spec the agent writes by hand still gets that refusal, which is the
+    # right answer there; a persisted chart gets the figure it was saved as.
+    meta = CHART_META.get(spec.get("chart_type", ""))
+
+    stored_inputs = config.get("inputs")
+    if isinstance(stored_inputs, dict):
+        spec_inputs: dict[str, Any] = {}
+        if isinstance(stored_inputs.get("columns"), list):
+            spec_inputs["columns"] = list(stored_inputs["columns"])
+        if stored_inputs.get("pairing") in _PAIRING_TO_SPEC:
+            spec_inputs["pairing"] = _PAIRING_TO_SPEC[stored_inputs["pairing"]]
+        for stored_key, spec_key in (("startFilter", "start_filter"), ("endFilter", "end_filter")):
+            if isinstance(stored_inputs.get(stored_key), dict):
+                spec_inputs[spec_key] = _filter_payload_to_spec(
+                    stored_inputs[stored_key]
+                ).model_dump(exclude_none=True)
+        if meta is not None:
+            spec_inputs = {k: v for k, v in spec_inputs.items() if k in meta.inputs}
+        if spec_inputs:
+            spec["inputs"] = spec_inputs
+
+    marks = _stored_marks_to_spec(config.get("marks"))
+    if marks and (meta is None or meta.supports_marks):
+        spec["marks"] = marks
 
     # The primary filter layer — the Explorer filters the chart was saved
     # under, stored beside the ChartConfig keys (the frontend's
@@ -326,6 +480,35 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
         if dumped_options.get(spec_key) is not None
     }
     config["options"] = options
+
+    stored_derive = _spec_derive_to_stored(getattr(spec, "derive", None))
+    if stored_derive:
+        config["derive"] = stored_derive
+        # The page's `scale` is the treat-as the derivation is computed from
+        # (its Derive control is offered per treat-as); the spec may have left
+        # it out or said "ordinal", the effective scale. Resolve here, the one
+        # spec → stored crossing, so the deep link and a saved card agree.
+        from vestigo.agent.chart_meta import derive_source_scale
+
+        config["scale"] = derive_source_scale(spec.derive.kind, config.get("scale"))
+
+    inputs = getattr(spec, "inputs", None)
+    if inputs is not None:
+        stored_inputs: dict[str, Any] = {}
+        if inputs.columns is not None:
+            stored_inputs["columns"] = list(inputs.columns)
+        if inputs.pairing:
+            stored_inputs["pairing"] = _PAIRING_TO_STORED[inputs.pairing]
+        if inputs.start_filter is not None:
+            stored_inputs["startFilter"] = _spec_filters_to_payload(inputs.start_filter)
+        if inputs.end_filter is not None:
+            stored_inputs["endFilter"] = _spec_filters_to_payload(inputs.end_filter)
+        if stored_inputs:
+            config["inputs"] = stored_inputs
+
+    stored_marks = _spec_marks_to_stored(getattr(spec, "marks", None))
+    if stored_marks:
+        config["marks"] = stored_marks
 
     mode = getattr(spec.compare, "mode", "off") if spec.compare is not None else "off"
     if mode != "off":
@@ -486,6 +669,7 @@ async def resolve_story_snapshot(
             "resolved": envelope.get("resolved"),
             "warnings": envelope.get("warnings", []),
             "chart": envelope.get("result"),
+            "marks": envelope.get("marks"),
         }
         return data, {"timeline_id": content["timeline_id"], "ref_extra": {"name": chart.name}}
 

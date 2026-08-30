@@ -15,7 +15,15 @@
  */
 import { CHART_META, chartTypesFor } from "./chartMeta";
 import { isTimeField } from "./timeFields";
-import type { ChartConfig, ChartOptions, ChartType, Scale } from "./chartConfig";
+import { TABLE_COLUMNS, defaultQuantity, legalQuantity } from "./chartConfig";
+import type {
+  ChartConfig,
+  ChartOptions,
+  ChartType,
+  Quantity,
+  Scale,
+  TableSortColumn,
+} from "./chartConfig";
 
 /**
  * Preference order for "the chart type to land on for this scale".
@@ -62,6 +70,8 @@ export interface ResolvedChartOptions {
   /** null = automatic bin count (server-side Freedman–Diaconis). */
   bins: number | null;
   buckets: number;
+  quantity: Quantity;
+  layout: "dumbbell" | "slope";
   limitX: number;
   limitY: number;
   sampleLimit: number;
@@ -73,6 +83,9 @@ export interface ResolvedChartOptions {
   showDensity: boolean;
   groups: number;
   showPoints: boolean;
+  tableSortBy: TableSortColumn;
+  tableSortDir: "asc" | "desc";
+  highlight: string[];
 }
 
 /**
@@ -108,10 +121,15 @@ export const TOPN_MAX: Record<ChartType, number> = {
   violin: 50,
   ecdf: 50,
   punchcard: 50,
+  cumulative: 50,
+  calendar: 50,
+  change: 100,
+  lanes: 100,
   pivot: 50,
   sankey: 50,
   scatter: 50,
   corr: 50,
+  table: 500,
 };
 
 /**
@@ -135,6 +153,9 @@ export const TOPN_SLIDER_MAX: Record<ChartType, number> = {
   waffle: 25,
   heatmap: 20,
   line: 20,
+  table: 50,
+  change: 20,
+  lanes: 20,
 };
 
 export function topNMax(chartType: ChartType): number {
@@ -159,6 +180,27 @@ export function clampTopN(value: unknown, chartType: ChartType): number {
   return Math.max(TOPN_MIN, Math.min(n, topNMax(chartType)));
 }
 
+/**
+ * Coerce an untrusted enum-typed option onto one of *allowed*, or the default.
+ *
+ * Same argument as `clampTopN`: `c_opts` arrives from the URL as `JSON.parse`d,
+ * unvalidated data (see `chartConfig.ts`), and these options are forwarded to
+ * `Literal`-typed query parameters. A hand-edited or mangled link carrying
+ * `{"tableSortBy":"Count"}` reached the endpoint as a 422 — a permanently blank
+ * chart with nothing on screen to explain it, which is the failure mode the
+ * `highlight` note below exists to prevent for arrays.
+ */
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+const LAYOUTS = ["dumbbell", "slope"] as const;
+const ORIENTATIONS = ["horizontal", "vertical"] as const;
+const SORTS = ["count", "value"] as const;
+const SERIES_MODES = ["overlay", "stacked"] as const;
+const TABLE_SORT_COLUMNS: TableSortColumn[] = ["value", ...TABLE_COLUMNS];
+const TABLE_SORT_DIRS = ["asc", "desc"] as const;
+
 export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
   const { options } = config;
   return {
@@ -168,17 +210,52 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     topN: clampTopN(options.topN, config.chartType),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
+    // "sum" and "distinct" both aggregate a field, and "sum" aggregates a
+    // *measure*. A stored one outlives both the field and the treat-as that
+    // justified it, so `legalQuantity` re-checks all three of `chart_exec`'s
+    // preconditions here — masking, on top of `normalizeChartConfig` dropping
+    // it from the config, because a config also reaches this function from
+    // the agent's proposal card without passing the page's URL round trip.
+    quantity:
+      legalQuantity(options.quantity, config.scale, config.field) ??
+      defaultQuantity(config.scale, config.field),
+    layout: oneOf(options.layout, LAYOUTS, "dumbbell"),
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
     sampleLimit: options.sampleLimit ?? 5000,
-    orientation: options.orientation ?? "horizontal",
-    sort: options.sort ?? "count",
+    orientation: oneOf(options.orientation, ORIENTATIONS, "horizontal"),
+    // A derived bar axis has no lexical order — "< 1,024" and "≥ 10,240" sort
+    // as strings before every digit — so `ChartCanvas` hands `BarChart` the
+    // derivation's own label order, which `BarChart` applies only under
+    // `sort: "value"`. Defaulted here rather than written into the config by
+    // the rail: a config that never passed through the rail (an agent's
+    // `propose_chart`, a deep link) drew the ranges in count order on the
+    // card, the snapshot and the HTML export while the page had them ordered.
+    sort: oneOf(options.sort, SORTS, config.derive && config.chartType === "bar" ? "value" : "count"),
     logScale: options.logScale ?? false,
-    seriesMode: options.seriesMode ?? "overlay",
+    seriesMode: oneOf(options.seriesMode, SERIES_MODES, "overlay"),
     legend: options.legend ?? true,
     // Grouped box/violin cap mirrors the backend's VIZ_GROUPS_MAX.
     groups: Math.min(options.groups ?? 6, 8),
     showDensity: options.showDensity ?? true,
     showPoints: options.showPoints ?? false,
+    // Same shape: "distinct_second" ranks by the second field's distinct count
+    // and the endpoint refuses it without one, but clearing the grouping field
+    // leaves the sort behind — and the sort control is not where an analyst
+    // looks when the table stops rendering.
+    tableSortBy:
+      options.tableSortBy === "distinct_second" && config.fieldY == null
+        ? "count"
+        : oneOf(options.tableSortBy, TABLE_SORT_COLUMNS, "count"),
+    tableSortDir: oneOf(options.tableSortDir, TABLE_SORT_DIRS, "desc"),
+    // `c_opts` is `JSON.parse`d, unvalidated URL data (see `clampTopN` above,
+    // which exists for the same reason): a hand-edited or mangled link can
+    // carry `"highlight": "admin"`. `.length` is then truthy and `.join` is
+    // undefined, so `buildCaptionLines` threw and the whole page went blank
+    // rather than degrading. The first array-typed option, hence the first
+    // that needs this.
+    highlight: Array.isArray(options.highlight)
+      ? options.highlight.filter((v): v is string => typeof v === "string")
+      : [],
   };
 }

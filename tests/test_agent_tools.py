@@ -659,7 +659,16 @@ class _FakeVizService:
 
     def field_value_timeseries(self, query, field, buckets, series_limit):
         self.calls.append(("field_value_timeseries", (field, buckets, series_limit), {}))
-        return {"field": field, "series": [], "interval_seconds": 3600, "min": None, "max": None}
+        return {
+            "field": field,
+            "series": [],
+            "interval_seconds": 3600,
+            "min": None,
+            "max": None,
+            "distinct": 0,
+            "other_count": 0,
+            "series_truncated": False,
+        }
 
     def time_punchcard(self, query):
         self.calls.append(("time_punchcard", (), {}))
@@ -901,8 +910,8 @@ class _FakeChartService(_FakeVizService):
     terms_values: list[dict[str, Any]] | None = None
     terms_other = 5
 
-    def field_terms(self, query, field, limit):
-        self.calls.append(("field_terms", (field, limit), {}))
+    def field_terms(self, query, field, limit, **kw):
+        self.calls.append(("field_terms", (field, limit), kw))
         values = self.terms_values or [
             {"value": "a", "count": 60},
             {"value": "b", "count": 40},
@@ -957,6 +966,183 @@ class _FakeChartService(_FakeVizService):
                 {"value": "bob", "count": 30, "quantiles": {"0.5": 50}, "bins": []},
             ],
             "points": None,
+        }
+
+    def mark_instants(self, query, limit):
+        self.calls.append(("mark_instants", (limit,), {"q": query.q}))
+        return {
+            "instants": [{"event_id": "e1", "source_id": "s1", "at": "2026-07-20T01:00:00+00:00"}],
+            "dated": 1,
+            "undated": 0,
+            "overflow": False,
+        }
+
+    def cumulative(self, query, *, field=None, quantity="events", buckets=60):
+        self.calls.append(("cumulative", (field, quantity, buckets), {}))
+        return {
+            "kind": "cumulative",
+            "quantity": quantity,
+            "field": field,
+            "interval_seconds": 3600,
+            "min": "2026-07-20T00:00:00+00:00",
+            "max": "2026-07-20T03:00:00+00:00",
+            "buckets": [{"start": "2026-07-20T00:00:00+00:00", "delta": 3, "value": 3}],
+            "total": 3,
+            "events": 4,
+            "unparsed": 1,
+        }
+
+    def field_lanes(self, primary, field, *, pairing, start=None, end=None, limit_y, rows_cap):
+        self.calls.append(
+            (
+                "field_lanes",
+                (field, pairing, limit_y, rows_cap),
+                {"layers": (start is not None, end is not None)},
+            )
+        )
+        return {
+            "kind": "lanes",
+            "field": field,
+            "pairing": pairing,
+            "lanes": [
+                {
+                    "key": "h2",
+                    "count": 4,
+                    "intervals": [
+                        {
+                            "start": "2026-07-20T09:00:00+00:00",
+                            "end": None,
+                            "start_event_id": "e2",
+                            "end_event_id": None,
+                        },
+                        {
+                            "start": "2026-07-20T10:00:00+00:00",
+                            "end": "2026-07-20T11:00:00+00:00",
+                            "start_event_id": "e4",
+                            "end_event_id": "e6",
+                        },
+                    ],
+                },
+                {
+                    "key": "h1",
+                    "count": 3,
+                    "intervals": [
+                        {
+                            "start": "2026-07-20T09:00:00+00:00",
+                            "end": "2026-07-20T10:00:00+00:00",
+                            "start_event_id": "e1",
+                            "end_event_id": "e3",
+                        },
+                    ],
+                },
+            ],
+            "lane_cap": limit_y,
+            "lanes_total": 3,
+            "lane_cap_hit": True,
+            "other_lanes": 1,
+            "starts": 4,
+            "ends": 3,
+            "unpaired_starts": 1,
+            "orphan_ends": 1,
+            "rows_cap": rows_cap,
+            "rows_truncated": False,
+            "rows_paired": 7,
+            "undated": 1,
+            "slice_start": "2026-07-20T08:00:00+00:00",
+            "slice_end": "2026-07-20T14:00:00+00:00",
+        }
+
+    def field_change(self, primary, comparison, field, limit, *, union_cap, derive=None):
+        self.calls.append(("field_change", (field, limit, union_cap), {"derive": derive}))
+        return {
+            "kind": "change",
+            "field": field,
+            "derive": None,
+            "top_n": limit,
+            "primary_total": 20,
+            "comparison_total": 10,
+            "rows": [
+                {
+                    "value": "alice",
+                    "primary": 4,
+                    "comparison": 6,
+                    "primary_share": 0.2,
+                    "comparison_share": 0.6,
+                    "delta_share": -0.4,
+                    "status": "fell",
+                },
+                {
+                    "value": "bob",
+                    "primary": 12,
+                    "comparison": 3,
+                    "primary_share": 0.6,
+                    "comparison_share": 0.3,
+                    "delta_share": 0.3,
+                    "status": "rose",
+                },
+                {
+                    "value": "dave",
+                    "primary": 3,
+                    "comparison": 0,
+                    "primary_share": 0.15,
+                    "comparison_share": 0.0,
+                    "delta_share": 0.15,
+                    "status": "new",
+                },
+            ],
+            "union_size": 4,
+            "rows_shown": 3,
+            "union_cap": union_cap,
+            "truncated": True,
+            "omitted": 1,
+        }
+
+    def calendar(self, query, *, field=None, max_weeks=53):
+        self.calls.append(("calendar", (field, max_weeks), {}))
+        return {
+            "kind": "calendar",
+            "field": field,
+            "timezone": "UTC",
+            "start": "2026-07-20",
+            "end": "2026-07-22",
+            "days": [{"date": "2026-07-20", "count": 2}],
+            "total": 2,
+            "max_count": 2,
+            "weeks": 1,
+            "weeks_total": 1,
+            "truncated": False,
+            "dropped": 0,
+        }
+
+    def field_table(self, query, field, limit, **kw):
+        self.calls.append(("field_table", (field, limit), kw))
+        return {
+            "kind": "table",
+            "field": field,
+            "second_field": kw.get("second_field"),
+            "total": 100,
+            "distinct": 4,
+            "rows": [
+                {
+                    "value": "a",
+                    "count": 60,
+                    "share": 0.6,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "distinct_second": None,
+                },
+                {
+                    "value": "b",
+                    "count": 30,
+                    "share": 0.3,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "distinct_second": None,
+                },
+            ],
+            "remainder": {"count": 10, "share": 0.1, "distinct_values": 2},
+            "sort": {"by": kw.get("sort_by", "count"), "dir": kw.get("sort_dir", "desc")},
+            "derive": None,
         }
 
     def field_correlation(self, query, fields):
@@ -1059,6 +1245,11 @@ _CHART_TYPE_CASES = [
     ("sankey", {"field": "attr:user", "field_y": "attr:status"}, "field_pivot"),
     ("scatter", {"field": "attr:bytes", "field_y": "attr:latency"}, "field_scatter"),
     ("corr", {"fields": ["attr:bytes", "attr:latency"]}, "field_correlation"),
+    ("table", {"field": "attr:user"}, "field_table"),
+    ("cumulative", {}, "cumulative"),
+    ("calendar", {}, "calendar"),
+    ("change", {"field": "attr:status", "compare": {"mode": "baseline"}}, "field_change"),
+    ("lanes", {"field": "attr:status"}, "field_lanes"),
 ]
 
 
@@ -1100,6 +1291,9 @@ async def test_propose_chart_echoes_what_will_be_drawn(store, monkeypatch):
         "field_y": None,
         "fields": None,
         "options": {"top_n": 30},
+        "derive": None,
+        "inputs": None,
+        "marks": None,
     }
     assert result["warnings"] == []
 
@@ -1934,6 +2128,62 @@ async def test_group_field_is_rejected_for_charts_that_take_no_second_field(stor
         )
 
 
+async def test_a_cut_series_list_is_disclosed_to_the_model(store, monkeypatch):
+    """One series per value, and the rest simply not drawn.
+
+    ``field_value_timeseries`` pays an extra aggregate to report the cut, and
+    a model reasoning over twelve drawn series has to know whether that was
+    all of them or the visible slice of fifty-three — a derived axis makes
+    that routine (53 ISO weeks against a default cap of 12), and ``derive``
+    echoes all 53 labels either way (#332).
+    """
+    fake = _patch_chart_service(monkeypatch)
+
+    def _truncated(query, field, buckets, series_limit):
+        return {
+            "field": field,
+            "series": [{"value": str(i), "buckets": []} for i in range(12)],
+            "interval_seconds": 3600,
+            "min": None,
+            "max": None,
+            "distinct": 53,
+            "other_count": 4120,
+            "series_truncated": True,
+        }
+
+    fake.field_value_timeseries = _truncated
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "heatmap", "field": "attr:status"}),
+    )
+    assert result["summary"]["distinct"] == 53
+    assert result["summary"]["other_count"] == 4120
+    assert any("top 12 of 53" in w and "4120 events" in w for w in result["warnings"])
+
+
+async def test_a_second_field_that_repeats_the_first_is_rejected(store, monkeypatch):
+    """One field named twice is not a two-field chart.
+
+    Every HTTP endpoint that takes a second field refuses it with a 422, and
+    the rail refuses it at the picker — but ``execute_chart_spec`` calls the
+    query service directly, so nothing stopped a spec that names one field
+    twice. It does not fail: a table's "distinct field_y" column is 1 on every
+    row, a pivot is diagonal, a scatter is y=x — each presented as a real
+    answer (#332).
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    for chart_type in ("table", "pivot", "violin"):
+        with pytest.raises(ToolError, match="field_y must differ from field"):
+            await _call(
+                server,
+                "propose_chart",
+                _chart({"chart_type": chart_type, "field": "attr:user", "field_y": "attr:user"}),
+            )
+
+
 async def test_pie_with_too_many_slices_is_warned_not_rejected(store, monkeypatch):
     """Lecture rule: past a handful of slices, angle comparison stops working.
     Advisory — the chart still validates, the model just learns a better mark."""
@@ -2668,3 +2918,700 @@ async def test_propose_story_block_absent_without_conversation(store):
     async with FastMCPClient(server) as client:
         names = [t.name for t in await client.list_tools()]
     assert "propose_story_block" not in names
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+async def test_derive_is_passed_to_the_terms_scan_and_echoed(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "bytes",
+                "derive": {"kind": "bins", "mode": "log", "count": 8},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    kw = next(kw for name, _, kw in fake.calls if name == "field_terms")
+    assert kw["derive"].mode == "log"
+    assert result["resolved"]["scale"] == "ordinal"
+    assert result["resolved"]["derive"] == {"kind": "bins", "mode": "log", "count": 8}
+
+
+async def test_derive_rejected_on_a_figure_that_admits_none(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "pie",
+            "field": "bytes",
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        },
+    )
+    assert "admits no derivation" in message
+    assert "bar" in message and "heatmap" in message
+
+
+async def test_derive_rejected_on_a_virtual_time_field(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "time:hour_of_day",
+            "derive": {"kind": "time_part", "part": "hour"},
+        },
+    )
+    assert "already a calendar part" in message
+
+
+async def test_derive_with_a_categorical_scale_is_rejected(store, monkeypatch):
+    """`scale` is what the field is treated as *before* the derivation — the
+    page's treat-as — so categories cannot be binned, and a calendar part is
+    taken from a number-or-time field, not a measure."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "bytes",
+            "scale": "nominal",
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        },
+    )
+    assert "ratio" in message and "interval" in message
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "ts",
+            "scale": "ratio",
+            "derive": {"kind": "time_part", "part": "hour"},
+        },
+    )
+    assert "interval" in message
+
+
+@pytest.mark.parametrize("scale", ["ratio", "interval", "ordinal", None])
+async def test_derive_accepts_the_treat_as_scale_and_resolves_to_ordinal(store, monkeypatch, scale):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    spec = {
+        "chart_type": "bar",
+        "field": "bytes",
+        "derive": {"kind": "bins", "mode": "width", "count": 4},
+    }
+    if scale is not None:
+        spec["scale"] = scale
+    result = await _call(server, "propose_chart", _chart(spec))
+    assert result["ok"] is True and result["resolved"]["scale"] == "ordinal"
+
+
+async def test_describe_field_lists_the_derivations_that_make_sense(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    numeric = await _call(server, "describe_field", {"field": "bytes"})
+    assert numeric["derivations"] == ["bins", "time_part"]
+    fake.numeric_count = 0
+    categorical = await _call(server, "describe_field", {"field": "status"})
+    assert categorical["derivations"] == ["time_part"]
+    virtual = await _call(server, "describe_field", {"field": "time:hour_of_day"})
+    assert virtual["derivations"] == []
+
+
+# ── table figure ─────────────────────────────────────────────────────────────
+
+
+async def test_table_dispatches_with_sort_second_field_and_columns(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "table",
+                "field": "user",
+                "field_y": "country",
+                "inputs": {"columns": ["count", "share", "distinct_second"]},
+                "options": {
+                    "top_n": 100,
+                    "table_sort_by": "distinct_second",
+                    "table_sort_dir": "asc",
+                },
+            }
+        ),
+    )
+    assert result["ok"] is True
+    name, args, kw = next(c for c in fake.calls if c[0] == "field_table")
+    assert args == ("user", 30)  # clamped to AGENT_CHART_LIMITS.table_rows
+    assert kw == {"second_field": "country", "sort_by": "distinct_second", "sort_dir": "asc"}
+    assert result["resolved"]["inputs"] == {"columns": ["count", "share", "distinct_second"]}
+    assert result["resolved"]["options"]["top_n"] == 30
+    assert result["summary"]["remainder"] == {"count": 10, "share": 0.1, "distinct_values": 2}
+    assert [r["value"] for r in result["summary"]["rows"]] == ["a", "b"]
+
+
+async def test_table_columns_on_another_figure_are_refused(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "bar", "field": "user", "inputs": {"columns": ["count"]}}
+    )
+    assert "only the table figure has columns" in message
+
+
+async def test_table_distinct_second_needs_field_y(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {"chart_type": "table", "field": "user", "inputs": {"columns": ["distinct_second"]}},
+    )
+    assert "distinct_second needs field_y" in message
+    message = await _reject(
+        server,
+        {"chart_type": "table", "field": "user", "options": {"table_sort_by": "distinct_second"}},
+    )
+    assert "distinct_second needs field_y" in message
+
+
+async def test_table_takes_a_derivation(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "table",
+                "field": "bytes",
+                "derive": {"kind": "bins", "mode": "log", "count": 4},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    kw = next(kw for name, _, kw in fake.calls if name == "field_table")
+    assert kw["derive"].count == 4 and result["resolved"]["scale"] == "ordinal"
+
+
+# ── marks: the spec ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("mark", "needle"),
+    [
+        ({"kind": "events"}, 'kind="events" needs filters'),
+        ({"kind": "baseline"}, 'kind="baseline" needs definition_id'),
+        ({"kind": "view"}, 'kind="view" needs view_id'),
+        ({"kind": "instant", "at": "2026-03-13T09:41:00Z"}, 'kind="instant" needs at and label'),
+        (
+            {
+                "kind": "range",
+                "start": "2026-03-13T09:41:00Z",
+                "end": "2026-03-13T08:00:00Z",
+                "label": "w",
+            },
+            "start must be before end",
+        ),
+        (
+            {"kind": "instant", "at": "2026-03-13T09:41:00Z", "label": "x", "view_id": "v1"},
+            'kind="instant" does not take view_id',
+        ),
+    ],
+)
+def test_chart_mark_spec_refuses_a_kind_without_its_fields(mark, needle):
+    from vestigo.agent.tools import ChartMarkSpec
+
+    with pytest.raises(ValidationError) as excinfo:
+        ChartMarkSpec.model_validate(mark)
+    assert needle in str(excinfo.value)
+
+
+def test_chart_mark_spec_accepts_each_kind():
+    from vestigo.agent.tools import ChartMarkSpec
+
+    events = ChartMarkSpec.model_validate(
+        {"kind": "events", "filters": {"tags_include": ["exfil"]}}
+    )
+    assert events.filters.tags_include == ["exfil"]
+    assert (
+        ChartMarkSpec.model_validate({"kind": "baseline", "definition_id": "bd1"}).definition_id
+        == "bd1"
+    )
+    assert ChartMarkSpec.model_validate({"kind": "view", "view_id": "v1"}).view_id == "v1"
+    instant = ChartMarkSpec.model_validate(
+        {"kind": "instant", "at": "2026-03-13T09:41:00Z", "label": "beacon"}
+    )
+    assert instant.at.year == 2026
+    r = ChartMarkSpec.model_validate(
+        {
+            "kind": "range",
+            "start": "2026-03-13T09:00:00Z",
+            "end": "2026-03-13T10:00:00Z",
+            "label": "w",
+        }
+    )
+    assert r.start < r.end
+
+
+def test_chart_limits_carry_marks_per_source():
+    from vestigo.agent.chart_exec import AGENT_CHART_LIMITS, ANALYST_CHART_LIMITS
+
+    assert AGENT_CHART_LIMITS.marks_per_source == 20
+    assert ANALYST_CHART_LIMITS.marks_per_source is None  # the viz_marks_max setting
+
+
+# ── marks: execution ─────────────────────────────────────────────────────────
+
+
+async def test_marks_resolve_into_the_envelope_and_the_tool_result_keeps_only_the_summary(
+    store, monkeypatch
+):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "time",
+                "marks": [
+                    {"kind": "events", "filters": {"q": "beacon"}, "label": "beacons"},
+                    {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"},
+                ],
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert "marks" not in result and "result" not in result
+    assert result["summary"]["marks"]["shown"] == 2
+    assert [s["kind"] for s in result["summary"]["marks"]["sources"]] == ["events", "instant"]
+    assert result["resolved"]["marks"][0]["kind"] == "events"
+    limit_args, kw = next((a, k) for n, a, k in fake.calls if n == "mark_instants")
+    assert limit_args == (20,) and kw == {"q": "beacon"}  # AGENT_CHART_LIMITS.marks_per_source
+
+
+async def test_marks_on_a_figure_without_them_are_refused(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "user",
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="bar" takes no marks' in message and "time, line" in message
+
+
+async def test_execute_chart_spec_carries_resolved_marks_for_the_export(store, monkeypatch):
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS, execute_chart_spec
+    from vestigo.agent.tools import ChartSpec
+
+    fake = _patch_chart_service(monkeypatch)
+    spec = ChartSpec.model_validate(
+        {
+            "chart_type": "time",
+            "marks": [
+                {
+                    "kind": "range",
+                    "start": "2026-07-20T09:00:00Z",
+                    "end": "2026-07-20T10:00:00Z",
+                    "label": "w",
+                }
+            ],
+        }
+    )
+    envelope = await execute_chart_spec(
+        _scope("c1", "t1", source_ids=["s1"]), spec, service=fake, limits=ANALYST_CHART_LIMITS
+    )
+    assert envelope["marks"]["marks"][0] == {
+        "kind": "range",
+        "start": "2026-07-20T09:00:00+00:00",
+        "end": "2026-07-20T10:00:00+00:00",
+        "label": "w",
+        "source": 0,
+        "provenance": {"kind": "analyst"},
+    }
+    assert envelope["marks"]["cap"] == 50  # viz_marks_max default under the analyst limits
+
+
+async def test_propose_chart_returns_the_visualize_deep_link(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "time", "filters": {"q": "4624"}})
+    )
+    assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
+    assert "q=4624" in result["open_url"] and "c_type=time" in result["open_url"]
+    assert not any("open_url" in w for w in result["warnings"])
+
+
+async def test_propose_chart_warns_when_open_url_cannot_carry_the_scope(store, monkeypatch):
+    """`event_ids` / `run_id` / `collapse_routine` have no URL form: the link
+    draws a wider chart than the result describes, and must say so."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "attr:user",
+                "filters": {"event_ids": ["e1", "e2"], "collapse_routine": True},
+            }
+        ),
+    )
+    assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
+    (warning,) = [w for w in result["warnings"] if w.startswith("open_url")]
+    assert "a fixed event set" in warning and "routine collapse" in warning
+
+
+# ── cumulative and calendar ──────────────────────────────────────────────────
+
+
+async def test_cumulative_resolves_the_quantity_from_field_and_scale(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    fieldless = await _call(server, "propose_chart", _chart({"chart_type": "cumulative"}))
+    assert fieldless["ok"] is True and fieldless["resolved"]["options"]["quantity"] == "events"
+    assert fieldless["summary"] == {
+        "total": 3,
+        "events": 4,
+        "unparsed": 1,
+        "buckets": 1,
+        "interval_seconds": 3600,
+    }
+    measure = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "ratio",
+                "options": {"buckets": 12},
+            }
+        ),
+    )
+    assert measure["resolved"]["options"] == {"buckets": 12, "quantity": "sum"}
+    categories = await _call(
+        server, "propose_chart", _chart({"chart_type": "cumulative", "field": "user"})
+    )
+    assert categories["resolved"]["options"]["quantity"] == "distinct"
+    assert [a for n, a, _ in fake.calls if n == "cumulative"] == [
+        (None, "events", 30),
+        ("bytes", "sum", 12),
+        ("user", "distinct", 30),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("spec", "needle"),
+    [
+        (
+            {"chart_type": "cumulative", "options": {"quantity": "sum"}},
+            'quantity="sum" needs field',
+        ),
+        (
+            {"chart_type": "cumulative", "options": {"quantity": "distinct"}},
+            'quantity="distinct" needs field',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "user",
+                "scale": "nominal",
+                "options": {"quantity": "sum"},
+            },
+            'quantity="sum" needs scale="ratio"',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "ratio",
+                "options": {"quantity": "distinct"},
+            },
+            'quantity="distinct" needs scale="nominal" or "ordinal"',
+        ),
+        (
+            {"chart_type": "calendar", "field": "time:hour_of_day"},
+            "a calendar part is always present",
+        ),
+        # `interval` was advertised by CHART_META and reachable by no quantity:
+        # `sum` demanded ratio, `distinct` demanded nominal/ordinal, `events`
+        # discarded the field, so the refusals cycled (#332). The scale is off
+        # the figure — a running total needs the true zero ratio has — and the
+        # scale check now precedes the per-figure rules, so the message names
+        # the scale instead of sending the model back round the quantities.
+        (
+            {"chart_type": "cumulative", "field": "bytes", "scale": "interval"},
+            'requires scale in {"nominal", "ordinal", "ratio"}',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "interval",
+                "options": {"quantity": "distinct"},
+            },
+            'requires scale in {"nominal", "ordinal", "ratio"}',
+        ),
+    ],
+)
+async def test_cumulative_and_calendar_refusals(store, monkeypatch, spec, needle):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    assert needle in await _reject(server, spec)
+
+
+async def test_cumulative_events_with_a_field_warns_that_the_field_is_ignored(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "cumulative", "field": "user", "options": {"quantity": "events"}}),
+    )
+    assert result["ok"] is True
+    assert any("field is ignored" in w for w in result["warnings"])
+
+
+async def test_calendar_summarises_the_cap_and_takes_marks_nowhere(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "calendar", "field": "user"})
+    )
+    assert result["summary"] == {
+        "total": 2,
+        "max_count": 2,
+        "weeks": 1,
+        "weeks_total": 1,
+        "truncated": False,
+        "dropped": 0,
+    }
+    assert next(a for n, a, _ in fake.calls if n == "calendar") == ("user", 53)
+    message = await _reject(
+        server,
+        {
+            "chart_type": "calendar",
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="calendar" takes no marks' in message
+
+
+async def test_cumulative_takes_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "cumulative",
+                "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+            }
+        ),
+    )
+    assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1
+
+
+# ── ranked change ────────────────────────────────────────────────────────────
+
+
+async def test_change_needs_a_comparison_layer_and_says_why(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(server, {"chart_type": "change", "field": "user"})
+    assert 'chart_type="change" needs a comparison layer' in message
+    assert 'compare.mode to "baseline" or "custom"' in message
+
+
+async def test_change_runs_both_windows_and_summarises_the_ranking(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "change",
+                "field": "user",
+                "compare": {"mode": "custom", "filters": {"q": "phase-a"}},
+                "options": {"top_n": 5, "layout": "slope"},
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["options"] == {"top_n": 5, "layout": "slope"}
+    assert result["resolved"]["compare_mode"] == "custom"
+    assert result["summary"] == {
+        "primary_total": 20,
+        "comparison_total": 10,
+        "union_size": 4,
+        "rows_shown": 3,
+        "truncated": True,
+        "top_rows": [
+            {"value": "alice", "status": "fell", "delta_share": -0.4},
+            {"value": "bob", "status": "rose", "delta_share": 0.3},
+            {"value": "dave", "status": "new", "delta_share": 0.15},
+        ],
+    }
+    assert _called(fake, "field_change") == ("user", 5, 30)
+
+
+async def test_change_clamps_top_n_to_the_agent_ceiling_and_defaults_the_layout(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "change",
+                "field": "user",
+                "compare": {"mode": "baseline"},
+                "options": {"top_n": 50},
+            }
+        ),
+    )
+    assert result["resolved"]["options"] == {"top_n": 20, "layout": "dumbbell"}
+    assert any("clamped to 20" in w for w in result["warnings"])
+    assert _called(fake, "field_change") == ("user", 20, 30)
+
+
+async def test_change_takes_no_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "change",
+            "field": "user",
+            "compare": {"mode": "baseline"},
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+        },
+    )
+    assert 'chart_type="change" takes no marks' in message
+
+
+# ── interval lanes ───────────────────────────────────────────────────────────
+
+
+async def test_lanes_first_last_by_default_and_summarises_the_lanes(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "lanes", "field": "status", "options": {"limit_y": 50}}),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["options"] == {"limit_y": 20}
+    assert any("clamped to 20" in w for w in result["warnings"])
+    assert result["summary"] == {
+        "pairing": "first_last",
+        "lanes_shown": 2,
+        "lanes_total": 3,
+        "lane_cap_hit": True,
+        "intervals": 3,
+        "unpaired_starts": 1,
+        "orphan_ends": 1,
+        "rows_truncated": False,
+        "undated": 1,
+        "top_lanes": [
+            {"key": "h2", "count": 4, "intervals": 2},
+            {"key": "h1", "count": 3, "intervals": 1},
+        ],
+    }
+    assert _called(fake, "field_lanes") == ("status", "first_last", 20, 2000)
+    assert fake.calls[-1][2]["layers"] == (False, False)
+
+
+async def test_lanes_next_end_builds_both_layers_and_echoes_the_inputs(store, monkeypatch):
+    fake = _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "lanes",
+                "field": "status",
+                "inputs": {
+                    "pairing": "next_end",
+                    "start_filter": {"filters": {"attr:kind": ["logon"]}},
+                    "end_filter": {"filters": {"attr:kind": ["logoff"]}},
+                },
+            }
+        ),
+    )
+    assert result["ok"] is True
+    assert result["resolved"]["inputs"]["pairing"] == "next_end"
+    assert result["resolved"]["inputs"]["start_filter"]["filters"] == {"attr:kind": ["logon"]}
+    assert _called(fake, "field_lanes") == ("status", "next_end", 10, 2000)
+    assert fake.calls[-1][2]["layers"] == (True, True)
+
+
+async def test_lanes_next_end_needs_both_filters_and_says_so(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server,
+        {
+            "chart_type": "lanes",
+            "field": "status",
+            "inputs": {"pairing": "next_end", "start_filter": {"q": "logon"}},
+        },
+    )
+    assert 'pairing="next_end" needs inputs.start_filter and inputs.end_filter' in message
+
+
+async def test_lane_inputs_on_another_figure_are_refused_and_first_last_ignores_filters(
+    store, monkeypatch
+):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    message = await _reject(
+        server, {"chart_type": "bar", "field": "status", "inputs": {"pairing": "first_last"}}
+    )
+    assert 'inputs.pairing / start_filter / end_filter are chart_type="lanes" only' in message
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "lanes", "field": "status", "inputs": {"start_filter": {"q": "x"}}}),
+    )
+    assert result["ok"] is True
+    assert any('ignored under pairing="first_last"' in w for w in result["warnings"])
+
+
+async def test_lanes_draw_marks(store, monkeypatch):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "lanes",
+                "field": "status",
+                "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "x"}],
+            }
+        ),
+    )
+    assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1

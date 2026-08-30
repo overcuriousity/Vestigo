@@ -120,6 +120,12 @@ export function downloadChartSvg(
   triggerDownload(blob, withExt(filename, "svg"));
 }
 
+/** A text file the figure already holds (the table's CSV) — no SVG involved. */
+export function downloadCsv(text: string, filename: string): void {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  triggerDownload(blob, withExt(filename, "csv"));
+}
+
 /**
  * The largest side, and the largest area, a `<canvas>` may have.
  *

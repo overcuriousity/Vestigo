@@ -1,0 +1,31 @@
+{
+  "case_id": "c1",
+  "timeline_id": "t1",
+  "spec": {
+    "chart_type": "time",
+    "filters": { "q": "4624", "artifacts": ["auth", "sysmon"], "filters": { "attr:user": ["alice"] } },
+    "marks": [
+      { "kind": "instant", "at": "2026-03-13T09:41:00+00:00", "label": "first beacon" },
+      { "kind": "baseline", "definition_id": "bd1" }
+    ]
+  },
+  "url": "/cases/c1/timelines/t1/visualize?q=4624&artifacts=auth%2Csysmon&filters=%7B%22attr%3Auser%22%3A%5B%22alice%22%5D%7D&c_type=time&c_scale=nominal&c_marks=%5B%7B%22kind%22%3A%22instant%22%2C%22at%22%3A%222026-03-13T09%3A41%3A00%2B00%3A00%22%2C%22label%22%3A%22first+beacon%22%7D%2C%7B%22kind%22%3A%22baseline%22%2C%22definitionId%22%3A%22bd1%22%7D%5D",
+  "config": {
+    "v": 2,
+    "field": null,
+    "fieldY": null,
+    "fields": null,
+    "scale": "nominal",
+    "chartType": "time",
+    "metric": "count",
+    "compare": { "mode": "off" },
+    "options": {},
+    "derive": null,
+    "inputs": {},
+    "marks": [
+      { "kind": "instant", "at": "2026-03-13T09:41:00+00:00", "label": "first beacon" },
+      { "kind": "baseline", "definitionId": "bd1" }
+    ]
+  },
+  "filters": { "q": "4624", "artifacts": ["auth", "sysmon"], "filters": { "attr:user": ["alice"] } }
+}

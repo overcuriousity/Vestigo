@@ -2475,7 +2475,7 @@ def test_confirm_story_block_inline_chart_creates_saved_chart(
     # SavedChart.config is the frontend's versioned camelCase ChartConfig, not
     # the agent's snake_case ChartSpec. Storing the spec dump produced a chart
     # that every consumer refused to draw, with no error at write time.
-    assert chart.config["v"] == 1
+    assert chart.config["v"] == 2
     assert chart.config["chartType"] == "bar"
     assert chart.config["field"] == "port"
     # And it must survive the trip back into an executable spec.

@@ -16,9 +16,10 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from vestigo.api.deps import (
+    get_current_user,
     get_store,
     require_case_contribute,
     require_case_read,
@@ -39,7 +40,9 @@ from vestigo.api.routers.events import (
     _validate_field_modes,
     _validate_regex,
 )
-from vestigo.db._time_fields import TIME_FIELD_SPECS
+from vestigo.core.config import get_settings
+from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
+from vestigo.db.derive import DeriveSpec, parse_derive
 from vestigo.db.field_stats import (
     ensure_source_field_stats,
     merged_field_terms,
@@ -208,6 +211,51 @@ def _is_unfiltered(query: EventQuery) -> bool:
     )
 
 
+def _derive_query() -> Any:
+    """A fresh ``Query`` per endpoint — never a shared module-level one.
+
+    FastAPI stamps the parameter name onto the ``Query`` object's ``alias`` the
+    first time it is bound, so one object shared between ``derive`` and
+    ``derive_x`` would make the pivot endpoint read the query key ``derive``
+    while advertising ``derive_x`` (found during verification of #viz-step-2).
+    The shared filter ``Query`` objects above are safe only because every
+    endpoint binds them under the same name.
+    """
+    return Query(
+        default=None,
+        description=(
+            "Optional derivation of the charted field, as a JSON object: "
+            '{"kind":"bins","mode":"width"|"log","count":N} | '
+            '{"kind":"bins","mode":"custom","edges":[…]} | '
+            '{"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"}. '
+            "A change of scale — the result is ordered categories."
+        ),
+    )
+
+
+def _parse_derive_param(raw: str | None, field: str | None) -> DeriveSpec | None:
+    """422 with the validator's own words on a bad derivation.
+
+    A virtual ``time:`` field is already a calendar part; deriving it again is
+    refused here with the same sentence the agent's ``propose_chart`` uses,
+    rather than surfacing as a 500 from the query service.
+    """
+    if not isinstance(raw, str):
+        # Absent — or, when a handler is called directly outside HTTP, the
+        # unresolved ``Query`` default object itself.
+        return None
+    try:
+        spec = parse_derive(raw)
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=422, detail=f"derive: {exc}") from exc
+    if spec is not None and field and resolve_time_field(field) is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"derive: {field} is already a calendar part — chart it directly, without derive.",
+        )
+    return spec
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-terms")
 async def get_field_terms(
     case_id: str,
@@ -222,6 +270,7 @@ async def get_field_terms(
             "values (e.g. autocomplete) to halve the scan."
         ),
     ),
+    derive: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -248,7 +297,12 @@ async def get_field_terms(
 
     Powers the per-value histogram modal's top-list and nominal/ordinal
     chart types (bar, pie) on the Visualization page.
+
+    ``derive`` (:mod:`vestigo.db.derive`) groups the field's bins or calendar
+    part instead of its raw values; such a request is never answered from the
+    field-stats cache, which holds raw values only.
     """
+    derive_spec = _parse_derive_param(derive, field)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -278,7 +332,11 @@ async def get_field_terms(
     # canonical mapped field must stay live (coalesce over several raw keys
     # dedupes per event; not derivable from per-key caches), and any filter
     # or a cache gap falls through to the live path below.
-    if _is_unfiltered(query) and not (query.field_mappings and field in query.field_mappings):
+    if (
+        derive_spec is None
+        and _is_unfiltered(query)
+        and not (query.field_mappings and field in query.field_mappings)
+    ):
         stats = await ensure_source_field_stats(
             get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
         )
@@ -293,6 +351,7 @@ async def get_field_terms(
         field,
         limit,
         totals=totals,
+        derive=derive_spec,
     )
 
 
@@ -540,6 +599,7 @@ async def get_field_value_timeseries(
     field: str = Query(..., description="Field token, e.g. 'attr:status_code'"),
     buckets: int = Query(default=60, ge=10, le=200),
     series_limit: int = Query(default=12, ge=1, le=50),
+    derive: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -568,6 +628,7 @@ async def get_field_value_timeseries(
     ``EventQueryService.field_value_timeseries``). Powers the multi-series
     line/area chart and the value×time heatmap on the Visualization page.
     """
+    derive_spec = _parse_derive_param(derive, field)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -600,6 +661,7 @@ async def get_field_value_timeseries(
         field,
         buckets,
         series_limit,
+        derive=derive_spec,
     )
 
 
@@ -668,6 +730,156 @@ async def get_time_punchcard(
     )
 
 
+@router.get("/{case_id}/timelines/{timeline_id}/viz/cumulative")
+async def get_cumulative(
+    case_id: str,
+    timeline_id: str,
+    field: str | None = Query(default=None, description="Optional field token."),
+    quantity: Literal["events", "sum", "distinct"] | None = Query(
+        default=None,
+        description=(
+            'What accumulates. Omitted: "events" without a field, "distinct" with one; '
+            '"sum" must be asked for.'
+        ),
+    ),
+    buckets: int = Query(default=60, ge=4, le=200),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return a running total over time (the cumulative step figure).
+
+    See ``EventQueryService.cumulative``. The endpoint knows no scale, so a
+    ``sum`` is never assumed — the page asks for it when the field is
+    treated as a measure.
+    """
+    resolved_quantity = quantity or ("distinct" if field else "events")
+    if resolved_quantity != "events" and not field:
+        raise HTTPException(status_code=422, detail=f'quantity="{resolved_quantity}" needs field')
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.cumulative,
+        query,
+        field=field,
+        quantity=resolved_quantity,
+        buckets=buckets,
+    )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/calendar")
+async def get_calendar(
+    case_id: str,
+    timeline_id: str,
+    field: str | None = Query(
+        default=None, description="Optional: count only events whose field is non-empty."
+    ),
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return event counts per UTC day, latest 53 weeks (the calendar heatmap).
+
+    See ``EventQueryService.calendar``; the week cap is
+    ``ANALYST_CHART_LIMITS.calendar_weeks`` so the page and a Story export
+    draw the same weeks.
+    """
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.calendar,
+        query,
+        field=field,
+        max_weeks=ANALYST_CHART_LIMITS.calendar_weeks,
+    )
+
+
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-pivot")
 async def get_field_pivot(
     case_id: str,
@@ -676,6 +888,7 @@ async def get_field_pivot(
     field_y: str = Query(..., description="Y-axis field token, e.g. 'attr:workstation'"),
     limit_x: int = Query(default=10, ge=1, le=50),
     limit_y: int = Query(default=10, ge=1, le=50),
+    derive_x: str | None = _derive_query(),  # noqa: B008
     q: str | None = _Q,
     q_regex: bool = _Q_REGEX,
     artifact: str | None = _ARTIFACT,
@@ -703,9 +916,13 @@ async def get_field_pivot(
     ``""`` on either axis of a cell means "outside that axis's top-N"
     (truthful Other rollup). Powers the field×field heatmap and the flow
     (Sankey) chart on the Visualization page.
+
+    ``derive_x`` derives the x axis (:mod:`vestigo.db.derive`); a derived
+    axis is a bounded domain — every range or part, in order, empty or not.
     """
     if field_x == field_y:
         raise HTTPException(status_code=422, detail="field_x and field_y must differ")
+    derive_x_spec = _parse_derive_param(derive_x, field_x)
     query = await _resolve_event_query(
         case_id,
         timeline_id,
@@ -739,7 +956,195 @@ async def get_field_pivot(
         field_y,
         limit_x,
         limit_y,
+        derive_x=derive_x_spec,
     )
+
+
+@router.get("/{case_id}/timelines/{timeline_id}/viz/field-table")
+async def get_field_table(
+    case_id: str,
+    timeline_id: str,
+    field: str = Query(..., description="Field token, e.g. 'attr:username'"),
+    second_field: str | None = Query(
+        default=None,
+        description="Optional second field: each row also counts its distinct values (uniqExact).",
+    ),
+    limit: int = Query(default=50, ge=1, le=500),
+    sort_by: Literal[
+        "value", "count", "share", "first_seen", "last_seen", "distinct_second"
+    ] = Query(
+        default="count",
+        description="Row order. 'share' orders like 'count'; 'distinct_second' needs second_field.",
+    ),
+    sort_dir: Literal["asc", "desc"] = Query(default="desc"),
+    derive: str | None = _derive_query(),  # noqa: B008
+    q: str | None = _Q,
+    q_regex: bool = _Q_REGEX,
+    artifact: str | None = _ARTIFACT,
+    artifacts: str | None = _ARTIFACTS,
+    source_id: str | None = _SOURCE_ID,
+    tag: str | None = _TAG,
+    exclude_tag: str | None = _EXCLUDE_TAG,
+    tags_include: str | None = _TAGS_INCLUDE,
+    tags_exclude: str | None = _TAGS_EXCLUDE,
+    ids: str | None = _IDS,
+    start: datetime | None = _START,  # noqa: B008
+    end: datetime | None = _END,  # noqa: B008
+    filters: str | None = _FILTERS,
+    exclusions: str | None = _EXCLUSIONS,
+    filter_modes: str | None = _FILTER_MODES,
+    exclusion_modes: str | None = _EXCLUSION_MODES,
+    annotated: str | None = _ANNOTATED,
+    annotation_tag_value: str | None = _ANNOTATION_TAG_VALUE,
+    run_id: str | None = _RUN_ID,
+    collapse_routine: bool = _COLLAPSE_ROUTINE,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return the top-N values of *field* as table rows (the table figure).
+
+    Count, share of the filtered slice, first/last seen and — with
+    ``second_field`` — the distinct count of that field per row; a
+    ``remainder`` row whenever values were cut. See
+    ``EventQueryService.field_table``.
+    """
+    if second_field is not None and second_field == field:
+        raise HTTPException(status_code=422, detail="second_field must differ from field")
+    if sort_by == "distinct_second" and not second_field:
+        raise HTTPException(status_code=422, detail="sort_by='distinct_second' needs second_field")
+    derive_spec = _parse_derive_param(derive, field)
+    query = await _resolve_event_query(
+        case_id,
+        timeline_id,
+        q=q,
+        q_regex=q_regex,
+        artifact=artifact,
+        artifacts=artifacts,
+        source_id=source_id,
+        tag=tag,
+        exclude_tag=exclude_tag,
+        tags_include=tags_include,
+        tags_exclude=tags_exclude,
+        ids=ids,
+        start=start,
+        end=end,
+        filters=filters,
+        exclusions=exclusions,
+        annotated=annotated,
+        annotation_tag_value=annotation_tag_value,
+        run_id=run_id,
+        filter_modes=filter_modes,
+        exclusion_modes=exclusion_modes,
+        collapse_routine=collapse_routine,
+    )
+    service = _get_query_service()
+    return await _run_regex_guarded(
+        _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+        service.field_table,
+        query,
+        field,
+        limit,
+        second_field=second_field,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        derive=derive_spec,
+    )
+
+
+class MarksRequest(BaseModel):
+    """Body for ``POST …/viz/marks``: the chart config's ``marks`` list, verbatim.
+
+    The stored ``MarkSource`` shape (camelCase, ``filters`` as a view payload)
+    — the same bytes the frontend keeps in ``c_marks`` and a saved chart, so
+    the page posts what it holds and nothing is re-encoded on the way.
+    """
+
+    marks: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/marks")
+async def resolve_viz_marks(
+    case_id: str,
+    timeline_id: str,
+    body: MarksRequest,
+    case: Case = Depends(require_case_read),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Resolve mark sources into instants and ranges with provenance.
+
+    See ``agent/marks.py``. Reads only; the per-source cap is the
+    ``viz_marks_max`` setting and is echoed as ``cap``.
+    """
+    from vestigo.agent.marks import resolve_marks
+    from vestigo.agent.tools import AgentScope, ChartMarkSpec, FilterSpec
+    from vestigo.stories.export import _stored_marks_to_spec
+
+    # `marks` is an unvalidated `list[dict[str, Any]]`, and `_stored_marks_to_spec`
+    # reads it structurally before pydantic ever sees it: `_filter_payload_to_spec`
+    # calls `datetime.fromisoformat` on `start`/`end` (a `ValueError` on
+    # "not-a-date") and `.items()` on `filters` (an `AttributeError` when it is a
+    # string, a `TypeError` when it is a number). All four are the client sending
+    # a malformed body, which is a 422 — only a bare `ValidationError` catch let
+    # them escape as a 500.
+    #
+    # `strict=True` because this is a request body, not stored state: the lenient
+    # reading drops an entry whose `kind` is not a string (a hand-edited `c_marks`
+    # reaches here verbatim) and the figure then draws fewer marks with nothing in
+    # `sources` or the caption disclosing it.
+    try:
+        specs = [
+            ChartMarkSpec.model_validate(m)
+            for m in (_stored_marks_to_spec(body.marks, strict=True) or [])
+        ]
+    except (ValueError, TypeError, AttributeError) as exc:  # ValidationError is a ValueError
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
+    scope = AgentScope(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        user=user,
+        source_ids=source_ids,
+        field_mappings=field_mappings,
+        source_offsets=source_offsets,
+    )
+
+    # An events mark is a foreground scan like every GET above: the same
+    # regex / match-mode pre-checks (a bad pattern is a 400, not a ClickHouse
+    # 500) and the same runner (a full lane answers 503, which is what the
+    # page's busy-retry waits for; a client that left cancels the scan).
+    def validated(fspec: FilterSpec | None) -> FilterSpec:
+        fspec = fspec or FilterSpec()
+        _validate_regex(fspec.q, fspec.q_regex)
+        _validate_field_modes(fspec.filters, fspec.filter_modes)
+        _validate_field_modes(fspec.exclusions, fspec.exclusion_modes)
+        return fspec
+
+    # Per mark, off the query that is about to run: an events mark can carry a
+    # regex in `filter_modes` rather than in `q_regex`, and a `view` mark's
+    # pattern lives in the saved view and is not known until `resolve_marks`
+    # has loaded it. Deciding once, from `q_regex` alone, left both of those
+    # unguarded — an RE2-only rejection surfaced as a 500 where every other viz
+    # endpoint answers 400.
+    async def run_mark_scan(fn: Any, query: Any, /, *args: Any, **kwargs: Any) -> Any:
+        return await _run_regex_guarded(
+            _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+            fn,
+            query,
+            *args,
+            **kwargs,
+        )
+
+    try:
+        return await resolve_marks(
+            scope,
+            specs,
+            service=_get_query_service(),
+            store=get_store(),
+            cap=get_settings().viz_marks_max,
+            run=run_mark_scan,
+            validated=validated,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/{case_id}/timelines/{timeline_id}/viz/field-scatter")
@@ -857,13 +1262,33 @@ class ComparisonSpec(BaseModel):
 class CompareRequest(BaseModel):
     """Body for ``POST .../viz/compare`` — two filter sets don't fit query params."""
 
-    kind: Literal["time", "terms", "numeric"]
+    kind: Literal["time", "terms", "numeric", "change"]
     field: str | None = None
     primary: CompareFilters = Field(default_factory=CompareFilters)
     comparison: ComparisonSpec
     buckets: int = Field(default=60, ge=10, le=200)
     bins: int = Field(default=30, ge=1, le=200)
     limit: int = Field(default=50, ge=1, le=500)
+    #: ``kind="terms"`` and ``kind="change"``: derive ``field`` (bins / calendar
+    #: part) before counting — both layers on the primary's edges.
+    derive: DeriveSpec | None = None
+
+
+class LanesRequest(BaseModel):
+    """Body for ``POST …/viz/lanes`` — three filter sets don't fit query params.
+
+    ``primary`` is the current filters; ``start_filter``/``end_filter`` are
+    the events that open and close an interval under ``pairing="next_end"``
+    — each ANDed with the primary and pinned to its time range, so an
+    analyst filtering to one host gets that host's starts.
+    """
+
+    field: str
+    pairing: Literal["first_last", "next_end"] = "first_last"
+    primary: CompareFilters = Field(default_factory=CompareFilters)
+    start_filter: CompareFilters | None = None
+    end_filter: CompareFilters | None = None
+    limit_y: int = Field(default=10, ge=1, le=500)
 
 
 async def _resolve_body_query(case_id: str, timeline_id: str, body: CompareFilters):
@@ -908,10 +1333,23 @@ async def compare_layers(
     so the returned series are comparable by construction. The response
     carries raw counts only — derived metrics (delta / rate / % of baseline /
     cumulative) are pure frontend transforms, keeping counts the forensic
-    ground truth.
+    ground truth. ``kind="change"`` is the ranked change figure — the union of
+    both windows' top-N values with each value's share of its own window
+    (``EventQueryService.field_change``); it rides on this endpoint because it
+    needs exactly the two-layer resolution done here.
     """
-    if body.kind in ("terms", "numeric") and not body.field:
+    if body.kind in ("terms", "numeric", "change") and not body.field:
         raise HTTPException(status_code=422, detail=f"kind={body.kind!r} requires 'field'")
+    if body.derive is not None:
+        if body.kind not in ("terms", "change"):
+            raise HTTPException(
+                status_code=422, detail="derive applies to kind='terms' and kind='change' only"
+            )
+        if body.field and resolve_time_field(body.field) is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"derive: {body.field} is already a calendar part — chart it directly, without derive.",
+            )
 
     primary = await _resolve_body_query(case_id, timeline_id, body.primary)
 
@@ -970,6 +1408,9 @@ async def compare_layers(
                         for sid in comparison.source_ids
                     )
                 ),
+                # A derived request never reads an underived layer (the
+                # service keys on the resolved expression too — belt and braces).
+                body.derive.model_dump_json() if body.derive is not None else None,
             )
     else:
         if body.comparison.filters is None:
@@ -1005,6 +1446,20 @@ async def compare_layers(
             body.field,
             body.limit,
             baseline_cache_token=baseline_token,
+            derive=body.derive,
+        )
+    if body.kind == "change":
+        from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+        return await _run_regex_guarded(
+            q_regex,
+            service.field_change,
+            primary,
+            comparison,
+            body.field,
+            min(body.limit, ANALYST_CHART_LIMITS.change_top_n[1]),
+            union_cap=ANALYST_CHART_LIMITS.change_union,
+            derive=body.derive,
         )
     return await _run_regex_guarded(
         q_regex,
@@ -1014,6 +1469,51 @@ async def compare_layers(
         body.field,
         body.bins,
         baseline_cache_token=baseline_token,
+    )
+
+
+@router.post("/{case_id}/timelines/{timeline_id}/viz/lanes")
+async def get_lanes(
+    case_id: str,
+    timeline_id: str,
+    body: LanesRequest,
+    case: Case = Depends(require_case_read),
+) -> dict[str, Any]:
+    """Return interval lanes — one lane per value of ``field``, bars from start to end.
+
+    See ``EventQueryService.field_lanes``. Reads only; the lane cap is clamped
+    to the analyst ceiling and the row cap is the analyst's, both echoed.
+    """
+    from vestigo.agent.chart_exec import ANALYST_CHART_LIMITS
+
+    if body.pairing == "next_end" and (body.start_filter is None or body.end_filter is None):
+        raise HTTPException(
+            status_code=422, detail="pairing='next_end' requires 'start_filter' and 'end_filter'"
+        )
+    primary = await _resolve_body_query(case_id, timeline_id, body.primary)
+    start = end = None
+    regex_flags = [primary.q_regex]
+    modes = [primary.filter_modes, primary.exclusion_modes]
+    if body.pairing == "next_end" and body.start_filter is not None and body.end_filter is not None:
+        start = await _resolve_body_query(case_id, timeline_id, body.start_filter)
+        end = await _resolve_body_query(case_id, timeline_id, body.end_filter)
+        # Pinned to the primary's window, as a custom Compare layer is.
+        start = replace(start, start=primary.start, end=primary.end)
+        end = replace(end, start=primary.start, end=primary.end)
+        regex_flags += [start.q_regex, end.q_regex]
+        modes += [start.filter_modes, start.exclusion_modes, end.filter_modes, end.exclusion_modes]
+    service = _get_query_service()
+    q_regex = _uses_regex(any(regex_flags), *modes)
+    return await _run_regex_guarded(
+        q_regex,
+        service.field_lanes,
+        primary,
+        body.field,
+        pairing=body.pairing,
+        start=start,
+        end=end,
+        limit_y=min(body.limit_y, ANALYST_CHART_LIMITS.lanes[1]),
+        rows_cap=ANALYST_CHART_LIMITS.lanes_rows,
     )
 
 

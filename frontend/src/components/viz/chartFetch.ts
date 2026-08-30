@@ -11,6 +11,10 @@ import { histogramToCompare, type ChartConfig } from "@/components/viz/lib/chart
 import { CHART_META } from "@/components/viz/lib/chartMeta";
 import type { ResolvedChartOptions } from "@/components/viz/lib/chartOptions";
 import type {
+  CalendarResponse,
+  ChangeResponse,
+  LanesResponse,
+  CumulativeResponse,
   CompareNumericResponse,
   CompareTermsResponse,
   CompareTimeResponse,
@@ -20,6 +24,7 @@ import type {
   FieldNumericResponse,
   FieldPivotResponse,
   FieldScatterResponse,
+  FieldTableResponse,
   FieldTermsResponse,
   FieldTimeseriesResponse,
   HistogramResponse,
@@ -59,6 +64,7 @@ export async function fetchChartData(
             primary: filters,
             comparison: compareApiSpec,
             limit: opts.topN,
+            derive: config.derive,
           })) as CompareTermsResponse,
         };
       }
@@ -71,6 +77,7 @@ export async function fetchChartData(
           config.field!,
           filters,
           opts.topN,
+          { derive: config.derive },
         ),
       };
     case "numeric":
@@ -126,6 +133,7 @@ export async function fetchChartData(
           filters,
           opts.buckets,
           opts.topN,
+          config.derive,
         ),
       };
     case "time": {
@@ -151,6 +159,53 @@ export async function fetchChartData(
         kind: "punchcard" as const,
         data: await vizApi.punchcard(caseId, timelineId, filters),
       };
+    case "cumulative":
+      return {
+        kind: "cumulative" as const,
+        data: await vizApi.cumulative(caseId, timelineId, filters, {
+          field: config.field,
+          quantity: opts.quantity,
+          buckets: opts.buckets,
+        }),
+      };
+    case "calendar":
+      return {
+        kind: "calendar" as const,
+        data: await vizApi.calendar(caseId, timelineId, filters, { field: config.field }),
+      };
+    case "change": {
+      if (!compareApiSpec) {
+        throw new Error("Ranked change needs a comparison layer — turn on Compare.");
+      }
+      return {
+        kind: "change" as const,
+        data: (await vizApi.compare(caseId, timelineId, {
+          kind: "change",
+          field: config.field!,
+          primary: filters,
+          comparison: compareApiSpec,
+          limit: opts.topN,
+          derive: config.derive,
+        })) as ChangeResponse,
+      };
+    }
+    case "lanes": {
+      const pairing = config.inputs.pairing ?? "firstLast";
+      if (pairing === "nextEnd" && (!config.inputs.startFilter || !config.inputs.endFilter)) {
+        throw new Error("Start → next end pairing needs a start filter and an end filter.");
+      }
+      return {
+        kind: "lanes" as const,
+        data: await vizApi.lanes(caseId, timelineId, {
+          field: config.field!,
+          pairing,
+          primary: filters,
+          startFilter: pairing === "nextEnd" ? config.inputs.startFilter : undefined,
+          endFilter: pairing === "nextEnd" ? config.inputs.endFilter : undefined,
+          limitY: opts.limitY,
+        }),
+      };
+    }
     case "pivot":
       return {
         kind: "pivot" as const,
@@ -162,7 +217,18 @@ export async function fetchChartData(
           filters,
           opts.limitX,
           opts.limitY,
+          config.derive,
         ),
+      };
+    case "table":
+      return {
+        kind: "table" as const,
+        data: await vizApi.fieldTable(caseId, timelineId, config.field!, filters, opts.topN, {
+          secondField: config.fieldY,
+          sortBy: opts.tableSortBy,
+          sortDir: opts.tableSortDir,
+          derive: config.derive,
+        }),
       };
     case "corr":
       return {
@@ -199,9 +265,14 @@ export type FrozenChartKind =
   | "timeseries"
   | "time"
   | "punchcard"
+  | "cumulative"
+  | "calendar"
+  | "change"
+  | "lanes"
   | "pivot"
   | "corr"
-  | "scatter";
+  | "scatter"
+  | "table";
 
 /**
  * Rebuild a `ChartResult` from a snapshot's frozen aggregation.
@@ -247,12 +318,22 @@ export function snapshotToChartResult(
       };
     case "punchcard":
       return { kind: "punchcard", data: frozen as PunchcardResponse };
+    case "cumulative":
+      return { kind: "cumulative", data: frozen as CumulativeResponse };
+    case "calendar":
+      return { kind: "calendar", data: frozen as CalendarResponse };
+    case "change":
+      return { kind: "change", data: frozen as ChangeResponse };
+    case "lanes":
+      return { kind: "lanes", data: frozen as LanesResponse };
     case "pivot":
       return { kind: "pivot", data: frozen as FieldPivotResponse };
     case "corr":
       return { kind: "corr", data: frozen as FieldCorrelationResponse };
     case "scatter":
       return { kind: "scatter", data: frozen as FieldScatterResponse };
+    case "table":
+      return { kind: "table", data: frozen as FieldTableResponse };
     default:
       return null;
   }

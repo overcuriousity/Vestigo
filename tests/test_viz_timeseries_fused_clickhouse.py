@@ -132,10 +132,18 @@ def _oracle(
         "min": None,
         "max": None,
         "series": [],
+        # No derivation was asked for; the fused path echoes that as None.
+        "derive": None,
+        "distinct": 0,
+        "other_count": 0,
+        "series_truncated": False,
     }
     if min_ts is None or max_ts is None:
         return empty
 
+    # `field_terms` derives the same two numbers by a different route (its own
+    # totals scan), which is what makes it a usable oracle for the fused path's
+    # `limit + 1` probe plus conditional second aggregate.
     terms = svc._field_terms_impl(query, field_token, limit=series_limit)
     top_values = [v["value"] for v in terms["values"]]
     if not top_values:
@@ -187,6 +195,10 @@ def _oracle(
         "min": min_ts.isoformat(),
         "max": max_ts.isoformat(),
         "series": series,
+        "derive": None,
+        "distinct": terms["distinct"],
+        "other_count": terms["other_count"],
+        "series_truncated": terms["distinct"] > len(top_values),
     }
 
 
@@ -252,3 +264,31 @@ def test_empty_field(service):
 def test_filtered_query(service):
     query = EventQuery(case_id=CASE_ID, source_ids=[SRC_A], field_filters={"proto": ["tcp", "udp"]})
     _assert_equivalent(service, query, "attr:proto")
+
+
+def test_capped_series_disclose_the_cut(service):
+    """The cap must be reported, not merely applied (#332).
+
+    `derive` echoes the full label list, so a chart whose series were cut
+    silently captions values it never drew — and a derived field reaches the
+    ceiling routinely (49 custom edges are 51 bin labels, a `week` time part
+    is 53). `attr:uid` is high-cardinality, so a limit of 3 truncates.
+    """
+    query = EventQuery(case_id=CASE_ID, source_ids=[SRC_A])
+    result = service.field_value_timeseries(query, "attr:uid", series_limit=3, buckets=24)
+    assert len(result["series"]) == 3
+    assert result["series_truncated"] is True
+    assert result["distinct"] > 3
+    # Exact, not a flag: the events in the series the chart does not draw.
+    terms = service._field_terms_impl(query, "attr:uid", limit=3)
+    assert result["other_count"] == terms["other_count"] > 0
+    assert result["distinct"] == terms["distinct"]
+
+
+def test_uncapped_series_report_no_remainder(service):
+    """The common case pays for no second aggregate and says the cut is empty."""
+    query = EventQuery(case_id=CASE_ID, source_ids=[SRC_A])
+    result = service.field_value_timeseries(query, "attr:host", series_limit=50, buckets=24)
+    assert result["series_truncated"] is False
+    assert result["other_count"] == 0
+    assert result["distinct"] == len(result["series"])

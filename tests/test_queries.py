@@ -1822,6 +1822,7 @@ def test_field_terms_empty_dataset_returns_zero_totals() -> None:
         "distinct": 0,
         "values": [],
         "other_count": 0,
+        "derive": None,
     }
     # Two scans, always: the top-N and the spillable totals aggregate that
     # replaced the non-spilling `OVER ()` windows (PR #305 review). They are
@@ -3372,3 +3373,242 @@ def test_a_chart_never_puts_more_queries_in_flight_than_its_slot_budgets() -> No
     svc = EventQueryService(store=store)
     svc.field_pivot(EventQuery(case_id="c1", source_ids=["s1"]), "artifact", "attr:status")
     assert peak <= 2, f"{peak} capped queries in flight under one foreground slot"
+
+
+def test_field_terms_with_bins_runs_a_range_preflight_then_groups_by_the_multi_if() -> None:
+    from vestigo.db.derive import DeriveSpec
+
+    svc = _viz_service(
+        [
+            ("minIf(v, v > 0)", FakeQueryResult(result_rows=[[0.0, 100.0, 1.0]])),
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[7, 2]])),
+            ("GROUP BY val", FakeQueryResult(result_rows=[["< 50", 4], ["≥ 50", 3]])),
+        ]
+    )
+    result = svc.field_terms(
+        EventQuery(case_id="c", source_ids=["s"]),
+        "attr:bytes",
+        10,
+        derive=DeriveSpec(kind="bins", mode="width", count=2),
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    assert any("minIf(v, v > 0)" in s for s in sqls)
+    assert any("multiIf(isNull(" in s and "GROUP BY val" in s for s in sqls)
+    assert result["derive"] == {
+        "kind": "bins",
+        "mode": "width",
+        "labels": ["< 50", "≥ 50"],
+        "edges": [50.0],
+        # The caption prints these rather than rounding the floats itself, so
+        # the sentence naming a boundary and the axis naming the bins either
+        # side of it are the same text.
+        "edge_labels": ["50"],
+        "negative_bin": False,
+    }
+
+
+def test_field_table_uses_the_inventory_select_core_and_a_totals_scan() -> None:
+    svc = _viz_service(
+        [
+            ("count() AS n_groups", FakeQueryResult(result_rows=[[10, 3]])),
+            (
+                "AS first_seen",
+                FakeQueryResult(result_rows=[["a", 6, None, None, 2], ["b", 3, None, None, 1]]),
+            ),
+        ]
+    )
+    result = svc.field_table(
+        EventQuery(case_id="c", source_ids=["s"]),
+        "attr:user",
+        2,
+        second_field="attr:host",
+        sort_by="distinct_second",
+        sort_dir="desc",
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    top = next(s for s in sqls if "AS first_seen" in s)
+    assert "count() AS c, min(" in top and "AS last_seen" in top
+    assert "uniqExactIf(" in top and "AS distinct_second" in top
+    assert "ORDER BY distinct_second DESC, val ASC" in top
+    assert "LIMIT 2" in top
+    assert result["remainder"] == {"count": 1, "share": 0.1, "distinct_values": 1}
+    assert result["rows"][0] == {
+        "value": "a",
+        "count": 6,
+        "share": 0.6,
+        "first_seen": None,
+        "last_seen": None,
+        "distinct_second": 2,
+    }
+
+
+def test_mark_instants_takes_the_ordered_head_and_a_countif_pair() -> None:
+    svc = _viz_service(
+        [
+            ("countIf(", FakeQueryResult(result_rows=[[3, 1]])),
+            (
+                "ORDER BY ts ASC",
+                FakeQueryResult(
+                    result_rows=[
+                        ["e1", "s1", datetime(2026, 7, 20, 1, tzinfo=UTC)],
+                        ["e2", "s1", datetime(2026, 7, 20, 2, tzinfo=UTC)],
+                        ["e3", "s1", datetime(2026, 7, 20, 3, tzinfo=UTC)],
+                    ]
+                ),
+            ),
+        ]
+    )
+    result = svc.mark_instants(EventQuery(case_id="c", source_ids=["s"], q="beacon"), limit=2)
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    head = next(s for s in sqls if "ORDER BY ts ASC" in s)
+    assert "LIMIT 3" in head and "ORDER BY ts ASC, event_id ASC" in head
+    assert [i["event_id"] for i in result["instants"]] == ["e1", "e2"]
+    assert result["overflow"] is True and result["dated"] == 3 and result["undated"] == 1
+
+
+def test_cumulative_distinct_merges_states_over_a_window_and_counts_empties() -> None:
+    svc = _viz_service(
+        [
+            (
+                "uniqExactMerge(st) OVER",
+                FakeQueryResult(
+                    result_rows=[
+                        [datetime(2026, 7, 20, 0, tzinfo=UTC), 0, 2],
+                        [datetime(2026, 7, 20, 2, tzinfo=UTC), 0, 3],
+                    ]
+                ),
+            ),
+            ("countIf(", FakeQueryResult(result_rows=[[7, 1]])),
+        ]
+    )
+    result = svc.cumulative(
+        EventQuery(
+            case_id="c",
+            source_ids=["s"],
+            start=datetime(2026, 7, 20, 0, tzinfo=UTC),
+            end=datetime(2026, 7, 20, 4, tzinfo=UTC),
+        ),
+        field="attr:user",
+        quantity="distinct",
+        buckets=4,
+    )
+    sqls = [q for q, _ in svc.store.client.queries]  # type: ignore[union-attr]
+    steps = next(s for s in sqls if "uniqExactMerge" in s)
+    assert "uniqExactState(" in steps and "!= ''" in steps
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" in steps
+    # Zero-filled across the range (the bucket holding `end` included); an
+    # empty hour carries the previous value.
+    assert [b["value"] for b in result["buckets"]] == [2, 2, 3, 3, 3]
+    assert [b["delta"] for b in result["buckets"]] == [2, 0, 1, 0, 0]
+    assert result["unparsed"] == 1 and result["events"] == 7
+
+
+def test_cumulative_refuses_a_fieldless_sum() -> None:
+    svc = _viz_service([])
+    with pytest.raises(ValueError, match='quantity="sum" needs a field'):
+        svc.cumulative(EventQuery(case_id="c", source_ids=["s"]), quantity="sum")
+
+
+def test_calendar_groups_by_utc_day_and_counts_a_field_when_given() -> None:
+    from datetime import date
+
+    svc = _viz_service(
+        [("toDate(", FakeQueryResult(result_rows=[[date(2026, 7, 20), 2], [date(2026, 7, 22), 0]]))]
+    )
+    result = svc.calendar(EventQuery(case_id="c", source_ids=["s"]), field="attr:user")
+    sql, _ = svc.store.client.queries[0]  # type: ignore[union-attr]
+    assert "toDate(" in sql and "'UTC'" in sql and "countIf(" in sql and "!= ''" in sql
+    assert result["days"] == [{"date": "2026-07-20", "count": 2}]  # zero days are not listed
+    assert result["start"] == "2026-07-20" and result["weeks"] == 1
+
+
+def test_rank_change_rows_encodes_share_of_window_and_names_the_status() -> None:
+    from vestigo.db.queries import rank_change_rows
+
+    rows, omitted = rank_change_rows(
+        ["alice", "bob", "carol", "dave", "same"],
+        {"alice": 4, "bob": 12, "dave": 3, "same": 2},
+        {"alice": 6, "bob": 3, "carol": 1, "same": 1},
+        20,
+        10,
+        union_cap=10,
+    )
+    assert omitted == 0
+    assert [r["value"] for r in rows] == ["alice", "bob", "dave", "carol", "same"]
+    assert [r["status"] for r in rows] == ["fell", "rose", "new", "vanished", "same"]
+    # Same count in both windows still *fell* when the window doubled — share, not count.
+    same = rows[-1]
+    assert same["primary_share"] == pytest.approx(0.1) and same[
+        "comparison_share"
+    ] == pytest.approx(0.1)
+    assert same["status"] == "same"
+    capped, dropped = rank_change_rows(
+        ["alice", "bob", "carol"],
+        {"alice": 4, "bob": 12},
+        {"alice": 6, "bob": 3, "carol": 1},
+        20,
+        10,
+        union_cap=2,
+    )
+    assert [r["value"] for r in capped] == ["alice", "bob"] and dropped == 1
+
+
+def test_rank_change_rows_with_an_empty_window_has_zero_shares_not_a_division_error() -> None:
+    from vestigo.db.queries import rank_change_rows
+
+    rows, _ = rank_change_rows(["x"], {"x": 3}, {}, 3, 0, union_cap=5)
+    assert rows == [
+        {
+            "value": "x",
+            "primary": 3,
+            "comparison": 0,
+            "primary_share": 1.0,
+            "comparison_share": 0.0,
+            "delta_share": 1.0,
+            "status": "new",
+        }
+    ]
+
+
+def test_pair_intervals_closes_the_most_recent_open_start_and_counts_orphans() -> None:
+    from vestigo.db.queries import pair_intervals
+
+    rows = [
+        ("h2", "08:00", "e0", 0),  # end before any start → orphan
+        ("h1", "09:00", "e1", 1),
+        ("h2", "09:00", "e2", 1),
+        ("h1", "10:00", "e3", 0),  # closes e1
+        ("h2", "10:00", "e4", 1),  # second start before one end
+        ("h1", "11:00", "e5", 1),  # never closed
+        ("h2", "11:00", "e6", 0),  # closes e4 (the most recent open start), e2 stays open
+    ]
+    intervals, unpaired, orphans = pair_intervals(rows)
+    assert [
+        (i["start"], i["end"], i["start_event_id"], i["end_event_id"]) for i in intervals["h1"]
+    ] == [
+        ("09:00", "10:00", "e1", "e3"),
+        ("11:00", None, "e5", None),
+    ]
+    assert [(i["start"], i["end"]) for i in intervals["h2"]] == [
+        ("09:00", None),
+        ("10:00", "11:00"),
+    ]
+    assert unpaired == 2 and orphans == 1
+
+
+def test_pair_intervals_over_nothing_is_empty() -> None:
+    from vestigo.db.queries import pair_intervals
+
+    assert pair_intervals([]) == ({}, 0, 0)
+
+
+def test_build_where_param_prefix_keeps_two_clauses_disjoint() -> None:
+    svc = EventQueryService(store=FakeClickHouseStore())
+    a = EventQuery(case_id="c1", source_ids=["s1"], field_filters={"attr:kind": ["logon"]})
+    b = EventQuery(case_id="c1", source_ids=["s1"], field_filters={"attr:kind": ["logoff"]})
+    where_a, params_a = svc._build_where(a)
+    where_b, params_b = svc._build_where(b, param_prefix="s_")
+    assert set(params_a) and set(params_b)
+    assert set(params_a).isdisjoint(set(params_b))
+    assert all(name.startswith("s_") for name in params_b)
+    assert "{s_p0:" in where_b and "{s_p0:" not in where_a

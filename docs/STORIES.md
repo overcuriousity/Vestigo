@@ -428,7 +428,23 @@ Per kind, `data` is:
   `components/viz/chartFetch.ts`, beside `fetchChartData` so the two can't
   drift) is the single place that reshaping happens, and it returns the real
   discriminated union rather than a cast — a divergence between the live and
-  frozen paths is a build failure, not a chart of blank bars.
+  frozen paths is a build failure, not a chart of blank bars. A `table` figure
+  freezes the `field_table` response as `chart`, and `SnapshotRenderer` draws
+  it as a real `<table>` (`ChartMarks tableAs="html"`), so the HTML export
+  contains a table rather than an image of one. A time-axis chart with marks
+  freezes the resolved `marks` (`{marks, sources, cap}`, each mark with its
+  provenance — `docs/VISUALIZE.md` §"Marks") beside `chart`, and
+  `SnapshotRenderer` draws them from the snapshot, never re-resolving. A
+  `cumulative` or `calendar` block freezes its `CumulativeResponse` /
+  `CalendarResponse` as `chart` like every other kind, and
+  `snapshotToChartResult` names both (`FrozenChartKind`). A `change` block
+  freezes its `ChangeResponse` (both window totals, the ranked share-of-window
+  rows, the union cap facts) as `chart`; `snapshotToChartResult` names it too,
+  and `RankedChange` redraws it without recounting either window. A `lanes`
+  block freezes its `LanesResponse` (the ranked, capped lanes with their paired
+  intervals, and every cap and count) as `chart` beside its resolved `marks`
+  — it is a time-axis figure — and `snapshotToChartResult` names it;
+  `IntervalLanes` redraws it without re-pairing a row.
 - `event_ref` — `{event, caption}`
 
 `SnapshotBlock` and `StoryBlock` are **discriminated unions** on `kind` in
