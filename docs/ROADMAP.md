@@ -114,6 +114,11 @@ constrained to be **field-agnostic** and SQL-explainable per the forensic-reprod
 requirement. D1–D9, `proportion_shift` and `sequence_motif` shipped — `ANOMALY_DETECTION.md`
 is each detector's contract, updated in the same commit as any detector change.
 
+Two items (D18, D19) come instead from [sktime](https://github.com/sktime/sktime)'s
+`detection` module, read as a second method source only — sktime's estimators are numeric-
+series ML and are not a dependency here; what is borrowed is the framing, re-derived as
+SQL over already-aggregated bucket counts.
+
 Every item below is incomplete until the frontend half lands with it: a plain-language
 method explanation, the SQL/params visible on the finding, disposition + allowlist wiring.
 A detector whose reasoning an analyst cannot read does not count as shipped.
@@ -145,6 +150,15 @@ A detector whose reasoning an analyst cannot read does not count as shipped.
   suspect-window transition faster than the baseline ever saw. `find_sequence_novelty`'s
   `lagInFrame` partitions already produce the pairs; this is a `min(dateDiff)` over the
   same shape. Score = `1 − (observed / learned_min)`.
+- [ ] **D19 — Point vs. collective anomaly on bucket counts** (framing from sktime's
+  `CAPA`): the temporal detectors currently answer "is this bucket unusual" one bucket at a
+  time, so a sustained mild elevation across twenty buckets and a single huge spike are
+  scored by the same statistic and rank alike. CAPA separates the two — a *point* anomaly
+  (one bucket, large deviation) and a *collective* anomaly (a contiguous run whose joint
+  cost beats a per-segment penalty). Implementable over the counts `frequency` already
+  pulls: keep the existing per-bucket score, add a max-over-segments scan with a length
+  penalty, report whichever wins. The finding must say which shape fired and name the
+  segment bounds — that distinction is most of the analyst value.
 
 **High effort, high value:**
 
@@ -157,6 +171,17 @@ A detector whose reasoning an analyst cannot read does not count as shipped.
   time bucket, compare suspect buckets against baseline by normalized Manhattan distance.
   Catches what `frequency` structurally cannot: a change in the *mix* at constant volume.
   Effort is in explainability — the finding must name the dimensions carrying the distance.
+- [ ] **D18 — Proposed baseline windows via change-point detection** (framing from sktime's
+  `PELT`/`BinarySegmentation`): the analyst declares the baseline window and the suspect
+  windows by hand, which is the single biggest source of a wrong answer — a baseline that
+  already contains the intrusion hides it, and nothing in the product says so. Run an exact
+  optimal-partition change-point scan over the timeline's bucket counts and *propose*
+  boundaries: "activity changes here, here and here — use the first span as baseline?".
+  Stays advice, never a lock: the proposal is a prefill on the baseline picker
+  (`ToolsSheet` › Scope), the analyst can ignore or edit every boundary, and what they
+  finally ran is what `DetectorRun` records. Segment-mean cost with an explicit penalty
+  term, both stamped into params; over counts, not events, so it is cheap and the SQL that
+  produced the counts is quotable on the proposal.
 
 **Low effort, low value:**
 
@@ -171,6 +196,10 @@ requirement by construction; revisit if D16 ships and misses correlated multi-fi
 `HistogramAnalysis`/`ParserCount` (descriptive statistics, already served); every
 `learn_mode`/persistence mechanism (replaced wholesale by analyst-declared baseline
 definitions — the core adaptation, and why no detector carries hidden state between runs).
+From sktime, everything except D18/D19: its segmentation, HMM, foundation-model and PyOD-
+adapter estimators all take a chosen numeric series, so they answer neither "which field"
+nor "which value" — the two questions a log finding has to answer — and none of them are
+field-agnostic in this codebase's sense.
 
 ## Milestone 5 — post-mortem workflow depth
 
