@@ -5,6 +5,61 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] — 2026-08-30
+
+### Added
+
+- **The Visualize round: a figure registry, and eight figures behind it (#332).**
+  `agent/chart_meta.py` is now a registry — each figure declares its `inputs` (a fixed
+  vocabulary), its `derives`, the `question` it answers, and whether it supports compare or
+  marks — with `chartMeta.ts` generated from it and a check test that keeps the two in step.
+  `ChartConfig` v2 adds `derive`, `inputs` and `marks` with a lossless v1 upgrade and
+  `c_derive` / `c_inputs` / `c_marks` in the URL codec. The rail reads Field → Treat as →
+  Derive → figure gallery → the declared inputs → Compare / Metric / Marks / Options; presets
+  are folded into each figure's `question`, and a greyed figure that exactly one derivation
+  would light applies it on click and says so.
+- **Derivations — a change of scale, and nothing more.** `db/derive.py` turns a number into
+  ordered ranges (`width` / `log` / `custom`) or a timestamp-valued attribute into a UTC
+  calendar part, threaded through terms, compare terms, value timeseries, pivot, change and
+  the table. Four registry-driven refusals name what a figure will not derive.
+- **Four new figures.** A **table** on the inventory's own SELECT core (top-N, share of the
+  slice, distinct of a second field per row, a remainder row, every column sortable, CSV
+  export). A **cumulative step** (running events, `sum` of a measure, or distinct values seen
+  so far — merged `uniqExactState`s, never a sum of per-bucket distincts). A **calendar
+  heatmap** (events per UTC day, latest 53 ISO weeks, always disclosed). **Ranked change**
+  (`rose | fell | new | vanished | same` by |Δ share| of window, never count — the windows are
+  rarely the same size), as dumbbell or slope. And **interval lanes**, pairing starts to ends
+  in each lane with open starts drawn under an arrowhead and orphan ends counted.
+- **Marks on every time-axis figure.** One resolution (`agent/marks.py::resolve_marks`) behind
+  `POST …/viz/marks`, `propose_chart` and the Stories export — events, view, baseline, instant
+  and range sources, each mark carrying its provenance, under a per-source cap
+  (`viz_marks_max`) that is always disclosed.
+- **`open_url` on every `propose_chart` result**, so an external `/mcp` client gets a deep link
+  back into the page (`agent/deep_link.py`).
+
+### Changed
+
+- **The converter excerpt is a few dozen records, not 64 KiB (#330).** A generation over a
+  348 KB nginx access log failed four times running: the prompt was 50,039 tokens, prefill
+  took 91 s, and an upstream 240 s cap killed it every time. It was that big because the
+  excerpt was 64 KiB of a log that says the same thing 3000 times.
+  `converter_sample_bytes` now defaults to **4 KiB** (floor 1 KiB), still split 70/15/15 across
+  the head, a middle window and the tail so the newest timestamps are in it. `sample_as_file`
+  writes every block, not the head alone, so the guarded sample run sees the middle and the
+  tail too. The system message says the excerpt is deliberately short and that the converter is
+  for the whole file (`SYSTEM_PROMPT_VERSION = "4"`). On the offending log the excerpt is now
+  35 lines / ~1.4k tokens and the whole prompt ~3.5k, against ~50k before.
+- **Embeddings are absent, not disabled, where nothing can embed (#333).** `EmbedWizard` and
+  `ToolsSheet` already gated on `capabilities.embeddings`; five other surfaces did not, and on
+  an instance with no embedding backend each described a subsystem that does not exist there —
+  a `TimelineList` badge reading `Embedding 0/N` forever, a `CaseOverviewPage` badge holding a
+  15 s poll open for a count that can never change, the Explorer's Keyword/Semantic switch with
+  Semantic permanently disabled, the find-similar icon that could only answer with an error,
+  and the "Optionally: embeddings" workflow step. All now gate on `useCapabilities()` — one
+  `GET /api/health` answer, one place. Every endpoint still refuses on its own, so hiding is
+  never the only enforcement.
+- Dependencies: `mcp` 1.28.1 → 1.29.1 (#321), `@tanstack/react-query` 5.102.3 → 5.102.4 (#322).
+
 ## [1.16.0] — 2026-08-28
 
 ### Added
