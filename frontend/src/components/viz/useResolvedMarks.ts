@@ -15,10 +15,14 @@ export function useResolvedMarks(
   config: ChartConfig,
 ) {
   const wanted = CHART_META[config.chartType].supportsMarks && config.marks.length > 0;
-  return useQuery({
+  const query = useQuery({
     queryKey: ["viz-marks", caseId, timelineId, config.marks],
     queryFn: () => vizApi.resolveMarks(caseId!, timelineId!, config.marks),
     enabled: wanted && !!caseId && !!timelineId,
     ...busyRetry,
   });
+  // The key deliberately omits the chart type (switching time → line keeps
+  // the resolution), so a disabled query still exposes the cached answer —
+  // and the caption printed "mark #1 …" under a bar chart that drew nothing.
+  return { ...query, data: wanted ? query.data : undefined };
 }

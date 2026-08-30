@@ -443,11 +443,18 @@ def spec_to_stored_chart_config(spec: Any) -> dict[str, Any]:
     stored_derive = _spec_derive_to_stored(getattr(spec, "derive", None))
     if stored_derive:
         config["derive"] = stored_derive
+        # The page's `scale` is the treat-as the derivation is computed from
+        # (its Derive control is offered per treat-as); the spec may have left
+        # it out or said "ordinal", the effective scale. Resolve here, the one
+        # spec → stored crossing, so the deep link and a saved card agree.
+        from vestigo.agent.chart_meta import derive_source_scale
+
+        config["scale"] = derive_source_scale(spec.derive.kind, config.get("scale"))
 
     inputs = getattr(spec, "inputs", None)
     if inputs is not None:
         stored_inputs: dict[str, Any] = {}
-        if inputs.columns:
+        if inputs.columns is not None:
             stored_inputs["columns"] = list(inputs.columns)
         if inputs.pairing:
             stored_inputs["pairing"] = _PAIRING_TO_STORED[inputs.pairing]

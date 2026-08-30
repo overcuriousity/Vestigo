@@ -587,3 +587,25 @@ describe("specToChartConfig — marks", () => {
     expect(specToChartConfig({ chart_type: "time" }).marks).toEqual([]);
   });
 });
+
+describe("specToChartConfig — a derived spec carries the treat-as, not the effective scale", () => {
+  const bins = { kind: "bins" as const, mode: "log" as const, count: 8 };
+  it("resolves an omitted or ordinal scale to what the derivation is computed from", () => {
+    expect(specToChartConfig({ chart_type: "bar", field: "a", derive: bins }).scale).toBe("ratio");
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", scale: "ordinal", derive: bins }).scale,
+    ).toBe("ratio");
+    expect(
+      specToChartConfig({
+        chart_type: "bar",
+        field: "a",
+        derive: { kind: "time_part", part: "hour" },
+      }).scale,
+    ).toBe("interval");
+  });
+  it("passes an explicit admitted treat-as through", () => {
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", scale: "interval", derive: bins }).scale,
+    ).toBe("interval");
+  });
+});

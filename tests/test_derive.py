@@ -89,3 +89,15 @@ def test_parse_derive_accepts_the_three_shapes() -> None:
     )
     assert parse_derive('{"kind":"bins","mode":"custom","edges":[0,1024]}').edges == [0.0, 1024.0]
     assert parse_derive('{"kind":"time_part","part":"weekday"}').part == "weekday"
+
+
+def test_bin_labels_never_collide_when_three_significant_digits_cannot_tell_edges_apart() -> None:
+    """Sub-integer steps above 1,000 rounded to the same label, so `multiIf`
+    emitted identical literals and GROUP BY merged bins the labels list still
+    named twice — the labels take whatever precision the edges need."""
+    labels = bin_labels(bin_edges("width", 8, 4000.0, 4001.0), negative_bin=False)
+    assert len(labels) == 8 and len(set(labels)) == 8
+    # The first precision that tells every edge apart, not the exact float.
+    assert labels[:3] == ["< 4,000.1", "4,000.1 – 4,000.2", "4,000.2 – 4,000.4"]
+    # The coarse form survives wherever it is unambiguous.
+    assert bin_labels([0.123456, 2.5], negative_bin=False) == ["< 0.123", "0.123 – 2.5", "≥ 2.5"]

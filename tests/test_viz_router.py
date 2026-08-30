@@ -9,6 +9,7 @@ TestClient needed.
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from vestigo.api.routers import viz
 from vestigo.db._time_fields import TIME_FIELD_PREFIX, TIME_FIELD_SPECS
@@ -1330,3 +1331,37 @@ async def test_lanes_first_last_passes_no_layers_and_next_end_needs_both(monkeyp
         )
     assert exc.value.status_code == 422
     assert "requires 'start_filter' and 'end_filter'" in str(exc.value.detail)
+
+
+async def test_viz_marks_runs_under_the_scan_gate_and_answers_503_when_busy(monkeypatch):
+    """An events mark is a foreground scan like every other viz read: a full
+    lane must surface as the 503 the page's busy-retry understands, not a 500."""
+    from types import SimpleNamespace
+
+    from vestigo.api.scan_exec import ScanBusyResponse
+    from vestigo.db._scan import ScanBusy
+
+    svc = _patch_agg(monkeypatch)
+
+    def busy(query, limit):
+        raise ScanBusy(ahead=2, wait=0.0)
+
+    monkeypatch.setattr(svc, "mark_instants", busy)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    body = viz.MarksRequest(marks=[{"kind": "events", "filters": {"q": "beacon"}}])
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(ScanBusyResponse):
+        await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+
+
+async def test_viz_marks_rejects_an_invalid_regex_in_an_events_mark_with_400(monkeypatch):
+    from types import SimpleNamespace
+
+    svc = _patch_agg(monkeypatch)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    body = viz.MarksRequest(marks=[{"kind": "events", "filters": {"q": "(", "qRegex": True}}])
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as info:
+        await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+    assert info.value.status_code == 400
+    assert svc.calls == []

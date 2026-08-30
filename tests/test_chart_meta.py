@@ -400,3 +400,24 @@ def test_every_input_key_is_declared_by_some_shipped_figure() -> None:
     declared = {key for c in CHART_TYPES for key in CHART_META[c].inputs}
     assert declared == set(INPUT_KEYS)
     assert "lane_key" not in INPUT_KEYS
+
+
+# ── the agent-facing prose is generated from this table ─────────────────────
+
+
+def test_chart_spec_prose_names_every_figure_and_every_taker() -> None:
+    """The `ChartSpec` field descriptions are what the model reads (relocated
+    verbatim into the spec reference); a figure the prose forgets is one the
+    model never proposes, and a taker it misnames is a rejection it cannot
+    predict."""
+    from vestigo.agent.tools import ChartSpec
+
+    described = {name: field.description or "" for name, field in ChartSpec.model_fields.items()}
+    for chart_type in CHART_TYPES:
+        assert f'"{chart_type}"' in described["chart_type"], chart_type
+    derive_takers = described["derive"].split("Figures that admit one: ")[1].split(";")[0]
+    assert set(derive_takers.split(", ")) == {c for c, m in CHART_META.items() if m.derives}
+    mark_takers = described["marks"].split("time-axis figure (")[1].split(")")[0]
+    assert set(mark_takers.split(", ")) == {c for c, m in CHART_META.items() if m.supports_marks}
+    for key in ("columns", "pairing", "start_filter", "end_filter"):
+        assert key in described["inputs"], key

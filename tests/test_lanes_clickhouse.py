@@ -171,3 +171,23 @@ def test_nothing_matching_is_an_empty_figure(service):
     assert empty["lanes"] == [] and empty["lanes_total"] == 0 and empty["other_lanes"] == 0
     assert empty["slice_start"] is None and empty["slice_end"] is None
     assert empty["undated"] == 0
+
+
+def test_next_end_carries_a_start_layer_external_id_list(service):
+    """An id list past ``EXTERNAL_LIST_THRESHOLD`` on the start layer alone travels
+    as an external table; the merged parameters must ship it even though the
+    primary registered none (it used to arrive as "Unknown table vestigo_ext_0")."""
+    from vestigo.db.queries import EXTERNAL_LIST_THRESHOLD
+
+    real = [_event(i, ts, h, k).event_id for i, (ts, h, k) in enumerate(_ROWS)]
+    padded = real + [f"{n:064x}" for n in range(EXTERNAL_LIST_THRESHOLD + 100)]
+    result = service.field_lanes(
+        _q(),
+        "attr:host",
+        pairing="next_end",
+        start=_q(field_filters={"attr:kind": ["logon"]}, event_ids=padded),
+        end=_kind("logoff"),
+        limit_y=10,
+    )
+    assert result["starts"] == 4 and result["ends"] == 3
+    assert [lane["key"] for lane in result["lanes"]] == ["h2", "h1"]

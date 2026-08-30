@@ -2908,7 +2908,10 @@ async def test_derive_rejected_on_a_virtual_time_field(store, monkeypatch):
     assert "already a calendar part" in message
 
 
-async def test_derive_with_a_non_ordinal_scale_is_rejected(store, monkeypatch):
+async def test_derive_with_a_categorical_scale_is_rejected(store, monkeypatch):
+    """`scale` is what the field is treated as *before* the derivation — the
+    page's treat-as — so categories cannot be binned, and a calendar part is
+    taken from a number-or-time field, not a measure."""
     _patch_chart_service(monkeypatch)
     server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
     message = await _reject(
@@ -2920,7 +2923,32 @@ async def test_derive_with_a_non_ordinal_scale_is_rejected(store, monkeypatch):
             "derive": {"kind": "bins", "mode": "width", "count": 4},
         },
     )
-    assert 'scale="ordinal"' in message
+    assert "ratio" in message and "interval" in message
+    message = await _reject(
+        server,
+        {
+            "chart_type": "bar",
+            "field": "ts",
+            "scale": "ratio",
+            "derive": {"kind": "time_part", "part": "hour"},
+        },
+    )
+    assert "interval" in message
+
+
+@pytest.mark.parametrize("scale", ["ratio", "interval", "ordinal", None])
+async def test_derive_accepts_the_treat_as_scale_and_resolves_to_ordinal(store, monkeypatch, scale):
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    spec = {
+        "chart_type": "bar",
+        "field": "bytes",
+        "derive": {"kind": "bins", "mode": "width", "count": 4},
+    }
+    if scale is not None:
+        spec["scale"] = scale
+    result = await _call(server, "propose_chart", _chart(spec))
+    assert result["ok"] is True and result["resolved"]["scale"] == "ordinal"
 
 
 async def test_describe_field_lists_the_derivations_that_make_sense(store, monkeypatch):
@@ -3162,6 +3190,28 @@ async def test_propose_chart_returns_the_visualize_deep_link(store, monkeypatch)
     )
     assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
     assert "q=4624" in result["open_url"] and "c_type=time" in result["open_url"]
+    assert not any("open_url" in w for w in result["warnings"])
+
+
+async def test_propose_chart_warns_when_open_url_cannot_carry_the_scope(store, monkeypatch):
+    """`event_ids` / `run_id` / `collapse_routine` have no URL form: the link
+    draws a wider chart than the result describes, and must say so."""
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart(
+            {
+                "chart_type": "bar",
+                "field": "attr:user",
+                "filters": {"event_ids": ["e1", "e2"], "collapse_routine": True},
+            }
+        ),
+    )
+    assert result["open_url"].startswith("/cases/c1/timelines/t1/visualize?")
+    (warning,) = [w for w in result["warnings"] if w.startswith("open_url")]
+    assert "a fixed event set" in warning and "routine collapse" in warning
 
 
 # ── cumulative and calendar ──────────────────────────────────────────────────

@@ -2431,7 +2431,27 @@ class EventQueryService:
         totals: bool = True,
         derive: DeriveSpec | None = None,
     ) -> dict[str, Any]:
-        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate.
+        """Ungated :py:meth:`field_terms` body — for callers already holding the scan gate."""
+        result, _ = self._field_terms_resolved(
+            query, field_token, limit, parallel=parallel, totals=totals, derive=derive
+        )
+        return result
+
+    def _field_terms_resolved(
+        self,
+        query: EventQuery,
+        field_token: str,
+        limit: int = 50,
+        *,
+        parallel: bool = True,
+        totals: bool = True,
+        derive: DeriveSpec | None = None,
+    ) -> tuple[dict[str, Any], ResolvedDerive | None]:
+        """:py:meth:`_field_terms_impl` plus the derivation it resolved.
+
+        A width/log derivation costs a min/max pre-flight scan; a caller that
+        counts a second layer on the same bins (``compare_field_terms``) takes
+        the resolution from here rather than resolving — and scanning — again.
 
         ``parallel=False`` runs the two scans one after the other, for a
         caller that is *itself* fanning out (the pivot's two axes) — see
@@ -2509,7 +2529,7 @@ class EventQueryService:
                 "values": values,
                 "other_count": 0,
                 "derive": echo,
-            }
+            }, resolved
 
         run = self._run_parallel if parallel else self._run_serial
         result, totals_result = run(top_n, all_groups)
@@ -2522,7 +2542,7 @@ class EventQueryService:
                 "values": [],
                 "other_count": 0,
                 "derive": echo,
-            }
+            }, resolved
 
         totals_row = totals_result.result_rows[0] if totals_result.result_rows else (0, 0)
         total, distinct = int(totals_row[0] or 0), int(totals_row[1] or 0)
@@ -2535,7 +2555,7 @@ class EventQueryService:
             "values": values,
             "other_count": max(0, other_count),
             "derive": echo,
-        }
+        }, resolved
 
     # ── Field value inventory (#295) ─────────────────────────────────────────
 
@@ -3568,13 +3588,12 @@ class EventQueryService:
         cache key, so a derived request never reads an underived layer.
         """
         self.store.init_schema()
-        terms = self._field_terms_impl(primary, field_token, limit=limit, derive=derive)
+        terms, resolved = self._field_terms_resolved(
+            primary, field_token, limit=limit, derive=derive
+        )
         top_values = [v["value"] for v in terms["values"]]
         primary_by_value = {v["value"]: v["count"] for v in terms["values"]}
-        derived_expr: str | None = None
-        if derive is not None:
-            _, resolved = self._resolve_derive(primary, field_token, derive)
-            derived_expr = resolved.expr if resolved is not None else None
+        derived_expr = resolved.expr if resolved is not None else None
 
         comparison_by_value: dict[str, int] = {}
         comparison_total = 0
@@ -3853,6 +3872,11 @@ class EventQueryService:
         start_where, start_params = self._build_where(start, external_tables=ext, param_prefix="s_")
         end_where, end_params = self._build_where(end, external_tables=ext, param_prefix="e_")
         parameters = _with_params(parameters, **start_params, **end_params)
+        # The three builders share one registry, but `_with_params` copies only
+        # the primary's `.external` and `**start_params` splats dict keys alone —
+        # a >512-id list on the start or end layer registered `vestigo_ext_N`
+        # and then shipped no table for it. The registry is the source of truth.
+        parameters.external = ext.data
         rows_src = f"""
             SELECT toString(event_id) AS eid, {eff} AS ts, {lane} AS lane,
                    {VESTIGO_NOT_SENTINEL_SQL} AS dated, 1 AS is_start

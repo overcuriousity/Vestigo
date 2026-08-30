@@ -117,15 +117,39 @@ def _fmt(x: float) -> str:
     return f"{rounded:,}"
 
 
+def _fmt_fixed(x: float, decimals: int) -> str:
+    """``x`` at exactly *decimals* places, trailing zeros trimmed: ``4000.25, 3`` → ``4,000.25``."""
+    text = f"{round(x, decimals):,.{decimals}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _fmt_edges(edges: list[float]) -> list[str]:
+    """Format *edges* so no two read the same.
+
+    Three significant digits is the readable default, but it names ``4000.125``
+    and ``4000.875`` both ``4,000`` — and a label is also the ``multiIf``
+    literal the rows are grouped by, so two edges with one label are one bin
+    in the result and two in the caption. The edges are strictly increasing,
+    so some finite precision separates them; take the first that does.
+    """
+    labels = [_fmt(e) for e in edges]
+    decimals = 0
+    while len(set(labels)) < len(labels) and decimals <= 15:
+        decimals += 1
+        labels = [_fmt_fixed(e, decimals) for e in edges]
+    return labels
+
+
 def bin_labels(edges: list[float], *, negative_bin: bool) -> list[str]:
     """Human labels for the bins ``edges`` delimit, in value order."""
     if not edges:
         return (["≤ 0"] if negative_bin else []) + ["all values"]
+    texts = _fmt_edges(edges)
     labels = ["≤ 0"] if negative_bin else []
-    labels.append(f"< {_fmt(edges[0])}")
-    for a, b in zip(edges, edges[1:], strict=False):
-        labels.append(f"{_fmt(a)} – {_fmt(b)}")
-    labels.append(f"≥ {_fmt(edges[-1])}")
+    labels.append(f"< {texts[0]}")
+    for a, b in zip(texts, texts[1:], strict=False):
+        labels.append(f"{a} – {b}")
+    labels.append(f"≥ {texts[-1]}")
     return labels
 
 

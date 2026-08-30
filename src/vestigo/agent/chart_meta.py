@@ -102,6 +102,31 @@ Derive = Literal["bins", "time_part"]
 INPUT_KEYS: tuple[InputKey, ...] = get_args(InputKey)
 
 CHART_TYPES: tuple[ChartType, ...] = get_args(ChartType)
+
+#: The scales a field may be treated as for each derivation to make sense —
+#: bins group a number (a measure or a number-or-time), a calendar part is
+#: taken from a number-or-time. The first entry is what an omitted scale
+#: resolves to. Mirrors ``frontend/src/components/viz/lib/derive.ts``
+#: ``deriveOptionsFor``, read the other way round.
+DERIVE_SOURCE_SCALES: dict[str, tuple[Scale, ...]] = {
+    "bins": ("ratio", "interval"),
+    "time_part": ("interval",),
+}
+
+
+def derive_source_scale(kind: str, scale: str | None) -> Scale:
+    """The treat-as a derived chart should carry: *scale* if it is one the
+    derivation admits, else the derivation's natural one.
+
+    ``ordinal`` is the *effective* scale of every derived field and what the
+    agent contract accepted alone for a while; stored and linked as the
+    treat-as it would hide the page's Derive control (the rail offers no
+    derivation on categories), so it resolves like an omitted scale.
+    """
+    admitted = DERIVE_SOURCE_SCALES[kind]
+    return scale if scale in admitted else admitted[0]  # type: ignore[return-value]
+
+
 SCALES: tuple[Scale, ...] = get_args(Scale)
 METRICS: tuple[Metric, ...] = get_args(Metric)
 

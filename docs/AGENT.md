@@ -271,13 +271,25 @@ list used only by the correlation matrix.
   a non-numeric field, scatter with no numeric pairs).
 - **Derivations are validated from the registry.** `ChartSpec.derive` (the same
   `DeriveSpec` the viz endpoints parse — `docs/VISUALIZE.md` §"Derivations") is
-  admitted only by figures whose `derives` lists its kind (bar, heatmap, pivot, sankey
-  today; the rejection names the figures that take it), never on a `time:` field
-  (already a calendar part), and forces `scale="ordinal"` — an omitted scale resolves
-  to ordinal, any other is rejected. Bins that find no numeric value after the scan are
-  rejected too, with the categorical alternative. `describe_field` reports
-  `derivations` so the model can see which apply before proposing. The resolved echo
-  carries `derive`.
+  admitted only by figures whose `derives` lists its kind (bar, heatmap, change, pivot,
+  sankey, table today; the rejection — and the `ChartSpec.derive` prose, generated from
+  the registry — name the figures that take it), never on a `time:` field (already a
+  calendar part). `scale` is then the treat-as the derivation is computed from
+  (`chart_meta.DERIVE_SOURCE_SCALES`: ratio or interval for bins, interval for
+  time_part) or omitted; the *effective* scale is always ordinal, which is what the
+  resolved echo reports, and `"ordinal"` itself is still accepted because it was the
+  only legal value for a while. The same rule is what a saved chart stores and a deep
+  link carries (`spec_to_stored_chart_config` resolves an omitted or ordinal scale to
+  the source scale), so the page's Derive control is offered for a chart the agent
+  proposed. Bins that find no numeric value after the scan are rejected too, with the
+  categorical alternative. `describe_field` reports `derivations` so the model can see
+  which apply before proposing. The resolved echo carries `derive`.
+- **`open_url` says when it is wider than the figure.** Three filter members have no
+  URL form (`event_ids`, `run_id`, `collapse_routine` — the page's
+  `URL_UNREPRESENTABLE_FILTERS`), and each only narrows, so a link that drops one draws
+  a wider chart than the summary describes. `propose_chart` keeps the link and adds a
+  warning naming the dropped narrowing; in the app the card's Open and Save keep the
+  full scope.
 - **The table figure has inputs and options of its own.** `chart_type="table"` takes
   `inputs.columns` (which of count, share, first_seen, last_seen, distinct_second to show)
   and `options.table_sort_by` / `table_sort_dir` / `highlight`; `inputs.columns` on any

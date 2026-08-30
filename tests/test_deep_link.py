@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from vestigo.agent.deep_link import visualize_url
+from vestigo.agent.deep_link import unrepresentable_filter_members, visualize_url
 from vestigo.agent.tools import ChartSpec
 from vestigo.stories.export import _spec_filters_to_payload, spec_to_stored_chart_config
 
@@ -40,7 +40,9 @@ def test_visualize_url_writes_every_c_key_the_page_reads() -> None:
     assert url.startswith("/cases/c/timelines/t/visualize?")
     for key in (
         "c_type=bar",
-        "c_scale=ordinal",
+        # The treat-as the derivation was computed from — what the rail needs
+        # to show its Derive control; "ordinal" is the *effective* scale.
+        "c_scale=ratio",
         "c_field=attr%3Auser",
         "c_compare=custom",
         "c_compare_filters=",
@@ -49,3 +51,37 @@ def test_visualize_url_writes_every_c_key_the_page_reads() -> None:
     ):
         assert key in url, key
     assert "c_metric" not in url and "c_marks" not in url and "c_inputs" not in url
+
+
+def test_visualize_url_carries_the_treat_as_a_derived_field_needs() -> None:
+    def scale_of(spec: dict) -> str:
+        parsed = ChartSpec.model_validate(spec)
+        url = visualize_url("c", "t", spec_to_stored_chart_config(parsed), None)
+        return url.split("c_scale=")[1].split("&")[0]
+
+    bins = {"kind": "bins", "mode": "width", "count": 4}
+    part = {"kind": "time_part", "part": "hour"}
+    assert scale_of({"chart_type": "bar", "field": "attr:bytes", "derive": bins}) == "ratio"
+    assert scale_of({"chart_type": "bar", "field": "attr:ts", "derive": part}) == "interval"
+    # An explicit treat-as passes through; a legacy "ordinal" resolves like an omitted one.
+    assert (
+        scale_of({"chart_type": "bar", "field": "attr:bytes", "scale": "interval", "derive": bins})
+        == "interval"
+    )
+    assert (
+        scale_of({"chart_type": "bar", "field": "attr:bytes", "scale": "ordinal", "derive": bins})
+        == "ratio"
+    )
+
+
+def test_unrepresentable_filter_members_names_the_three_url_less_members() -> None:
+    """Mirror of `chartConfig.ts` URL_UNREPRESENTABLE_FILTERS: the narrowings a
+    `c_*` link silently drops, so a link that would widen the chart says so."""
+    from vestigo.agent.tools import FilterSpec
+
+    assert unrepresentable_filter_members(None) == []
+    assert unrepresentable_filter_members(FilterSpec(q="x")) == []
+    members = unrepresentable_filter_members(
+        FilterSpec(event_ids=["e1"], run_id="r1", collapse_routine=True)
+    )
+    assert members == ["a fixed event set", "a detector run", "routine collapse"]

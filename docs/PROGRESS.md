@@ -4,7 +4,39 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 207 — interval lanes and the docs consolidation).
+Last updated: 2026-08-30 (session 208 — review findings on #332).
+
+## Session 208 — 2026-08-30: eleven review findings on the Visualize round (#332)
+
+`/code-review 332` verified twelve candidates (ten confirmed, one plausible, one refuted);
+all ten confirmed ones and the plausible one's neighbour are fixed here, each with the test
+that would have caught it.
+
+**Two 500s.** `field_lanes(pairing="next_end")` merged the start/end layers' parameters
+with `_with_params`, which copies only the primary's `.external` — a >512-id list on the
+start layer registered `vestigo_ext_0` and shipped no table for it ("Unknown table"). The
+shared registry is now the source of truth after the merge. And `POST …/viz/marks` ran
+`resolve_marks` on a bare `run_in_threadpool` with no `validated=`: a full scan lane
+escaped as a 500 the page's busy-retry never sees, and a bad regex reached ClickHouse. It
+goes through `_run_regex_guarded` with the same pre-checks as every viz GET.
+
+**`scale` is the treat-as, on both sides of the agent boundary.** The spec demanded
+`scale="ordinal"` with a derive while the page stores the treat-as (ratio/interval) and needs
+it to offer the Derive control — so an agent-proposed binned chart opened with no Derive
+section, and a page-saved one was *rejected* on Stories export. `chart_exec` now accepts the
+source scale (`DERIVE_SOURCE_SCALES`; ordinal kept for compatibility) and resolves the
+effective ordinal itself; `spec_to_stored_chart_config`, `deep_link.py` and `agent.ts`
+(`deriveSourceScale`) all carry the treat-as. `docs/AGENT.md`, `docs/VISUALIZE.md`.
+
+**The rest.** `propose_chart` warns when `open_url` cannot carry `event_ids` / `run_id` /
+`collapse_routine` (the link is wider than the result). The `ChartSpec` prose is generated
+from the registry (derive and mark takers) and names every figure, pinned by a test. Bin
+labels take the precision the edges need instead of merging bins under one label. The
+gallery drops a derivation the picked figure cannot take, and says so. The numeric probe
+keeps cumulative / calendar / lanes / change and moves only the treat-as, only where the
+figure admits it. `useResolvedMarks` hands out no data for a figure that draws none (the
+caption printed marks under a bar). `columns: []` — the value-only table — survives the URL,
+storage and the spec crossing. `compare_field_terms` resolves width/log edges once.
 
 ## Session 207 — 2026-08-30: interval lanes and the docs consolidation (viz plan D)
 

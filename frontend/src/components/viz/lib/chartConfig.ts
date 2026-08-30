@@ -232,10 +232,11 @@ export function parseChartInputs(raw: unknown): ChartInputs {
     out.pairing = raw.pairing as ChartInputs["pairing"];
   }
   if (Array.isArray(raw.columns)) {
-    const cols = raw.columns.filter((c): c is TableColumn =>
+    // `[]` is the value-only table the rail's checkboxes can produce and the
+    // figure draws; dropping it here snapped every box back on after each edit.
+    out.columns = raw.columns.filter((c): c is TableColumn =>
       TABLE_COLUMNS.includes(c as TableColumn),
     );
-    if (cols.length > 0) out.columns = cols;
   }
   return out;
 }

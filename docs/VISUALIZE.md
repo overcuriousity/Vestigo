@@ -189,8 +189,18 @@ two kinds, and nothing in the subsystem knows what an IP address, a URL or a por
 domain parsing belongs to the enrichers, not to a chart's axis. `ChartConfig.derive` holds
 one (`{kind: "bins", mode: "width"|"log", count}` / `{kind: "bins", mode: "custom", edges}` /
 `{kind: "timePart", part}`); on the wire the kind is `time_part` (`lib/derive.ts`
-`deriveToParam`). `CHART_META[c].derives` says which figures admit one — bar, heatmap, pivot
-and sankey today, the terms-fed marks — and the registry is the only rule.
+`deriveToParam`). `CHART_META[c].derives` says which figures admit one — bar, heatmap, change,
+pivot, sankey and table today, the terms-fed marks — and the registry is the only rule.
+`ChartConfig.scale` stays the **treat-as** the derivation was computed from (a measure or a
+number-or-time), never the ordinal it yields: that is what decides whether the rail offers the
+Derive control at all (`deriveOptionsFor`), so the agent contract, a saved chart and a deep
+link all carry it the same way (`lib/derive.ts` `deriveSourceScale`, Python
+`chart_meta.DERIVE_SOURCE_SCALES`; an omitted or "ordinal" scale resolves to the derivation's
+natural one). Picking a figure that admits no derivation drops the active one and says so —
+legality is judged at the effective scale, so such a figure lights up under a derivation it
+cannot carry. Bin labels take the first precision that tells every edge apart (`_fmt_edges`):
+a label is also the `multiIf` literal rows are grouped by, so two edges with one label were
+one bin in the result and two in the caption.
 
 **Computed in ClickHouse, before aggregation** (`db/derive.py`, threaded by
 `EventQueryService._resolve_derive`):

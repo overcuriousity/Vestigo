@@ -416,3 +416,18 @@ describe("ChartConfig v2", () => {
     expect(parsed.marks).toEqual([{ kind: "baseline", definitionId: "bd1" }]);
   });
 });
+
+describe("table columns", () => {
+  it("keeps an empty column set through the URL and storage — the value-only table is a choice", () => {
+    const table: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table",
+      field: "artifact",
+      scale: "nominal",
+      inputs: { columns: [] },
+    };
+    expect(paramsToChartConfig(chartConfigToParams(table)).inputs.columns).toEqual([]);
+    const stored = chartConfigToStored(table, undefined);
+    expect(parseStoredChartConfig(stored)?.inputs.columns).toEqual([]);
+  });
+});

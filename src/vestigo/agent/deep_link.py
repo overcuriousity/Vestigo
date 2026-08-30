@@ -59,6 +59,23 @@ def _filter_params(payload: dict[str, Any] | None) -> list[tuple[str, str]]:
     return out
 
 
+#: Filter members with no URL form — the mirror of ``chartConfig.ts``
+#: ``URL_UNREPRESENTABLE_FILTERS``, same labels. Each only ever narrows, so a
+#: link that drops one draws a *wider* chart than the result it came with.
+_URL_UNREPRESENTABLE: tuple[tuple[str, str], ...] = (
+    ("event_ids", "a fixed event set"),
+    ("run_id", "a detector run"),
+    ("collapse_routine", "routine collapse"),
+)
+
+
+def unrepresentable_filter_members(fspec: Any) -> list[str]:
+    """Human labels for the narrowings in *fspec* that :func:`visualize_url` loses."""
+    if fspec is None:
+        return []
+    return [label for key, label in _URL_UNREPRESENTABLE if getattr(fspec, key, None)]
+
+
 def visualize_url(
     case_id: str,
     timeline_id: str,

@@ -554,6 +554,24 @@ export function VisualizePage() {
       return;
     const isNumeric = numericQuery.data.count > 0;
     const nextScale: Scale = isNumeric ? "ratio" : "nominal";
+    const label = fieldTokenLabel(field);
+    // The figures that take a field as a lane key, a ranked value, or a
+    // running quantity (lanes, change, cumulative, calendar) were chosen
+    // *before* the field: the probe may move the treat-as where the figure
+    // admits it — a cumulative sum over a measure — but never the figure.
+    if (fieldOptional || dataKind === "lanes" || dataKind === "change") {
+      if (nextScale === scale) return;
+      if (!CHART_META[chartType].scales.includes(nextScale)) {
+        if (isNumeric)
+          setAutoNotice(
+            `${label} looks numeric — ${CHART_META[chartType].label} charts it as ${SCALE_DISPLAY[scale].label.toLowerCase()}.`,
+          );
+        return;
+      }
+      updateConfig({ scale: nextScale });
+      setAutoNotice(treatAsNotice(label, nextScale, isNumeric));
+      return;
+    }
     const nextType: ChartType = isNumeric ? "histogram" : "bar";
     // Say exactly which of the two controls moved, and say nothing when
     // neither did. The non-numeric branch used to re-pick *both* silently —
@@ -564,7 +582,6 @@ export function VisualizePage() {
     // already has is not a change and must not claim to be one.
     if (nextScale === scale && nextType === chartType) return;
     updateConfig({ scale: nextScale, chartType: nextType });
-    const label = fieldTokenLabel(field);
     let notice =
       nextScale !== scale
         ? treatAsNotice(label, nextScale, isNumeric)
@@ -578,6 +595,8 @@ export function VisualizePage() {
     fieldIsTime,
     numericQuery.data,
     fieldFree,
+    fieldOptional,
+    dataKind,
     requiresSecondField,
     multiField,
     scale,

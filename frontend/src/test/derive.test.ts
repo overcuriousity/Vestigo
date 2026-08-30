@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   defaultDerive,
   deriveOptionsFor,
+  deriveSourceScale,
   deriveToParam,
   describeDerive,
   effectiveScale,
@@ -55,5 +56,28 @@ describe("derivations", () => {
     expect(singleFixFor("histogram", "ratio", "attr:bytes")).toBeNull();
     // Legal only via a derivation the figure does not admit (pie has no derives).
     expect(singleFixFor("pie", "ratio", "attr:bytes")).toBeNull();
+  });
+});
+
+describe("deriveSourceScale", () => {
+  it("keeps a treat-as the derivation is offered under, and falls back to its natural one", () => {
+    expect(deriveSourceScale("bins", "ratio")).toBe("ratio");
+    expect(deriveSourceScale("bins", "interval")).toBe("interval");
+    expect(deriveSourceScale("timePart", "interval")).toBe("interval");
+    // The effective scale, and categories, are not what it was computed from.
+    expect(deriveSourceScale("bins", "ordinal")).toBe("ratio");
+    expect(deriveSourceScale("bins", "nominal")).toBe("ratio");
+    expect(deriveSourceScale("timePart", "ratio")).toBe("interval");
+    expect(deriveSourceScale("bins", null)).toBe("ratio");
+    expect(deriveSourceScale("timePart", undefined)).toBe("interval");
+  });
+
+  it("agrees with deriveOptionsFor in both directions", () => {
+    for (const scale of ["nominal", "ordinal", "interval", "ratio"] as const) {
+      for (const kind of ["bins", "timePart"] as const) {
+        const offered = deriveOptionsFor(scale, "attr:x").includes(kind);
+        expect(deriveSourceScale(kind, scale) === scale).toBe(offered);
+      }
+    }
   });
 });

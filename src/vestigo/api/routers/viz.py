@@ -11,13 +11,13 @@ notion of "current filters".
 
 from __future__ import annotations
 
+import functools
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from vestigo.api.deps import (
     get_current_user,
@@ -1076,7 +1076,7 @@ async def resolve_viz_marks(
     ``viz_marks_max`` setting and is echoed as ``cap``.
     """
     from vestigo.agent.marks import resolve_marks
-    from vestigo.agent.tools import AgentScope, ChartMarkSpec
+    from vestigo.agent.tools import AgentScope, ChartMarkSpec, FilterSpec
     from vestigo.stories.export import _stored_marks_to_spec
 
     try:
@@ -1092,6 +1092,21 @@ async def resolve_viz_marks(
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
+
+    # An events mark is a foreground scan like every GET above: the same
+    # regex / match-mode pre-checks (a bad pattern is a 400, not a ClickHouse
+    # 500) and the same runner (a full lane answers 503, which is what the
+    # page's busy-retry waits for; a client that left cancels the scan).
+    def validated(fspec: FilterSpec | None) -> FilterSpec:
+        fspec = fspec or FilterSpec()
+        _validate_regex(fspec.q, fspec.q_regex)
+        _validate_field_modes(fspec.filters, fspec.filter_modes)
+        _validate_field_modes(fspec.exclusions, fspec.exclusion_modes)
+        return fspec
+
+    any_regex = any(
+        m.kind == "events" and m.filters is not None and bool(m.filters.q_regex) for m in specs
+    )
     try:
         return await resolve_marks(
             scope,
@@ -1099,7 +1114,8 @@ async def resolve_viz_marks(
             service=_get_query_service(),
             store=get_store(),
             cap=get_settings().viz_marks_max,
-            run=run_in_threadpool,
+            run=functools.partial(_run_regex_guarded, any_regex),
+            validated=validated,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

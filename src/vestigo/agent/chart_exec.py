@@ -24,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from vestigo.agent.chart_meta import (
     CHART_META,
+    DERIVE_SOURCE_SCALES,
     METRIC_INFO,
     chart_types_for,
     compare_capable,
@@ -250,9 +251,15 @@ async def execute_chart_spec(
             raise ValueError(
                 f"{spec.field} is already a calendar part — chart it directly, without derive."
             )
-        if spec.scale is not None and spec.scale != "ordinal":
+        # `scale` is the treat-as the derivation is computed from (the page's
+        # "Number or time" / "Measure"), never the categories it yields — the
+        # effective scale is ordinal whatever the field was. "ordinal" itself
+        # is still accepted: it was the only legal value for a while.
+        admitted = DERIVE_SOURCE_SCALES[spec.derive.kind]
+        if spec.scale is not None and spec.scale != "ordinal" and spec.scale not in admitted:
             raise ValueError(
-                'a derived field is ordered categories: set scale="ordinal" or omit it.'
+                f"a {spec.derive.kind} derivation is computed from a field treated as "
+                f"{' or '.join(admitted)}: set scale to that, or omit it."
             )
         scale = "ordinal"
     if spec.inputs is not None and spec.inputs.columns is not None and chart_type != "table":

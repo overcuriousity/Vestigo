@@ -925,3 +925,21 @@ def test_first_last_lanes_config_carries_only_the_pairing() -> None:
     assert spec.inputs is not None and spec.inputs.pairing == "first_last"
     assert spec.inputs.start_filter is None and spec.inputs.end_filter is None
     assert spec_to_stored_chart_config(spec)["inputs"] == {"pairing": "firstLast"}
+
+
+def test_an_empty_table_column_set_round_trips_through_the_spec() -> None:
+    """`columns: []` is the value-only table the page can produce — dropping
+    it re-instated every default column on export."""
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "table",
+        "scale": "nominal",
+        "field": "artifact",
+        "options": {},
+        "inputs": {"columns": []},
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.columns == []
+    assert spec_to_stored_chart_config(spec)["inputs"] == {"columns": []}

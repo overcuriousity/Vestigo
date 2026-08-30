@@ -377,3 +377,58 @@ describe("VisualizePage auto-change notices", () => {
     );
   });
 });
+
+describe("the numeric probe and the figures chosen before the field", () => {
+  const numeric = {
+    field: "artifact",
+    count: 5,
+    min: 1,
+    max: 9,
+    mean: 5,
+    stddev: 2,
+    quantiles: {},
+    bins: [],
+  };
+
+  it("keeps the cumulative step and only moves the treat-as when the field looks numeric", async () => {
+    fieldNumericMock.mockResolvedValue(numeric);
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=cumulative&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /^artifact/ }));
+    expect(
+      await screen.findByText(/artifact looks numeric — treating it as a measure/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("ratio"),
+    );
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("cumulative");
+    expect(screen.queryByText(/figure set to/)).toBeNull();
+  });
+
+  it("keeps interval lanes as categories when the lane key looks numeric, and says so", async () => {
+    fieldNumericMock.mockResolvedValue(numeric);
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=lanes&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /^artifact/ }));
+    expect(
+      await screen.findByText(/artifact looks numeric — Interval lanes .* charts it as categories/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("artifact"),
+    );
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("lanes");
+    expect(new URLSearchParams(lastSearch).get("c_scale")).toBe("nominal");
+  });
+
+  it("says nothing on interval lanes when the lane key is categorical", async () => {
+    renderPage("/cases/c1/timelines/t1/visualize?c_type=lanes&c_scale=nominal");
+    fireEvent.focus(await screen.findByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /data_type/ }));
+    await waitFor(() =>
+      expect(new URLSearchParams(lastSearch).get("c_field")).toBe("data_type"),
+    );
+    await waitFor(() => expect(fieldNumericMock).toHaveBeenCalled());
+    expect(new URLSearchParams(lastSearch).get("c_type")).toBe("lanes");
+    expect(screen.queryByText(/figure set to|has no numeric values/)).toBeNull();
+  });
+});

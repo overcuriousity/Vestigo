@@ -37,6 +37,24 @@ export function effectiveScale(scale: Scale, derive: DeriveSpec | null): Scale {
   return derive ? "ordinal" : scale;
 }
 
+/** The treat-as values each derivation is computed from; the first is what an
+ * unstated one resolves to. `deriveOptionsFor` read the other way round — the
+ * Python twin is `chart_meta.DERIVE_SOURCE_SCALES`. */
+const DERIVE_SOURCE_SCALES: Record<DeriveKind, Scale[]> = {
+  bins: ["ratio", "interval"],
+  timePart: ["interval"],
+};
+
+/** The `scale` a derived chart should carry on the page: *scale* if the
+ * derivation admits it, else the derivation's natural one. "ordinal" is the
+ * *effective* scale of every derived field (and all the agent contract took
+ * for a while); as the treat-as it would hide the Derive control — the rail
+ * offers no derivation on categories — so it resolves like an unstated one. */
+export function deriveSourceScale(kind: DeriveKind, scale: Scale | null | undefined): Scale {
+  const admitted = DERIVE_SOURCE_SCALES[kind];
+  return scale && admitted.includes(scale) ? scale : admitted[0];
+}
+
 export function defaultDerive(kind: DeriveKind, scale: Scale): DeriveSpec {
   if (kind === "timePart") return { kind: "timePart", part: "hour" };
   return { kind: "bins", mode: scale === "ratio" ? "log" : "width", count: 8 };

@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vestigo.agent.chart_exec import execute_chart_spec, run_gated_scan
 from vestigo.agent.chart_meta import (
+    CHART_META,
     LEGACY_KIND_MAP,
     PIE_COMFORTABLE_MAX,
     ChartType,
@@ -588,6 +589,13 @@ class ChartDeriveSpec(ObjectArgModel, DeriveSpec):
     """
 
 
+# The prose the model reads for `derive` and `marks` names the figures that
+# take them, from the registry itself — a hand-kept list drifted the first
+# time a figure was added.
+_DERIVE_TAKERS = ", ".join(c for c in CHART_META if CHART_META[c].derives)
+_MARK_TAKERS = ", ".join(c for c in CHART_META if CHART_META[c].supports_marks)
+
+
 class ChartInputsSpec(ObjectArgModel):
     """Figure-specific inputs, mirroring the frontend's `ChartConfig.inputs`.
 
@@ -709,15 +717,18 @@ class ChartSpec(ObjectArgModel):
     chart_type: ChartType = Field(
         description=(
             "The visual mark to draw. Field-free: "
-            '"time" (events over time), "punchcard" (day x hour). One field: '
-            '"bar", "pie", "waffle" (shares of a whole as a 10x10 cell grid — '
+            '"time" (events over time), "punchcard" (day x hour). Optional field: '
+            '"cumulative" (running total over time), "calendar" (day-of-year grid). '
+            'One field: "bar", "pie", "waffle" (shares of a whole as a 10x10 cell grid — '
             'prefer it over "pie" past four categories), "histogram", "box", '
             '"violin", "ecdf" (numeric), "line", "heatmap" (one field over time '
-            "— NOT field x field). "
+            '— NOT field x field), "change" (values ranked by change against the '
+            'comparison layer), "lanes" (one interval bar per value), "table" (one '
+            "row per value with count, share, first/last seen). "
             'Two fields: "pivot" (the field x field heatmap grid), "sankey" (flow), '
-            '"scatter" (numeric x numeric). "box"/"violin" additionally take an '
-            "OPTIONAL categorical field_y to split the distribution into one "
-            "box/violin per group."
+            '"scatter" (numeric x numeric). Field list: "corr" (correlation matrix). '
+            '"box"/"violin"/"table" additionally take an OPTIONAL categorical field_y '
+            "(a grouping variable; the table counts its distinct values per row)."
         )
     )
     scale: Scale | None = Field(
@@ -775,20 +786,25 @@ class ChartSpec(ObjectArgModel):
             'ordered categories: {"kind":"bins","mode":"width"|"log","count":N} groups a '
             'number into N ranges; {"kind":"bins","mode":"custom","edges":[…]} uses your '
             'edges; {"kind":"time_part","part":"hour"|"weekday"|"day"|"week"|"month"} takes '
-            "a calendar part (UTC) of a timestamp-valued field. Only bar, heatmap, pivot and "
-            "sankey admit one; a virtual time: field never needs one."
+            "a calendar part (UTC) of a timestamp-valued field. Figures that admit one: "
+            f"{_DERIVE_TAKERS}; a virtual time: field never needs one. `scale` is then what "
+            "the field is treated as BEFORE the derivation — ratio or interval for bins, "
+            "interval for time_part — or omitted."
         ),
     )
     inputs: ChartInputsSpec | None = Field(
         default=None,
-        description="Figure-specific inputs — today only the table's `columns`.",
+        description=(
+            "Figure-specific inputs: the table's `columns`; the lanes' `pairing`, "
+            "`start_filter`, `end_filter`."
+        ),
     )
     marks: list[ChartMarkSpec] | None = Field(
         default=None,
         max_length=20,
         description=(
-            "Instants and windows drawn over a time-axis figure (time, line). Each is resolved "
-            "on the server with provenance; an events source is capped per source."
+            f"Instants and windows drawn over a time-axis figure ({_MARK_TAKERS}). Each is "
+            "resolved on the server with provenance; an events source is capped per source."
         ),
     )
 
@@ -2004,16 +2020,26 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # same config; the summary carries what the model needs.
         payload.pop("marks", None)
 
-        from vestigo.agent.deep_link import visualize_url
+        from vestigo.agent.deep_link import unrepresentable_filter_members, visualize_url
         from vestigo.stories.export import _spec_filters_to_payload, spec_to_stored_chart_config
 
-        # External /mcp clients get no card: this is the exact figure, as a link.
+        # External /mcp clients get no card: this is the figure, as a link —
+        # except that three filter members have no URL form, and each only
+        # narrows, so a link that lost one would draw a wider chart than the
+        # summary above describes, with nothing on the page to say so.
         payload["open_url"] = visualize_url(
             scope.case_id,
             scope.timeline_id,
             spec_to_stored_chart_config(spec),
             _spec_filters_to_payload(spec.filters),
         )
+        dropped = unrepresentable_filter_members(spec.filters)
+        if dropped:
+            payload.setdefault("warnings", []).append(
+                f"open_url cannot carry {', '.join(dropped)}: the link draws this chart "
+                "over the whole slice, wider than the result here. In the app, the "
+                "card's Open and Save keep the full scope."
+            )
         return payload
 
     if scope.conversation_id is not None:

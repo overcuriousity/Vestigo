@@ -25,6 +25,7 @@ import {
   type TableColumn,
 } from "@/components/viz/lib/chartConfig";
 import { CHART_META } from "@/components/viz/lib/chartMeta";
+import { deriveSourceScale } from "@/components/viz/lib/derive";
 import type { Metric } from "@/components/viz/lib/transforms";
 
 /** Backend FilterSpec shape (snake_case) — what agent tool calls carry. */
@@ -286,17 +287,22 @@ export function specToChartConfig(raw: AgentChartSpec | string): ChartConfig {
   if (o.highlight != null && o.highlight.length) options.highlight = o.highlight;
 
   const compare = parseToolArgObject<NonNullable<AgentChartSpecV2["compare"]>>(spec.compare);
+  const derive = specDeriveToConfig(spec.derive);
   return {
     v: 2,
-    derive: specDeriveToConfig(spec.derive),
+    derive,
     inputs: specInputsToConfig(spec.inputs),
     marks: specMarksToConfig(spec.marks),
     field: spec.field ?? null,
     fieldY: spec.field_y ?? null,
     fields: spec.fields ?? null,
     // An omitted scale takes the chart type's default — the same value the
-    // backend resolved and echoed in `resolved.scale`.
-    scale: spec.scale ?? CHART_META[spec.chart_type].defaultScale,
+    // backend resolved and echoed in `resolved.scale`. A derived spec is the
+    // exception: its effective scale is ordinal, but the page's `scale` is the
+    // treat-as the derivation was computed from (`deriveSourceScale`).
+    scale: derive
+      ? deriveSourceScale(derive.kind, spec.scale)
+      : (spec.scale ?? CHART_META[spec.chart_type].defaultScale),
     chartType: spec.chart_type,
     metric: spec.metric ?? "count",
     compare:

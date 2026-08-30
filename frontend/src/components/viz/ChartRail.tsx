@@ -703,7 +703,7 @@ export function ChartRail({
             if (v === NO_FIELD) {
               if (fieldOptional) updateConfig({ field: null, derive: null });
               else if (!fieldFree)
-                updateConfig({ field: null, chartType: "time" });
+                updateConfig({ field: null, chartType: "time", ...(derive ? { derive: null } : {}) });
               setAutoNotice(null);
               return;
             }
@@ -959,17 +959,31 @@ export function ChartRail({
                   }
                   onClick={() => {
                     if (legal) {
+                      // Legality was judged at the *effective* scale, which a
+                      // derivation makes ordinal — so a figure that admits no
+                      // derivation lights up under one. It cannot carry it:
+                      // the query would drop it silently while the caption
+                      // (and a Story export) still claimed it.
+                      const dropDerive =
+                        derive && !CHART_META[c].derives.includes(derive.kind);
+                      const patch: Partial<ChartConfig> = dropDerive
+                        ? { chartType: c, derive: null }
+                        : { chartType: c };
                       if (CHART_META[c].requiresCompare && config.compare.mode === "off") {
                         // The figure is defined by two windows; Baseline is the
                         // one reference window that always exists.
-                        updateConfig({ chartType: c, compare: { mode: "baseline" } });
+                        updateConfig({ ...patch, compare: { mode: "baseline" } });
                         setAutoNotice(
                           `Compare set to Baseline — ${CHART_META[c].label} needs two windows.`,
                         );
                         return;
                       }
-                      updateConfig({ chartType: c });
-                      setAutoNotice(null);
+                      updateConfig(patch);
+                      setAutoNotice(
+                        dropDerive && field
+                          ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is — the derivation was dropped.`
+                          : null,
+                      );
                       return;
                     }
                     if (!fix || !field) return;

@@ -486,3 +486,39 @@ describe("ChartRail — interval lanes inputs", () => {
     expect(screen.getByText(/Lanes: 10/)).toBeTruthy();
   });
 });
+
+describe("ChartRail — a figure pick and the active derivation", () => {
+  const derived: ChartConfig = {
+    ...DEFAULT_CHART_CONFIG,
+    chartType: "bar",
+    field: "attr:bytes",
+    scale: "ratio",
+    derive: { kind: "bins", mode: "log", count: 8 },
+  };
+
+  it("drops the derivation when the picked figure admits none, and says so", () => {
+    const { updateConfig, setAutoNotice } = renderRail(derived);
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    // Legal at the derived (ordinal) scale, but `derives` is empty for it.
+    fireEvent.click(within(gallery).getByRole("radio", { name: CHART_META.cumulative.label }));
+    expect(updateConfig).toHaveBeenCalledWith({ chartType: "cumulative", derive: null });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      `${CHART_META.cumulative.label} charts attr:bytes as is — the derivation was dropped.`,
+    );
+  });
+
+  it("keeps the derivation when the picked figure admits it", () => {
+    const { updateConfig } = renderRail(derived);
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: CHART_META.heatmap.label }));
+    expect(updateConfig).toHaveBeenCalledWith({ chartType: "heatmap" });
+  });
+
+  it("drops the derivation with the field when 'No field' lands on the time histogram", () => {
+    const { updateConfig } = renderRail(derived);
+    const combo = screen.getByRole("combobox", { name: "Field" });
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(screen.getByRole("option", { name: /No field/ }));
+    expect(updateConfig).toHaveBeenCalledWith({ field: null, chartType: "time", derive: null });
+  });
+});
