@@ -72,19 +72,25 @@ export function ChartCanvas({
   // the analyst gets from "Open in Visualize" are drawn from identical values.
   const opts = useMemo(() => resolveChartOptions(config), [config]);
 
-  // Every kind but time/punchcard needs a field, and pivot/scatter need two.
   // Callers normally validate before rendering (`propose_chart` rejects an
   // incomplete spec; a saved chart was legal when saved), but an un-run query
   // renders as neither loading nor error — i.e. a silently blank chart box —
   // so say so explicitly rather than leave the analyst looking at nothing.
+  //
+  // Read off CHART_META rather than listing the field-free kinds by hand: the
+  // hardcoded time/punchcard pair did not grow when Cumulative and Calendar
+  // arrived with `field: "optional"`, so a legitimately fieldless one of those
+  // fell through to `!!config.field`, never ran its query, and rendered the
+  // "missing a field" message in the agent card and in every Story snapshot —
+  // while the Visualize page drew it correctly.
+  const fieldRequired =
+    CHART_META[config.chartType].inputs.field === "required";
   const specComplete =
-    dataKind === "time" || dataKind === "punchcard"
-      ? true
-      : dataKind === "corr"
-        ? (config.fields?.length ?? 0) >= 2
-        : dataKind === "pivot" || dataKind === "scatter"
-          ? !!(config.field && config.fieldY)
-          : !!config.field;
+    dataKind === "corr"
+      ? (config.fields?.length ?? 0) >= 2
+      : dataKind === "pivot" || dataKind === "scatter"
+        ? !!(config.field && config.fieldY)
+        : !fieldRequired || !!config.field;
 
   const marksQuery = useResolvedMarks(caseId, timelineId, config);
   const chartQuery = useQuery({
@@ -183,6 +189,13 @@ export function ChartMarks({
           compare={data.compare ? data.data : undefined}
           orientation={opts.orientation}
           sort={opts.sort}
+          // A derived axis has no lexical order — "< 1,024" and "≥ 10,240"
+          // sort as strings before every digit — which is why `BarChart` takes
+          // an explicit order and why `applyDerive` sets `sort: "value"` on
+          // every derived bar chart. Omitting it here made the snapshot, the
+          // HTML export and the agent card disagree with the live page about
+          // the order of the same ranges.
+          valueOrder={data.data.derive?.labels}
           logScale={opts.logScale}
         />
       )}

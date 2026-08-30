@@ -211,6 +211,14 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
         ? "count"
         : (options.tableSortBy ?? "count"),
     tableSortDir: options.tableSortDir ?? "desc",
-    highlight: options.highlight ?? [],
+    // `c_opts` is `JSON.parse`d, unvalidated URL data (see `clampTopN` above,
+    // which exists for the same reason): a hand-edited or mangled link can
+    // carry `"highlight": "admin"`. `.length` is then truthy and `.join` is
+    // undefined, so `buildCaptionLines` threw and the whole page went blank
+    // rather than degrading. The first array-typed option, hence the first
+    // that needs this.
+    highlight: Array.isArray(options.highlight)
+      ? options.highlight.filter((v): v is string => typeof v === "string")
+      : [],
   };
 }

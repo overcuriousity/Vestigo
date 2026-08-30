@@ -194,25 +194,33 @@ const TABLE_COLUMNS: TableColumn[] = ["count", "share", "first_seen", "last_seen
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
   !!x && typeof x === "object" && !Array.isArray(x);
-const isPosInt = (x: unknown): x is number =>
-  typeof x === "number" && Number.isInteger(x) && x > 0;
+// Mirrors `db/derive.py`'s `BINS_MIN`/`BINS_MAX` and its edge rules. This
+// function is the gate for the URL and stored paths — the rail's own controls
+// already clamp and validate — so anything it admits that the server refuses
+// is a 422 the analyst sees as a permanently blank chart with nothing on
+// screen to explain it, the exact failure `clampTopN` documents for `limit=0`.
+const BINS_MIN = 2;
+const BINS_MAX = 50;
+const isBinCount = (x: unknown): x is number =>
+  typeof x === "number" && Number.isInteger(x) && x >= BINS_MIN && x <= BINS_MAX;
+const isEdgeList = (x: unknown): x is number[] =>
+  Array.isArray(x) &&
+  x.length > 0 &&
+  x.length < BINS_MAX &&
+  x.every((e) => typeof e === "number" && Number.isFinite(e)) &&
+  x.every((e, i) => i === 0 || (x[i - 1] as number) < e);
 
 /** A `DeriveSpec` or null — a malformed one is *no* derivation, never a guess. */
 export function parseDeriveSpec(raw: unknown): DeriveSpec | null {
   if (!isRecord(raw)) return null;
   if (raw.kind === "bins") {
     if (raw.mode === "custom") {
-      const edges = raw.edges;
-      if (
-        Array.isArray(edges) &&
-        edges.length > 0 &&
-        edges.every((e) => typeof e === "number" && Number.isFinite(e))
-      ) {
-        return { kind: "bins", mode: "custom", edges: [...(edges as number[])] };
+      if (isEdgeList(raw.edges)) {
+        return { kind: "bins", mode: "custom", edges: [...raw.edges] };
       }
       return null;
     }
-    if ((DERIVE_MODES as readonly unknown[]).includes(raw.mode) && isPosInt(raw.count)) {
+    if ((DERIVE_MODES as readonly unknown[]).includes(raw.mode) && isBinCount(raw.count)) {
       return { kind: "bins", mode: raw.mode as "width" | "log", count: raw.count };
     }
     return null;

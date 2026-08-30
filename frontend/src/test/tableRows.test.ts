@@ -98,3 +98,29 @@ describe("tableRows", () => {
     ).toBe('"a,""b""",5');
   });
 });
+
+describe("tableCsv — escaping", () => {
+  it("quotes a lone CR, which Excel treats as a record terminator", () => {
+    // Routine in a field taken from a Windows-sourced log. Unquoted, the row
+    // splits and every following column shifts — a silently corrupted export
+    // of forensic data (#332).
+    const withCr: FieldTableResponse = {
+      ...data,
+      rows: [{ ...data.rows[0], value: "alice\rbob" }],
+      remainder: null,
+    };
+    const csv = tableCsv(withCr, { ...DEFAULT_CHART_CONFIG, field: "attr:user" }, []);
+    const valueLine = csv.split("\n").find((l) => l.includes("alice"))!;
+    expect(valueLine.startsWith('"alice\rbob"')).toBe(true);
+  });
+
+  it("escapes caption comment lines, which routinely carry commas", () => {
+    const csv = tableCsv(
+      { ...data, remainder: null },
+      { ...DEFAULT_CHART_CONFIG, field: "attr:user" },
+      ["showing top 10 of 1,234 distinct values"],
+    );
+    // Unescaped, the comment parses as two fields rather than one.
+    expect(csv.split("\n")[0]).toBe('"# showing top 10 of 1,234 distinct values"');
+  });
+});

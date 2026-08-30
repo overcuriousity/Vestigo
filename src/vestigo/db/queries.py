@@ -2381,8 +2381,24 @@ class EventQueryService:
             )
         if derive.kind == "time_part":
             part = derive.part or "hour"
-            expr = time_part_expr(base, part)
             spec = TIME_FIELD_SPECS[TIME_PART_TOKENS[part]]
+            # Deriving a calendar part *from the timestamp column* is the same
+            # question `time:hour_of_day` answers, and must give the same answer:
+            # build it the same way. `time_part_expr` parses a string, which the
+            # year-2299 null sentinel parses into perfectly well — every undated
+            # event piling into hour 23 / weekday 5 / month 12 — and it reads the
+            # raw column, ignoring per-source clock skew. `TimeFieldSpec.sql`
+            # blanks the sentinel and `effective_ts_sql` applies the offsets.
+            #
+            # Scoped to the timestamp column on purpose: the sentinel predicate
+            # names that column, so applying it to an *attribute* that happens to
+            # hold a timestamp would blank values the attribute genuinely carries
+            # merely because the event around it is undated.
+            column, _attr = resolve_column_token(field_token)
+            if column == "timestamp":
+                expr = spec.sql(effective_ts_sql(query.source_offsets))
+            else:
+                expr = time_part_expr(base, part)
             labels = list(spec.domain or [])
             return expr, ResolvedDerive(
                 spec=derive, expr=expr, labels=labels, edges=None, negative_bin=False
@@ -3250,10 +3266,10 @@ class EventQueryService:
         """Return per-value event counts bucketed over time for *field_token*.
 
         Restricts to the top *series_limit* values by overall count so a
-        high-cardinality field doesn't explode into hundreds of series — the
-        Visualization page surfaces ``field_terms``' ``other_count``/
-        ``distinct`` alongside this so the analyst knows series were capped.
-        Powers the multi-series line chart and the value×time heatmap.
+        high-cardinality field doesn't explode into hundreds of series, and
+        reports the cut as ``distinct``/``other_count``/``series_truncated``
+        so the analyst knows series were capped. Powers the multi-series line
+        chart and the value×time heatmap.
 
         Top-value selection and per-bucket counting are fused into one scan
         (M24b): the inner aggregate groups by (sentinel-flag, bucket, value),
@@ -3304,6 +3320,9 @@ class EventQueryService:
             "max": None,
             "series": [],
             "derive": echo,
+            "distinct": 0,
+            "other_count": 0,
+            "series_truncated": False,
         }
         if min_ts is None or max_ts is None:
             return empty
@@ -3326,7 +3345,7 @@ class EventQueryService:
             )
             GROUP BY val
             ORDER BY total DESC, val ASC
-            LIMIT {int(series_limit)}
+            LIMIT {int(series_limit) + 1}
             {foreground_scan_settings()}
             """,
             parameters=parameters,
@@ -3339,6 +3358,37 @@ class EventQueryService:
                 "min": min_ts.isoformat(),
                 "max": max_ts.isoformat(),
             }
+
+        # One row past the cap is the probe: `series_limit` series can be all
+        # there is, or the visible slice of many. A derived field makes this
+        # routine rather than exotic — 49 custom edges are 51 bin labels and a
+        # `week` time part is 53, both past the ceiling of 50 — and `derive`
+        # echoes the full label list, so an undisclosed cut leaves the caption
+        # naming series the chart does not draw. Every other figure in this
+        # module reports `distinct`/`other_count`; this one now does too.
+        series_truncated = len(rows) > series_limit
+        rows = rows[:series_limit]
+        distinct = len(rows)
+        other_count = 0
+        if series_truncated:
+            # Only now is a second aggregate worth its scan: the untruncated
+            # case (the overwhelmingly common one) already knows both answers
+            # from the rows it holds.
+            totals = self._select(
+                f"""
+                SELECT count() AS n_groups, sum(c) AS total FROM (
+                    SELECT {col_expr} AS val, count() AS c
+                    FROM {database}.events
+                    WHERE {where} AND {col_expr} != ''
+                    GROUP BY val
+                )
+                {foreground_scan_settings()}
+                """,
+                parameters=parameters,
+            ).result_rows
+            if totals:
+                distinct = int(totals[0][0])
+                other_count = max(0, int(totals[0][1]) - sum(int(row[1]) for row in rows))
 
         # Pivot into one bucket-list per value, in the same top-N order the
         # ranking produced, filling buckets with zero rows so every series
@@ -3371,6 +3421,9 @@ class EventQueryService:
             "max": max_ts.isoformat(),
             "series": series,
             "derive": echo,
+            "distinct": distinct,
+            "other_count": other_count,
+            "series_truncated": series_truncated,
         }
 
     def _union_timestamp_range(
@@ -3872,7 +3925,15 @@ class EventQueryService:
             raise RuntimeError("next_end pairing reached the scan without both layers")
         start_where, start_params = self._build_where(start, external_tables=ext, param_prefix="s_")
         end_where, end_params = self._build_where(end, external_tables=ext, param_prefix="e_")
-        parameters = _with_params(parameters, **start_params, **end_params)
+        # Merged as one dict, never as `**start_params, **end_params`: the
+        # prefix covers the generated `p0..pN` but deliberately *not* the fixed
+        # names, so both layers bind `clk_off_src`/`clk_off_val` whenever any
+        # in-scope source carries a clock offset (`bind_offset_params`) — and a
+        # duplicate keyword is a `TypeError`, not a silent overwrite. The values
+        # are equal by construction (all three queries share the timeline's
+        # offsets), so last-wins is the same answer, but the merge has to be the
+        # kind that permits a duplicate at all.
+        parameters = _with_params(parameters, **{**start_params, **end_params})
         # The three builders share one registry, but `_with_params` copies only
         # the primary's `.external` and `**start_params` splats dict keys alone —
         # a >512-id list on the start or end layer registered `vestigo_ext_N`

@@ -262,6 +262,13 @@ the same `_fmt_edges` the bin labels are cut by — the caption naming a boundar
 naming the bin either side of it are then the same text, and rounding the floats a second time
 client-side (which said `4,000 – 4,001` over bins starting at 4000.125) cannot happen.
 
+Because `labels` advertises the derivation's *whole* domain, a figure that draws fewer series
+than the domain has must say so. `field_value_timeseries` caps at `series_limit` (≤ 50) and a
+derivation routinely exceeds it — 49 custom edges are 51 bin labels, an ISO-week part is 53 —
+so the response carries `series_truncated`, `distinct` and `other_count` beside `series`. The
+cap is detected by fetching one row past it; the exact `distinct`/`other_count` cost a second
+aggregate and are only paid for when the probe says the cap was actually hit.
+
 ## Table figure
 
 The one figure that is a table: the top-N values of a field with their count, share, first
@@ -334,6 +341,17 @@ events across M more values in the remainder row` (only when a remainder exists)
 `highlighted rows: a · b — presentation only` (only when set). The generic "(capped…)" line
 does not fire for a table — the remainder row *is* the disclosure.
 
+`showing top K` only when the sort is **count descending**; otherwise `showing the first K in
+this order`. The server applies the analyst's `sort_by`/`sort_dir` *before* the `LIMIT`, so
+the sort decides which values survive and not merely how the survivors are arranged — sorted
+by count ascending the drawn rows are the K *rarest* and the remainder holds nearly every
+event, which "top" would misdescribe with nothing else on the canvas to correct it.
+
+**CSV escaping.** Every cell — the `#` caption rows included — goes through `csvCell`, which
+quotes on `"`, `,`, `\n` *and a lone `\r`*: a bare CR is routine in a field taken from a
+Windows-sourced log, and RFC-4180 parsers (Excel among them) read it as a record terminator,
+splitting the row and shifting every column after it.
+
 ## Marks
 
 A **mark** is an instant or a window drawn over a time-axis figure to say *this is when*.
@@ -345,9 +363,14 @@ figure resolves them again on every draw. Five kinds:
 |---|---|---|
 | `events` | `filters` (a view payload, plus `eventIds` — see below), `label?` | one instant per **dated** event matching the filter, capped |
 | `view` | `viewId` | one instant per dated event of the saved view's filter, capped |
-| `baseline` | `definitionId` | the definition's baseline window and every suspect window, as ranges, labeled as declared |
+| `baseline` | `definitionId`, `label?` | the definition's baseline window and every suspect window, as ranges, labeled as declared |
 | `instant` | `at`, `label` | itself |
 | `range` | `start`, `end`, `label` | itself |
+
+`label` is required on `instant` and `range` and optional on the other three, where it
+*replaces* the name the source would otherwise carry — the view's name, or the baseline
+definition's — as the prefix on every window the source draws. Provenance still names the
+definition or view, so a renamed mark never hides where it came from.
 
 **One resolution.** `agent/marks.py::resolve_marks(scope, marks, …)` is the only place a
 source becomes marks, and three callers share it: `POST …/viz/marks` (the page and the
@@ -429,6 +452,15 @@ measure ("a running sum over anything but a measure is not a quantity"), `distin
 measure, and either without a field — and warns, without refusing, when a field is set under
 `events` (the field is ignored). The endpoint knows no scale, so it never assumes `sum`: the
 page asks for it, and a `quantity` that needs a field without one is a 422.
+
+The figure is legal at **nominal, ordinal and ratio, never interval**: accumulating needs the
+true zero that separates the two, so a running total of temperatures or calendar years totals
+nothing. The scale was briefly advertised and reachable by no quantity at all — `sum` demanded
+ratio, `distinct` demanded nominal/ordinal, `events` discarded the field — so the refusals
+cycled with no way through. Accumulating the *event count* over an interval-scaled field is
+`quantity="events"`, which takes no field. `chart_exec` runs the scale check *before* the
+per-figure rules for this reason: those are phrased in terms of the scale, so on a scale the
+figure does not admit they answer the wrong question.
 
 **The SQL.** Buckets are `toStartOfInterval(ts, INTERVAL n second)` on the histogram's
 epoch-aligned grid (`bucket_interval_seconds` + `aligned_bucket_starts`, the range being the

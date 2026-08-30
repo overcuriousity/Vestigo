@@ -634,6 +634,14 @@ table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks
 `ChartInputsSpec.pairing` / `start_filter` / `end_filter` took it to 42,285 on 2026-08-30,
 ceiling unchanged) — if a change trips it, re-measure rather than raising the ceiling.
 
+**Every figure above 42,285 was measured over 31 tools, not 33.** The two
+`embeddings_gated` tools (`semantic_search`, `similar_events`) are not advertised where the
+extra is absent and no embedding endpoint is set, so the guard measured a developer's
+narrower set and CI's full one — 513 chars apart — and could pass locally on a branch that
+overflowed in CI. The test now forces `embeddings_available()` true, so the number is the
+same everywhere: **42,798 over 33 tools, ceiling 43,000**. That one-off move is the tools the
+guard never counted, not new prose; the rule is unchanged for everything after it.
+
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`
 (`_deflate_findings` — on the turn that motivated it: 33.7k → 15.7k tokens);

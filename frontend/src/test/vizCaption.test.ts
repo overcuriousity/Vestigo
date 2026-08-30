@@ -469,11 +469,52 @@ describe("buildCaptionLines — table", () => {
     });
     expect(lines).toContain("sorted by last seen (ascending)");
     expect(lines).toContain("share = count / 11 events with a non-empty attr:user");
+    // Not "top": the facts sort by last seen ascending, and the server applies
+    // that sort before the LIMIT — so these are the first two rows in the
+    // analyst's order, not the two largest (#332).
     expect(lines).toContain(
-      "showing top 2 of 4 distinct values; 3 events across 2 more values in the remainder row",
+      "showing the first 2 in this order of 4 distinct values; 3 events across 2 more values in the remainder row",
     );
     expect(lines).toContain("highlighted rows: alice · bob — presentation only");
     expect(lines.some((l) => l.includes("(capped"))).toBe(false);
+  });
+
+  it("says \"top\" only when count-descending actually makes these the top rows", () => {
+    const facts = {
+      tableTotal: 11,
+      distinct: 4,
+      shownValues: 2,
+      tableRemainder: { count: 3, distinctValues: 2 },
+    };
+    const base = {
+      caseId: "c",
+      timelineId: "t",
+      chartLabel: "Table (values with counts)",
+      filters: {},
+    };
+    const chart = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      field: "attr:user",
+      scale: "nominal" as const,
+    };
+    const ranked = buildCaptionLines({
+      ...base,
+      config: { ...chart, options: { tableSortBy: "count", tableSortDir: "desc" } },
+      facts: { ...facts, tableSort: { by: "count", dir: "desc" } },
+    });
+    expect(ranked).toContain(
+      "showing top 2 of 4 distinct values; 3 events across 2 more values in the remainder row",
+    );
+    // Count *ascending* keeps the two rarest values, and the remainder then
+    // holds nearly every event — "top" would be plainly false.
+    const rarest = buildCaptionLines({
+      ...base,
+      config: { ...chart, options: { tableSortBy: "count", tableSortDir: "asc" } },
+      facts: { ...facts, tableSort: { by: "count", dir: "asc" } },
+    });
+    expect(rarest.some((l) => l.includes("showing top"))).toBe(false);
+    expect(rarest.some((l) => l.includes("showing the first 2 in this order"))).toBe(true);
   });
 });
 

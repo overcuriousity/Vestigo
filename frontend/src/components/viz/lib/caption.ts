@@ -424,8 +424,21 @@ export function buildCaptionLines(args: {
       facts.shownValues != null
     ) {
       const more = facts.tableRemainder.distinctValues;
+      // "top" only when the ordering makes these rows the top ones. The server
+      // applies the analyst's sort *before* the LIMIT, so the sort decides
+      // which values survive, not just how the survivors are arranged: sorted
+      // by count ascending, the drawn rows are the ten rarest and the
+      // remainder holds nearly every event. Claiming "top" there is false, and
+      // the generic top-N line is suppressed for tables, so nothing else
+      // corrects it. Descending by count is the only ordering that means it.
+      const ranked =
+        facts.tableSort == null ||
+        (facts.tableSort.by === "count" && facts.tableSort.dir === "desc");
+      const shown = ranked
+        ? `showing top ${fmtInt(facts.shownValues)}`
+        : `showing the first ${fmtInt(facts.shownValues)} in this order`;
       lines.push(
-        `showing top ${fmtInt(facts.shownValues)} of ${fmtInt(facts.distinct)} distinct values; ${fmtInt(facts.tableRemainder.count)} events across ${fmtInt(more)} more value${more === 1 ? "" : "s"} in the remainder row`,
+        `${shown} of ${fmtInt(facts.distinct)} distinct values; ${fmtInt(facts.tableRemainder.count)} events across ${fmtInt(more)} more value${more === 1 ? "" : "s"} in the remainder row`,
       );
     }
     if (facts.tableHighlight?.length) {

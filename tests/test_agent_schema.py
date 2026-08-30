@@ -20,6 +20,7 @@ from typing import Any
 
 from fastmcp.client import Client as FastMCPClient
 
+from vestigo.agent import tools as agent_tools
 from vestigo.agent.schema_slim import (
     SHARED_SPEC_NAMES,
     slim_schema,
@@ -49,7 +50,11 @@ from vestigo.db.postgres import User
 # at 42,500.
 # 2026-08-30: 42,115 → 42,285 with ChartInputsSpec.pairing/start_filter/end_filter (viz
 # plan D); ceiling unchanged at 42,500.
-SCHEMA_BUDGET_CHARS = 42_500
+# Covers the full advertised set (embeddings included) — see
+# `test_total_schema_budget`, which forces them on so the number is the same
+# everywhere. The jump from 42,500 is the two `embeddings_gated` tools this
+# guard never used to measure, not new prose.
+SCHEMA_BUDGET_CHARS = 43_000
 
 
 def _scope(case_id: str = "c1", timeline_id: str = "t1") -> AgentScope:
@@ -244,9 +249,23 @@ async def test_slimming_preserves_callability(store):
         assert "title" in by_name["propose_finding"].inputSchema["properties"]
 
 
-async def test_total_schema_budget(store):
+async def test_total_schema_budget(store, monkeypatch):
+    """The serialized tool list, measured over *every* tool that can be advertised.
+
+    Embeddings are forced available rather than left to the environment. The
+    two `embeddings_gated` tools are absent wherever the extra is not installed
+    and the API base URL is unset, so this guard used to measure 31 tools on a
+    developer's machine and 33 in CI — 513 chars apart. It therefore protected
+    a smaller set than it named, passed locally on a branch that overflowed,
+    and could only fail after the push. Every figure recorded in
+    `docs/AGENT.md` up to 42,285 was measured the narrow way; the ceiling now
+    covers the full set, which is what the model is actually sent.
+    """
     await store.init_schema()
+    monkeypatch.setattr(agent_tools, "embeddings_available", lambda: True)
     tools = await _advertised(build_tool_server(_scope()))
+    gated = {t.name for t in agent_tools.TOOL_REGISTRY if t.embeddings_gated}
+    assert gated <= {t.name for t in tools}, "the gated tools must be in the measurement"
     total = sum(
         len(json.dumps({"name": t.name, "description": t.description, "schema": t.inputSchema}))
         for t in tools

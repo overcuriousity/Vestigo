@@ -109,6 +109,18 @@ export function MarksEditor({ caseId, timelineId, marks, onChange, fields, resol
   // Confirmed findings resolve as soon as the list arrives: one mark over
   // every confirmed event id, or a notice when there is nothing to mark.
   const confirmedData = adding === "confirmed" ? confirmed.data : undefined;
+  // A rejected lookup used to end the interaction wordlessly: `isLoading` goes
+  // false, the effect below early-returns on the absent data, and `adding`
+  // stays "confirmed" — leaving the analyst unable to tell a failed request
+  // from a timeline with no confirmed findings, which *is* reported. Same
+  // shape as the empty case: say what happened and clear the picker.
+  const confirmedError = adding === "confirmed" ? confirmed.error : undefined;
+  useEffect(() => {
+    if (!confirmedError) return;
+    setNotice("Could not load confirmed findings — the request failed.");
+    reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [confirmedError]);
   useEffect(() => {
     if (!confirmedData) return;
     const ids = [

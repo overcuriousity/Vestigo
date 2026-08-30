@@ -142,3 +142,84 @@ def test_compare_terms_counts_both_layers_on_the_primary_edges(service) -> None:
     assert {v["value"] for v in result["values"]} == {"< 1,024", "≥ 1,024"}
     assert all(v["primary"] == v["comparison"] for v in result["values"])
     assert result["derive"]["labels"] == ["< 1,024", "≥ 1,024"]
+
+
+_SENTINEL_SRC = "src-derive-undated"
+
+
+@pytest.fixture(scope="module")
+def sentinel_service():
+    """A corpus of dated + undated events under its own source.
+
+    Kept off the module corpus so the counts every other test asserts stay
+    put; `_query()` scopes to `SRC`, so this source is invisible to them.
+    """
+    store = ClickHouseStore()
+    store.init_schema()
+    events = [
+        _event(200, "2026-07-20T08:00:00+00:00", {"host": "h9"}),
+        _event(201, "2026-07-20T08:30:00+00:00", {"host": "h9"}),
+        _event(202, None, {"host": "h9"}),
+        _event(203, None, {"host": "h9"}),
+    ]
+    for event in events:
+        event.source_id = _SENTINEL_SRC
+    store.insert_events(events)
+    svc = EventQueryService(store=store)
+    yield svc
+    store.delete_source_events(CASE_ID, _SENTINEL_SRC)
+
+
+def _sentinel_query(**kw) -> EventQuery:
+    return EventQuery(case_id=CASE_ID, source_ids=[_SENTINEL_SRC], **kw)
+
+
+def test_time_part_over_the_timestamp_column_blanks_undated_events(sentinel_service) -> None:
+    """Deriving a calendar part from `timestamp` must answer as `time:` does (#332).
+
+    An undated event carries the year-2299 null sentinel, which
+    `parseDateTimeBestEffortOrNull` parses perfectly well — so every undated
+    event used to pile into hour 23, and a derived chart disagreed with the
+    equivalent `time:hour_of_day` chart. That is the exact disagreement the
+    module exists to prevent.
+    """
+    derived = sentinel_service.field_terms(
+        _sentinel_query(), "timestamp", 50, derive=DeriveSpec(kind="time_part", part="hour")
+    )
+    direct = sentinel_service.field_terms(_sentinel_query(), "time:hour_of_day", 50)
+    assert _counts(derived) == {"08": 2}
+    assert _counts(derived) == _counts(direct)
+    assert "23" not in _counts(derived)
+
+
+def test_time_part_over_the_timestamp_column_applies_the_clock_offset(sentinel_service) -> None:
+    """`time_part_expr` read the raw column; a `time:` field reads the corrected one."""
+    offsets = {_SENTINEL_SRC: 7200}
+    derived = sentinel_service.field_terms(
+        _sentinel_query(source_offsets=offsets),
+        "timestamp",
+        50,
+        derive=DeriveSpec(kind="time_part", part="hour"),
+    )
+    direct = sentinel_service.field_terms(
+        _sentinel_query(source_offsets=offsets), "time:hour_of_day", 50
+    )
+    assert _counts(derived) == {"10": 2}
+    assert _counts(derived) == _counts(direct)
+
+
+def test_time_part_over_an_attribute_still_ignores_the_events_sentinel(sentinel_service) -> None:
+    """The guard is scoped to the timestamp column on purpose.
+
+    The sentinel predicate names the `timestamp` column, so applying it to an
+    attribute holding a timestamp would blank a value the attribute genuinely
+    carries merely because the event around it is undated.
+    """
+    store = sentinel_service.store
+    extra = _event(204, None, {"host": "h9", "logon_at": "2026-07-20T05:00:00Z"})
+    extra.source_id = _SENTINEL_SRC
+    store.insert_events([extra])
+    result = sentinel_service.field_terms(
+        _sentinel_query(), "attr:logon_at", 50, derive=DeriveSpec(kind="time_part", part="hour")
+    )
+    assert _counts(result) == {"05": 1}

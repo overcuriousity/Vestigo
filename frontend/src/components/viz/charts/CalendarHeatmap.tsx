@@ -105,6 +105,13 @@ export function CalendarHeatmap({ data, svgRef }: CalendarHeatmapProps) {
                   </text>,
                 );
               }
+              // The grid runs to the Sunday of `data.end`'s week, so its last
+              // column can hold up to six days the query never covered. Drawn
+              // as cells they were outlined exactly like a genuine zero day —
+              // the figure asserting "nothing happened" for days it was never
+              // asked about. Leave them blank. Placed after the month label so
+              // the axis is unaffected either way.
+              if (day.getTime() > endDay.getTime()) continue;
               cells.push(
                 <rect
                   key={date}

@@ -112,7 +112,9 @@ def test_field_optional_charts_are_exactly_cumulative_and_calendar() -> None:
 def test_cumulative_row_is_a_marked_time_figure_without_compare() -> None:
     meta = CHART_META["cumulative"]
     assert meta.data_kind == "cumulative"
-    assert meta.scales == ("nominal", "ordinal", "interval", "ratio")
+    # No `interval`: a running total needs the true zero that separates ratio
+    # from interval, and every quantity refused the scale anyway (#332).
+    assert meta.scales == ("nominal", "ordinal", "ratio")
     assert meta.inputs == {"field": "optional"}
     assert meta.derives == ()
     assert set(meta.reads_options) == {"buckets", "quantity"}

@@ -285,6 +285,18 @@ async def execute_chart_spec(
     )
     if lane_inputs and chart_type != "lanes":
         raise ValueError('inputs.pairing / start_filter / end_filter are chart_type="lanes" only.')
+    # Before the per-figure rules below, not after: those are stated in terms
+    # of the scale ("quantity=\"sum\" needs scale=\"ratio\""), so on a scale the
+    # figure does not admit at all they send the model round a loop of
+    # refusals that cannot be satisfied — which is exactly what cumulative at
+    # scale="interval" did. Naming the illegal scale once ends it.
+    if scale not in meta.scales:
+        raise ValueError(
+            f'chart_type="{chart_type}" requires scale in '
+            f"{{{', '.join(chr(34) + s + chr(34) for s in meta.scales)}}}, "
+            f'got "{scale}". Chart types legal for scale="{scale}": '
+            f"{', '.join(chart_types_for(scale))}."
+        )
     pairing: str | None = None
     if data_kind == "lanes":
         pairing = (spec.inputs.pairing if spec.inputs else None) or "first_last"
@@ -325,13 +337,6 @@ async def execute_chart_spec(
         raise ValueError(
             f"{spec.field}: a calendar part is always present — a calendar over it counts "
             "every event; omit field."
-        )
-    if scale not in meta.scales:
-        raise ValueError(
-            f'chart_type="{chart_type}" requires scale in '
-            f"{{{', '.join(chr(34) + s + chr(34) for s in meta.scales)}}}, "
-            f'got "{scale}". Chart types legal for scale="{scale}": '
-            f"{', '.join(chart_types_for(scale))}."
         )
 
     if requires_field(chart_type) and not meta.multi_field and not spec.field:

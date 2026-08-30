@@ -7,6 +7,7 @@ import {
   DEFAULT_CHART_CONFIG,
   paramsToChartConfig,
   parseStoredChartConfig,
+  parseDeriveSpec,
   normalizeChartConfig,
   parseStoredChartFilters,
   unrepresentableFilterMembers,
@@ -468,5 +469,32 @@ describe("normalizeChartConfig", () => {
       derive: { kind: "bins", mode: "log", count: 8 },
     };
     expect(normalizeChartConfig(kept)).toBe(kept);
+  });
+});
+
+describe("parseDeriveSpec — gates what the server accepts", () => {
+  it("refuses a bin count outside the server's 2..50", () => {
+    // The rail's own controls clamp, so the URL and stored paths are the ones
+    // this function gates. Admitting `count: 1` produced a 422 and a
+    // permanently blank chart with nothing on screen to explain it (#332).
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 1 })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 51 })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 2 })).toEqual({
+      kind: "bins",
+      mode: "width",
+      count: 2,
+    });
+  });
+
+  it("refuses edges that are not strictly increasing, or too many of them", () => {
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [10, 5] })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [5, 5] })).toBeNull();
+    const tooMany = Array.from({ length: 50 }, (_, i) => i);
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: tooMany })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [1, 2, 3] })).toEqual({
+      kind: "bins",
+      mode: "custom",
+      edges: [1, 2, 3],
+    });
   });
 });

@@ -1202,6 +1202,44 @@ async def test_viz_marks_rejects_a_malformed_mark_and_an_unknown_baseline(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark",
+    [
+        # `_filter_payload_to_spec` reads the body structurally before pydantic
+        # ever sees it: `datetime.fromisoformat` on a bad start is a ValueError,
+        # `.items()` on a string `filters` is an AttributeError, and on a number
+        # a TypeError. `marks` is an unvalidated `list[dict[str, Any]]`, so all
+        # three were reachable — and escaped as 500s (#332).
+        {"kind": "events", "filters": {"start": "not-a-date"}},
+        {"kind": "events", "filters": {"filters": "abc"}},
+        {"kind": "events", "filters": {"filters": 7}},
+        {"kind": "events", "filters": "abc"},
+    ],
+)
+async def test_viz_marks_answers_422_for_a_structurally_malformed_filter(monkeypatch, mark):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as exc:
+        await viz.resolve_viz_marks(
+            "c1", "t1", viz.MarksRequest(marks=[mark]), case=None, user=user
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_viz_cumulative_resolves_quantity_and_passes_field_and_buckets(monkeypatch):
     svc = _patch_agg(monkeypatch)
     result = await viz.get_cumulative(

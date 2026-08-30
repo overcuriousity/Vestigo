@@ -138,3 +138,42 @@ describe("markCaptionLines", () => {
     expect(disclosed).toHaveLength(2);
   });
 });
+
+describe("layoutMarks — degenerate ranges", () => {
+  const zeroLength: ResolvedMark[] = [
+    {
+      kind: "range",
+      start: "2026-07-20T03:00:00+00:00",
+      end: "2026-07-20T03:00:00+00:00",
+      label: "instant window",
+      source: 0,
+      provenance: { kind: "analyst" },
+    },
+  ];
+
+  it("draws a zero-length range inside the domain rather than dropping it", () => {
+    // `x1 > x0` used to drop it while `outsideDomain` still called it drawn —
+    // only a range *fully* outside the domain is reported off-axis — so the
+    // caption described a band that was not on the canvas (#332).
+    const layout = layoutMarks(zeroLength, x, 24);
+    expect(layout.ranges).toHaveLength(1);
+    const [band] = layout.ranges;
+    expect(band.x0).toBe(3);
+    expect(band.x1).toBeGreaterThan(band.x0);
+  });
+
+  it("still drops a range that starts past the right edge", () => {
+    // That one `outsideDomain` does report, so the caption stays honest.
+    const offEdge: ResolvedMark[] = [
+      {
+        kind: "range",
+        start: "2026-07-20T30:00:00+00:00",
+        end: "2026-07-20T30:00:00+00:00",
+        label: "past the axis",
+        source: 0,
+        provenance: { kind: "analyst" },
+      },
+    ];
+    expect(layoutMarks(offEdge, x, 24).ranges).toHaveLength(0);
+  });
+});

@@ -212,3 +212,43 @@ async def test_unknown_references_are_refused_by_index(mark, needle):
         await resolve_marks(
             _scope(), [_mark(**mark)], service=_FakeService(), store=_FakeStore(), cap=5, run=_run
         )
+
+
+async def test_a_baseline_marks_label_overrides_the_definitions_name():
+    """`label` is accepted on every kind and was discarded on this one (#332).
+
+    The schema documents it as "optional otherwise" and the `view` branch
+    honours `mark.label or view.name`; the baseline branch hardcoded the
+    definition's name, so an analyst naming the definition "W-3" and the mark
+    "the exfil window" got "W-3" on the canvas with no word about it.
+    """
+    result = await resolve_marks(
+        _scope(),
+        [_mark(kind="baseline", definition_id="bd1", label="the exfil window")],
+        service=_FakeService(),
+        store=_FakeStore(),
+        cap=50,
+        run=_run,
+    )
+    assert [m["label"] for m in result["marks"]] == [
+        "the exfil window — baseline",
+        "the exfil window — Exfil day",
+    ]
+    assert [s["label"] for s in result["sources"]] == ["the exfil window"]
+    # Provenance still names the definition, so the label never hides the source.
+    assert all(m["provenance"]["definition_id"] == "bd1" for m in result["marks"])
+
+
+async def test_a_baseline_without_a_label_still_uses_the_definitions_name():
+    result = await resolve_marks(
+        _scope(),
+        [_mark(kind="baseline", definition_id="bd1")],
+        service=_FakeService(),
+        store=_FakeStore(),
+        cap=50,
+        run=_run,
+    )
+    assert [m["label"] for m in result["marks"]] == [
+        "Quiet week — baseline",
+        "Quiet week — Exfil day",
+    ]

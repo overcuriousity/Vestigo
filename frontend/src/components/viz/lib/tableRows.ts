@@ -101,7 +101,11 @@ export function tableRowModels(
   return rows;
 }
 
-const csvCell = (s: string) => (/[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+// A lone CR needs quoting as much as LF does: it is routine in a field taken
+// from a Windows-sourced log, and RFC-4180 parsers (Excel among them) treat a
+// bare CR as a record terminator — the row splits and every following column
+// shifts, which is a silently corrupted export of forensic data.
+const csvCell = (s: string) => (/[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
 
 /** Raw values (a share is `0.4545…`, not `45.5%`), so the file computes. */
 export function tableCsv(
@@ -124,7 +128,10 @@ export function tableCsv(
         return r.distinct_second == null ? "" : String(r.distinct_second);
     }
   };
-  const lines = captionLines.map((l) => `# ${l}`);
+  // Escaped like every other cell: a caption line routinely carries commas
+  // ("showing top 10 of 1,234 distinct values"), and an unescaped one parses
+  // as several fields — a comment row that is not even a comment row.
+  const lines = captionLines.map((l) => csvCell(`# ${l}`));
   lines.push(["value", ...columns].map(csvCell).join(","));
   for (const r of data.rows)
     lines.push([r.value, ...columns.map((c) => raw(r, c))].map(csvCell).join(","));

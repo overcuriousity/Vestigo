@@ -236,7 +236,7 @@ export const CHART_META: Record<
   cumulative: {
     label: "Cumulative step (running total over time)",
     question: "How did the total grow — steadily, in bursts, or all at once — and when?",
-    scales: ["nominal", "ordinal", "interval", "ratio"],
+    scales: ["nominal", "ordinal", "ratio"],
     dataKind: "cumulative",
     defaultScale: "nominal",
     inputs: { field: "optional" },

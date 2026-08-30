@@ -239,3 +239,26 @@ describe("resolveChartOptions — options that outlive their precondition", () =
     expect(resolveChartOptions({ ...stored, fieldY: null }).tableSortBy).toBe("count");
   });
 });
+
+describe("resolveChartOptions — untrusted highlight", () => {
+  it("coerces a non-array highlight rather than letting the caption throw", () => {
+    // `c_opts` is JSON.parsed, unvalidated URL data. A string made `.length`
+    // truthy and `.join` undefined, so `buildCaptionLines` threw and the page
+    // went blank instead of degrading (#332).
+    const config = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      options: { highlight: "admin" as unknown as string[] },
+    };
+    expect(resolveChartOptions(config).highlight).toEqual([]);
+  });
+
+  it("keeps only the string members of a mixed array", () => {
+    const config = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      options: { highlight: ["admin", 7, null, "root"] as unknown as string[] },
+    };
+    expect(resolveChartOptions(config).highlight).toEqual(["admin", "root"]);
+  });
+});

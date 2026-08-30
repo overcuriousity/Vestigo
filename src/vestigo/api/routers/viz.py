@@ -1078,9 +1078,16 @@ async def resolve_viz_marks(
     from vestigo.agent.tools import AgentScope, ChartMarkSpec, FilterSpec
     from vestigo.stories.export import _stored_marks_to_spec
 
+    # `marks` is an unvalidated `list[dict[str, Any]]`, and `_stored_marks_to_spec`
+    # reads it structurally before pydantic ever sees it: `_filter_payload_to_spec`
+    # calls `datetime.fromisoformat` on `start`/`end` (a `ValueError` on
+    # "not-a-date") and `.items()` on `filters` (an `AttributeError` when it is a
+    # string, a `TypeError` when it is a number). All four are the client sending
+    # a malformed body, which is a 422 — only a bare `ValidationError` catch let
+    # them escape as a 500.
     try:
         specs = [ChartMarkSpec.model_validate(m) for m in (_stored_marks_to_spec(body.marks) or [])]
-    except ValidationError as exc:
+    except (ValueError, TypeError, AttributeError) as exc:  # ValidationError is a ValueError
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     scope = AgentScope(

@@ -3399,6 +3399,10 @@ def test_field_terms_with_bins_runs_a_range_preflight_then_groups_by_the_multi_i
         "mode": "width",
         "labels": ["< 50", "≥ 50"],
         "edges": [50.0],
+        # The caption prints these rather than rounding the floats itself, so
+        # the sentence naming a boundary and the axis naming the bins either
+        # side of it are the same text.
+        "edge_labels": ["50"],
         "negative_bin": False,
     }
 

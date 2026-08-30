@@ -26,15 +26,30 @@ const data: CalendarResponse = {
 };
 
 describe("CalendarHeatmap", () => {
-  it("draws every day of every shown week, empty days visibly empty", () => {
+  it("draws every covered day, empty days visibly empty", () => {
     const { container } = render(<CalendarHeatmap data={data} />);
     const cells = container.querySelectorAll("rect[data-cal-day]");
-    expect(cells).toHaveLength(14); // two full weeks, Monday through Sunday
+    // 2026-07-13 (Mon) through 2026-07-22 (Wed) inclusive — the covered span,
+    // not the 14 cells of the two-column grid it is drawn on.
+    expect(cells).toHaveLength(10);
     const busy = container.querySelector('rect[data-date="2026-07-20"]')!;
     const quiet = container.querySelector('rect[data-date="2026-07-15"]')!;
     expect(busy.getAttribute("fill")).not.toBe("none");
     expect(quiet.getAttribute("fill")).toBe("none");
     expect(quiet.getAttribute("stroke")).toBeTruthy();
+  });
+
+  it("leaves days past the data's end blank rather than drawing them as zero", () => {
+    // The grid runs to the Sunday of `end`'s week, so 07-23…07-26 are days the
+    // query never covered. Drawn as outlined cells they were indistinguishable
+    // from a genuine zero day — the figure asserting "nothing happened" for
+    // days it was never asked about (#332).
+    const { container } = render(<CalendarHeatmap data={data} />);
+    for (const date of ["2026-07-23", "2026-07-24", "2026-07-25", "2026-07-26"]) {
+      expect(container.querySelector(`rect[data-date="${date}"]`)).toBeNull();
+    }
+    // The last covered day is still drawn.
+    expect(container.querySelector('rect[data-date="2026-07-22"]')).not.toBeNull();
   });
 
   it("places weeks in columns and weekdays in rows", () => {

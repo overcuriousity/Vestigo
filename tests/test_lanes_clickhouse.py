@@ -191,3 +191,32 @@ def test_next_end_carries_a_start_layer_external_id_list(service):
     )
     assert result["starts"] == 4 and result["ends"] == 3
     assert [lane["key"] for lane in result["lanes"]] == ["h2", "h1"]
+
+
+def test_next_end_survives_a_source_clock_offset(service):
+    """A clock offset must not collide the two layers' fixed parameters (#332).
+
+    ``param_prefix`` renames the generated ``p0..pN`` so the primary, start and
+    end clauses can share one statement, but deliberately leaves the fixed
+    names alone — so ``bind_offset_params`` binds ``clk_off_src``/
+    ``clk_off_val`` into *both* layers whenever an in-scope source carries an
+    offset. Splatting the two dicts as keywords was a hard ``TypeError`` on
+    that duplicate; every other lanes test has no offsets and stayed green.
+    """
+    off = {SRC: 3600}
+    result = service.field_lanes(
+        _q(source_offsets=off),
+        "attr:host",
+        pairing="next_end",
+        start=_q(field_filters={"attr:kind": ["logon"]}, source_offsets=off),
+        end=_q(field_filters={"attr:kind": ["logoff"]}, source_offsets=off),
+        limit_y=10,
+    )
+    # Same pairing as the un-offset case, every bar shifted by the offset —
+    # proof the arrays were bound and applied, not merely accepted.
+    lanes = _by_key(result)
+    assert [(i["start"], i["end"]) for i in lanes["h1"]["intervals"]] == [
+        (_t(10), _t(11)),
+        (_t(12), None),
+    ]
+    assert result["starts"] == 4 and result["ends"] == 3

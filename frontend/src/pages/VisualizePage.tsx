@@ -442,12 +442,20 @@ export function VisualizePage() {
 
   // Default to the first field once the list loads — the backend sorts by
   // coverage descending, so this is the highest-coverage field.
+  //
+  // Never for a field-optional figure. Fieldless is a legal, meaningful state
+  // for Cumulative and Calendar — "count every event", which is what
+  // `resolveChartOptions` clamps `quantity` to — and the rail renders it as
+  // its own selection (`NO_FIELD`). Defaulting here reverted that pick on the
+  // very next render, and not cosmetically: with a field set, `/viz/calendar`
+  // counts only events whose field is non-empty and the quantity flips back to
+  // sum/distinct, so the analyst gets a filtered chart they did not ask for.
   useEffect(() => {
-    if (chartRefLive) return;
+    if (chartRefLive || fieldOptional) return;
     if (field == null && fieldsQuery.data?.fields.length) {
       updateConfig({ field: fieldsQuery.data.fields[0].token });
     }
-  }, [field, fieldsQuery.data, updateConfig, chartRefLive]);
+  }, [field, fieldsQuery.data, updateConfig, chartRefLive, fieldOptional]);
 
   // Probe numeric-ness only when actually needed: once per field change (to
   // auto-suggest a scale) and while a numeric chart type is displayed (as its
@@ -528,16 +536,48 @@ export function VisualizePage() {
     // field's one-shot suggestion is spent", not "we fetched something".
     autoProbedField.current = field;
     if (fieldFree || requiresSecondField || multiField) return;
-    const scale = TIME_FIELDS[field].scale;
-    const nextType = defaultChartTypeForScale(scale, field);
-    updateConfig({ scale, chartType: nextType });
+    // `nextScale`, not `scale`: the outer `scale` is the config's current one,
+    // which the guard below compares against — as the numeric probe does.
+    const nextScale = TIME_FIELDS[field].scale;
+    const label = fieldTokenLabel(field);
+    // The same rule the numeric probe below states and this effect used to
+    // ignore: the figures that take a field as a lane key, a ranked value, a
+    // running quantity or a table were chosen *before* the field, so a scale
+    // suggestion may move the treat-as where the figure admits it but never
+    // re-picks the figure. Without this, `?c_type=cumulative` plus a pick of
+    // `time:hour_of_day` silently became a bar chart.
+    if (
+      fieldOptional ||
+      dataKind === "lanes" ||
+      dataKind === "change" ||
+      chartType === "table"
+    ) {
+      if (nextScale === scale) return;
+      if (!CHART_META[chartType].scales.includes(nextScale)) {
+        setAutoNotice(
+          `${label} is a time field — ${CHART_META[chartType].label} charts it as ${SCALE_DISPLAY[scale].label.toLowerCase()}.`,
+        );
+        return;
+      }
+      updateConfig({ scale: nextScale });
+      setAutoNotice(
+        `${label} is a time field — treating it as ${SCALE_DISPLAY[nextScale].label.toLowerCase()}.`,
+      );
+      return;
+    }
+    const nextType = defaultChartTypeForScale(nextScale, field);
+    updateConfig({ scale: nextScale, chartType: nextType });
     setAutoNotice(
-      `${fieldTokenLabel(field)} is a time field — treating it as ${SCALE_DISPLAY[scale].label.toLowerCase()}; figure set to ${CHART_META[nextType].label}.`,
+      `${label} is a time field — treating it as ${SCALE_DISPLAY[nextScale].label.toLowerCase()}; figure set to ${CHART_META[nextType].label}.`,
     );
   }, [
     field,
     fieldIsTime,
     fieldFree,
+    fieldOptional,
+    dataKind,
+    chartType,
+    scale,
     requiresSecondField,
     multiField,
     updateConfig,
@@ -1653,12 +1693,17 @@ export function VisualizePage() {
       {pendingClick && caseId && timelineId && (
         <ChartActionPopover
           click={pendingClick}
+          // `urlFilters`, not `filters`: the latter carries the live
+          // `collapseRoutine` this page derives from dispositions, which the
+          // URL never carried and `takeOver` therefore reports as a narrowing
+          // the edit dropped. Every other call site passes `urlFilters` for
+          // exactly this reason — see the take-over comment above.
           explorerHref={`/cases/${caseId}/timelines/${timelineId}?${filtersToParams(
-            applyFieldEntries(filters, pendingClick.entries, true),
+            applyFieldEntries(urlFilters, pendingClick.entries, true),
           ).toString()}`}
           onFilter={(include) => {
             updateFilters(
-              applyFieldEntries(filters, pendingClick.entries, include),
+              applyFieldEntries(urlFilters, pendingClick.entries, include),
             );
             setPendingClick(null);
           }}

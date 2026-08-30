@@ -334,7 +334,15 @@ CHART_META: dict[ChartType, ChartMeta] = {
     "cumulative": ChartMeta(
         label="Cumulative step (running total over time)",
         question="How did the total grow — steadily, in bursts, or all at once — and when?",
-        scales=("nominal", "ordinal", "interval", "ratio"),
+        # No `interval`: a running total needs a true zero to accumulate
+        # towards, which is what separates ratio from interval — a running sum
+        # of temperatures or of calendar years totals nothing. The scale was
+        # advertised and unreachable in every quantity anyway: `sum` demands
+        # ratio, `distinct` demands nominal/ordinal, and `events` ignores the
+        # field, so an interval measure had no way through `chart_exec`.
+        # Accumulating the *event count* over an interval-scaled field is
+        # already `quantity="events"`, which takes no field at all.
+        scales=("nominal", "ordinal", "ratio"),
         data_kind="cumulative",
         default_scale="nominal",
         inputs={"field": "optional"},

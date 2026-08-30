@@ -95,12 +95,18 @@ async def resolve_marks(
                     f'marks[{index}]: baseline definition "{mark.definition_id}" not found in '
                     "this timeline. list_baselines names the ones that exist."
                 )
+            # `label` is optional on every kind but instant/range, and the view
+            # branch below honours `mark.label or view.name`. The baseline
+            # branch used to hardcode the definition's name, silently dropping
+            # a label the schema accepts — so an analyst naming a definition
+            # "W-3" and the mark "the exfil window" got "W-3" on the canvas.
+            base_label = mark.label or definition.name
             windows = [
                 {
                     "kind": "range",
                     "start": _iso(definition.baseline_start),
                     "end": _iso(definition.baseline_end),
-                    "label": f"{definition.name} — baseline",
+                    "label": f"{base_label} — baseline",
                     "source": index,
                     "provenance": {
                         "kind": "baseline",
@@ -115,7 +121,7 @@ async def resolve_marks(
                         "kind": "range",
                         "start": _iso(window.get("start")),
                         "end": _iso(window.get("end")),
-                        "label": f"{definition.name} — {window.get('label', '')}",
+                        "label": f"{base_label} — {window.get('label', '')}",
                         "source": index,
                         "provenance": {
                             "kind": "baseline",
@@ -125,7 +131,7 @@ async def resolve_marks(
                     }
                 )
             out.extend(windows)
-            sources.append(_source(index, "baseline", definition.name, len(windows), len(windows)))
+            sources.append(_source(index, "baseline", base_label, len(windows), len(windows)))
         else:  # "events" or "view": a filter becomes instants
             if mark.kind == "view":
                 view = await store.get_view(scope.case_id, mark.view_id)

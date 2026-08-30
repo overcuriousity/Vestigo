@@ -3286,6 +3286,25 @@ async def test_cumulative_resolves_the_quantity_from_field_and_scale(store, monk
             {"chart_type": "calendar", "field": "time:hour_of_day"},
             "a calendar part is always present",
         ),
+        # `interval` was advertised by CHART_META and reachable by no quantity:
+        # `sum` demanded ratio, `distinct` demanded nominal/ordinal, `events`
+        # discarded the field, so the refusals cycled (#332). The scale is off
+        # the figure — a running total needs the true zero ratio has — and the
+        # scale check now precedes the per-figure rules, so the message names
+        # the scale instead of sending the model back round the quantities.
+        (
+            {"chart_type": "cumulative", "field": "bytes", "scale": "interval"},
+            'requires scale in {"nominal", "ordinal", "ratio"}',
+        ),
+        (
+            {
+                "chart_type": "cumulative",
+                "field": "bytes",
+                "scale": "interval",
+                "options": {"quantity": "distinct"},
+            },
+            'requires scale in {"nominal", "ordinal", "ratio"}',
+        ),
     ],
 )
 async def test_cumulative_and_calendar_refusals(store, monkeypatch, spec, needle):

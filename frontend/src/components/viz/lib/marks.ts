@@ -29,6 +29,9 @@ export function numberInstants(marks: ResolvedMark[]): NumberedInstant[] {
 /** Instants closer than this (px) alternate their label tier. */
 export const LABEL_CROWD_PX = 48;
 
+/** Narrowest a range band is ever drawn, so a zero-length one is still visible. */
+const MIN_RANGE_PX = 2;
+
 export interface InstantLayout extends NumberedInstant {
   px: number;
   tier: 0 | 1;
@@ -77,11 +80,21 @@ export function layoutMarks(
   for (const mark of sorted) {
     const x0 = Math.max(0, x(new Date(mark.start)));
     const x1 = Math.min(innerWidth, x(new Date(mark.end)));
-    if (!(x1 > x0)) continue;
-    let tier = tierEnds.findIndex((end) => end <= x0);
+    if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 < x0) continue;
+    // A zero-length range — or one whose whole span is sub-pixel at this
+    // width — used to be dropped by `x1 > x0` while `outsideDomain` still
+    // called it drawn (it only reports a range fully outside the domain), so
+    // the caption described a band that was not on the canvas. Give it the
+    // minimum width instead: the band is real, and one pixel is a smaller lie
+    // about its extent than not drawing it at all.
+    const end = Math.min(innerWidth, Math.max(x1, x0 + MIN_RANGE_PX));
+    // Only a range starting at the very right edge survives that clamp with
+    // no width — and `outsideDomain` already reports it as off-axis.
+    if (end <= x0) continue;
+    let tier = tierEnds.findIndex((e) => e <= x0);
     if (tier === -1) tier = tierEnds.length;
-    tierEnds[tier] = x1;
-    ranges.push({ mark, x0, x1, tier });
+    tierEnds[tier] = end;
+    ranges.push({ mark, x0, x1: end, tier });
   }
   return { instants, ranges, offscreen };
 }
