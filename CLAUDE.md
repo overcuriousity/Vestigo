@@ -31,6 +31,9 @@ trail (`api/routers/auth.py`, `admin.py`, `deps.py`).
   baseline/disposition model. Update alongside any detector change in the same commit.
 - `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
   config incl. Kimi coding plan). Update alongside any `src/vestigo/agent/` change.
+- `VISUALIZE.md` — the Visualize page: figure registry, `ChartConfig`, the rail, figures and
+  marks. Update alongside any `components/viz/`, `api/routers/viz.py` or
+  `agent/chart_meta.py` change.
 - `STORIES.md` — the Stories subsystem (block model, collaboration and export semantics,
   snapshot format, agent parity). Update alongside any `src/vestigo/stories/` change.
 - `DEPLOYMENT.md` — operator guide: reference compose stack, containerized app, airgapped

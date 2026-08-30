@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from vestigo.db.postgres import User, View
 from vestigo.db.queries import EventPage
 from vestigo.stories.export import _view_filter_to_spec, resolve_story_snapshot
@@ -380,6 +382,40 @@ def test_stored_chart_config_translates_to_spec():
     assert spec.compare.filters.q == "ssh"
 
 
+def test_stored_chart_drops_controls_the_figure_cannot_honour():
+    """A saved chart resolves as the figure it was saved as.
+
+    `ChartInputs` and `marks` are deliberately carried across a figure switch
+    on the Visualize page, so a chart could be saved as a bar chart with lane
+    inputs and marks still attached. ``execute_chart_spec`` refuses both by
+    name, so that chart drew on the page and then failed to resolve as a Story
+    block — naming a control the analyst could no longer see (#332). A spec
+    the agent writes by hand still gets that refusal, which is the right
+    answer there.
+    """
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    stored = {
+        "v": 2,
+        "chartType": "bar",
+        "scale": "nominal",
+        "field": "user",
+        "metric": "count",
+        "compare": {"mode": "off"},
+        "options": {},
+        "inputs": {"pairing": "nextEnd", "startFilter": {"q": "4624"}},
+        "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"}],
+    }
+    spec = _stored_chart_to_spec(stored)
+    assert spec.inputs is None or spec.inputs.pairing is None
+    assert not spec.marks
+
+    # The figure that declares them keeps every one.
+    lanes = _stored_chart_to_spec({**stored, "chartType": "lanes"})
+    assert lanes.inputs is not None and lanes.inputs.pairing == "next_end"
+    assert lanes.marks and lanes.marks[0].kind == "instant"
+
+
 def test_stored_chart_config_minimal_and_compare_off():
     from vestigo.stories.export import _stored_chart_to_spec
 
@@ -457,7 +493,7 @@ def test_chart_spec_and_stored_config_round_trip():
     ):
         spec = ChartSpec.model_validate(payload)
         config = spec_to_stored_chart_config(spec)
-        assert config["v"] == 1, config
+        assert config["v"] == 2, config
         assert _stored_chart_to_spec(config) == spec, config
 
 
@@ -697,3 +733,247 @@ async def test_terms_top_n_narrows_for_the_marks_bounded_by_legibility():
         result = await _run(mark)
         assert captured["top_n"] == 50, mark
         assert any("clamped to 50" in w for w in result["warnings"]), mark
+
+
+def test_spec_to_stored_chart_config_writes_the_current_version() -> None:
+    from vestigo.agent.tools import ChartSpec
+    from vestigo.stories.export import CHART_CONFIG_VERSION, spec_to_stored_chart_config
+
+    stored = spec_to_stored_chart_config(ChartSpec(chart_type="bar", field="artifact"))
+    assert stored["v"] == CHART_CONFIG_VERSION == 2
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("stored", "spec_kind"),
+    [
+        ({"kind": "bins", "mode": "log", "count": 8}, "bins"),
+        ({"kind": "bins", "mode": "custom", "edges": [0, 1024]}, "bins"),
+        ({"kind": "timePart", "part": "weekday"}, "time_part"),
+    ],
+)
+def test_derive_round_trips_between_stored_config_and_spec(stored, spec_kind) -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "bar",
+        "scale": "ordinal",
+        "field": "attr:bytes",
+        "options": {},
+        "derive": stored,
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.derive is not None and spec.derive.kind == spec_kind
+    back = spec_to_stored_chart_config(spec)
+    assert back["derive"] == stored
+
+
+def test_stored_config_without_derive_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "bar", "scale": "nominal", "field": "x", "options": {}}
+    )
+    assert spec.derive is None
+    assert "derive" not in spec_to_stored_chart_config(spec)
+
+
+def test_table_inputs_and_options_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "table",
+        "scale": "nominal",
+        "field": "attr:user",
+        "fieldY": "attr:host",
+        "options": {
+            "topN": 20,
+            "tableSortBy": "last_seen",
+            "tableSortDir": "asc",
+            "highlight": ["alice"],
+        },
+        "inputs": {"columns": ["count", "share", "distinct_second"]},
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.columns == ["count", "share", "distinct_second"]
+    assert spec.options.table_sort_by == "last_seen" and spec.options.highlight == ["alice"]
+    back = spec_to_stored_chart_config(spec)
+    assert back["inputs"] == {"columns": ["count", "share", "distinct_second"]}
+    assert back["options"] == config["options"]
+
+
+def test_stored_config_without_inputs_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "bar", "scale": "nominal", "field": "x", "options": {}}
+    )
+    assert spec.inputs is None
+    assert "inputs" not in spec_to_stored_chart_config(spec)
+
+
+def test_marks_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "time",
+        "scale": "interval",
+        "field": None,
+        "options": {},
+        "marks": [
+            {
+                "kind": "events",
+                "filters": {"tagsInclude": ["exfil"], "eventIds": ["e1"]},
+                "label": "tagged exfil",
+            },
+            {"kind": "baseline", "definitionId": "bd1"},
+            {"kind": "view", "viewId": "v1"},
+            {"kind": "instant", "at": "2026-03-13T09:41:00+00:00", "label": "first beacon"},
+            {
+                "kind": "range",
+                "start": "2026-03-13T09:00:00+00:00",
+                "end": "2026-03-13T10:00:00+00:00",
+                "label": "w",
+            },
+        ],
+    }
+    spec = _stored_chart_to_spec(config)
+    assert [m.kind for m in spec.marks] == ["events", "baseline", "view", "instant", "range"]
+    assert spec.marks[0].filters.tags_include == ["exfil"] and spec.marks[0].filters.event_ids == [
+        "e1"
+    ]
+    assert spec.marks[1].definition_id == "bd1" and spec.marks[2].view_id == "v1"
+    assert spec.marks[3].at.isoformat() == "2026-03-13T09:41:00+00:00"
+    back = spec_to_stored_chart_config(spec)
+    assert back["marks"] == config["marks"]
+
+
+def test_stored_config_without_marks_yields_none() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {"v": 2, "chartType": "time", "scale": "interval", "field": None, "options": {}}
+    )
+    assert spec.marks is None
+    assert "marks" not in spec_to_stored_chart_config(spec)
+
+
+async def test_chart_block_freezes_resolved_marks_beside_the_aggregation(store):
+    case, story, blocks = await _case_with_story(
+        store, [("chart_ref", {"chart_id": "ch1", "timeline_id": "t1"})]
+    )
+    await store.create_saved_chart(
+        case.id,
+        "t1",
+        "ch1",
+        "Beacons over time",
+        {
+            "v": 2,
+            "chartType": "time",
+            "scale": "interval",
+            "field": None,
+            "options": {},
+            "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00+00:00", "label": "first"}],
+        },
+    )
+
+    async def fake_chart(scope, spec):
+        assert spec.marks and spec.marks[0].kind == "instant"
+        return {
+            "ok": True,
+            "resolved": {"chart_type": "time"},
+            "warnings": [],
+            "summary": {},
+            "result": {"buckets": []},
+            "marks": {
+                "marks": [
+                    {
+                        "kind": "instant",
+                        "at": "2026-07-20T09:41:00+00:00",
+                        "label": "first",
+                        "source": 0,
+                        "provenance": {"kind": "analyst"},
+                    }
+                ],
+                "sources": [],
+                "cap": 50,
+            },
+        }
+
+    snapshot = await resolve_story_snapshot(
+        story,
+        blocks,
+        user=_user(),
+        store=store,
+        run_chart=fake_chart,
+        resolve_scope=lambda case_id, timeline_id: (["src1"], None, None),
+        now=lambda: FROZEN_NOW,
+    )
+    blk = snapshot["blocks"][0]
+    assert blk["data"]["marks"]["marks"][0]["label"] == "first"
+
+
+def test_lanes_inputs_round_trip_between_stored_config_and_spec() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "lanes",
+        "scale": "nominal",
+        "field": "attr:host",
+        "options": {"limitY": 12},
+        "inputs": {
+            "pairing": "nextEnd",
+            "startFilter": {"filters": {"attr:kind": ["logon"]}},
+            "endFilter": {"q": "logoff", "filters": {"attr:kind": ["logoff"]}},
+        },
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.pairing == "next_end"
+    assert spec.inputs.start_filter is not None
+    assert spec.inputs.start_filter.filters == {"attr:kind": ["logon"]}
+    assert spec.inputs.end_filter is not None and spec.inputs.end_filter.q == "logoff"
+    assert spec.options.limit_y == 12
+    back = spec_to_stored_chart_config(spec)
+    assert back["inputs"] == config["inputs"]
+    assert back["options"] == {"limitY": 12}
+
+
+def test_first_last_lanes_config_carries_only_the_pairing() -> None:
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    spec = _stored_chart_to_spec(
+        {
+            "v": 2,
+            "chartType": "lanes",
+            "scale": "nominal",
+            "field": "attr:host",
+            "inputs": {"pairing": "firstLast"},
+        }
+    )
+    assert spec.inputs is not None and spec.inputs.pairing == "first_last"
+    assert spec.inputs.start_filter is None and spec.inputs.end_filter is None
+    assert spec_to_stored_chart_config(spec)["inputs"] == {"pairing": "firstLast"}
+
+
+def test_an_empty_table_column_set_round_trips_through_the_spec() -> None:
+    """`columns: []` is the value-only table the page can produce — dropping
+    it re-instated every default column on export."""
+    from vestigo.stories.export import _stored_chart_to_spec, spec_to_stored_chart_config
+
+    config = {
+        "v": 2,
+        "chartType": "table",
+        "scale": "nominal",
+        "field": "artifact",
+        "options": {},
+        "inputs": {"columns": []},
+    }
+    spec = _stored_chart_to_spec(config)
+    assert spec.inputs is not None and spec.inputs.columns == []
+    assert spec_to_stored_chart_config(spec)["inputs"] == {"columns": []}

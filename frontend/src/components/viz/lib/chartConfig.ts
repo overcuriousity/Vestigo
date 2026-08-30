@@ -4,7 +4,7 @@
  * captions all derive from this one object, so what an analyst sees, saves,
  * shares, and exports is the same chart by construction.
  *
- * Versioned (`v: 1`): saved charts round-trip through Postgres and may be
+ * Versioned (`v: 2`): saved charts round-trip through Postgres and may be
  * loaded by a future frontend — bump the version on breaking shape changes
  * and handle old versions explicitly instead of silently misreading them.
  */
@@ -16,6 +16,7 @@ import {
   viewPayloadToFilters,
 } from "@/lib/queryParams";
 import type { Metric } from "./transforms";
+import { CHART_META } from "./chartMeta";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
 export type ChartType =
@@ -30,10 +31,15 @@ export type ChartType =
   | "violin"
   | "ecdf"
   | "punchcard"
+  | "cumulative"
+  | "calendar"
+  | "change"
+  | "lanes"
   | "pivot"
   | "sankey"
   | "scatter"
-  | "corr";
+  | "corr"
+  | "table";
 
 export type CompareSpec =
   | { mode: "off" }
@@ -52,6 +58,10 @@ export interface ChartOptions {
   /** Histogram: smoothed density (KDE) curve overlay. Default on. */
   showDensity?: boolean;
   buckets?: number;
+  /** cumulative: what accumulates — resolved from field/scale when omitted. */
+  quantity?: Quantity;
+  /** change: one row per value (dumbbell) or two columns (slope). Default dumbbell. */
+  layout?: "dumbbell" | "slope";
   /** pivot/sankey: per-axis top-N caps. */
   limitX?: number;
   limitY?: number;
@@ -61,10 +71,78 @@ export interface ChartOptions {
   groups?: number;
   /** box/violin: jittered raw-value strip overlay; line: point markers. */
   showPoints?: boolean;
+  /** table: row order and direction. Default count / desc. */
+  tableSortBy?: TableSortColumn;
+  tableSortDir?: "asc" | "desc";
+  /** table: values whose rows are highlighted — presentation only, captioned. */
+  highlight?: string[];
 }
 
+/** What a cumulative chart can accumulate. */
+export const QUANTITIES = ["events", "sum", "distinct"] as const;
+export type Quantity = (typeof QUANTITIES)[number];
+
+/** The quantity a cumulative chart accumulates when its config names none. */
+export function defaultQuantity(scale: Scale, field: string | null): Quantity {
+  if (field == null) return "events";
+  return scale === "ratio" ? "sum" : "distinct";
+}
+
+/**
+ * The stored quantity if this `(field, scale)` pair admits it, else undefined.
+ *
+ * The three preconditions are `chart_exec`'s, stated once here so the page and
+ * the executor cannot drift: only `"events"` counts without a field, a running
+ * sum is a sum of a *measure*, and distinct values of a measure are not a
+ * count of anything. The rail already disables the illegal items in the
+ * Quantity picker — but an option outlives the field and the treat-as that
+ * justified it, and the picker is not on screen for the figure the analyst is
+ * looking at when they change either. Left behind, it drew on the page (the
+ * `/viz/cumulative` endpoint knows no scale, so it never refused) while the
+ * same chart failed to resolve as a Story block or through the agent.
+ */
+export function legalQuantity(
+  value: unknown,
+  scale: Scale,
+  field: string | null,
+): Quantity | undefined {
+  if (!(QUANTITIES as readonly unknown[]).includes(value)) return undefined;
+  const quantity = value as Quantity;
+  if (quantity !== "events" && field == null) return undefined;
+  if (quantity === "sum" && scale !== "ratio") return undefined;
+  if (quantity === "distinct" && scale !== "nominal" && scale !== "ordinal") return undefined;
+  return quantity;
+}
+
+export type DeriveSpec =
+  | { kind: "bins"; mode: "width" | "log"; count: number }
+  | { kind: "bins"; mode: "custom"; edges: number[] }
+  | { kind: "timePart"; part: TimePart };
+export type TimePart = "hour" | "weekday" | "day" | "week" | "month";
+
+export type TableColumn = "count" | "share" | "first_seen" | "last_seen" | "distinct_second";
+export type TableSortColumn = "value" | TableColumn;
+
+/** Figure-specific inputs declared by the registry (`CHART_META[c].inputs`).
+ * Only the keys the current figure declares are meaningful; the rest are
+ * carried so switching figures and back loses nothing. */
+export interface ChartInputs {
+  startFilter?: EventFilters;
+  endFilter?: EventFilters;
+  pairing?: "nextEnd" | "firstLast";
+  columns?: TableColumn[];
+}
+
+/** A mark is a *source* resolved at render time — never a stored pixel. */
+export type MarkSource =
+  | { kind: "events"; filters: EventFilters; label?: string }
+  | { kind: "baseline"; definitionId: string }
+  | { kind: "view"; viewId: string }
+  | { kind: "instant"; at: string; label: string }
+  | { kind: "range"; start: string; end: string; label: string };
+
 export interface ChartConfig {
-  v: 1;
+  v: 2;
   /** Field token, or null for pure event-count charts ("time"/"punchcard"). */
   field: string | null;
   /** Second field token for two-field charts (pivot/sankey/scatter), or the
@@ -79,10 +157,14 @@ export interface ChartConfig {
   metric: Metric;
   compare: CompareSpec;
   options: ChartOptions;
+  /** Change of scale applied before aggregation, or null for the raw value. */
+  derive: DeriveSpec | null;
+  inputs: ChartInputs;
+  marks: MarkSource[];
 }
 
 export const DEFAULT_CHART_CONFIG: ChartConfig = {
-  v: 1,
+  v: 2,
   field: null,
   fieldY: null,
   fields: null,
@@ -94,6 +176,9 @@ export const DEFAULT_CHART_CONFIG: ChartConfig = {
   metric: "count",
   compare: { mode: "off" },
   options: {},
+  derive: null,
+  inputs: {},
+  marks: [],
 };
 
 const CHART_TYPES: ChartType[] = [
@@ -108,10 +193,15 @@ const CHART_TYPES: ChartType[] = [
   "violin",
   "ecdf",
   "punchcard",
+  "cumulative",
+  "calendar",
+  "change",
+  "lanes",
   "pivot",
   "sankey",
   "scatter",
   "corr",
+  "table",
 ];
 const SCALES: Scale[] = ["nominal", "ordinal", "interval", "ratio"];
 const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
@@ -132,6 +222,151 @@ const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
  * survive an edit that makes it untrue.
  */
 export const CHART_ID_PARAM = "c_chart";
+
+const DERIVE_MODES = ["width", "log"] as const;
+const TIME_PARTS: TimePart[] = ["hour", "weekday", "day", "week", "month"];
+const PAIRINGS = ["nextEnd", "firstLast"] as const;
+/** Also `chartOptions.ts`, which validates `tableSortBy` against these plus "value". */
+export const TABLE_COLUMNS: TableColumn[] = ["count", "share", "first_seen", "last_seen", "distinct_second"];
+
+const isRecord = (x: unknown): x is Record<string, unknown> =>
+  !!x && typeof x === "object" && !Array.isArray(x);
+// Mirrors `db/derive.py`'s `BINS_MIN`/`BINS_MAX` and its edge rules. This
+// function is the gate for the URL and stored paths — the rail's own controls
+// already clamp and validate — so anything it admits that the server refuses
+// is a 422 the analyst sees as a permanently blank chart with nothing on
+// screen to explain it, the exact failure `clampTopN` documents for `limit=0`.
+const BINS_MIN = 2;
+const BINS_MAX = 50;
+const isBinCount = (x: unknown): x is number =>
+  typeof x === "number" && Number.isInteger(x) && x >= BINS_MIN && x <= BINS_MAX;
+const isEdgeList = (x: unknown): x is number[] =>
+  Array.isArray(x) &&
+  x.length > 0 &&
+  x.length < BINS_MAX &&
+  x.every((e) => typeof e === "number" && Number.isFinite(e)) &&
+  x.every((e, i) => i === 0 || (x[i - 1] as number) < e);
+
+/** A `DeriveSpec` or null — a malformed one is *no* derivation, never a guess. */
+export function parseDeriveSpec(raw: unknown): DeriveSpec | null {
+  if (!isRecord(raw)) return null;
+  if (raw.kind === "bins") {
+    if (raw.mode === "custom") {
+      if (isEdgeList(raw.edges)) {
+        return { kind: "bins", mode: "custom", edges: [...raw.edges] };
+      }
+      return null;
+    }
+    if ((DERIVE_MODES as readonly unknown[]).includes(raw.mode) && isBinCount(raw.count)) {
+      return { kind: "bins", mode: raw.mode as "width" | "log", count: raw.count };
+    }
+    return null;
+  }
+  if (raw.kind === "timePart" && (TIME_PARTS as unknown[]).includes(raw.part)) {
+    return { kind: "timePart", part: raw.part as TimePart };
+  }
+  return null;
+}
+
+/** Field-by-field: a bad member is dropped, the good ones survive. */
+export function parseChartInputs(raw: unknown): ChartInputs {
+  const out: ChartInputs = {};
+  if (!isRecord(raw)) return out;
+  if (isRecord(raw.startFilter)) out.startFilter = viewPayloadToFilters(raw.startFilter);
+  if (isRecord(raw.endFilter)) out.endFilter = viewPayloadToFilters(raw.endFilter);
+  if ((PAIRINGS as readonly unknown[]).includes(raw.pairing)) {
+    out.pairing = raw.pairing as ChartInputs["pairing"];
+  }
+  if (Array.isArray(raw.columns)) {
+    // `[]` is the value-only table the rail's checkboxes can produce and the
+    // figure draws; dropping it here snapped every box back on after each edit.
+    out.columns = raw.columns.filter((c): c is TableColumn =>
+      TABLE_COLUMNS.includes(c as TableColumn),
+    );
+  }
+  return out;
+}
+
+/** Each mark is validated on its own; a malformed one is dropped. */
+export function parseMarkSources(raw: unknown): MarkSource[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MarkSource[] = [];
+  for (const m of raw) {
+    if (!isRecord(m)) continue;
+    const label = typeof m.label === "string" ? m.label : undefined;
+    switch (m.kind) {
+      case "events":
+        if (isRecord(m.filters)) {
+          const filters = viewPayloadToFilters(m.filters);
+          const ids = Array.isArray(m.filters.eventIds)
+            ? m.filters.eventIds.filter((v): v is string => typeof v === "string" && v !== "")
+            : [];
+          if (ids.length) filters.ids = ids;
+          out.push({ kind: "events", filters, ...(label !== undefined ? { label } : {}) });
+        }
+        break;
+      case "baseline":
+        if (typeof m.definitionId === "string" && m.definitionId) {
+          out.push({ kind: "baseline", definitionId: m.definitionId });
+        }
+        break;
+      case "view":
+        if (typeof m.viewId === "string" && m.viewId) out.push({ kind: "view", viewId: m.viewId });
+        break;
+      case "instant":
+        if (typeof m.at === "string" && m.at && label !== undefined) {
+          out.push({ kind: "instant", at: m.at, label });
+        }
+        break;
+      case "range":
+        if (
+          typeof m.start === "string" &&
+          m.start &&
+          typeof m.end === "string" &&
+          m.end &&
+          label !== undefined
+        ) {
+          out.push({ kind: "range", start: m.start, end: m.end, label });
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+/** Filters inside inputs/marks travel in the View payload shape, like `compare`. */
+function inputsToPayload(inputs: ChartInputs): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...inputs };
+  if (inputs.startFilter) out.startFilter = filtersToViewPayload(inputs.startFilter);
+  if (inputs.endFilter) out.endFilter = filtersToViewPayload(inputs.endFilter);
+  return out;
+}
+export function marksToPayload(marks: MarkSource[]): unknown[] {
+  return marks.map((m) =>
+    m.kind === "events"
+      ? {
+          ...m,
+          filters: {
+            ...filtersToViewPayload(m.filters),
+            // A mark's event ids are its provenance, so unlike the Explorer's
+            // session-only `ids` they travel with the chart.
+            ...(m.filters.ids?.length ? { eventIds: m.filters.ids } : {}),
+          },
+        }
+      : m,
+  );
+}
+
+/**
+ * Bring any stored/URL config object to the v2 key set. v1 lacked `derive`,
+ * `inputs` and `marks`; every other key kept its meaning, so the upgrade is
+ * lossless and a v2 object passes through untouched. Unknown versions are
+ * returned as-is for the caller to refuse.
+ */
+export function upgradeChartConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  if (raw.v === 1) return { ...raw, v: 2, derive: null, inputs: {}, marks: [] };
+  return raw;
+}
 
 /**
  * Write the chart-specific state into *params* under `c_*` keys, leaving the
@@ -163,6 +398,11 @@ export function chartConfigToParams(
   if (Object.keys(config.options).length > 0) {
     params.set("c_opts", JSON.stringify(config.options));
   }
+  if (config.derive) params.set("c_derive", JSON.stringify(config.derive));
+  if (Object.keys(config.inputs).length > 0) {
+    params.set("c_inputs", JSON.stringify(inputsToPayload(config.inputs)));
+  }
+  if (config.marks.length > 0) params.set("c_marks", JSON.stringify(marksToPayload(config.marks)));
   return params;
 }
 
@@ -197,11 +437,76 @@ export function chartUrlParams(
 }
 
 /**
+ * Drop what the figure cannot honour, so nothing downstream can assert it.
+ *
+ * A `compare` layer on a single-layer figure and a `derive` on a figure whose
+ * registry entry admits none are both invisible in the rail and unreachable to
+ * clear there, but the caption reads the *config*, not the request — which is
+ * how a pie came to print "comparison: all timeline events" under one layer it
+ * never fetched, and a cumulative step to claim a binning it never sent. Run
+ * on every way a config enters the app (a URL, a saved chart, a Story
+ * snapshot), so the rail is not the only thing keeping the two honest.
+ */
+export function normalizeChartConfig(config: ChartConfig): ChartConfig {
+  const meta = CHART_META[config.chartType];
+  const dropCompare = config.compare.mode !== "off" && !meta.supportsCompare;
+  const dropDerive =
+    config.derive != null && !meta.derives.includes(config.derive.kind);
+  // An illegal `quantity` is the same shape of dead state, reached by a
+  // control the analyst *can* see but not while it matters: changing Treat-as
+  // or picking "No field" leaves a stored "sum" behind, and the Quantity
+  // picker only renders for the cumulative figure. See `legalQuantity`.
+  const dropQuantity =
+    config.options.quantity !== undefined &&
+    legalQuantity(config.options.quantity, config.scale, config.field) === undefined;
+  if (!dropCompare && !dropDerive && !dropQuantity) return config;
+  const options = { ...config.options };
+  if (dropQuantity) delete options.quantity;
+  return {
+    ...config,
+    ...(dropQuantity ? { options } : {}),
+    ...(dropCompare ? { compare: { mode: "off" as const } } : {}),
+    ...(dropDerive ? { derive: null } : {}),
+  };
+}
+
+/**
+ * The marks and figure-inputs *this* figure can honour.
+ *
+ * `ChartInputs` and `marks` are deliberately carried across a figure switch
+ * so switching back loses nothing (see `ChartInputs`), which is why
+ * `normalizeChartConfig` — run on every config entering the app, including
+ * the URL the page rewrites on every edit — does not drop them. Storage is
+ * the other side of that: `chart_exec` refuses a mark or an `inputs` key the
+ * figure does not declare *by name*, so a chart saved with the carry still on
+ * it drew on the page and then failed to resolve as a Story block or through
+ * the agent, naming a control the analyst could no longer see. Dropped here,
+ * at the boundary where the config stops being editable state and becomes a
+ * record — driven by the same registry both sides read.
+ */
+function honouredFor(config: ChartConfig): { inputs: ChartInputs; marks: MarkSource[] } {
+  const meta = CHART_META[config.chartType];
+  const inputs: ChartInputs = {};
+  for (const key of Object.keys(config.inputs) as (keyof ChartInputs)[]) {
+    if (meta.inputs[key] !== undefined) {
+      (inputs as Record<string, unknown>)[key] = config.inputs[key];
+    }
+  }
+  return { inputs, marks: meta.supportsMarks ? config.marks : [] };
+}
+
+/**
  * Read a ChartConfig back out of URL params. Unknown/malformed values fall
  * back to defaults field-by-field rather than discarding the whole config.
  */
 export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
-  const config: ChartConfig = { ...DEFAULT_CHART_CONFIG, compare: { mode: "off" }, options: {} };
+  const config: ChartConfig = {
+    ...DEFAULT_CHART_CONFIG,
+    compare: { mode: "off" },
+    options: {},
+    inputs: {},
+    marks: [],
+  };
 
   const type = params.get("c_type");
   if (type && (CHART_TYPES as string[]).includes(type)) config.chartType = type as ChartType;
@@ -246,7 +551,19 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
       // malformed options — keep defaults
     }
   }
-  return config;
+  const json = (key: string): unknown => {
+    const raw = params.get(key);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  };
+  config.derive = parseDeriveSpec(json("c_derive"));
+  config.inputs = parseChartInputs(json("c_inputs"));
+  config.marks = parseMarkSources(json("c_marks"));
+  return normalizeChartConfig(config);
 }
 
 /**
@@ -256,12 +573,14 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
  */
 export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   if (!stored || typeof stored !== "object") return null;
-  const raw = stored as Record<string, unknown>;
-  if (raw.v !== 1) return null;
+  const raw = upgradeChartConfig(stored as Record<string, unknown>);
+  if (raw.v !== 2) return null;
   const config: ChartConfig = {
     ...DEFAULT_CHART_CONFIG,
     compare: { mode: "off" },
     options: {},
+    inputs: {},
+    marks: [],
   };
   if (typeof raw.chartType === "string" && (CHART_TYPES as string[]).includes(raw.chartType)) {
     config.chartType = raw.chartType as ChartType;
@@ -292,7 +611,10 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   if (raw.options && typeof raw.options === "object") {
     config.options = raw.options as ChartOptions;
   }
-  return config;
+  config.derive = parseDeriveSpec(raw.derive);
+  config.inputs = parseChartInputs(raw.inputs);
+  config.marks = parseMarkSources(raw.marks);
+  return normalizeChartConfig(config);
 }
 
 /** Adapt the single-layer histogram response to the compare shape so one
@@ -364,12 +686,20 @@ export function chartConfigToStored(
   filters?: EventFilters,
 ): Record<string, unknown> {
   const storedFilters = filters ? chartFiltersToStored(filters) : null;
+  // Everything the figure cannot honour is dropped first: the compare layer,
+  // the derivation and an illegal quantity by `normalizeChartConfig`, the
+  // carried marks/inputs by `honouredFor`. What is stored is what the figure
+  // draws — which is what every consumer of a saved chart re-executes.
+  const normalized = normalizeChartConfig(config);
+  const honoured = honouredFor(normalized);
   const stored: Record<string, unknown> = {
-    ...config,
+    ...normalized,
     compare:
-      config.compare.mode === "custom"
-        ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
-        : config.compare,
+      normalized.compare.mode === "custom"
+        ? { mode: "custom", filters: filtersToViewPayload(normalized.compare.filters) }
+        : normalized.compare,
+    inputs: inputsToPayload(honoured.inputs),
+    marks: marksToPayload(honoured.marks),
   };
   // `filters` is *this function's* key, never `ChartConfig`'s. Cleared before
   // writing rather than merely overwritten: a future `ChartConfig.filters`

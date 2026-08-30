@@ -1265,8 +1265,28 @@ export interface FieldTermCount {
 }
 
 /** Top-N value/count terms aggregation for a field, honoring the active filters. */
+/**
+ * What a derived aggregation resolved its derivation to — the labels every
+ * bin / part can take, in order, and (for width/log bins) the edges the
+ * server computed from the data's range, so the caption can print them.
+ */
+export interface DeriveEcho {
+  kind: "bins" | "time_part";
+  labels: string[];
+  mode?: string;
+  edges?: number[];
+  /** `edges` formatted by `db/derive.py::_fmt_edges` — the precision the bin
+   * labels are cut at, so the caption and the axis name the same boundary. */
+  edge_labels?: string[];
+  negative_bin?: boolean;
+  part?: string;
+  timezone?: string;
+}
+
 export interface FieldTermsResponse {
   field: string;
+  /** Present (non-null) when the request carried a `derive`. */
+  derive?: DeriveEcho | null;
   /** Total non-empty matching rows (across all values, not just the top-N returned). */
   total: number;
   /** Number of distinct non-empty values. */
@@ -1399,10 +1419,17 @@ export interface FieldTimeseriesSeries {
  */
 export interface FieldTimeseriesResponse {
   field: string;
+  derive?: DeriveEcho | null;
   interval_seconds: number;
   min: string | null;
   max: string | null;
   series: FieldTimeseriesSeries[];
+  /** Distinct values of the field, of which `series` draws the top N. */
+  distinct: number;
+  /** Events across the values the series cap left out — 0 when nothing was cut. */
+  other_count: number;
+  /** True when more values exist than the series cap draws. */
+  series_truncated: boolean;
 }
 
 /** One (day-of-week × hour-of-day) cell; `dow` is ISO (1=Mon … 7=Sun), UTC. */
@@ -1421,6 +1448,119 @@ export interface PunchcardResponse {
   total: number;
   max_count: number;
   cells: PunchcardCell[];
+}
+
+export type CumulativeQuantity = "events" | "sum" | "distinct";
+export interface CumulativeBucket {
+  start: string;
+  /** This bucket's own contribution. */
+  delta: number;
+  /** Running total at the end of this bucket. */
+  value: number;
+}
+/** Running total over time from `viz/cumulative` — zero-filled, epoch-aligned buckets. */
+export interface CumulativeResponse {
+  kind: "cumulative";
+  quantity: CumulativeQuantity;
+  field: string | null;
+  interval_seconds: number;
+  min: string | null;
+  max: string | null;
+  buckets: CumulativeBucket[];
+  total: number;
+  events: number;
+  /** sum: events with no numeric value; distinct: events with an empty value. */
+  unparsed: number;
+}
+export interface CalendarDay {
+  date: string;
+  count: number;
+}
+/** Events per UTC day from `viz/calendar`, latest 53 weeks; `days` is sparse. */
+export interface CalendarResponse {
+  kind: "calendar";
+  field: string | null;
+  timezone: "UTC";
+  start: string | null;
+  end: string | null;
+  days: CalendarDay[];
+  total: number;
+  max_count: number;
+  weeks: number;
+  weeks_total: number;
+  truncated: boolean;
+  dropped: number;
+}
+
+export type ChangeStatus = "rose" | "fell" | "new" | "vanished" | "same";
+export interface ChangeRow {
+  value: string;
+  primary: number;
+  comparison: number;
+  /** count / that window's non-empty total; 0 when the total is 0. */
+  primary_share: number;
+  comparison_share: number;
+  /** primary_share − comparison_share. */
+  delta_share: number;
+  status: ChangeStatus;
+}
+/**
+ * Ranked change from `viz/compare` (kind=change): the union of both windows'
+ * top-N values, each with its share of its own window, ranked by |Δ share|.
+ * Share, never count — the windows are rarely the same size.
+ */
+export interface ChangeResponse {
+  kind: "change";
+  field: string;
+  derive?: DeriveEcho | null;
+  top_n: number;
+  primary_total: number;
+  comparison_total: number;
+  rows: ChangeRow[];
+  union_size: number;
+  rows_shown: number;
+  union_cap: number;
+  truncated: boolean;
+  omitted: number;
+}
+
+export interface LaneInterval {
+  start: string;
+  /** null = open-ended (no end seen); drawn to `slice_end`. */
+  end: string | null;
+  start_event_id: string;
+  end_event_id: string | null;
+}
+export interface Lane {
+  key: string;
+  /** The dated rows that fed this lane — the ranking quantity. */
+  count: number;
+  intervals: LaneInterval[];
+}
+/**
+ * Interval lanes from `viz/lanes`: one lane per value of the field, ranked
+ * by event count and capped; each interval either first→last per lane or a
+ * start paired with the most recent-open-start rule. Every cap is disclosed.
+ */
+export interface LanesResponse {
+  kind: "lanes";
+  field: string;
+  pairing: "first_last" | "next_end";
+  lanes: Lane[];
+  lane_cap: number;
+  lanes_total: number;
+  lane_cap_hit: boolean;
+  other_lanes: number;
+  starts: number;
+  ends: number;
+  unpaired_starts: number;
+  orphan_ends: number;
+  rows_cap: number;
+  rows_truncated: boolean;
+  rows_paired: number;
+  undated: number;
+  slice_start: string | null;
+  slice_end: string | null;
 }
 
 /** One co-occurrence cell; `""` on an axis means "outside that axis's top-N" (Other). */
@@ -1448,8 +1588,82 @@ export interface FieldPivotResponse {
   y_distinct: number;
   x_bounded: boolean;
   y_bounded: boolean;
+  /** Present when the request carried `derive_x`; the axis is then bounded. */
+  derive_x?: DeriveEcho | null;
   cells: FieldPivotCell[];
   total: number;
+}
+
+export type TableSortColumnWire =
+  | "value"
+  | "count"
+  | "share"
+  | "first_seen"
+  | "last_seen"
+  | "distinct_second";
+
+export interface FieldTableRow {
+  value: string;
+  count: number;
+  /** count / total — the share of the filtered slice's non-empty values. */
+  share: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  /** Distinct non-empty values of `second_field` on this row; null without one. */
+  distinct_second: number | null;
+}
+
+/** `GET …/viz/field-table` — the table figure (`EventQueryService.field_table`). */
+export interface FieldTableResponse {
+  kind: "table";
+  field: string;
+  second_field: string | null;
+  /** Events with a non-empty value — the share denominator. */
+  total: number;
+  /** Distinct non-empty values. */
+  distinct: number;
+  rows: FieldTableRow[];
+  /** Present exactly when values were cut by the top-N. */
+  remainder: { count: number; share: number; distinct_values: number } | null;
+  sort: { by: TableSortColumnWire; dir: "asc" | "desc" };
+  derive?: DeriveEcho | null;
+}
+
+export type MarkProvenance =
+  | { kind: "analyst" }
+  | { kind: "event"; event_id: string; source_id: string }
+  | { kind: "view"; view_id: string; event_id: string; source_id: string }
+  | { kind: "baseline"; definition_id: string; window_id: string };
+export interface ResolvedInstantMark {
+  kind: "instant";
+  at: string;
+  label: string;
+  source: number;
+  provenance: MarkProvenance;
+}
+export interface ResolvedRangeMark {
+  kind: "range";
+  start: string;
+  end: string;
+  label: string;
+  source: number;
+  provenance: MarkProvenance;
+}
+export type ResolvedMark = ResolvedInstantMark | ResolvedRangeMark;
+export interface ResolvedMarkSource {
+  index: number;
+  kind: "events" | "baseline" | "view" | "instant" | "range";
+  label: string | null;
+  count: number;
+  shown: number;
+  overflow: boolean;
+  undated: number;
+}
+/** `POST …/viz/marks` — every mark with its provenance, one status row per source. */
+export interface ResolvedMarksResponse {
+  marks: ResolvedMark[];
+  sources: ResolvedMarkSource[];
+  cap: number;
 }
 
 /**
@@ -1534,6 +1748,7 @@ export interface CompareTermValue {
 export interface CompareTermsResponse {
   kind: "terms";
   field: string;
+  derive?: DeriveEcho | null;
   values: CompareTermValue[];
   distinct: number;
   primary_total: number;
@@ -1735,6 +1950,8 @@ export interface SnapshotChartData {
   warnings: string[];
   /** Raw aggregation payload — reshape via `snapshotToChartResult`, never cast. */
   chart: unknown;
+  /** Resolved marks frozen beside the aggregation (time-axis figures with marks). */
+  marks?: ResolvedMarksResponse | null;
 }
 
 export interface SnapshotEventData {

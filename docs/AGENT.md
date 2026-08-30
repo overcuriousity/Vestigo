@@ -258,7 +258,9 @@ grouping variable producing one distribution per group; `fields` is a 2–8 toke
 list used only by the correlation matrix.
 
 - **Legality is enforced from one table.** `agent/chart_meta.py` is the source of
-  truth (admissible scales per mark, comparison support, second field, options);
+  truth (admissible scales per mark, comparison support, second field, options, and
+  since `ChartConfig` v2 each figure's `inputs`, `derives`, `question` and
+  `supports_marks` — `docs/VISUALIZE.md`);
   `viz/lib/chartMeta.ts` is **generated** from it by `scripts/gen_chart_meta.py`
   (committed; `tests/test_chart_meta.py` asserts regeneration is a no-op). The
   analyst gets the rules as UI affordances; the agent gets them as validation
@@ -267,6 +269,94 @@ list used only by the correlation matrix.
   unsupported comparison, illegal metric, unknown field token with `difflib`
   near-miss suggestions) and after it for silent-success cases (numeric chart over
   a non-numeric field, scatter with no numeric pairs).
+- **Derivations are validated from the registry.** `ChartSpec.derive` (the same
+  `DeriveSpec` the viz endpoints parse — `docs/VISUALIZE.md` §"Derivations") is
+  admitted only by figures whose `derives` lists its kind (bar, heatmap, change, pivot,
+  sankey, table today; the rejection — and the `ChartSpec.derive` prose, generated from
+  the registry — name the figures that take it), never on a `time:` field (already a
+  calendar part). `scale` is then the treat-as the derivation is computed from
+  (`chart_meta.DERIVE_SOURCE_SCALES`: ratio or interval for bins, interval for
+  time_part) or omitted; the *effective* scale is always ordinal, which is what the
+  resolved echo reports, and `"ordinal"` itself is still accepted because it was the
+  only legal value for a while. The same rule is what a saved chart stores and a deep
+  link carries (`spec_to_stored_chart_config` resolves an omitted or ordinal scale to
+  the source scale), so the page's Derive control is offered for a chart the agent
+  proposed. Bins that find no numeric value after the scan are rejected too, with the
+  categorical alternative. `describe_field` reports `derivations` so the model can see
+  which apply before proposing. The resolved echo carries `derive`.
+- **`open_url` says when it is wider than the figure.** Three filter members have no
+  URL form (`event_ids`, `run_id`, `collapse_routine` — the page's
+  `URL_UNREPRESENTABLE_FILTERS`), and each only narrows, so a link that drops one draws
+  a wider chart than the summary describes. `propose_chart` keeps the link and adds a
+  warning naming the dropped narrowing; in the app the card's Open and Save keep the
+  full scope.
+- **The table figure has inputs and options of its own.** `chart_type="table"` takes
+  `inputs.columns` (which of count, share, first_seen, last_seen, distinct_second to show)
+  and `options.table_sort_by` / `table_sort_dir` / `highlight`; `inputs.columns` on any
+  other figure is refused, and `distinct_second` — as a column or a sort — needs `field_y`.
+  Rows are capped by `ChartLimits.table_rows` (20 default, 30 ceiling for the agent). The
+  summary carries the first five rows and the remainder; the echo carries `resolved.inputs`.
+- **Marks.** `ChartSpec.marks` (up to 20) names instants and windows to draw over a
+  time-axis figure — `docs/VISUALIZE.md` §"Marks". Each is one `ChartMarkSpec` whose
+  `kind` is `events` (a `FilterSpec`), `baseline` (`definition_id`), `view` (`view_id`),
+  `instant` (`at`, `label`) or `range` (`start`, `end`, `label`); a field that belongs to
+  another kind is refused by name. One model with a validator rather than a union: the
+  schema is budgeted. Marks on a figure whose `supports_marks` is false are refused
+  (`chart_type="bar" takes no marks — figures that draw them: time, line.`). Resolution is
+  `agent/marks.py::resolve_marks`, shared with `POST …/viz/marks` and the Stories export;
+  an `events`/`view` source is capped at `ChartLimits.marks_per_source` (20 for the agent;
+  the analyst's ceiling is the `viz_marks_max` setting) and the overflow is disclosed in
+  `summary.marks.sources`. The tool result keeps the summary and `resolved.marks` (the
+  sources); the resolved instants themselves are not returned — the card resolves its own.
+- **Cumulative and calendar.** `chart_type="cumulative"` and `"calendar"` are the
+  field-optional figures (`docs/VISUALIZE.md` §"Cumulative step", §"Calendar heatmap"):
+  the `requires_field` refusal now names them as the two that take an optional field beside
+  `time` and `punchcard`, which take none. `options.quantity` (`events` / `sum` /
+  `distinct`) is resolved from the field and scale when omitted — no field → `events`, a
+  ratio field → `sum`, otherwise `distinct` — and echoed in `resolved.options`. Four
+  refusals name themselves: `sum` or `distinct` without a field, `sum` without
+  `scale="ratio"`, `distinct` on a measure; a field under `quantity="events"` is a warning
+  (the field is ignored), not a refusal. The calendar refuses a `time:` field (a calendar
+  part is always present) and keeps the latest `ChartLimits.calendar_weeks` = 53 weeks —
+  the same number for the agent and the analyst, since the cap is a display truth rather
+  than a context budget; `summary` carries `weeks`, `weeks_total`, `truncated`, `dropped`.
+- **Ranked change.** `chart_type="change"` (`docs/VISUALIZE.md` §"Ranked change") is the
+  first figure whose registry row says `requires_compare`: without a comparison layer there
+  is nothing to draw, so a spec with `compare.mode="off"` is refused by name
+  (`chart_type="change" needs a comparison layer — it ranks how each value's share of the
+  window moved between two windows; set compare.mode to "baseline" or "custom".`).
+  `options.top_n` is the per-window top-N before the union, clamped to
+  `ChartLimits.change_top_n` (10 default, 20 max for the agent); `options.layout`
+  (`dumbbell` default / `slope`) is echoed in `resolved.options`. The union of the two
+  top-N lists is capped at `ChartLimits.change_union` (30 for the agent, 200 for the
+  analyst) and `summary.truncated` says when it bit; the summary also carries
+  `primary_total`, `comparison_total`, `union_size`, `rows_shown` and the first five
+  `top_rows` (`{value, status, delta_share}`). The encoded quantity is share of window,
+  never count — `delta_share` is `primary_share − comparison_share`.
+- **Interval lanes.** `chart_type="lanes"` (`docs/VISUALIZE.md` §"Interval lanes") charts
+  one lane per value of `field` with a bar per interval. `inputs.pairing` is `first_last`
+  (default; one bar per lane, first to last event) or `next_end`, under which
+  `inputs.start_filter` and `inputs.end_filter` (each a `FilterSpec`, ANDed with `filters`
+  and pinned to its time window) name the events that open and close an interval, and an
+  end closes the most recent open start in its lane. Three refusals name themselves:
+  `pairing="next_end" needs inputs.start_filter and inputs.end_filter — the events that
+  open and close an interval; pairing="first_last" needs neither.`; `inputs.pairing /
+  start_filter / end_filter are chart_type="lanes" only.`; and the registry's scale check
+  (nominal or ordinal). Filters under `first_last` are a warning (`inputs.start_filter/
+  end_filter ignored under pairing="first_last".`), not a refusal. `options.limit_y` is the
+  lane cap, clamped to `ChartLimits.lanes` (10 default, 20 max for the agent; 100 for the
+  analyst); the ordered start/end scan the pairing runs over is capped at
+  `ChartLimits.lanes_rows` (2,000 for the agent, 50,000 for the analyst) and
+  `summary.rows_truncated` says when it bit. The summary carries `pairing`, `lanes_shown`,
+  `lanes_total`, `lane_cap_hit`, `intervals`, `unpaired_starts` (open-ended, drawn to the
+  slice end), `orphan_ends` (counted, not drawn), `undated` and the first five `top_lanes`
+  (`{key, count, intervals}`). `supports_marks` is true: marks draw across every lane.
+- **`open_url`.** Every `propose_chart` result carries the Visualize page link for that
+  exact figure, so an external `/mcp` client — which gets no card — can hand a human the
+  chart. `agent/deep_link.py::visualize_url` mirrors the page's own URL codec
+  (`filtersToParams` then `chartConfigToParams`, same order and encodings);
+  `frontend/src/test/fixtures/viz-deep-link.json` is the contract, asserted by
+  `tests/test_deep_link.py` on the way out and by `agent.test.ts` parsing it back.
 - **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
   the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
   quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
@@ -530,11 +620,27 @@ Three levers (all in 1.4.1) cut the fixed overhead from ~17.3k tokens to
   Explorer/Visualize frontends depend on.
 
 Both the slim schemas and the encoding notes reach the external `/mcp`
-surface too: `SPEC_REFERENCE` and `RESULT_FORMAT_NOTE` are appended to
-`FastMCP(instructions=…)`, sharing the exact strings the in-app
+surface too: `SPEC_REFERENCE`, `RESULT_FORMAT_NOTE` and `SCALE_VOCABULARY_NOTE` (the
+page calls `scale` "treat as" — Categories / Ordered categories / Number or time /
+Measure — and the model should use the plain phrase only when speaking to the analyst)
+are appended to `FastMCP(instructions=…)`, sharing the exact strings the in-app
 `SYSTEM_PROMPT` composes from. `tests/test_agent_schema.py` holds a budget
-guard (serialized tool list < 40,000 chars) — if a change trips it,
-re-measure rather than raising the ceiling.
+guard (serialized tool list < 42,500 chars; `ChartSpec.derive` measured 39,382 →
+40,213 on 2026-08-29 and the ceiling moved by that delta; `ChartSpec.inputs` and the
+table options took it to 40,953 the same day; `ChartMarkSpec` / `ChartSpec.marks` and the
+`open_url` docstring took it to 41,947, and the ceiling moved to 42,000;
+`ChartOptionsSpec.quantity` took it to 42,044 and the ceiling to 42,500;
+`ChartOptionsSpec.layout` took it to 42,115, ceiling unchanged;
+`ChartInputsSpec.pairing` / `start_filter` / `end_filter` took it to 42,285 on 2026-08-30,
+ceiling unchanged) — if a change trips it, re-measure rather than raising the ceiling.
+
+**Every figure above 42,285 was measured over 31 tools, not 33.** The two
+`embeddings_gated` tools (`semantic_search`, `similar_events`) are not advertised where the
+extra is absent and no embedding endpoint is set, so the guard measured a developer's
+narrower set and CI's full one — 513 chars apart — and could pass locally on a branch that
+overflowed in CI. The test now forces `embeddings_available()` true, so the number is the
+same everywhere: **42,798 over 33 tools, ceiling 43,000**. That one-off move is the tools the
+guard never counted, not new prose; the rule is unchanged for everything after it.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

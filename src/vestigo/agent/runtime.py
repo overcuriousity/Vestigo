@@ -63,6 +63,7 @@ from vestigo.agent.config import AgentConfig, is_kimi_coding_endpoint, resolve_a
 from vestigo.agent.resume import repair_partial
 from vestigo.agent.tools import (
     RESULT_FORMAT_NOTE,
+    SCALE_VOCABULARY_NOTE,
     SPEC_REFERENCE,
     AgentScope,
     build_tool_server,
@@ -217,7 +218,9 @@ results stay small.
 # a dozen times per request, and paid once here instead (A13). Both are
 # generated from the tool layer (see agent/schema_slim.py) and shared verbatim
 # with the external /mcp instructions, so the two surfaces cannot diverge.
-SYSTEM_PROMPT = f"{_BASE_SYSTEM_PROMPT}\n{RESULT_FORMAT_NOTE}\n{SPEC_REFERENCE}"
+SYSTEM_PROMPT = (
+    f"{_BASE_SYSTEM_PROMPT}\n{RESULT_FORMAT_NOTE}\n{SCALE_VOCABULARY_NOTE}\n{SPEC_REFERENCE}"
+)
 
 
 class KimiAnthropicModel(AnthropicModel):

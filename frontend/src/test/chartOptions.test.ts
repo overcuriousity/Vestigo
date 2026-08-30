@@ -31,6 +31,8 @@ describe("resolveChartOptions", () => {
       groups: 6,
       showPoints: false,
       buckets: 60,
+      quantity: "events",
+      layout: "dumbbell",
       limitX: 10,
       limitY: 10,
       sampleLimit: 5000,
@@ -39,6 +41,9 @@ describe("resolveChartOptions", () => {
       logScale: false,
       seriesMode: "overlay",
       legend: true,
+      tableSortBy: "count",
+      tableSortDir: "desc",
+      highlight: [],
     });
   });
 
@@ -169,5 +174,176 @@ describe("chartTypesForField", () => {
       // ...and the default pick is one of them.
       expect(chartTypesForField(scale, token)).toContain(defaultChartTypeForScale(scale, token));
     }
+  });
+});
+
+describe("resolveChartOptions — cumulative quantity", () => {
+  it("defaults from field and scale, and keeps an explicit choice", () => {
+    const base = { ...DEFAULT_CHART_CONFIG, chartType: "cumulative" as const };
+    expect(resolveChartOptions({ ...base, field: null }).quantity).toBe("events");
+    expect(resolveChartOptions({ ...base, field: "attr:bytes", scale: "ratio" }).quantity).toBe(
+      "sum",
+    );
+    expect(
+      resolveChartOptions({ ...base, field: "attr:user", scale: "nominal" }).quantity,
+    ).toBe("distinct");
+    expect(
+      resolveChartOptions({
+        ...base,
+        field: "attr:user",
+        scale: "nominal",
+        options: { quantity: "events" },
+      }).quantity,
+    ).toBe("events");
+  });
+});
+
+describe("resolveChartOptions — ranked change", () => {
+  it("defaults the layout to dumbbell and keeps an explicit slope", () => {
+    const base = { ...DEFAULT_CHART_CONFIG, chartType: "change" as const, field: "artifact" };
+    expect(resolveChartOptions(base).layout).toBe("dumbbell");
+    expect(resolveChartOptions({ ...base, options: { layout: "slope" } }).layout).toBe("slope");
+  });
+
+  it("caps the per-window top-N at 100 with the slider stopping at 20", () => {
+    expect(TOPN_MAX.change).toBe(100);
+    expect(TOPN_SLIDER_MAX.change).toBe(20);
+  });
+});
+
+describe("resolveChartOptions — options that outlive their precondition", () => {
+  it("falls back to counting events when the field a quantity aggregates is gone", () => {
+    // "No field — count every event" clears `field` and leaves `quantity`;
+    // `/viz/cumulative` answers 422 for `sum` without one, which is a blank
+    // figure with nothing on screen to explain it.
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative" as const,
+      scale: "ratio" as const,
+      options: { quantity: "sum" as const },
+    };
+    expect(resolveChartOptions({ ...stored, field: "attr:bytes" }).quantity).toBe("sum");
+    expect(resolveChartOptions({ ...stored, field: null }).quantity).toBe("events");
+  });
+
+  it("falls back when the treat-as no longer admits the quantity", () => {
+    // The other half of the same shape: a running sum is a sum of a *measure*,
+    // so switching Treat-as to Categories under it leaves a quantity the
+    // executor refuses (`quantity="sum" needs scale="ratio"`) while
+    // `/viz/cumulative`, which knows no scale, drew it anyway (#332).
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative" as const,
+      field: "attr:bytes",
+      options: { quantity: "sum" as const },
+    };
+    expect(resolveChartOptions({ ...stored, scale: "ratio" }).quantity).toBe("sum");
+    expect(resolveChartOptions({ ...stored, scale: "nominal" }).quantity).toBe("distinct");
+    // And the mirror image: distinct values of a measure are not a count.
+    expect(
+      resolveChartOptions({
+        ...stored,
+        scale: "ratio",
+        options: { quantity: "distinct" },
+      }).quantity,
+    ).toBe("sum");
+  });
+
+  it("falls back to the count sort when the second field the sort ranks by is gone", () => {
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      field: "attr:host",
+      options: { tableSortBy: "distinct_second" as const },
+    };
+    expect(resolveChartOptions({ ...stored, fieldY: "attr:user" }).tableSortBy).toBe(
+      "distinct_second",
+    );
+    expect(resolveChartOptions({ ...stored, fieldY: null }).tableSortBy).toBe("count");
+  });
+});
+
+describe("resolveChartOptions — untrusted highlight", () => {
+  it("coerces a non-array highlight rather than letting the caption throw", () => {
+    // `c_opts` is JSON.parsed, unvalidated URL data. A string made `.length`
+    // truthy and `.join` undefined, so `buildCaptionLines` threw and the page
+    // went blank instead of degrading (#332).
+    const config = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      options: { highlight: "admin" as unknown as string[] },
+    };
+    expect(resolveChartOptions(config).highlight).toEqual([]);
+  });
+
+  it("keeps only the string members of a mixed array", () => {
+    const config = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      options: { highlight: ["admin", 7, null, "root"] as unknown as string[] },
+    };
+    expect(resolveChartOptions(config).highlight).toEqual(["admin", "root"]);
+  });
+});
+
+describe("resolveChartOptions — untrusted enum options", () => {
+  // Same argument as `highlight` above and `clampTopN`: these three are
+  // forwarded to `Literal`-typed query params, so a hand-edited `c_opts`
+  // produced a 422 and a permanently blank chart with nothing on screen to
+  // explain it (#332).
+  const table = { ...DEFAULT_CHART_CONFIG, chartType: "table" as const, field: "attr:host" };
+
+  it("falls back to the default for a bogus tableSortBy, tableSortDir or quantity", () => {
+    const opts = resolveChartOptions({
+      ...table,
+      options: {
+        tableSortBy: "Count",
+        tableSortDir: "up",
+        quantity: "total",
+      } as unknown as (typeof table)["options"],
+    });
+    expect(opts.tableSortBy).toBe("count");
+    expect(opts.tableSortDir).toBe("desc");
+    expect(opts.quantity).toBe("distinct");
+  });
+
+  it("keeps every legal value it is given", () => {
+    const opts = resolveChartOptions({
+      ...table,
+      // "sum" accumulates a measure, so it is legal only under scale "ratio".
+      scale: "ratio",
+      fieldY: "attr:user",
+      options: { tableSortBy: "distinct_second", tableSortDir: "asc", quantity: "sum" },
+    });
+    expect(opts.tableSortBy).toBe("distinct_second");
+    expect(opts.tableSortDir).toBe("asc");
+    expect(opts.quantity).toBe("sum");
+  });
+
+});
+
+describe("resolveChartOptions — a derived bar axis reads in value order", () => {
+  // `BarChart` applies the derivation's own label order only under
+  // `sort: "value"`, and only the rail used to write one. An agent's
+  // `propose_chart` or a deep link drew the ranges in count order on the card,
+  // the snapshot and the HTML export while the page had them ordered (#332).
+  const derived = {
+    ...DEFAULT_CHART_CONFIG,
+    chartType: "bar" as const,
+    field: "attr:bytes",
+    scale: "ratio" as const,
+    derive: { kind: "bins", mode: "log", count: 8 } as const,
+  };
+
+  it("defaults sort to value with no option in the config", () => {
+    expect(resolveChartOptions(derived).sort).toBe("value");
+  });
+
+  it("still lets the analyst ask for count order", () => {
+    expect(resolveChartOptions({ ...derived, options: { sort: "count" } }).sort).toBe("count");
+  });
+
+  it("leaves an underived bar in count order", () => {
+    expect(resolveChartOptions({ ...derived, derive: null }).sort).toBe("count");
   });
 });

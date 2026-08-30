@@ -231,8 +231,18 @@ export const CHART_HOW_TO_READ: Record<ChartType, string> = {
     "Width = how common values are at that height — a smoothed, mirrored histogram. Humps are clusters.",
   ecdf: "Height at x = fraction of events with a value ≤ x. Steep sections are where most values sit.",
   punchcard: "Day-of-week × hour-of-day grid — recurring dark cells reveal rhythms, off-hours activity stands out.",
+  cumulative:
+    "Height = the running total so far; each step up is one time slice's contribution. Flat = nothing happened; a jump = a burst.",
+  calendar:
+    "One square per day, darker = more events; columns are weeks, rows are weekdays. Blank squares had no events at all.",
+  change:
+    "Each row is one value; the grey dot is its share of the reference window, the coloured dot its share of this window. Longer bar = bigger shift. \"new\" and \"vanished\" mark values present in one window only.",
+  lanes:
+    "Each row is one value of the field; a bar runs from an interval's start to its end. A bar ending in an arrow never saw an end — it runs to the edge of the slice. Ends with no start before them are counted in the caption, not drawn.",
   pivot: "Cell darkness = events with that combination of the two field values.",
   sankey: "Ribbon width = events flowing from the left value to the right value.",
   corr: "One cell per field pair; colour and number give the correlation (−1…+1). Click a cell to see the scatter behind it.",
   scatter: "One dot per event pair — patterns (lines, clusters, outliers) mean the two fields are related.",
+  table:
+    "One row per value: how often it occurred, its share of the filtered events, and when it was first and last seen. The last row is everything the top-N cut off.",
 };

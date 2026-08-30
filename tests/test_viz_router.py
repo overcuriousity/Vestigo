@@ -9,6 +9,7 @@ TestClient needed.
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from vestigo.api.routers import viz
 from vestigo.db._time_fields import TIME_FIELD_PREFIX, TIME_FIELD_SPECS
@@ -132,13 +133,23 @@ class _FakeCompareService:
         self.calls.append(("time", primary, comparison, baseline_cache_token))
         return {"kind": "time"}
 
-    def compare_field_terms(self, primary, comparison, field, limit, baseline_cache_token=None):
+    def compare_field_terms(
+        self, primary, comparison, field, limit, baseline_cache_token=None, *, derive=None
+    ):
         self.calls.append(("terms", primary, comparison, baseline_cache_token))
         return {"kind": "terms"}
 
     def compare_field_numeric(self, primary, comparison, field, bins, baseline_cache_token=None):
         self.calls.append(("numeric", primary, comparison, baseline_cache_token))
         return {"kind": "numeric"}
+
+    def field_change(self, primary, comparison, field, limit, *, union_cap, derive=None):
+        self.calls.append(("change", primary, comparison, (field, limit, union_cap, derive)))
+        return {"kind": "change", "field": field, "top_n": limit, "union_cap": union_cap}
+
+    def field_lanes(self, primary, field, *, pairing, start=None, end=None, limit_y, rows_cap):
+        self.calls.append(("lanes", primary, (start, end), (field, pairing, limit_y, rows_cap)))
+        return {"kind": "lanes", "field": field, "pairing": pairing, "lane_cap": limit_y}
 
 
 async def _fake_id_filters(case_id, source_ids, **_kwargs):
@@ -271,17 +282,38 @@ class _FakeAggService:
         self.calls.append(("punchcard", query))
         return {"kind": "punchcard"}
 
-    def field_pivot(self, query, field_x, field_y, limit_x, limit_y):
+    def field_pivot(self, query, field_x, field_y, limit_x, limit_y, *, derive_x=None):
         self.calls.append(("pivot", query, field_x, field_y, limit_x, limit_y))
         return {"kind": "pivot"}
+
+    def field_table(self, query, field, limit, **kw):
+        self.calls.append(("table", query, field, limit, kw))
+        return {"kind": "table"}
 
     def field_scatter(self, query, field_x, field_y, limit):
         self.calls.append(("scatter", query, field_x, field_y, limit))
         return {"kind": "scatter"}
 
+    def mark_instants(self, query, limit):
+        self.calls.append(("marks", query, limit))
+        return {
+            "instants": [{"event_id": "e1", "source_id": "s1", "at": "2026-07-20T01:00:00+00:00"}],
+            "dated": 1,
+            "undated": 0,
+            "overflow": False,
+        }
+
     def field_numeric_stats(self, query, field, bins, points, points_limit):
         self.calls.append(("numeric", query, field, bins, points, points_limit))
         return {"kind": "numeric"}
+
+    def cumulative(self, query, *, field=None, quantity="events", buckets=60):
+        self.calls.append(("cumulative", query, field, quantity, buckets))
+        return {"kind": "cumulative", "quantity": quantity, "field": field}
+
+    def calendar(self, query, *, field=None, max_weeks=53):
+        self.calls.append(("calendar", query, field, max_weeks))
+        return {"kind": "calendar", "field": field}
 
     def field_correlation(self, query, fields):
         self.calls.append(("corr", query, tuple(fields)))
@@ -530,7 +562,7 @@ class _FakeTermsService:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def field_terms(self, query, field, limit, *, totals=True):
+    def field_terms(self, query, field, limit, *, totals=True, derive=None):
         self.calls.append((query, field, limit, totals))
         return {"kind": "live"}
 
@@ -662,7 +694,7 @@ class _CaptureTermsService:
     def __init__(self) -> None:
         self.last_query = None
 
-    def field_terms(self, query, field_token, limit=50, *, totals=True):
+    def field_terms(self, query, field_token, limit=50, *, totals=True, derive=None):
         self.last_query = query
         return {"values": [], "other": 0, "total": 0}
 
@@ -778,3 +810,690 @@ async def test_compare_custom_layer_honors_its_own_flag(monkeypatch):
     assert primary.exclude_template_hashes is None
     assert comparison.exclude_template_hashes == [4736]
     assert comparison.exclude_routine_disposition_ids == ["m1"]
+
+
+# ── derivations ──────────────────────────────────────────────────────────────
+
+
+class _RecordingService:
+    """Records the kwargs the endpoint hands the aggregation."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple, dict]] = []
+
+    def field_terms(self, query, field, limit, **kw):
+        self.calls.append(("field_terms", (field, limit), kw))
+        return {"field": field, "total": 0, "distinct": 0, "values": [], "other_count": 0}
+
+    def field_value_timeseries(self, query, field, buckets, series_limit, **kw):
+        self.calls.append(("field_value_timeseries", (field, buckets, series_limit), kw))
+        return {"field": field, "series": [], "interval_seconds": 60, "min": None, "max": None}
+
+    def field_pivot(self, query, fx, fy, lx, ly, **kw):
+        self.calls.append(("field_pivot", (fx, fy, lx, ly), kw))
+        return {
+            "field_x": fx,
+            "field_y": fy,
+            "x_values": [],
+            "y_values": [],
+            "cells": [],
+            "total": 0,
+        }
+
+
+async def _fake_query(*args, **kwargs):
+    from vestigo.db.queries import EventQuery
+
+    return EventQuery(case_id="c1", source_ids=["s1"], q="narrow")  # filtered → bypasses the cache
+
+
+def _wire(monkeypatch) -> _RecordingService:
+    svc = _RecordingService()
+    monkeypatch.setattr(viz, "_resolve_event_query", _fake_query)
+    monkeypatch.setattr(viz, "_get_query_service", lambda: svc)
+    return svc
+
+
+#: The handlers are called directly, so every `Query(...)` default the
+#: endpoint reads has to be spelled out — FastAPI resolves them only under HTTP.
+_FILTER_PARAMS: dict = {
+    "q": None,
+    "q_regex": False,
+    "artifact": None,
+    "artifacts": None,
+    "source_id": None,
+    "tag": None,
+    "exclude_tag": None,
+    "tags_include": None,
+    "tags_exclude": None,
+    "ids": None,
+    "start": None,
+    "end": None,
+    "filters": None,
+    "exclusions": None,
+    "filter_modes": None,
+    "exclusion_modes": None,
+    "annotated": None,
+    "annotation_tag_value": None,
+    "run_id": None,
+    "collapse_routine": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_field_terms_passes_a_parsed_derive_to_the_aggregation(monkeypatch):
+    from vestigo.db.derive import DeriveSpec
+
+    svc = _wire(monkeypatch)
+    await viz.get_field_terms(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        limit=10,
+        totals=True,
+        derive='{"kind":"bins","mode":"log","count":8}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    name, args, kw = svc.calls[0]
+    assert name == "field_terms" and args == ("attr:bytes", 10)
+    assert kw["derive"] == DeriveSpec(kind="bins", mode="log", count=8)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_rejects_a_malformed_derive_with_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _wire(monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        await viz.get_field_terms(
+            "c1",
+            "t1",
+            field="attr:bytes",
+            limit=50,
+            totals=True,
+            derive='{"kind":"bins"}',
+            case=None,
+            **_FILTER_PARAMS,
+        )
+    assert excinfo.value.status_code == 422
+    assert "mode" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_rejects_a_derive_on_a_virtual_time_field_with_422(monkeypatch):
+    from fastapi import HTTPException
+
+    _wire(monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        await viz.get_field_terms(
+            "c1",
+            "t1",
+            field="time:hour_of_day",
+            limit=50,
+            totals=True,
+            derive='{"kind":"time_part","part":"hour"}',
+            case=None,
+            **_FILTER_PARAMS,
+        )
+    assert excinfo.value.status_code == 422
+    assert "already a calendar part" in str(excinfo.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_terms_with_derive_never_answers_from_the_stats_cache(monkeypatch):
+    """An unfiltered request normally reads the M24a cache; a derived one cannot
+    — the cache holds raw values, not bins."""
+    from vestigo.db.queries import EventQuery
+
+    svc = _wire(monkeypatch)
+
+    async def unfiltered(*a, **k):
+        return EventQuery(case_id="c1", source_ids=["s1"])
+
+    monkeypatch.setattr(viz, "_resolve_event_query", unfiltered)
+
+    async def must_not_run(*a, **k):
+        raise AssertionError("cache consulted for a derived request")
+
+    monkeypatch.setattr(viz, "ensure_source_field_stats", must_not_run)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
+    await viz.get_field_terms(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        limit=50,
+        totals=True,
+        derive='{"kind":"time_part","part":"hour"}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    assert svc.calls[0][2]["derive"].part == "hour"
+
+
+@pytest.mark.asyncio
+async def test_timeseries_and_pivot_take_derive(monkeypatch):
+    svc = _wire(monkeypatch)
+    await viz.get_field_value_timeseries(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        buckets=60,
+        series_limit=12,
+        derive='{"kind":"bins","mode":"custom","edges":[1]}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    await viz.get_field_pivot(
+        "c1",
+        "t1",
+        field_x="attr:bytes",
+        field_y="attr:host",
+        limit_x=10,
+        limit_y=10,
+        derive_x='{"kind":"bins","mode":"custom","edges":[1]}',
+        case=None,
+        **_FILTER_PARAMS,
+    )
+    assert svc.calls[0][2]["derive"].edges == [1.0]
+    assert svc.calls[1][2]["derive_x"].edges == [1.0]
+
+
+def test_compare_request_takes_a_derive_spec() -> None:
+    from vestigo.db.derive import DeriveSpec
+
+    body = viz.CompareRequest.model_validate(
+        {
+            "kind": "terms",
+            "field": "attr:bytes",
+            "comparison": {"mode": "baseline"},
+            "derive": {"kind": "bins", "mode": "width", "count": 4},
+        }
+    )
+    assert body.derive == DeriveSpec(kind="bins", mode="width", count=4)
+    assert (
+        viz.CompareRequest.model_validate(
+            {"kind": "time", "comparison": {"mode": "baseline"}}
+        ).derive
+        is None
+    )
+
+
+def test_each_derive_parameter_binds_under_its_own_name() -> None:
+    """FastAPI stamps the first bound parameter name onto a `Query` object's
+    alias, so a `Query` shared between `derive` and `derive_x` made the pivot
+    endpoint read `derive` while advertising `derive_x` — a request that used
+    the documented name was silently underived. Each endpoint gets its own."""
+    import inspect
+
+    for endpoint, name in [
+        (viz.get_field_terms, "derive"),
+        (viz.get_field_value_timeseries, "derive"),
+        (viz.get_field_pivot, "derive_x"),
+        (viz.get_field_table, "derive"),
+    ]:
+        default = inspect.signature(endpoint).parameters[name].default
+        assert default.alias in (None, name), (endpoint.__name__, default.alias)
+
+
+@pytest.mark.asyncio
+async def test_field_table_passes_field_limit_sort_and_second_field(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_field_table(
+        "c1",
+        "t1",
+        field="attr:user",
+        second_field="attr:host",
+        limit=25,
+        sort_by="last_seen",
+        sort_dir="asc",
+        derive=None,
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert result == {"kind": "table"}
+    kind, query, field, limit, kw = svc.calls[0]
+    assert (kind, field, limit) == ("table", "attr:user", 25)
+    assert kw == {
+        "second_field": "attr:host",
+        "sort_by": "last_seen",
+        "sort_dir": "asc",
+        "derive": None,
+    }
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_field_table_rejects_same_second_field_and_distinct_sort_without_one(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as same:
+        await viz.get_field_table(
+            "c1",
+            "t1",
+            field="attr:user",
+            second_field="attr:user",
+            limit=50,
+            sort_by="count",
+            sort_dir="desc",
+            derive=None,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert same.value.status_code == 422
+    with pytest.raises(HTTPException) as no_second:
+        await viz.get_field_table(
+            "c1",
+            "t1",
+            field="attr:user",
+            second_field=None,
+            limit=50,
+            sort_by="distinct_second",
+            sort_dir="desc",
+            derive=None,
+            case=None,
+            **_FILTER_KWARGS,
+        )
+    assert no_second.value.status_code == 422
+    assert "distinct_second" in str(no_second.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_field_table_takes_a_derive(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    await viz.get_field_table(
+        "c1",
+        "t1",
+        field="attr:bytes",
+        second_field=None,
+        limit=50,
+        sort_by="count",
+        sort_dir="desc",
+        derive='{"kind":"bins","mode":"log","count":4}',
+        case=None,
+        **_FILTER_KWARGS,
+    )
+    assert svc.calls[0][4]["derive"].count == 4
+
+
+def test_field_table_sort_columns_match_the_service() -> None:
+    import inspect
+    from typing import get_args
+
+    from vestigo.db.queries import TABLE_SORT_COLUMNS
+
+    annotation = (
+        inspect.signature(viz.get_field_table, eval_str=True).parameters["sort_by"].annotation
+    )
+    assert set(get_args(annotation)) == set(TABLE_SORT_COLUMNS)
+
+
+@pytest.mark.asyncio
+async def test_viz_marks_resolves_stored_marks_under_the_setting_cap(monkeypatch):
+    from types import SimpleNamespace
+
+    svc = _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    body = viz.MarksRequest(
+        marks=[
+            {"kind": "events", "filters": {"q": "beacon"}, "label": "beacons"},
+            {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"},
+        ]
+    )
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    result = await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+    assert result["cap"] == 50
+    assert [m["kind"] for m in result["marks"]] == ["instant", "instant"]
+    assert result["marks"][0]["provenance"] == {
+        "kind": "event",
+        "event_id": "e1",
+        "source_id": "s1",
+    }
+    assert result["marks"][1]["provenance"] == {"kind": "analyst"}
+    kind, query, limit = svc.calls[0]
+    assert kind == "marks" and query.q == "beacon" and limit == 50
+    assert query.source_ids == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_viz_marks_rejects_a_malformed_mark_and_an_unknown_baseline(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as malformed:
+        await viz.resolve_viz_marks(
+            "c1",
+            "t1",
+            viz.MarksRequest(marks=[{"kind": "instant", "at": "2026-07-20T09:41:00Z"}]),
+            case=None,
+            user=user,
+        )
+    assert malformed.value.status_code == 422
+    assert "needs at and label" in str(malformed.value.detail)
+    with pytest.raises(HTTPException) as unknown:
+        await viz.resolve_viz_marks(
+            "c1",
+            "t1",
+            viz.MarksRequest(marks=[{"kind": "baseline", "definitionId": "nope"}]),
+            case=None,
+            user=user,
+        )
+    assert unknown.value.status_code == 422
+    assert 'baseline definition "nope" not found' in str(unknown.value.detail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark",
+    [
+        # `_filter_payload_to_spec` reads the body structurally before pydantic
+        # ever sees it: `datetime.fromisoformat` on a bad start is a ValueError,
+        # `.items()` on a string `filters` is an AttributeError, and on a number
+        # a TypeError. `marks` is an unvalidated `list[dict[str, Any]]`, so all
+        # three were reachable — and escaped as 500s (#332).
+        {"kind": "events", "filters": {"start": "not-a-date"}},
+        {"kind": "events", "filters": {"filters": "abc"}},
+        {"kind": "events", "filters": {"filters": 7}},
+        {"kind": "events", "filters": "abc"},
+    ],
+)
+async def test_viz_marks_answers_422_for_a_structurally_malformed_filter(monkeypatch, mark):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as exc:
+        await viz.resolve_viz_marks(
+            "c1", "t1", viz.MarksRequest(marks=[mark]), case=None, user=user
+        )
+    assert exc.value.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark",
+    [
+        # A non-dict entry is already refused by `MarksRequest` itself.
+        {"kind": 7, "at": "2026-07-20T09:41:00Z"},
+        {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": 7},
+        {"kind": "baseline", "definitionId": 7},
+        {"kind": "instant", "at": 1_753_000_000},
+    ],
+)
+async def test_viz_marks_refuses_a_mark_it_would_otherwise_drop_in_silence(monkeypatch, mark):
+    """A request body is not stored state.
+
+    ``_stored_marks_to_spec`` drops a malformed entry — or a malformed key
+    within one — so that a chart saved by an older build still renders what it
+    can. Here that silently drew fewer marks than the caller asked for, with
+    nothing in ``sources`` or the caption to say so (#332), and a hand-edited
+    ``c_marks`` reaches this endpoint verbatim.
+    """
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as exc:
+        await viz.resolve_viz_marks(
+            "c1", "t1", viz.MarksRequest(marks=[mark]), case=None, user=user
+        )
+    assert exc.value.status_code == 422
+    assert "mark 0" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_viz_cumulative_resolves_quantity_and_passes_field_and_buckets(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_cumulative(
+        "c1", "t1", field="attr:user", quantity=None, buckets=24, case=None, **_FILTER_KWARGS
+    )
+    assert result["quantity"] == "distinct"
+    kind, query, field, quantity, buckets = svc.calls[0]
+    assert (kind, field, quantity, buckets) == ("cumulative", "attr:user", "distinct", 24)
+    assert query.source_ids == ["s1", "s2"]
+    fieldless = await viz.get_cumulative(
+        "c1", "t1", field=None, quantity=None, buckets=60, case=None, **_FILTER_KWARGS
+    )
+    assert fieldless["quantity"] == "events"
+
+
+@pytest.mark.asyncio
+async def test_viz_cumulative_refuses_a_fieldless_sum(monkeypatch):
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_cumulative(
+            "c1", "t1", field=None, quantity="sum", buckets=60, case=None, **_FILTER_KWARGS
+        )
+    assert exc.value.status_code == 422 and 'quantity="sum" needs field' in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_viz_calendar_passes_the_field_and_the_week_cap(monkeypatch):
+    svc = _patch_agg(monkeypatch)
+    result = await viz.get_calendar("c1", "t1", field="attr:user", case=None, **_FILTER_KWARGS)
+    assert result == {"kind": "calendar", "field": "attr:user"}
+    kind, query, field, max_weeks = svc.calls[0]
+    assert (kind, field, max_weeks) == ("calendar", "attr:user", 53)
+
+
+@pytest.mark.asyncio
+async def test_compare_change_pins_the_window_and_passes_top_n_and_the_union_cap(monkeypatch):
+    from datetime import UTC, datetime
+
+    svc = _patch_compare(monkeypatch)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, tzinfo=UTC)
+    body = viz.CompareRequest(
+        kind="change",
+        field="attr:user",
+        primary=viz.CompareFilters(filters='{"attr:phase": "b"}', start=start, end=end),
+        comparison=viz.ComparisonSpec(
+            mode="custom", filters=viz.CompareFilters(filters='{"attr:phase": "a"}')
+        ),
+        limit=7,
+    )
+    result = await viz.compare_layers("c1", "t1", body, case=None)
+    assert result == {"kind": "change", "field": "attr:user", "top_n": 7, "union_cap": 200}
+    kind, primary, comparison, args = svc.calls[0]
+    assert kind == "change"
+    assert primary.field_filters == {"attr:phase": ["b"]}
+    assert comparison.field_filters == {"attr:phase": ["a"]}
+    assert (comparison.start, comparison.end) == (start, end)  # pinned to the primary
+    assert args == ("attr:user", 7, 200, None)
+
+
+@pytest.mark.asyncio
+async def test_compare_change_clamps_top_n_to_the_analyst_ceiling_and_needs_a_field(monkeypatch):
+    from fastapi import HTTPException
+
+    svc = _patch_compare(monkeypatch)
+    body = viz.CompareRequest(
+        kind="change",
+        field="attr:user",
+        comparison=viz.ComparisonSpec(mode="baseline"),
+        limit=500,
+    )
+    await viz.compare_layers("c1", "t1", body, case=None)
+    assert svc.calls[0][3][1] == 100
+    with pytest.raises(HTTPException) as exc:
+        await viz.compare_layers(
+            "c1",
+            "t1",
+            viz.CompareRequest(kind="change", comparison=viz.ComparisonSpec(mode="baseline")),
+            case=None,
+        )
+    assert exc.value.status_code == 422 and "requires 'field'" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_lanes_next_end_pins_both_layers_and_passes_the_caps(monkeypatch):
+    from datetime import UTC, datetime
+
+    svc = _patch_compare(monkeypatch)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, tzinfo=UTC)
+    body = viz.LanesRequest(
+        field="attr:host",
+        pairing="next_end",
+        primary=viz.CompareFilters(filters='{"attr:host": "h1"}', start=start, end=end),
+        start_filter=viz.CompareFilters(filters='{"attr:kind": "logon"}'),
+        end_filter=viz.CompareFilters(filters='{"attr:kind": "logoff"}'),
+        limit_y=500,
+    )
+    result = await viz.get_lanes("c1", "t1", body, case=None)
+    assert result == {"kind": "lanes", "field": "attr:host", "pairing": "next_end", "lane_cap": 100}
+    kind, primary, (start_q, end_q), args = svc.calls[0]
+    assert kind == "lanes"
+    assert primary.field_filters == {"attr:host": ["h1"]}
+    assert start_q.field_filters == {"attr:kind": ["logon"]}
+    assert end_q.field_filters == {"attr:kind": ["logoff"]}
+    assert (start_q.start, start_q.end) == (start, end) and (end_q.start, end_q.end) == (start, end)
+    assert args == ("attr:host", "next_end", 100, 50_000)
+
+
+@pytest.mark.asyncio
+async def test_lanes_first_last_passes_no_layers_and_next_end_needs_both(monkeypatch):
+    from fastapi import HTTPException
+
+    svc = _patch_compare(monkeypatch)
+    await viz.get_lanes("c1", "t1", viz.LanesRequest(field="attr:host"), case=None)
+    assert svc.calls[0][2] == (None, None) and svc.calls[0][3][1] == "first_last"
+    with pytest.raises(HTTPException) as exc:
+        await viz.get_lanes(
+            "c1",
+            "t1",
+            viz.LanesRequest(
+                field="attr:host", pairing="next_end", start_filter=viz.CompareFilters()
+            ),
+            case=None,
+        )
+    assert exc.value.status_code == 422
+    assert "requires 'start_filter' and 'end_filter'" in str(exc.value.detail)
+
+
+async def test_viz_marks_runs_under_the_scan_gate_and_answers_503_when_busy(monkeypatch):
+    """An events mark is a foreground scan like every other viz read: a full
+    lane must surface as the 503 the page's busy-retry understands, not a 500."""
+    from types import SimpleNamespace
+
+    from vestigo.api.scan_exec import ScanBusyResponse
+    from vestigo.db._scan import ScanBusy
+
+    svc = _patch_agg(monkeypatch)
+
+    def busy(query, limit):
+        raise ScanBusy(ahead=2, wait=0.0)
+
+    monkeypatch.setattr(svc, "mark_instants", busy)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    body = viz.MarksRequest(marks=[{"kind": "events", "filters": {"q": "beacon"}}])
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(ScanBusyResponse):
+        await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+
+
+async def test_viz_marks_rejects_an_invalid_regex_in_an_events_mark_with_400(monkeypatch):
+    from types import SimpleNamespace
+
+    svc = _patch_agg(monkeypatch)
+    monkeypatch.setattr(viz, "get_store", lambda: None)
+    body = viz.MarksRequest(marks=[{"kind": "events", "filters": {"q": "(", "qRegex": True}}])
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as info:
+        await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
+    assert info.value.status_code == 400
+    assert svc.calls == []
+
+
+async def test_viz_marks_maps_an_re2_rejection_to_400_for_every_regex_path(monkeypatch):
+    """The RE2 guard is decided per mark, off the query that is about to run.
+
+    A pattern can live in three places — ``qRegex``, a per-field ``regex``
+    match mode, or a saved view's own filter — and only the first is visible
+    on the request body. Deciding once from ``q_regex`` left the other two
+    unguarded, so an RE2-only rejection surfaced as a 500 where every other
+    viz endpoint answers 400.
+    """
+    from types import SimpleNamespace
+
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    view = SimpleNamespace(
+        id="v1",
+        name="Beacons",
+        view_filter={"q": "(?<=x)beacon", "qRegex": True},
+    )
+
+    class _Store:
+        async def get_view(self, case_id, view_id):
+            return view
+
+    def re2_failure(query, limit):
+        raise DatabaseError("Code: 427. DB::Exception: OK, but cannot compile re2: (?<=x)")
+
+    for marks in (
+        # A per-field match mode, not `qRegex`.
+        [
+            {
+                "kind": "events",
+                "filters": {
+                    "filters": {"attr:msg": ["(?<=x)b"]},
+                    "filterModes": {"attr:msg": "regex"},
+                },
+            }
+        ],
+        # A saved view whose own query is a regex — not on the request at all.
+        [{"kind": "view", "viewId": "v1"}],
+    ):
+        svc = _patch_agg(monkeypatch)
+        monkeypatch.setattr(svc, "mark_instants", re2_failure)
+        monkeypatch.setattr(viz, "get_store", _Store)
+        user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+        with pytest.raises(HTTPException) as info:
+            await viz.resolve_viz_marks(
+                "c1", "t1", viz.MarksRequest(marks=marks), case=None, user=user
+            )
+        assert info.value.status_code == 400, marks

@@ -274,6 +274,11 @@ class Settings(BaseSettings):
     # bounded aggregates; freshness is keyed, not TTL'd.
     viz_baseline_cache_entries: int = Field(default=64, ge=0)
 
+    # Marks (Visualize): instants a single mark source may draw. A source is
+    # one filter, saved view or baseline definition; past the cap the figure
+    # draws the first N by time and the caption says how many it did not.
+    viz_marks_max: int = Field(default=50, ge=1, le=500)
+
     # Ingestion
     # Events per ClickHouse insert during ingestion. Each batch is one HTTP
     # round-trip, so larger batches amortize LAN latency and ClickHouse's
@@ -464,8 +469,9 @@ class Settings(BaseSettings):
     converter_generation_enabled: bool = False
     # Generation + repair rounds on the sample before giving up.
     converter_max_attempts: int = Field(default=4, ge=1, le=10)
-    # Bytes of the raw file sent to the model (head/middle/tail excerpt).
-    converter_sample_bytes: int = Field(default=65536, ge=4096, le=1048576)
+    # Bytes of the excerpt shown to the model (head/middle/tail, whole records).
+    # Small on purpose — docs/INPUT_FORMATS.md §"The loop" step 1 says why.
+    converter_sample_bytes: int = Field(default=4096, ge=4096, le=1048576)
     # Wall clock for one generation or repair round — availability probe,
     # config resolution and the model request together, not just the request.
     # A local model writing a whole converter script is the slow case: when

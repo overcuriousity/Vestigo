@@ -1,18 +1,23 @@
 /**
- * VisualizePage control rail — cause before effect (#298).
+ * VisualizePage control rail — cause before effect (#298), field first.
  *
- * The rail used to read Field → Scale → Chart type while the *dependency* ran
- * the other way: which of those controls are live is derived from the chart
- * type, so an analyst landing on the default Time histogram saw the topmost
- * control inert and only discovered why by changing a dropdown below it. Worse,
- * two controls moved on their own — the scale radio re-picks the chart type,
- * and the numeric auto-probe reassigns both — without a word.
+ * The rail once read Field → Scale → Chart type while the *dependency* ran
+ * the other way, and two controls moved on their own without a word. It now
+ * reads Field → Treat as → Figure: the field is what the analyst has, "treat
+ * as" says what it is, and the gallery lights the figures that pair admits.
  *
- * These pin the fix: the order states the dependency, the inert state explains
- * itself and offers the way out, and every automatic re-pick says what it did.
+ * These pin the contract: the order states the dependency, the field-free
+ * figures are reachable from the field picker itself, and every automatic
+ * re-pick says what it did.
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { VisualizePage } from "@/pages/VisualizePage";
@@ -47,12 +52,16 @@ vi.mock("@/api/viz", async () => {
 // `scopeReady` — and therefore the numeric probe — waits on the dispositions
 // query, so this has to resolve or no automatic re-pick ever fires.
 vi.mock("@/api/dispositions", async () => {
-  const actual = await vi.importActual<typeof import("@/api/dispositions")>(
-    "@/api/dispositions",
-  );
+  const actual =
+    await vi.importActual<typeof import("@/api/dispositions")>(
+      "@/api/dispositions",
+    );
   return {
     ...actual,
-    dispositionsApi: { ...actual.dispositionsApi, list: (...a: unknown[]) => dispositionsListMock(...a) },
+    dispositionsApi: {
+      ...actual.dispositionsApi,
+      list: (...a: unknown[]) => dispositionsListMock(...a),
+    },
   };
 });
 
@@ -68,7 +77,9 @@ const FIELDS: VizFieldsResponse = {
 const LANDING = "/cases/c1/timelines/t1/visualize";
 
 function renderPage(entry = LANDING) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
@@ -89,7 +100,7 @@ function renderPage(entry = LANDING) {
 function railOrder(): string[] {
   return [...document.querySelectorAll("label")]
     .map((el) => el.textContent?.trim() ?? "")
-    .filter((t) => /^(Field|Field \(X\)|Scale of measurement|Chart type)/.test(t));
+    .filter((t) => /^(Field|Treat as|Figure)$/.test(t));
 }
 
 beforeEach(() => {
@@ -116,20 +127,21 @@ beforeEach(() => {
 });
 
 describe("VisualizePage rail order", () => {
-  it("puts the controls everything depends on above the ones that depend on them", async () => {
+  it("reads field first, then what to treat it as, then the figure", async () => {
     renderPage();
     await waitFor(() => expect(railOrder().length).toBeGreaterThan(0));
 
     const order = railOrder();
-    const scale = order.findIndex((t) => t.startsWith("Scale of measurement"));
-    const type = order.findIndex((t) => t.startsWith("Chart type"));
-    const field = order.findIndex((t) => t.startsWith("Field"));
+    const field = order.indexOf("Field");
+    const scale = order.indexOf("Treat as");
+    const figure = order.indexOf("Figure");
 
-    // Scale gates which chart types are legal; the chart type decides whether
-    // Field means anything at all. Read top-down, that is now a sentence.
-    expect(scale).toBeGreaterThanOrEqual(0);
-    expect(scale).toBeLessThan(type);
-    expect(type).toBeLessThan(field);
+    // The field is what the analyst has; "treat as" says what it is; the
+    // figure gallery lights what that pair admits. Read top-down, that is a
+    // sentence — and the topmost control is never inert.
+    expect(field).toBeGreaterThanOrEqual(0);
+    expect(field).toBeLessThan(scale);
+    expect(scale).toBeLessThan(figure);
   });
 });
 
@@ -140,27 +152,34 @@ describe("VisualizePage field picker when the chart charts no field", () => {
     expect(await screen.findByText(/counts every event/i)).toBeInTheDocument();
   });
 
-  it("offers the one-click way out, and the picker comes alive", async () => {
+  it("picking a field is the way out, and the rail says which figure it landed on", async () => {
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: /chart a field instead/i }));
-
-    // The picker replaces the inert box — no second dropdown hunt required.
-    await waitFor(() =>
-      expect(screen.getByRole("combobox", { name: /^Field/ })).toBeInTheDocument(),
+    const combo = await screen.findByRole("combobox", { name: /^Field/ });
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(
+      await screen.findByRole("option", { name: /artifact/ }),
     );
-    expect(screen.queryByText(/counts every event/i)).not.toBeInTheDocument();
+
+    // The field-free figure is left behind for one that charts the field —
+    // an automatic move, so it names itself.
+    expect(await screen.findByText(/figure set to bar/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText(/counts every event/i)).not.toBeInTheDocument(),
+    );
   });
 });
 
 describe("VisualizePage automatic re-picks", () => {
   it("says so when changing the scale forces a new chart type", async () => {
     // Start on a chart type that is legal for nominal but not for ratio.
-    renderPage("/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact");
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact",
+    );
     await screen.findByRole("combobox", { name: /^Field/ });
 
-    fireEvent.click(screen.getByRole("radio", { name: /ratio/i }));
+    fireEvent.click(screen.getByRole("radio", { name: "Measure" }));
 
-    expect(await screen.findByText(/chart type switched to/i)).toBeInTheDocument();
+    expect(await screen.findByText(/figure switched to/i)).toBeInTheDocument();
   });
 
   it("says so when the numeric probe reassigns scale and chart type", async () => {
@@ -174,7 +193,9 @@ describe("VisualizePage automatic re-picks", () => {
       quantiles: {},
       bins: [],
     });
-    renderPage("/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact");
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact",
+    );
     const combo = await screen.findByRole("combobox", { name: /^Field/ });
 
     fireEvent.change(combo, { target: { value: "attr:src_port" } });
@@ -185,26 +206,30 @@ describe("VisualizePage automatic re-picks", () => {
   });
 
   it("drops the explanation once the analyst picks a chart type themselves", async () => {
-    renderPage("/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact");
+    renderPage(
+      "/cases/c1/timelines/t1/visualize?c_type=bar&c_scale=nominal&c_field=artifact",
+    );
     await screen.findByRole("combobox", { name: /^Field/ });
-    fireEvent.click(screen.getByRole("radio", { name: /ratio/i }));
-    await screen.findByText(/chart type switched to/i);
+    fireEvent.click(screen.getByRole("radio", { name: "Measure" }));
+    await screen.findByText(/figure switched to/i);
 
     // An explicit choice supersedes the explanation of the automatic one.
-    // Another scale radio would not do: that is a second automatic re-pick,
-    // which correctly replaces the notice rather than clearing it.
-    const chartType = screen.getAllByRole("combobox")[0];
-    fireEvent.keyDown(chartType, { key: "ArrowDown" });
-    await screen.findByRole("listbox");
-    // Any option other than the one already selected — re-picking the current
-    // value fires no change and would prove nothing.
-    const other = screen
-      .getAllByRole("option")
-      .find((o) => o.getAttribute("aria-selected") !== "true")!;
+    // Another "treat as" chip would not do: that is a second automatic
+    // re-pick, which correctly replaces the notice rather than clearing it.
+    // Any lit figure other than the one already selected — re-picking the
+    // current value fires no change and would prove nothing.
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    const other = within(gallery)
+      .getAllByRole("radio")
+      .find(
+        (o) =>
+          o.getAttribute("aria-checked") !== "true" &&
+          o.getAttribute("aria-disabled") !== "true",
+      )!;
     fireEvent.click(other);
 
     await waitFor(() =>
-      expect(screen.queryByText(/chart type switched to/i)).not.toBeInTheDocument(),
+      expect(screen.queryByText(/figure switched to/i)).not.toBeInTheDocument(),
     );
   });
 });

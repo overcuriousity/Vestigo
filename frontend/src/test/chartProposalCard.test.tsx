@@ -188,7 +188,7 @@ describe("ChartProposalCard", () => {
     expect(caseId).toBe(CASE);
     expect(timelineId).toBe(TL);
     expect(name).toBe("my chart");
-    expect(config).toMatchObject({ v: 1, chartType: "bar", field: "artifact" });
+    expect(config).toMatchObject({ v: 2, chartType: "bar", field: "artifact" });
   });
 
   it("Save stores the spec's own filters alongside the config", async () => {

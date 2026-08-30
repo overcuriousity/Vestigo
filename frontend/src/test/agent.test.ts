@@ -23,6 +23,7 @@ const CHART_TYPES = Object.keys(CHART_META) as ChartType[];
 import { filtersToParams, paramsToFilters } from "@/lib/queryParams";
 import { computeEffectiveFilters, overlaysFromApplied } from "@/lib/effectiveFilters";
 import type { EventFilters } from "@/api/types";
+import deepLink from "./fixtures/viz-deep-link.json";
 
 describe("specToEventFilters", () => {
   it("maps every FilterSpec field onto EventFilters", () => {
@@ -527,5 +528,84 @@ describe("specToChartConfig (current shape)", () => {
     });
     expect(config.options.topN).toBe(5);
     expect(config.options.buckets).toBe(20);
+  });
+});
+
+describe("specToChartConfig — derive", () => {
+  it("carries the derivation across, in the frontend's casing", () => {
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", derive: { kind: "time_part", part: "weekday" } }).derive,
+    ).toEqual({ kind: "timePart", part: "weekday" });
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", derive: { kind: "bins", mode: "log", count: 8 } }).derive,
+    ).toEqual({ kind: "bins", mode: "log", count: 8 });
+    expect(specToChartConfig({ chart_type: "bar", field: "a", derive: null }).derive).toBeNull();
+  });
+});
+
+describe("specToChartConfig — inputs", () => {
+  it("carries the table's columns across, dropping unknown ones", () => {
+    expect(
+      specToChartConfig({
+        chart_type: "table",
+        field: "a",
+        inputs: { columns: ["count", "share", "bogus" as never] },
+      }).inputs,
+    ).toEqual({ columns: ["count", "share"] });
+    expect(specToChartConfig({ chart_type: "bar", field: "a" }).inputs).toEqual({});
+  });
+});
+
+describe("open_url — the page parses the backend's deep link back to the same chart", () => {
+  it("round-trips config and filters through the URL the agent hands an external client", () => {
+    const params = new URLSearchParams(deepLink.url.split("?")[1]);
+    expect(paramsToChartConfig(params)).toEqual(deepLink.config);
+    expect(paramsToFilters(params)).toEqual(deepLink.filters);
+  });
+});
+
+describe("specToChartConfig — marks", () => {
+  it("maps the agent's snake_case marks onto MarkSource, dropping a malformed one", () => {
+    const config = specToChartConfig({
+      chart_type: "time",
+      marks: [
+        { kind: "events", filters: { tags_include: ["exfil"], event_ids: ["e1"] }, label: "x" },
+        { kind: "baseline", definition_id: "bd1" },
+        { kind: "view", view_id: "v1" },
+        { kind: "instant", at: "2026-03-13T09:41:00+00:00", label: "first" },
+        { kind: "range", start: "2026-03-13T09:00:00+00:00", end: "2026-03-13T10:00:00+00:00", label: "w" },
+        { kind: "instant" } as never,
+      ],
+    });
+    expect(config.marks).toEqual([
+      { kind: "events", filters: { tagsInclude: ["exfil"], ids: ["e1"] }, label: "x" },
+      { kind: "baseline", definitionId: "bd1" },
+      { kind: "view", viewId: "v1" },
+      { kind: "instant", at: "2026-03-13T09:41:00+00:00", label: "first" },
+      { kind: "range", start: "2026-03-13T09:00:00+00:00", end: "2026-03-13T10:00:00+00:00", label: "w" },
+    ]);
+    expect(specToChartConfig({ chart_type: "time" }).marks).toEqual([]);
+  });
+});
+
+describe("specToChartConfig — a derived spec carries the treat-as, not the effective scale", () => {
+  const bins = { kind: "bins" as const, mode: "log" as const, count: 8 };
+  it("resolves an omitted or ordinal scale to what the derivation is computed from", () => {
+    expect(specToChartConfig({ chart_type: "bar", field: "a", derive: bins }).scale).toBe("ratio");
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", scale: "ordinal", derive: bins }).scale,
+    ).toBe("ratio");
+    expect(
+      specToChartConfig({
+        chart_type: "bar",
+        field: "a",
+        derive: { kind: "time_part", part: "hour" },
+      }).scale,
+    ).toBe("interval");
+  });
+  it("passes an explicit admitted treat-as through", () => {
+    expect(
+      specToChartConfig({ chart_type: "bar", field: "a", scale: "interval", derive: bins }).scale,
+    ).toBe("interval");
   });
 });

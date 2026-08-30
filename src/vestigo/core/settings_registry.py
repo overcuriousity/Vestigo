@@ -596,6 +596,13 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Bytes after which a heavy GROUP BY spills to disk.",
     ),
     SettingSpec(
+        "viz_marks_max",
+        "scans",
+        "Visualize marks per source",
+        "Instants one mark source (a filter, saved view or baseline definition) may draw on a "
+        "figure. Beyond it the earliest N are drawn and the overflow is stated in the caption.",
+    ),
+    SettingSpec(
         "stat_scan_external_sort_bytes",
         "scans",
         "ORDER BY spill threshold (bytes)",
@@ -905,8 +912,10 @@ _SPECS: tuple[SettingSpec, ...] = (
         "converter_sample_bytes",
         "converters",
         "Sample size sent to the model (bytes)",
-        "Head, middle and tail of the raw file, up to this many bytes, are the only "
-        "evidence that leaves this host.",
+        "Whole records from the head, middle and tail of the raw file, shown to the model "
+        "within this many bytes (long values shortened), are the only evidence that leaves "
+        "this host. Small on purpose: a few records teach the model a format, and a large "
+        "excerpt of a repetitive log is mostly prompt cost.",
         subsystem="converter_generation",
     ),
     SettingSpec(

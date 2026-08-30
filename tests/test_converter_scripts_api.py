@@ -53,7 +53,7 @@ def test_disabled_returns_503(client, admin_bootstrap):
     assert r.status_code == 503
     # Listing is a record, always readable.
     body = client.get(f"/api/cases/{cid}/converters").json()
-    assert body["scripts"] == [] and body["sample_bytes"] == 65536
+    assert body["scripts"] == [] and body["sample_bytes"] == 4096
 
 
 def test_convert_starts_job_and_refuses_binary(client, admin_bootstrap, enabled, stub_job):

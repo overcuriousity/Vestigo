@@ -104,7 +104,7 @@ export const BUDGET: Record<string, FileBudget> = {
   "../components/viz/primitives/Legend.tsx": { rawButton: 1 },
   "../pages/ExplorerPage.tsx": { rawButton: 3 },
   "../pages/StoryEditorPage.tsx": { rawButton: 1 },
-  "../pages/VisualizePage.tsx": { rawButton: 7 },
+  "../pages/VisualizePage.tsx": { rawButton: 2 },
   "../pages/admin/AdminAgentPage.tsx": { fontSize: 2, rawButton: 1 },
   "../pages/admin/AdminSettingsPage.tsx": { fontSize: 1 },
 };

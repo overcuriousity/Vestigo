@@ -318,6 +318,7 @@ def test_merged_field_terms_fallbacks():
         "distinct": 0,
         "values": [],
         "other_count": 0,
+        "derive": None,
     }
 
 

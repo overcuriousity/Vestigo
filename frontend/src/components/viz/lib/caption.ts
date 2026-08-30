@@ -5,20 +5,85 @@
  * exactly what a report reader sees. Includes the truthfulness warnings
  * (top-N capping, undefined metric bins) forensic rigor demands.
  */
-import type { EventFilters, ScatterStats } from "@/api/types";
+import type {
+  DeriveEcho,
+  EventFilters,
+  ResolvedMarksResponse,
+  ScatterStats,
+} from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
+import { describeDerive } from "./derive";
+import { markCaptionLines, type MarksDomain } from "./marks";
+import { TABLE_COLUMN_LABELS } from "./tableRows";
 import { METRIC_INFO } from "./transforms";
 
 /** Data-derived facts the active query contributes to the caption. */
 export interface CaptionFacts {
+  /** A derived field's resolved derivation (the server's echo) — the edges
+   * width/log bins landed on, and whether `≤ 0` got its own range. */
+  derive?: DeriveEcho | null;
   /** kind=time: layer totals + resolved bucket width. */
   primaryTotal?: number;
   comparisonTotal?: number;
   intervalSeconds?: number;
+  /** kind=cumulative: what accumulated and what could not be. */
+  cumulative?: {
+    quantity: "events" | "sum" | "distinct";
+    field: string | null;
+    total: number;
+    events: number;
+    unparsed: number;
+  };
+  /** kind=calendar: the shown span and the week cap. */
+  calendar?: {
+    field: string | null;
+    start: string | null;
+    end: string | null;
+    weeks: number;
+    weeksTotal: number;
+    truncated: boolean;
+    dropped: number;
+    total: number;
+  };
+  /** kind=change: the ranking's inputs and what the union cap dropped. */
+  change?: {
+    topN: number;
+    unionSize: number;
+    rowsShown: number;
+    truncated: boolean;
+    omitted: number;
+    newCount: number;
+    vanishedCount: number;
+  };
+  /** kind=lanes: the pairing rule's inputs and every cap. */
+  lanes?: {
+    pairing: "first_last" | "next_end";
+    /** Lanes with at least one interval — what the figure draws. */
+    lanesShown: number;
+    /** Lanes returned but drawn empty (every event an orphan end). */
+    lanesEmpty: number;
+    lanesTotal: number;
+    laneCapHit: boolean;
+    otherLanes: number;
+    starts: number;
+    ends: number;
+    unpairedStarts: number;
+    orphanEnds: number;
+    rowsTruncated: boolean;
+    rowsPaired: number;
+    rowsCap: number;
+    undated: number;
+    sliceEnd: string | null;
+  };
   /** kind=terms/timeseries: top-N truthfulness. */
   distinct?: number;
   shownValues?: number;
   otherCount?: number;
+  /** Whether the events outside the drawn values are rolled into a visible
+   * "Other" bucket (terms figures) or simply not drawn (a value-over-time
+   * chart draws one series per value and has nowhere to put the rest).
+   * Defaults to true — the terms case, which is where this line started. */
+  otherDrawn?: boolean;
   /** kind=numeric: bin count over the value range. */
   binCount?: number;
   valueMin?: number | null;
@@ -54,6 +119,14 @@ export interface CaptionFacts {
   groupedViolin?: boolean;
   groupsShown?: number;
   groupsOmitted?: number;
+  /** kind=table: the share denominator (events with a non-empty value). */
+  tableTotal?: number;
+  /** kind=table: the row order the server applied. */
+  tableSort?: { by: string; dir: string };
+  /** kind=table: values whose rows are highlighted — presentation only. */
+  tableHighlight?: string[];
+  /** kind=table: what the top-N cut, reported as the remainder row. */
+  tableRemainder?: { count: number; distinctValues: number };
   groupOmittedCount?: number;
   /** box/violin raw-value strip overlay: sample truthfulness. */
   overlayShown?: number;
@@ -66,6 +139,12 @@ export interface CaptionFacts {
   corrDropped?: string[];
   corrMinPairN?: number;
   corrMaxPairN?: number;
+  /** Time-axis figures: the server's resolution of `config.marks`. */
+  marks?: ResolvedMarksResponse;
+  /** The time interval the figure actually draws (`lib/timeDomain.ts`) — what
+   * lets the mark lines say how many marks fall outside it and are not
+   * drawn. Omitted while the figure's own query has not answered. */
+  marksDomain?: MarksDomain | null;
 }
 
 /** Distinct grouping values past which the grouping field reads as an
@@ -119,7 +198,15 @@ export function buildCaptionLines(args: {
    * histogram" for the per-value drill-down modal). */
   headerLabel?: string;
 }): string[] {
-  const { caseId, timelineId, chartLabel, config, filters, facts, headerLabel } = args;
+  const {
+    caseId,
+    timelineId,
+    chartLabel,
+    config,
+    filters,
+    facts,
+    headerLabel,
+  } = args;
   const { field, scale, chartType, metric, compare } = config;
   const lines: (string | undefined)[] = [];
 
@@ -129,23 +216,54 @@ export function buildCaptionLines(args: {
   lines.push(
     facts.focusedValue != null && field
       ? `field: ${field} = ${facts.focusedValue}`
-      : chartType === "time"
+      : chartType === "lanes" && field
+        ? `intervals of ${field} over time — ${chartLabel}`
+        : chartType === "change" && field
+          ? `share-of-window change of ${field}${
+            config.derive ? ` (${scale} → ordered categories)` : ""
+          } between two windows — ${chartLabel}`
+        : chartType === "time"
         ? `event count over time — ${chartLabel}`
         : chartType === "punchcard"
           ? `event count by day-of-week × hour-of-day, UTC — ${chartLabel}`
-          : field && config.fieldY
-            ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
-            : field
-              ? `field: ${field} (${scale}) — ${chartLabel}`
-              : undefined,
+          : chartType === "cumulative"
+            ? `${
+                facts.cumulative?.quantity === "sum"
+                  ? `cumulative sum of ${field} (measure) over time`
+                  : facts.cumulative?.quantity === "distinct"
+                    ? `distinct values of ${field} seen so far`
+                    : "cumulative event count over time"
+              } — ${chartLabel}`
+            : chartType === "calendar"
+              ? `${field ? `events with a ${field} value` : "event count"} per day, UTC — ${chartLabel}`
+              : field && config.fieldY
+                ? `fields: ${field} × ${config.fieldY} — ${chartLabel}`
+                : field && config.derive
+                  ? `field: ${field} (${scale} → ordered categories) — ${chartLabel}`
+                  : field
+                    ? `field: ${field} (${scale}) — ${chartLabel}`
+                    : undefined,
   );
+  // A derived chart says what it did to the values and what it could not
+  // count — a chart of ranges that did not name its edges is uncheckable.
+  if (config.derive) {
+    lines.push(
+      `derived: ${describeDerive(config.derive, facts.derive)} — ${
+        config.derive.kind === "bins"
+          ? "values that do not parse as numbers are not counted"
+          : "values that do not parse as timestamps are not counted; parts are UTC"
+      }`,
+    );
+  }
 
   // Layer summaries: what each series is, with its total.
   const primaryDesc = describeFilters(filters);
   if (compare.mode !== "off") {
     lines.push(
       `primary: ${primaryDesc}` +
-        (facts.primaryTotal != null ? ` — ${fmtInt(facts.primaryTotal)} events` : ""),
+        (facts.primaryTotal != null
+          ? ` — ${fmtInt(facts.primaryTotal)} events`
+          : ""),
     );
     lines.push(
       compare.mode === "baseline"
@@ -160,7 +278,72 @@ export function buildCaptionLines(args: {
     );
   } else {
     if (filters.q) lines.push(`search: ${filters.q}`);
-    if (facts.primaryTotal != null) lines.push(`${fmtInt(facts.primaryTotal)} events`);
+    if (facts.primaryTotal != null)
+      lines.push(`${fmtInt(facts.primaryTotal)} events`);
+  }
+
+  // The ranked change encodes share, never count — say so before any
+  // number, and say what the per-window top-N and the union cap hid.
+  if (facts.change) {
+    const c = facts.change;
+    const nv =
+      c.newCount || c.vanishedCount
+        ? ` — ${fmtInt(c.newCount)} new, ${fmtInt(c.vanishedCount)} vanished`
+        : "";
+    lines.push(
+      `ranked by |Δ share of window|, not by count; top ${fmtInt(c.topN)} values per window, ${fmtInt(c.unionSize)} in the union${nv}`,
+    );
+    if (c.truncated) {
+      lines.push(
+        `union capped at ${fmtInt(c.rowsShown)} of ${fmtInt(c.unionSize)} values; the ${fmtInt(c.omitted)} with the smallest change not drawn`,
+      );
+    }
+  }
+
+  // Interval lanes: the pairing rule in one sentence, then every cap — the
+  // reader must be able to say what a bar means and what is not on the canvas.
+  if (facts.lanes) {
+    const l = facts.lanes;
+    lines.push(
+      l.pairing === "next_end"
+        ? "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn"
+        : "pairing: first to last — one bar per lane, from its first event to its last",
+    );
+    // A lane can survive the cap and still draw nothing — under `next_end`,
+    // one whose events are all orphan ends pairs no interval. Counting those
+    // in "lanes: N" made the caption name more rows than the canvas has.
+    const empty =
+      l.lanesEmpty > 0
+        ? `; ${fmtInt(l.lanesEmpty)} lane${l.lanesEmpty === 1 ? "" : "s"} with no interval to draw`
+        : "";
+    lines.push(
+      l.laneCapHit
+        ? `lanes: ${fmtInt(l.lanesShown)} shown of ${fmtInt(l.lanesTotal)} (top by event count); ${fmtInt(l.otherLanes)} more not drawn${empty}`
+        : `lanes: ${fmtInt(l.lanesShown)}${empty}`,
+    );
+    if (l.pairing === "next_end") {
+      // Two sentences because they are two scopes, and one sentence carrying
+      // both is arithmetic nobody can reconcile: `starts`/`ends` are counted
+      // over the whole union, before the lane cap, while the pairing runs only
+      // over the lanes that survived it.
+      lines.push(
+        `starts: ${fmtInt(l.starts)} · ends: ${fmtInt(l.ends)} — matched across all ${fmtInt(l.lanesTotal)} lane${l.lanesTotal === 1 ? "" : "s"}, before the caps`,
+      );
+      // The pairing ran over every lane that survived the cap, drawn or not —
+      // an orphan end in an empty lane is counted here and nowhere on screen.
+      const paired = l.lanesShown + l.lanesEmpty;
+      lines.push(
+        `paired over the ${fmtInt(paired)} lane${paired === 1 ? "" : "s"} kept: ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
+      );
+      if (l.rowsTruncated) {
+        lines.push(
+          `first ${fmtInt(l.rowsPaired)} start/end events (by time) paired — the row cap; later ones not drawn`,
+        );
+      }
+    }
+    if (l.undated > 0) {
+      lines.push(`${fmtInt(l.undated)} undated event${l.undated === 1 ? "" : "s"} not drawn`);
+    }
   }
 
   if (filters.start || filters.end) {
@@ -171,7 +354,44 @@ export function buildCaptionLines(args: {
   if (facts.intervalSeconds != null && facts.intervalSeconds > 0) {
     lines.push(`${describeInterval(facts.intervalSeconds)} buckets, UTC`);
   }
-  if (facts.binCount != null && facts.valueMin != null && facts.valueMax != null) {
+  // A running total says what it reached and what it could not add — a sum
+  // that silently skipped "n/a" is a smaller number than the reader assumes.
+  if (facts.cumulative) {
+    const c = facts.cumulative;
+    const num = (n: number) =>
+      Number.isInteger(n)
+        ? fmtInt(n)
+        : n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    let line =
+      c.quantity === "distinct"
+        ? `${fmtInt(c.total)} distinct values over ${fmtInt(c.events)} events`
+        : `final value ${num(c.total)} over ${fmtInt(c.events)} events`;
+    if (c.unparsed > 0) {
+      const n = `${fmtInt(c.unparsed)} event${c.unparsed === 1 ? "" : "s"}`;
+      line +=
+        c.quantity === "sum"
+          ? `; ${n} with no numeric ${c.field} value not summed`
+          : `; ${n} with an empty ${c.field} not counted`;
+    }
+    lines.push(line);
+  }
+  // The calendar names its day boundary and its cap: a figure that quietly
+  // dropped the first eight weeks would read as "nothing happened then".
+  if (facts.calendar) {
+    const c = facts.calendar;
+    if (c.start && c.end)
+      lines.push(`${c.weeks} weeks, ${c.start} → ${c.end}, day boundaries UTC`);
+    if (c.truncated) {
+      lines.push(
+        `latest ${c.weeks} of ${c.weeksTotal} weeks drawn; ${fmtInt(c.dropped)} earlier events not drawn`,
+      );
+    }
+  }
+  if (
+    facts.binCount != null &&
+    facts.valueMin != null &&
+    facts.valueMax != null
+  ) {
     // Each rule names itself exactly. Crediting Freedman–Diaconis for a fixed
     // fallback, or for a count the clamp overrode, would put a decision in the
     // caption that the data never made.
@@ -201,24 +421,83 @@ export function buildCaptionLines(args: {
   }
 
   // Truthfulness warnings.
+  if (chartType === "table") {
+    if (facts.tableSort) {
+      const label =
+        TABLE_COLUMN_LABELS[
+          facts.tableSort.by as keyof typeof TABLE_COLUMN_LABELS
+        ] ?? facts.tableSort.by;
+      lines.push(
+        `sorted by ${label} (${facts.tableSort.dir === "asc" ? "ascending" : "descending"})`,
+      );
+    }
+    if (facts.tableTotal != null && field) {
+      lines.push(
+        `share = count / ${fmtInt(facts.tableTotal)} events with a non-empty ${field}`,
+      );
+    }
+    if (
+      facts.tableRemainder &&
+      facts.distinct != null &&
+      facts.shownValues != null
+    ) {
+      const more = facts.tableRemainder.distinctValues;
+      // "top" only when the ordering makes these rows the top ones. The server
+      // applies the analyst's sort *before* the LIMIT, so the sort decides
+      // which values survive, not just how the survivors are arranged: sorted
+      // by count ascending, the drawn rows are the ten rarest and the
+      // remainder holds nearly every event. Claiming "top" there is false, and
+      // the generic top-N line is suppressed for tables, so nothing else
+      // corrects it. Descending by count is the only ordering that means it.
+      const ranked =
+        facts.tableSort == null ||
+        (facts.tableSort.by === "count" && facts.tableSort.dir === "desc");
+      const shown = ranked
+        ? `showing top ${fmtInt(facts.shownValues)}`
+        : `showing the first ${fmtInt(facts.shownValues)} in this order`;
+      lines.push(
+        `${shown} of ${fmtInt(facts.distinct)} distinct values; ${fmtInt(facts.tableRemainder.count)} events across ${fmtInt(more)} more value${more === 1 ? "" : "s"} in the remainder row`,
+      );
+    }
+    if (facts.tableHighlight?.length) {
+      lines.push(
+        `highlighted rows: ${facts.tableHighlight.join(" · ")} — presentation only`,
+      );
+    }
+  }
+  if (facts.marks && facts.marks.sources.length > 0) {
+    lines.push(...markCaptionLines(facts.marks, facts.marksDomain));
+  }
   if (
+    chartType !== "table" &&
     facts.distinct != null &&
     facts.shownValues != null &&
     facts.distinct > facts.shownValues
   ) {
+    const outside = facts.distinct - facts.shownValues;
     lines.push(
       `showing top ${fmtInt(facts.shownValues)} of ${fmtInt(facts.distinct)} distinct values (capped` +
         (facts.otherCount != null && facts.otherCount > 0
-          ? `; ${fmtInt(facts.otherCount)} events in "Other")`
+          ? facts.otherDrawn === false
+            ? `; ${fmtInt(facts.otherCount)} events across the ${fmtInt(outside)} value${outside === 1 ? "" : "s"} not drawn)`
+            : `; ${fmtInt(facts.otherCount)} events in "Other")`
           : ")"),
     );
   }
-  if (facts.xDistinct != null && facts.xShown != null && facts.xDistinct > facts.xShown) {
+  if (
+    facts.xDistinct != null &&
+    facts.xShown != null &&
+    facts.xDistinct > facts.xShown
+  ) {
     lines.push(
       `x-axis: top ${fmtInt(facts.xShown)} of ${fmtInt(facts.xDistinct)} distinct values (rest in "Other")`,
     );
   }
-  if (facts.yDistinct != null && facts.yShown != null && facts.yDistinct > facts.yShown) {
+  if (
+    facts.yDistinct != null &&
+    facts.yShown != null &&
+    facts.yDistinct > facts.yShown
+  ) {
     lines.push(
       `y-axis: top ${fmtInt(facts.yShown)} of ${fmtInt(facts.yDistinct)} distinct values (rest in "Other")`,
     );
@@ -240,7 +519,10 @@ export function buildCaptionLines(args: {
           : "") +
         " — all groups binned over the same value range",
     );
-    if (facts.groupDistinct != null && facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT) {
+    if (
+      facts.groupDistinct != null &&
+      facts.groupDistinct > IDENTIFIER_LIKE_GROUP_COUNT
+    ) {
       lines.push(
         `${facts.groupField} has ${fmtInt(facts.groupDistinct)} distinct values — that is usually an identifier rather than a grouping variable, and only the largest groups are drawn`,
       );
@@ -301,15 +583,23 @@ export function buildCaptionLines(args: {
         `no numeric values under these filters: ${facts.corrDropped.join(", ")} — their cells are empty`,
       );
     }
-    lines.push("correlation is not causation; a coefficient near 0 rules out only the relationship it measures");
+    lines.push(
+      "correlation is not causation; a coefficient near 0 rules out only the relationship it measures",
+    );
   }
-  if (facts.readabilityWarning) lines.push(`readability: ${facts.readabilityWarning}`);
+  if (facts.readabilityWarning)
+    lines.push(`readability: ${facts.readabilityWarning}`);
   if (metric === "delta") lines.push("first bin omitted (Δ undefined)");
-  if (metric === "ratio") lines.push("bins with a zero-count comparison layer omitted (ratio undefined)");
+  if (metric === "ratio")
+    lines.push(
+      "bins with a zero-count comparison layer omitted (ratio undefined)",
+    );
 
   // Metric formula.
   if (metric !== "count") {
-    lines.push(`metric: ${METRIC_INFO[metric].label} = ${METRIC_INFO[metric].formula}`);
+    lines.push(
+      `metric: ${METRIC_INFO[metric].label} = ${METRIC_INFO[metric].formula}`,
+    );
   }
 
   return lines.filter((l): l is string => !!l);

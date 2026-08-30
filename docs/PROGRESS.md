@@ -4,9 +4,9 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 202 — embeddings UI is absent, not disabled, where nothing can embed).
+Last updated: 2026-08-30 (session 212 — embeddings UI is absent, not disabled, where nothing can embed).
 
-## Session 202 — 2026-08-30: every embeddings entry point is gated on the capability
+## Session 212 — 2026-08-30: every embeddings entry point is gated on the capability
 
 `EmbedWizard` and `ToolsSheet` already hid themselves where `capabilities.embeddings` is
 false; five other surfaces did not, and on an instance with no embedding backend they each
@@ -28,6 +28,445 @@ described a subsystem that does not exist there:
 All of them gate on `useCapabilities()` — the same `GET /api/health` answer, one place — per
 `core/capabilities.py`: an unconfigured subsystem shows no entry point at all, and every
 endpoint still refuses on its own, so hiding is never the only enforcement.
+
+## Session 211 — 2026-08-30: the converter excerpt shrinks to a few dozen records
+
+A converter generation over a 348 KB / 3006-line nginx access log failed four times in a
+row with `TimeoutError`, then `502 ... upstream command exited prematurely`. The llama.cpp
+logs name it precisely: the prompt was **50,039 tokens**, prefill took 91 s at ~546 tok/s,
+generation ran at ~18.8 tok/s, and the process was killed at exactly `4.00.000` —
+`srv operator(): cleaning up before exit...` — on all three server-side attempts. A 240 s
+cap upstream (not ours: `converter_generation_timeout_seconds` is 180 and the client's read
+timeout was 300) that the request could never fit inside.
+
+The prompt was that big because the excerpt was 64 KiB of a log that says the same thing
+3000 times. A first cut of this fix condensed the excerpt to distinct line *shapes* (masked
+quoted runs / hex / digits, five lines per shape per block). Review found eight defects in
+that machinery — a clamp that produced a phantom empty line for files just over budget, a
+tail walk that orphaned stack-trace continuations, per-line request ids defeating the
+masking entirely, quoted delimiters and apostrophes confusing the shape, a sample-run input
+skewed toward unparseable lines, and two tests that never exercised the path they named —
+and the conclusion was that the cleverness was the problem. Generated converters are best
+effort by design: a frictionless start on a standard log, or a first try at a format nothing
+else covers, and if that fails the analyst takes the longer route anyway.
+
+**So the fix is a smaller sample.** `converter_sample_bytes` defaults to **4 KiB** (also the
+floor, as before) — split 70/15/15 across the head, a middle window and the tail so the newest
+timestamps are in it. The system message says the excerpt is deliberately short and that the
+converter is for the whole file (`SYSTEM_PROMPT_VERSION` → `"4"`), and `sample_as_file` writes
+**every** block rather than the head alone, so the guarded sample run sees the middle and the
+tail too. On the offending log the task message drops from ~23k tokens to ~1.4k (35 lines).
+
+Review of that cut found the byte split had no notion of a record: at 4 KiB the blocks are
+2867/614/615 bytes, so a 1.5 KB JSONL line came out as a fragment with an absolute line number
+and no marker, a 3 KB line made even the head a fragment (0/2 valid records — no converter
+could ever pass the 50 % floor), a last line longer than 615 bytes meant no tail at all, and a
+middle block could start inside a quoted multi-line CSV field. **The budget now bounds what is
+shown, not what a block may hold.** `converters/sample.py` reads whole *records* — a marker
+(`\n`; `\n<indent>{` for pretty-printed JSON objects and array elements; a quote-parity-aware
+newline when the probe shows multi-line quoted fields) found at C speed in the same O(1)
+streaming scan — at least one per block however long, with the last record as the tail
+fallback, and a one-line `[{…},{…}]` array yields a head of decoded elements. `Sample.raw_blocks`
+are those records (the sample-run input, a top-level array written back as one);
+`Sample.blocks` are what the model sees: a JSON record with every key but long strings and
+arrays cut as `…[N more chars]` / `…[N more items]`, any other line cut at its block's share.
+The task header names the real block line ranges and that rule instead of a literal in the
+system message. Measured on an 85-record Claude session transcript (2.8 KB median, 20 KB max
+line): head/middle/tail all whole records, prompt ~4k tokens.
+
+Docs and copy followed: `INPUT_FORMATS.md` §"The loop" steps 1 and 4 state the size, the
+record rule and that the sample run sees the whole excerpt; `DEPLOYMENT.md` and the setting
+help say "small on purpose"; the upload dialog's disclosure waits for the server's
+`sample_bytes` (submit is disabled until then) instead of rendering a guessed default.
+
+**Not fixed here:** the 240 s cap that killed the requests is in the llama.cpp/llama-swap
+deployment, not in this repo; a file of very wide lines (minified JSON) can still be a large
+prompt at 4 KiB, and the setting cannot go below it — 4 KiB is both the default and the floor,
+because below it the 70/15/15 split cannot hold a whole ordinary line per block, and a block
+holds at least one record however long. Such a file is what the longer route is for.
+
+A second review of the excerpt found three more defects, all in how a leading `[` was read.
+`_detect_layout` treated *any* file whose first non-space byte was `[` as a JSON array, so a
+bracket-prefixed plain log — Apache `error_log`, `[2026-03-01T10:00:00Z] INFO …`, the
+commonest shape there is — had `raw_decode` called at the byte after it, which happily read
+`2026` as the array's first element: the whole excerpt became five numbers and the sample run
+got `[2026,-0,3,-0,1]`, so generation could never succeed and it *looked* like it had sampled
+the file. A leading `[` is now only an array when the next non-space character opens a
+container; anything else is lines, which is what it is. When nothing decodes after that (a
+truncated export), the head is raw text, and `sample_as_file` no longer wraps it in a second
+pair of brackets the file never had. And `record_lines` assumed shown line *j* was raw line
+*j*, which is false for a pretty-printed record re-dumped with its arrays and strings
+shortened: every line after the first shortening carried a number pointing at unrelated text,
+under a header that promised the numbers were absolute. A re-formatted record now numbers only
+its own first line and leaves the rest of the gutter blank, the elements of a multi-line array
+carry their own line numbers, and the header states the file lines each block spans
+(`Sample.line_spans`) rather than counting shown lines against file lines.
+
+## Session 210 — 2026-08-30: twelve review findings on the Visualize round (#332)
+
+A third `/code-review 332` pass. All twelve fixed; the ones with a testable surface carry
+the test that catches them.
+
+**Two figures asserted in the caption what they never sent to the server.** A Cumulative step
+offered *Group into ranges*, stored the derivation and never put `derive` on the wire — while
+the caption (and therefore the PNG/SVG export and any Story snapshot) printed `derived:
+grouped into 8 log-spaced ranges`. Switching away from Ranked change onto a pie left
+`compare.mode: "baseline"` in the config, where all three Compare radios render unchecked
+*and* disabled — invisible and unreachable — under a caption naming a comparison layer that
+was never fetched. Both are now gated twice: the rail offers a derivation only when the figure
+that would *result* sends one (`deriveOptionsForChart` / `resolveDeriveTarget` — a histogram
+still offers it and lands on a bar), drops a comparison the newly picked figure cannot draw
+with its own notice, and `normalizeChartConfig` runs on every way a config enters the app —
+a URL, a saved chart, a Story snapshot — so the rail is not the only thing keeping the two
+honest.
+
+**A Table figure fired the grouped-numeric scan on a categorical X.** `groupedOn` read
+`acceptsSecondField && fieldY`, and `table` declares an optional second field, so every table
+with a "count distinct of" field also ran `viz/field-numeric-grouped` — a heavy ClickHouse
+scan on every render and every knob change, whose result and error nothing on the page reads.
+It is a modifier on the *numeric* kind only.
+
+**Two options outlived the field they needed and answered 422.** "No field — count every
+event" cleared `field` and left `options.quantity: "sum"`; clearing a table's grouping field
+left `tableSortBy: "distinct_second"`. Both preconditions are now enforced where the value is
+resolved (`resolveChartOptions`), which is also what the request and the Sort-by control read,
+rather than at the one mutation site that happened to be found.
+
+**Bin-edge labels named numbers that were not the edges.** `_fmt_edges` escalated precision
+only on *collisions*, so edges `4000.125` / `4000.875` labelled `4,000` / `4,001` — and the
+label is what a reader checks a value against, so 4000.05 sat in the bin below a label saying
+it was above it. Precision now rises twice for two reasons: until every label names its own
+edge (relative 1e-6, capped at six decimals — a log-spaced edge is irrational), then uncapped
+until no two collide. The echo carries `edge_labels` so the caption prints the server's text
+instead of rounding the floats a second time client-side.
+
+**The calendar clipped its most recent weeks.** A `Math.max(3, …)` floor on the cell broke the
+`weeks × step ≤ innerWidth` guarantee: 53 columns needed 265px, and below that the `<svg>`
+clipped the overflow — which, weeks running left→right, is the newest days, under a caption
+still claiming 53 weeks. The step is derived from the width, so the fit is exact at every size.
+
+**The lanes caption mixed two scopes in one sentence.** `starts`/`ends` are counted over the
+whole union; `unpaired_starts`/`orphan_ends` come from the pairing over the *kept* lanes. Two
+sentences now, each naming its own scope.
+
+**Four smaller ones.** An open interval starting within 7px of the panel's right edge drew its
+arrowhead to the left of its own start, pointing at time it does not cover (the arrowhead sits
+at the bar's end now, never wider than half of it). A negative bucket delta on a signed sum
+rendered as `+-3.5`. Two baseline suspect windows with identical bounds collided on a React
+key and one band vanished. And the Highlight box split on commas, so a DN or a user-agent
+could never be highlighted — it is one value per line.
+
+## Session 209 — 2026-08-30: five more review findings on the Visualize round (#332)
+
+A second `/code-review 332` pass; all five fixed, each with the test that catches it.
+
+**Marks off the drawn axis were counted and never disclosed.** `layoutMarks` computed
+`offscreen` and documented it as "disclosed, not silently dropped", but nothing read it: the
+overlay drew only what fit, and `markCaptionLines` built its lines from the unfiltered
+server response — a chart windowed to August captioned four July marks it never drew. The
+axis a figure draws is now one pure function per figure (`lib/timeDomain.ts`), which the
+chart builds its x scale from *and* the caption reasons about, so the two cannot drift; each
+source's caption line ends in `; N outside the drawn time axis, not drawn`. Ranges count
+too — a baseline whose windows fall outside the slice drew nothing and said nothing.
+
+**A number range that named other sources' marks.** Instant numbering is global and by time,
+so two interleaved sources give one of them `#1,#3,#5,#7,#9,#11` — captioned `marks #1–#11`,
+which names five rules belonging to the other source. Non-contiguous runs now read `marks 6
+of #1–#11`.
+
+**A derived table sorted by value came back in lexical order.** `field_table` ordered on the
+raw `multiIf` output, and `<`, `≥` and `≤` all sort after the digits, so the ranges
+interleaved (`1,000 – 2,000` before `< 1,000`) — and the `LIMIT` kept the wrong rows.
+`derive.label_order_expr` orders by the label's rank in the derivation's own list, in SQL.
+
+**The RE2 guard on `POST …/viz/marks` covered one of three regex paths.** It inspected
+`m.filters.q_regex` only, so a per-field `regex` match mode, and a `view` mark whose saved
+view carries a regex, ran unguarded — an RE2-only rejection surfaced as a 500. The guard is
+now decided per mark, off the query about to run.
+
+**The cumulative step's y axis assumed a monotonic total.** `yMax` was the *final* value, but
+`quantity="sum"` over a signed measure is not monotonic: a series peaking at 500 and settling
+at 20 was drawn against a `[0, 20]` axis. The domain is the running series' own min and max.
+
+`docs/VISUALIZE.md` updated alongside (table sorting, marks, the cumulative axis).
+
+## Session 208 — 2026-08-30: eleven review findings on the Visualize round (#332)
+
+`/code-review 332` verified twelve candidates (ten confirmed, one plausible, one refuted);
+all ten confirmed ones and the plausible one's neighbour are fixed here, each with the test
+that would have caught it.
+
+**Two 500s.** `field_lanes(pairing="next_end")` merged the start/end layers' parameters
+with `_with_params`, which copies only the primary's `.external` — a >512-id list on the
+start layer registered `vestigo_ext_0` and shipped no table for it ("Unknown table"). The
+shared registry is now the source of truth after the merge. And `POST …/viz/marks` ran
+`resolve_marks` on a bare `run_in_threadpool` with no `validated=`: a full scan lane
+escaped as a 500 the page's busy-retry never sees, and a bad regex reached ClickHouse. It
+goes through `_run_regex_guarded` with the same pre-checks as every viz GET.
+
+**`scale` is the treat-as, on both sides of the agent boundary.** The spec demanded
+`scale="ordinal"` with a derive while the page stores the treat-as (ratio/interval) and needs
+it to offer the Derive control — so an agent-proposed binned chart opened with no Derive
+section, and a page-saved one was *rejected* on Stories export. `chart_exec` now accepts the
+source scale (`DERIVE_SOURCE_SCALES`; ordinal kept for compatibility) and resolves the
+effective ordinal itself; `spec_to_stored_chart_config`, `deep_link.py` and `agent.ts`
+(`deriveSourceScale`) all carry the treat-as. `docs/AGENT.md`, `docs/VISUALIZE.md`.
+
+**The rest.** `propose_chart` warns when `open_url` cannot carry `event_ids` / `run_id` /
+`collapse_routine` (the link is wider than the result). The `ChartSpec` prose is generated
+from the registry (derive and mark takers) and names every figure, pinned by a test. Bin
+labels take the precision the edges need instead of merging bins under one label. The
+gallery drops a derivation the picked figure cannot take, and says so. The numeric probe
+keeps cumulative / calendar / lanes / change and moves only the treat-as, only where the
+figure admits it. `useResolvedMarks` hands out no data for a figure that draws none (the
+caption printed marks under a bar). `columns: []` — the value-only table — survives the URL,
+storage and the spec crossing. `compare_field_terms` resolves width/log edges once.
+
+## Session 207 — 2026-08-30: interval lanes and the docs consolidation (viz plan D)
+
+Plan D of the Visualize design round (steps 8 and 9 of the original nine, the last); the
+reference is `docs/VISUALIZE.md` §"Interval lanes", and that document is now the durable
+form of the whole round (§"History"). Stacked on ranked change (#329).
+
+**The lane key is `field`.** The design listed a `laneKey` input beside a field-free
+figure; on the field-first rail that would have put a "No field" control over a second
+"Lane key" picker with the treat-as chips and the field probe applying to nothing.
+Declaring `inputs={"field": "required", …}` gives the lane key the scale check, the probe
+and the greyed-tile reasons for free, exactly like the bar — and `lane_key` left
+`INPUT_KEYS`, so a new test pins that every key in the vocabulary is declared by a shipped
+figure.
+
+**One pairing rule, stated as the rule.** The design's two sentences about `next_end`
+disagree when two starts precede one end; the shipped rule is *an end closes the most
+recent open start in its lane* — nested activity draws as nested bars — and the caption
+prints it verbatim. An open start runs to the slice end under an arrowhead; an orphan end
+is counted, never drawn. `first_last` is one `argMin`/`argMax` scan per lane.
+
+**Python pairing over a capped, ordered scan.** LIFO matching where orphans consume nothing
+is a stack, not a running sum, so it is the pure, unit-tested `pair_intervals` over a
+`ORDER BY ts, is_start DESC, event_id LIMIT rows_cap + 1` scan of the kept lanes rather
+than a window function; the cap (`ChartLimits.lanes_rows`, 2,000 agent / 50,000 analyst)
+is disclosed in the response and the caption, as are the lane cap (`ChartLimits.lanes`, 10
+default; 20 agent / 100 analyst), the starts and ends, the open-ended and orphan counts and
+the undated rows.
+
+**`POST …/viz/lanes`.** The design named a GET; three filter sets do not fit query params.
+The start and end layers are resolved as Compare layers are and pinned to the primary's
+window; both are **ANDed with the current filters** — an analyst filtering to one host
+expects that host's starts — which needed a `param_prefix` on `_build_where` so three
+clauses can share one statement without their `p0…` colliding.
+
+**Schema budget.** `ChartInputsSpec.pairing` / `start_filter` / `end_filter` took the tool
+schemas from 42,115 to 42,285 chars; the ceiling stays at 42,500 (`docs/AGENT.md`).
+
+## Session 206 — 2026-08-29: ranked change (viz plan C)
+
+Plan C of the Visualize design round (step 6 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Ranked change". Stacked on the time figures (#328).
+
+**The first figure that requires Compare.** `change` is *defined* by two windows, so the
+registry row gains `requires_compare=True` (generated as `requiresCompare`) with three
+consequences: the rail disables Compare's *Off* and says why, picking the figure with
+Compare off switches Compare to Baseline together with the figure and says so in
+`autoNotice`, and `propose_chart` refuses a `change` without a comparison layer by name.
+A config that still arrives without one (a URL, a saved chart) gets an empty state that
+names the fix rather than a blank chart.
+
+**Share of window, never count.** The two windows are rarely the same size, so the encoded
+quantity is each value's share of its own window; the pure `rank_change_rows` turns two
+count maps and two totals into `rose | fell | new | vanished | same` rows ranked by |Δ
+share|, and the live test pins the case the figure exists for — the same count in both
+windows *fell* when the second window doubled. `field_change` is four scans in two
+parallel pairs: top-N per window (both on the primary's derived expression, as
+`compare_field_terms` does), the union, and one count scan per window over the union that
+also yields the window's non-empty total. The union is capped (`ChartLimits.change_union`,
+30 agent / 200 analyst) and the omitted count is a caption line, like every other honesty
+disclosure here (both totals, the per-window top-N, the union size, new/vanished counts).
+
+**Endpoint decision.** The design named `GET …/viz/field-change`; it ships as
+`kind="change"` on `POST …/viz/compare`, because two filter sets do not fit query params
+and the two-layer resolution, window pinning and derive rule already live there.
+
+**Schema budget.** `ChartOptionsSpec.layout` took the tool schemas from 42,044 to 42,115
+chars; the ceiling stays at 42,500 (`docs/AGENT.md`).
+
+## Session 205 — 2026-08-29: cumulative step and calendar heatmap (viz plan B)
+
+Plan B of the Visualize design round (steps 5 and 7 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Cumulative step" and §"Calendar heatmap". Stacked on marks (#327).
+
+**A third field state.** `cumulative` and `calendar` are the first figures that chart every
+event without a field and a field's values with one: `inputs={"field": "optional"}` beside
+field-free (`time`, `punchcard`) and field-required. `requires_field` is false for both,
+the rail offers *No field* and keeps the figure whichever way the analyst goes, the page's
+"pick a field" empty state stays out of the way, and `propose_chart` accepts either.
+
+**One quantity rule on both sides.** The cumulative step accumulates `events`, a `sum` or
+`distinct` values, chosen by `options.quantity` or resolved from field and scale by the same
+rule in `resolveChartOptions` and `chart_exec`; the registry refuses `sum` over anything but
+a measure and `distinct` over a measure by name, and a field under `events` is a warning.
+The `distinct` quantity merges per-bucket `uniqExactState`s through a window function
+rather than adding per-bucket distinct counts — 2/3/3/4 users, not 2/4/4/6 — and the live
+test pins the difference. Values that could not be summed or counted are `unparsed` and
+captioned. The step is `curveStepAfter` and never interpolates; marks draw on it, Compare
+does not.
+
+**UTC by decision.** The calendar's day boundary is UTC and the caption says so: no
+timeline or user carries a display timezone, and the punch card already pins UTC. The figure
+keeps the latest 53 ISO weeks (`ChartLimits.calendar_weeks`, the same for the agent and the
+analyst — a display truth, not a context budget), discloses the weeks and the events it
+dropped, and draws an empty day as an outlined cell distinct from the ramp's lowest step.
+
+**Schema budget.** `ChartOptionsSpec.quantity` took the tool schemas from 41,947 to
+42,044 chars; the ceiling moved to 42,500 (`docs/AGENT.md`).
+
+## Session 204 — 2026-08-29: marks, `open_url`, the schema budget (viz plan A)
+
+Plan A of the Visualize design round (step 4 of the original nine); the reference is
+`docs/VISUALIZE.md` §"Marks". Stacked on the table figure (#326).
+
+**One resolution, three callers.** A mark is stored as a *source* (`MarkSource`: an
+events filter, a saved view, a baseline definition, or a typed instant/range) and
+`agent/marks.py::resolve_marks` is the only place a source becomes drawable marks — behind
+`POST …/viz/marks` (the page and the agent's card, through one hook), `execute_chart_spec`
+(the agent) and, through it, the Stories export. An `events`/`view` source goes through the
+new `EventQueryService.mark_instants`: the earliest N dated events under the filter plus a
+`countIf` pair, so an undated event is counted and disclosed rather than drawn at the
+sentinel year. A baseline's windows are drawn as declared; nothing is derived from them.
+
+**Provenance on every mark, the cap in every caption.** Each resolved mark carries
+`{kind: event | view | baseline | analyst, …ids}`; each source reports `count`, `shown`,
+`overflow`, `undated`. The per-source cap is `viz_marks_max` (setting, default 50) on the
+page and `ChartLimits.marks_per_source = 20` for the agent, and `markCaptionLines` writes
+one line per source naming its provenance, its instant numbers, the cap and the undated
+count. `lib/marks.ts` numbers instants in time order across sources and lays them out
+(alternating label tiers when crowded, stacked bands), and both `MarksOverlay` and the
+caption read it, so `#3` on the figure is `#3` in the text.
+
+**The rail's eight sources.** `MarksEditor` lists the chart's marks with their resolved
+status and adds one from event id · tag · confirmed findings · custom filter · baseline
+definition · saved view · instant · range. *Confirmed findings* is an `events` mark over
+disposition event ids, which is why the marks codec now carries `eventIds` inside the
+filter payload while the Explorer's `ids` stay session-only. Rendered after Metric (Compare
+and Metric belong together), before the per-chart options.
+
+**Agent parity and `open_url`.** `ChartSpec.marks` is one `ChartMarkSpec` with a
+kind-validator rather than a five-member union — the tool schema is budgeted. Every
+`propose_chart` result now carries `open_url`, the Visualize deep link for that exact
+figure, for external `/mcp` clients that get no card: `agent/deep_link.py` mirrors the
+page's URL codec and a shared fixture is asserted from both sides (backend produces it,
+`agent.test.ts` parses it back). The "treat as" vocabulary note joins both prompts. The
+schema budget was measured 40,953 → 41,947 and the ceiling moved to 42,000, recorded in
+`docs/AGENT.md`.
+
+## Session 203 — 2026-08-29: the table figure (viz step 3/9)
+
+Step 3 of 9 from the Visualize design round; the reference is `docs/VISUALIZE.md` §"Table
+figure". Stacked on step 2 (#325).
+
+**The value inventory made bounded.** `EventQueryService.field_table` is the top-N of
+`iter_field_inventory` (#295) on the *same* SELECT core — `_inventory_select_core`, lifted
+out so a row's count and seen range can never mean one thing in a streamed inventory and
+another in a table; a live test asserts the two agree cell for cell. It adds `share` against
+the slice's non-empty total, `uniqExactIf` of a second field per row, any column as the sort
+(`NULLS LAST`, `val ASC` tie-break), and derivations. Two parallel scans as `field_terms`.
+
+**The remainder-row rule.** Whenever the top-N cut anything the response carries a
+`remainder` and the figure draws it as a final italic row — count and share only, because a
+seen range for "everything else" would be a third scan for a row that exists to say "there
+is more". Absent exactly when nothing was cut; the shown shares plus the remainder's sum to
+one, and the caption names the share denominator.
+
+**Two renderings over one row model.** `lib/tableRows.ts` decides columns, cell text,
+highlighting and the remainder once; `TableFigure` draws an `<svg>` (page, PNG/SVG export,
+in-cell bar encoding count only) and `TableHtml` a real `<table>` that `ChartMarks
+tableAs="html"` selects for Stories and the HTML export. CSV is built client-side from the
+same model — caption as `#` lines, raw shares — and offered as a third export format only
+while a table is on the canvas.
+
+**The rail's first `columns` renderer** — a checklist, *distinct* disabled until a second
+field ("Count distinct of (optional)") is set — plus sort, direction and highlight options.
+`RAIL_RENDERED_INPUTS` grew in the same commit. Agent parity: `ChartSpec.inputs.columns`,
+`options.table_sort_by/table_sort_dir/highlight`, two refusals, `ChartLimits.table_rows`;
+Stories round-trip `inputs` unchanged.
+
+## Session 202 — 2026-08-29: derivations — ranges and calendar parts (viz step 2/9)
+
+Step 2 of 9 from the Visualize design round; the reference is `docs/VISUALIZE.md`
+§"Derivations". Stacked on step 1 (#324).
+
+**A derivation is a change of scale and nothing else.** `db/derive.py` owns the one
+`DeriveSpec` (two kinds: `bins` — number → ordered ranges, `width`/`log`/`custom`; and
+`time_part` — a timestamp-valued attribute → hour/weekday/day/week/month), the edge maths,
+the human labels and the SQL (one `multiIf` over `_finite_float_cast`, or the existing
+`TIME_FIELD_SPECS` expression over `parseDateTimeBestEffortOrNull(…, 'UTC')`, so a derived
+hour can never disagree with `time:hour_of_day`). Nothing knows what an IP or a URL is — that
+stays with the enrichers. Both kinds yield the ordinal scale.
+
+**Resolved once, in ClickHouse, before aggregation.** `EventQueryService._resolve_derive`
+runs the one-scan min/max pre-flight `width`/`log` bins need, under the same WHERE as the
+aggregation that follows, and returns the expression plus a `ResolvedDerive` whose `echo()`
+(`labels`, `edges`, `negative_bin` / `part`, `timezone`) rides on every response — a chart of
+ranges that did not say where its bins are would be uncheckable. `log` gives values ≤ 0
+their own disclosed bin; unparseable values map to `''` and fall out through the existing
+guard, counted nowhere, and the caption says so. Threaded through `field_terms`,
+`compare_field_terms` (both layers on the **primary's** resolved expression, which is also
+part of the baseline-cache key), `field_value_timeseries`, and `field_pivot`, where a derived
+x axis is a bounded domain like a cyclical `time:` axis — every label in order, empty or not.
+
+**Endpoints and parity.** `derive` on `field-terms` / `field-timeseries`, `derive_x` on
+`field-pivot`, `CompareRequest.derive`; malformed → 422 in the validator's words, a `time:`
+field → 422 rather than a 500; a derived terms request bypasses the M24a stats cache.
+`ChartSpec.derive` is the same model in nested-argument position (`ChartDeriveSpec`, an
+`ObjectArgModel`, so the schema-slimming and stringified-object tolerance both apply); four
+registry-driven rejections; `describe_field.derivations`. The tool-schema budget moved
+39,382 → 40,213 chars, ceiling now 41,000. Stories export round-trips `timePart` ↔
+`time_part`.
+
+**The rail.** A **Derive** step between *Treat as* and *Figure*, present only when the
+treat-as admits a change (`lib/derive.ts`). The gallery and every legality check run at the
+effective scale; a bar over ranges defaults to value order and `BarChart.valueOrder` follows
+the echoed labels rather than the alphabet; the caption gains a `derived:` line with the
+resolved edges. The greyed-figure fix deferred from step 1: clicking a greyed figure that
+exactly one derivation would light applies it and says so; with two candidates the tile
+stays inert. A derived chart also suppresses the numeric auto-probe's re-pick, which would
+otherwise have dropped it silently.
+
+## Session 201 — 2026-08-29: figure registry, `ChartConfig` v2, the field-first rail
+
+Step 1 of 9 from the Visualize design round (durable form: the new `docs/VISUALIZE.md`).
+Behaviour-preserving for every existing chart; the foundation the six new figures land on.
+
+**The chart table became a figure registry.** `agent/chart_meta.py` rows now declare
+`inputs` (what the figure asks for, from a fixed eight-key vocabulary), `derives` (which
+change-of-scale derivations it admits), `question` (the forensic question it answers) and
+`supports_marks`. `requires_second_field` / `accepts_second_field` / `multi_field` are
+read-only views over `inputs`, so the generated `chartMeta.ts` and `propose_chart` keep their
+vocabulary. Two tests pin the registry to the rail from both sides: a row may only declare
+keys the rail renders (`RAIL_RENDERED_INPUTS`), and the rail renders exactly the declared
+keys for every figure.
+
+**`ChartConfig` v2.** Three new slots — `derive`, `inputs`, `marks` — all empty until their
+figures ship, plus `c_derive` / `c_inputs` / `c_marks` in the URL codec (JSON, dropped
+field-by-field when malformed). A stored `v: 1` row upgrades losslessly on read
+(`upgradeChartConfig`); the backend writes `CHART_CONFIG_VERSION = 2`. Saved charts, story
+blocks and links keep meaning what they meant.
+
+**The rail reads field first.** `ChartRail.tsx` leaves `VisualizePage.tsx` (2218 → 1358
+lines) as its own component: Field (with *No field — count every event* as the first entry,
+so the top control is never inert) → **Treat as** (four plain-language chips — Categories,
+Ordered categories, Number or time, Measure — with the Stevens term in the tooltip) →
+**Figure** (a thumbnail gallery; illegal figures greyed with their reason) → the figure's
+declared inputs → Compare → Metric → Options. The scale radio and the presets drawer are
+gone; each preset's question is its figure's `question`. Every automatic re-pick still
+names itself, now in the rail's own words ("`src_port` looks numeric — treating it as a
+measure; change this if its values are categories to you").
+
+Declined and removed from the roadmap: facetting / small multiples — a shared axis across
+panels is a correctness trap, and figures are assembled side by side in the report instead.
+
+Next, in order: derivations (bins, calendar part), the table figure, marks, cumulative
+step, ranked change, calendar heatmap, interval lanes.
 
 ## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
 

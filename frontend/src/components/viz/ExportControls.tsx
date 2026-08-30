@@ -8,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/Select";
-import { downloadChartPng, downloadChartSvg } from "@/components/viz/lib/export";
+import { downloadChartPng, downloadChartSvg, downloadCsv } from "@/components/viz/lib/export";
 
 const SCALES = [1, 2, 3, 4] as const;
 
@@ -20,12 +20,25 @@ interface ExportControlsProps {
   /** Lines appended as a caption footer on the exported image — case,
    * timeline, field, active filters, bin params, etc. */
   captionLines?: string[];
+  /** CSV text the figure already holds (the table). Non-null adds a CSV
+   * format; the text is written verbatim, no SVG involved. */
+  csv?: string | null;
 }
+
+type ExportFormat = "svg" | "png" | "csv";
 
 /** Format (SVG/PNG) + resolution picker and download button, shared by the
  * per-value histogram modal and the Visualization page. */
-export function ExportControls({ svgRef, filename, captionLines = [] }: ExportControlsProps) {
-  const [format, setFormat] = useState<"svg" | "png">("png");
+export function ExportControls({
+  svgRef,
+  filename,
+  captionLines = [],
+  csv = null,
+}: ExportControlsProps) {
+  const [format, setFormat] = useState<ExportFormat>("png");
+  // A CSV pick outlives the table that offered it when the analyst switches
+  // figure; fall back rather than offer a download that has nothing to write.
+  const effective: ExportFormat = csv == null && format === "csv" ? "png" : format;
   const [scale, setScale] = useState<(typeof SCALES)[number]>(2);
   const [busy, setBusy] = useState(false);
   // Set when the browser's canvas limits forced the PNG below the picked
@@ -35,12 +48,16 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
   const [downscaled, setDownscaled] = useState<number | null>(null);
 
   const handleDownload = async () => {
+    if (effective === "csv") {
+      if (csv != null) downloadCsv(csv, filename);
+      return;
+    }
     const svg = svgRef.current;
     if (!svg) return;
     setBusy(true);
     setDownscaled(null);
     try {
-      if (format === "svg") {
+      if (effective === "svg") {
         downloadChartSvg(svg, filename, captionLines);
       } else {
         const used = await downloadChartPng(svg, filename, scale, captionLines);
@@ -53,28 +70,29 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
 
   return (
     <div className="flex items-center gap-2">
-      {downscaled != null && format === "png" && (
+      {downscaled != null && effective === "png" && (
         <span role="status" className="max-w-64 text-xs text-[var(--color-fg-muted)]">
           Exported at {downscaled < 1 ? downscaled.toFixed(2) : downscaled.toFixed(1)}× — this
           chart is too tall for a {scale}× canvas. Export as SVG for full detail.
         </span>
       )}
       <Select
-        value={format}
+        value={effective}
         onValueChange={(v) => {
-          setFormat(v as "svg" | "png");
+          setFormat(v as ExportFormat);
           setDownscaled(null);
         }}
       >
-        <SelectTrigger className="h-8 w-20 text-xs">
+        <SelectTrigger className="h-8 w-20 text-xs" aria-label="Export format">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
           <SelectItem value="png">PNG</SelectItem>
           <SelectItem value="svg">SVG</SelectItem>
+          {csv != null && <SelectItem value="csv">CSV</SelectItem>}
         </SelectContent>
       </Select>
-      {format === "png" && (
+      {effective === "png" && (
         <Select
           value={String(scale)}
           onValueChange={(v) => {
@@ -99,7 +117,11 @@ export function ExportControls({ svgRef, filename, captionLines = [] }: ExportCo
         size="sm"
         onClick={handleDownload}
         disabled={busy}
-        title={`Download chart as ${format.toUpperCase()}`}
+        title={
+          effective === "csv"
+            ? "Download table as CSV"
+            : `Download chart as ${effective.toUpperCase()}`
+        }
       >
         <Download size={13} />
         Export

@@ -7,13 +7,15 @@ import {
   DEFAULT_CHART_CONFIG,
   paramsToChartConfig,
   parseStoredChartConfig,
+  parseDeriveSpec,
+  normalizeChartConfig,
   parseStoredChartFilters,
   unrepresentableFilterMembers,
   type ChartConfig,
 } from "@/components/viz/lib/chartConfig";
 
 const fullConfig: ChartConfig = {
-  v: 1,
+  v: 2,
   field: "attr:src_ip",
   fieldY: null,
   fields: null,
@@ -22,6 +24,9 @@ const fullConfig: ChartConfig = {
   metric: "ratio",
   compare: { mode: "custom", filters: { q: "error", filters: { artifact: ["apache"] } } },
   options: { orientation: "vertical", logScale: true, buckets: 90 },
+  derive: null,
+  inputs: {},
+  marks: [],
 };
 
 describe("URL round-trip", () => {
@@ -118,7 +123,7 @@ describe("stored (saved chart) round-trip", () => {
   });
 
   it("rejects unsupported versions", () => {
-    expect(parseStoredChartConfig({ ...chartConfigToStored(fullConfig), v: 2 })).toBeNull();
+    expect(parseStoredChartConfig({ ...chartConfigToStored(fullConfig), v: 3 })).toBeNull();
   });
 
   it("rejects non-object payloads", () => {
@@ -333,5 +338,204 @@ describe("chartUrlParams", () => {
     const prev = new URLSearchParams({ tour: "viz", c_field: "old", q: "old" });
     const params = chartUrlParams(config, {}, prev);
     expect(params.get("tour")).toBe("viz");
+  });
+});
+
+describe("ChartConfig v2", () => {
+  const v2Extras: ChartConfig = {
+    ...fullConfig,
+    chartType: "bar",
+    metric: "count",
+    compare: { mode: "off" },
+    options: {},
+    derive: { kind: "bins", mode: "log", count: 8 },
+    inputs: { pairing: "nextEnd", startFilter: { q: "4624" }, endFilter: { q: "4634" } },
+    marks: [
+      { kind: "events", filters: { tagsInclude: ["exfil"] }, label: "tagged exfil" },
+      { kind: "baseline", definitionId: "bd1" },
+      { kind: "instant", at: "2026-03-13T09:41:00Z", label: "first beacon" },
+    ],
+  };
+
+  it("round-trips derive, inputs and marks through the URL", () => {
+    expect(paramsToChartConfig(chartConfigToParams(v2Extras))).toEqual(v2Extras);
+  });
+
+  it("carries an events mark's event ids as provenance through the URL", () => {
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "time",
+      marks: [{ kind: "events", filters: { ids: ["e1", "e2"] }, label: "two events" }],
+    };
+    const params = chartConfigToParams(config);
+    expect(JSON.parse(params.get("c_marks")!)[0].filters.eventIds).toEqual(["e1", "e2"]);
+    expect(paramsToChartConfig(params).marks).toEqual(config.marks);
+  });
+
+  it("writes no c_derive / c_inputs / c_marks when they are empty", () => {
+    const params = chartConfigToParams(fullConfig);
+    expect(params.has("c_derive")).toBe(false);
+    expect(params.has("c_inputs")).toBe(false);
+    expect(params.has("c_marks")).toBe(false);
+  });
+
+  it("round-trips derive, inputs and marks through storage", () => {
+    // `lanes` is the figure that honours all three of them at once.
+    const lanes: ChartConfig = { ...v2Extras, chartType: "lanes", derive: null };
+    expect(parseStoredChartConfig(chartConfigToStored(lanes))).toEqual(lanes);
+  });
+
+  it("stores no mark or input the figure cannot honour", () => {
+    // The carry across a figure switch is deliberate on the page and in the
+    // URL, but `chart_exec` refuses a mark or an `inputs` key the figure does
+    // not declare *by name* — so a bar chart saved with lane inputs and marks
+    // still on it drew here and failed to resolve as a Story block (#332).
+    const stored = chartConfigToStored(v2Extras);
+    expect(stored.marks).toEqual([]);
+    expect(stored.inputs).toEqual({});
+    // What the bar figure does honour is untouched.
+    expect(stored.derive).toEqual(v2Extras.derive);
+  });
+
+  it("keeps marks and inputs in the URL, so a figure switch and back loses nothing", () => {
+    const params = chartConfigToParams(v2Extras);
+    expect(params.has("c_marks")).toBe(true);
+    expect(params.has("c_inputs")).toBe(true);
+    expect(paramsToChartConfig(params)).toEqual(v2Extras);
+  });
+
+  it("drops a quantity the field and treat-as no longer admit", () => {
+    // "Running sum" outlives the measure that justified it: changing Treat-as
+    // or picking "No field" leaves it in `options`, the page drew it (the
+    // endpoint knows no scale) and the same chart failed to execute (#332).
+    const cumulative: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative",
+      scale: "ratio",
+      field: "attr:bytes",
+      options: { quantity: "sum" },
+    };
+    expect(normalizeChartConfig(cumulative).options.quantity).toBe("sum");
+    expect(
+      normalizeChartConfig({ ...cumulative, scale: "nominal" }).options.quantity,
+    ).toBeUndefined();
+    expect(
+      normalizeChartConfig({ ...cumulative, field: null }).options.quantity,
+    ).toBeUndefined();
+  });
+
+  it("upgrades a stored v1 config losslessly", () => {
+    const v1 = {
+      v: 1,
+      chartType: "bar",
+      scale: "nominal",
+      field: "attr:host",
+      fieldY: null,
+      fields: null,
+      metric: "count",
+      compare: { mode: "off" },
+      options: { topN: 12 },
+    };
+    expect(parseStoredChartConfig(v1)).toEqual({
+      ...v1,
+      v: 2,
+      derive: null,
+      inputs: {},
+      marks: [],
+    });
+  });
+
+  it("drops a malformed derive / inputs / marks param field-by-field", () => {
+    const params = chartConfigToParams(fullConfig);
+    params.set("c_derive", '{"kind":"bins","mode":"custom","edges":"nope"}');
+    params.set("c_inputs", '{"pairing":"sideways","startFilter":{"q":"x"},"endFilter":"nope"}');
+    params.set(
+      "c_marks",
+      '[{"kind":"instant","at":"x"},{"kind":"baseline","definitionId":"bd1"}]',
+    );
+    const parsed = paramsToChartConfig(params);
+    expect(parsed.derive).toBeNull();
+    expect(parsed.inputs).toEqual({ startFilter: { q: "x" } });
+    expect(parsed.marks).toEqual([{ kind: "baseline", definitionId: "bd1" }]);
+  });
+});
+
+describe("table columns", () => {
+  it("keeps an empty column set through the URL and storage — the value-only table is a choice", () => {
+    const table: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table",
+      field: "artifact",
+      scale: "nominal",
+      inputs: { columns: [] },
+    };
+    expect(paramsToChartConfig(chartConfigToParams(table)).inputs.columns).toEqual([]);
+    const stored = chartConfigToStored(table, undefined);
+    expect(parseStoredChartConfig(stored)?.inputs.columns).toEqual([]);
+  });
+});
+
+describe("normalizeChartConfig", () => {
+  it("drops a comparison and a derivation the figure cannot honour, wherever the config came from", () => {
+    // Both are invisible in the rail and unreachable to clear there, and both
+    // are read by the caption — which is how a pie printed "comparison: all
+    // timeline events" over one layer it never fetched.
+    const stale: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "pie",
+      field: "artifact",
+      scale: "nominal",
+      compare: { mode: "baseline" },
+      derive: { kind: "bins", mode: "log", count: 8 },
+    };
+    expect(normalizeChartConfig(stale).compare).toEqual({ mode: "off" });
+    expect(normalizeChartConfig(stale).derive).toBeNull();
+    // The same config carried by a URL and by a saved chart — a Story snapshot
+    // renders through the second one.
+    const viaUrl = paramsToChartConfig(chartConfigToParams(stale));
+    expect(viaUrl.compare).toEqual({ mode: "off" });
+    expect(viaUrl.derive).toBeNull();
+    const viaStore = parseStoredChartConfig(chartConfigToStored(stale, undefined));
+    expect(viaStore?.compare).toEqual({ mode: "off" });
+    expect(viaStore?.derive).toBeNull();
+  });
+
+  it("leaves a figure that does honour them untouched", () => {
+    const kept: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "attr:bytes",
+      scale: "ratio",
+      compare: { mode: "baseline" },
+      derive: { kind: "bins", mode: "log", count: 8 },
+    };
+    expect(normalizeChartConfig(kept)).toBe(kept);
+  });
+});
+
+describe("parseDeriveSpec — gates what the server accepts", () => {
+  it("refuses a bin count outside the server's 2..50", () => {
+    // The rail's own controls clamp, so the URL and stored paths are the ones
+    // this function gates. Admitting `count: 1` produced a 422 and a
+    // permanently blank chart with nothing on screen to explain it (#332).
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 1 })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 51 })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "width", count: 2 })).toEqual({
+      kind: "bins",
+      mode: "width",
+      count: 2,
+    });
+  });
+
+  it("refuses edges that are not strictly increasing, or too many of them", () => {
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [10, 5] })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [5, 5] })).toBeNull();
+    const tooMany = Array.from({ length: 50 }, (_, i) => i);
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: tooMany })).toBeNull();
+    expect(parseDeriveSpec({ kind: "bins", mode: "custom", edges: [1, 2, 3] })).toEqual({
+      kind: "bins",
+      mode: "custom",
+      edges: [1, 2, 3],
+    });
   });
 });
