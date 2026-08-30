@@ -16,6 +16,7 @@ import {
   viewPayloadToFilters,
 } from "@/lib/queryParams";
 import type { Metric } from "./transforms";
+import { CHART_META } from "./chartMeta";
 
 export type Scale = "nominal" | "ordinal" | "interval" | "ratio";
 export type ChartType =
@@ -391,6 +392,30 @@ export function chartUrlParams(
 }
 
 /**
+ * Drop what the figure cannot honour, so nothing downstream can assert it.
+ *
+ * A `compare` layer on a single-layer figure and a `derive` on a figure whose
+ * registry entry admits none are both invisible in the rail and unreachable to
+ * clear there, but the caption reads the *config*, not the request — which is
+ * how a pie came to print "comparison: all timeline events" under one layer it
+ * never fetched, and a cumulative step to claim a binning it never sent. Run
+ * on every way a config enters the app (a URL, a saved chart, a Story
+ * snapshot), so the rail is not the only thing keeping the two honest.
+ */
+export function normalizeChartConfig(config: ChartConfig): ChartConfig {
+  const meta = CHART_META[config.chartType];
+  const dropCompare = config.compare.mode !== "off" && !meta.supportsCompare;
+  const dropDerive =
+    config.derive != null && !meta.derives.includes(config.derive.kind);
+  if (!dropCompare && !dropDerive) return config;
+  return {
+    ...config,
+    ...(dropCompare ? { compare: { mode: "off" as const } } : {}),
+    ...(dropDerive ? { derive: null } : {}),
+  };
+}
+
+/**
  * Read a ChartConfig back out of URL params. Unknown/malformed values fall
  * back to defaults field-by-field rather than discarding the whole config.
  */
@@ -458,7 +483,7 @@ export function paramsToChartConfig(params: URLSearchParams): ChartConfig {
   config.derive = parseDeriveSpec(json("c_derive"));
   config.inputs = parseChartInputs(json("c_inputs"));
   config.marks = parseMarkSources(json("c_marks"));
-  return config;
+  return normalizeChartConfig(config);
 }
 
 /**
@@ -509,7 +534,7 @@ export function parseStoredChartConfig(stored: unknown): ChartConfig | null {
   config.derive = parseDeriveSpec(raw.derive);
   config.inputs = parseChartInputs(raw.inputs);
   config.marks = parseMarkSources(raw.marks);
-  return config;
+  return normalizeChartConfig(config);
 }
 
 /** Adapt the single-layer histogram response to the compare shape so one

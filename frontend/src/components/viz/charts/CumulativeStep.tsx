@@ -146,7 +146,13 @@ export function CumulativeStep({ data, svgRef, height = 260, marks = [] }: Cumul
             <div>
               <strong>{fmt(data.buckets[hover.index].value)}</strong> {noun} so far
             </div>
-            <div>+{fmt(data.buckets[hover.index].delta)} in this bucket</div>
+            {/* Signed, not `+`-prefixed: a "sum" quantity over a field with
+                negative values has negative deltas (which is why `yMin`
+                admits them), and a hard-coded sign read `+-3.5`. */}
+            <div>
+              {data.buckets[hover.index].delta < 0 ? "" : "+"}
+              {fmt(data.buckets[hover.index].delta)} in this bucket
+            </div>
           </>
         )}
       </ChartTooltip>

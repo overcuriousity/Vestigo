@@ -68,8 +68,10 @@ import { galleryEntries } from "./lib/figureGallery";
 import {
   defaultDerive,
   deriveOptionsFor,
+  deriveOptionsForChart,
   describeDerive,
   effectiveScale,
+  resolveDeriveTarget,
   singleFixFor,
   TIME_PART_LABELS,
   type DeriveKind,
@@ -296,7 +298,13 @@ const TABLE_SORT_CHOICES: TableSortColumn[] = [
   ...TABLE_COLUMN_CHOICES,
 ];
 
-/** Comma-separated values whose rows are highlighted; committed on blur/Enter. */
+/** One value per line, committed on blur (or Ctrl/Cmd-Enter).
+ *
+ * A line, not a comma-separated list: the values are field values, and a DN
+ * (`CN=a,OU=b`) or a user-agent carries commas of its own — splitting on them
+ * turned one value nothing matches into two, and the caption then named
+ * highlighted values that do not exist. A newline is the one character a
+ * ClickHouse field value in this box will not contain. */
 function HighlightInput({
   values,
   onCommit,
@@ -305,10 +313,10 @@ function HighlightInput({
   onCommit: (values: string[]) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
-  const shown = draft ?? values.join(", ");
+  const shown = draft ?? values.join("\n");
   const commit = () => {
     const parsed = shown
-      .split(",")
+      .split("\n")
       .map((s) => s.trim())
       .filter((s) => s !== "");
     setDraft(null);
@@ -319,20 +327,21 @@ function HighlightInput({
       <label className="mb-1 block text-xs text-[var(--color-fg-secondary)]">
         Highlight values
       </label>
-      <input
-        type="text"
+      <textarea
         aria-label="Highlight values"
+        rows={3}
         value={shown}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) commit();
         }}
-        placeholder="alice, bob"
-        className="w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
+        placeholder={"alice\nCN=bob,OU=staff"}
+        className="w-full resize-y rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-1.5 py-0.5 font-mono text-xs text-[var(--color-fg-primary)] focus:border-[var(--color-accent)] focus:outline-none"
       />
       <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
-        Presentation only — the caption says which rows were highlighted.
+        One value per line. Presentation only — the caption says which rows were
+        highlighted.
       </p>
     </div>
   );
@@ -540,7 +549,10 @@ export function ChartRail({
   const acceptsSecondField = CHART_META[chartType].acceptsSecondField;
   const multiField = CHART_META[chartType].multiField;
   const selectedFields = config.fields ?? [];
-  const groupedOn = acceptsSecondField && !!fieldY;
+  // A *numeric* modifier: box/violin per group. `table` also takes an optional
+  // second field, but it counts that field's distinct values in a column — not
+  // one distribution per group, and not the grouped endpoint.
+  const groupedOn = dataKind === "numeric" && acceptsSecondField && !!fieldY;
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
   // A third state: the figure charts every event without a field and the
   // field's values with one. "No field" is selectable and keeps the figure.
@@ -560,6 +572,7 @@ export function ChartRail({
     sampleLimit,
     groups,
     showPoints,
+    tableSortBy,
   } = resolved;
 
   /** A token typed into the second-field picker that X already holds (#308).
@@ -570,7 +583,7 @@ export function ChartRail({
   // A derivation is a change of scale: the field is treated as `scale`, but
   // the figure sees `effScale` — ordered categories whenever one is active.
   const derive = config.derive;
-  const deriveKinds = deriveOptionsFor(scale, field);
+  const deriveKinds = deriveOptionsForChart(chartType, scale, field);
   const effScale = effectiveScale(scale, derive);
 
   // Keep chartType valid when the analyst changes what the field is treated
@@ -606,19 +619,20 @@ export function ChartRail({
    * figure is re-picked at that scale when the current one is illegal there,
    * and the bar axis defaults to value order — ranges read in order. */
   const applyDerive = (next: DeriveSpec | null, chartOverride?: ChartType) => {
-    const eff = effectiveScale(scale, next);
+    const resolvedType = resolveDeriveTarget(
+      chartOverride ?? chartType,
+      scale,
+      field,
+      next,
+    );
+    // The figure that ends up selected has to be one that actually sends the
+    // derivation. Storing it on a figure whose registry entry admits none
+    // (cumulative, calendar, punchcard, time, corr) leaves the query unchanged
+    // while the caption — and a Story export — asserts a binning that never ran.
+    if (next && !CHART_META[resolvedType].derives.includes(next.kind)) return;
     const patch: Partial<ChartConfig> = { derive: next };
-    const target = chartOverride ?? chartType;
-    if (!chartTypesForField(eff, field).includes(target)) {
-      patch.chartType = defaultChartTypeForScale(eff, field);
-    } else if (chartOverride) {
-      patch.chartType = chartOverride;
-    }
-    if (
-      next &&
-      (patch.chartType ?? chartType) === "bar" &&
-      config.options.sort == null
-    ) {
+    if (resolvedType !== chartType) patch.chartType = resolvedType;
+    if (next && resolvedType === "bar" && config.options.sort == null) {
       patch.options = { ...config.options, sort: "value" };
     }
     updateConfig(patch);
@@ -965,10 +979,17 @@ export function ChartRail({
                       // the query would drop it silently while the caption
                       // (and a Story export) still claimed it.
                       const dropDerive =
-                        derive && !CHART_META[c].derives.includes(derive.kind);
-                      const patch: Partial<ChartConfig> = dropDerive
-                        ? { chartType: c, derive: null }
-                        : { chartType: c };
+                        !!derive && !CHART_META[c].derives.includes(derive.kind);
+                      // Same argument one control over: a Compare layer the
+                      // new figure cannot draw stays in the config, where its
+                      // three radios render unchecked *and* disabled — nothing
+                      // on screen to see it by, nothing to clear it with — and
+                      // the caption names a comparison layer never fetched.
+                      const dropCompare =
+                        config.compare.mode !== "off" && !CHART_META[c].supportsCompare;
+                      const patch: Partial<ChartConfig> = { chartType: c };
+                      if (dropDerive) patch.derive = null;
+                      if (dropCompare) patch.compare = { mode: "off" };
                       if (CHART_META[c].requiresCompare && config.compare.mode === "off") {
                         // The figure is defined by two windows; Baseline is the
                         // one reference window that always exists.
@@ -980,9 +1001,13 @@ export function ChartRail({
                       }
                       updateConfig(patch);
                       setAutoNotice(
-                        dropDerive && field
-                          ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is — the derivation was dropped.`
-                          : null,
+                        dropDerive && dropCompare && field
+                          ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is, in one layer — the derivation and the comparison were dropped.`
+                          : dropDerive && field
+                            ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is — the derivation was dropped.`
+                            : dropCompare
+                              ? `${CHART_META[c].label} charts one layer — the comparison was dropped.`
+                              : null,
                       );
                       return;
                     }
@@ -1520,7 +1545,7 @@ export function ChartRail({
                     Sort by
                   </label>
                   <Select
-                    value={config.options.tableSortBy ?? "count"}
+                    value={tableSortBy}
                     onValueChange={(v) =>
                       updateConfig({
                         options: {

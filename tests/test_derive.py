@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from vestigo.db.derive import (
     TIME_PART_TOKENS,
     DeriveSpec,
+    ResolvedDerive,
     bin_edges,
     bin_labels,
     bins_expr,
@@ -41,8 +42,31 @@ def test_bin_labels_are_open_ended_and_human() -> None:
     assert bin_labels([], negative_bin=False) == ["all values"]
 
 
-def test_bin_labels_round_non_integers_to_three_significant_digits() -> None:
-    assert bin_labels([0.123456, 2.5], negative_bin=False) == ["< 0.123", "0.123 – 2.5", "≥ 2.5"]
+def test_bin_labels_name_the_edge_they_delimit() -> None:
+    """Three significant digits is the readable default, but a label is what
+    the reader checks a value against — ``< 0.123`` over a boundary at
+    0.123456 puts 0.1234 on the wrong side of its own label."""
+    assert bin_labels([0.123456, 2.5], negative_bin=False) == [
+        "< 0.123456",
+        "0.123456 – 2.5",
+        "≥ 2.5",
+    ]
+    # Whole numbers keep the readable form — three digits already name them.
+    assert bin_labels([1024.0, 10240.0], negative_bin=False) == [
+        "< 1,024",
+        "1,024 – 10,240",
+        "≥ 10,240",
+    ]
+
+
+def test_bin_labels_stop_at_six_decimals_for_an_irrational_edge() -> None:
+    """A log-spaced edge has no finite decimal, so the fidelity escalation is
+    capped — six places name it to a relative 1e-6 and stay readable."""
+    assert bin_labels(bin_edges("log", 3, 1.0, 10.0), negative_bin=False) == [
+        "< 2.154435",
+        "2.154435 – 4.641589",
+        "≥ 4.641589",
+    ]
 
 
 def test_bins_expr_is_a_multi_if_over_the_cast_value() -> None:
@@ -97,7 +121,23 @@ def test_bin_labels_never_collide_when_three_significant_digits_cannot_tell_edge
     named twice — the labels take whatever precision the edges need."""
     labels = bin_labels(bin_edges("width", 8, 4000.0, 4001.0), negative_bin=False)
     assert len(labels) == 8 and len(set(labels)) == 8
-    # The first precision that tells every edge apart, not the exact float.
-    assert labels[:3] == ["< 4,000.1", "4,000.1 – 4,000.2", "4,000.2 – 4,000.4"]
-    # The coarse form survives wherever it is unambiguous.
-    assert bin_labels([0.123456, 2.5], negative_bin=False) == ["< 0.123", "0.123 – 2.5", "≥ 2.5"]
+    assert labels[:3] == ["< 4,000.125", "4,000.125 – 4,000.25", "4,000.25 – 4,000.375"]
+
+
+def test_echo_carries_the_edge_labels_the_bins_are_cut_at() -> None:
+    """The caption prints these rather than rounding the floats client-side —
+    the sentence naming the edges and the axis naming the bins are then the
+    same text, cut at the same precision."""
+    edges = [4000.125, 4000.875]
+    spec = DeriveSpec(kind="bins", mode="custom", edges=edges)
+    labels = bin_labels(edges, negative_bin=False)
+    echo = ResolvedDerive(
+        spec=spec,
+        expr=bins_expr("v", edges, negative_bin=False),
+        labels=labels,
+        edges=edges,
+        negative_bin=False,
+    ).echo()
+    assert echo["edges"] == edges
+    assert echo["edge_labels"] == ["4,000.125", "4,000.875"]
+    assert echo["labels"][1] == "4,000.125 – 4,000.875"

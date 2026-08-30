@@ -75,6 +75,41 @@ describe("IntervalLanes", () => {
     expect(container.querySelectorAll("path[data-lane-open-arrow]")).toHaveLength(1);
   });
 
+  it("puts the arrowhead at the bar's own end, never left of where it starts", () => {
+    // Pinned to the panel's right edge instead, an interval opening within a
+    // few pixels of it drew its arrowhead *behind* its own start — pointing at
+    // time the interval does not cover.
+    const lateOpen: LanesResponse = {
+      ...data,
+      lanes: [
+        {
+          key: "h3",
+          count: 1,
+          intervals: [
+            {
+              start: "2026-07-20T13:59:00+00:00",
+              end: null,
+              start_event_id: "e9",
+              end_event_id: null,
+            },
+          ],
+        },
+      ],
+      lanes_total: 1,
+    };
+    const { container } = render(<IntervalLanes data={lateOpen} />);
+    const bar = container.querySelector('rect[data-lane-interval][data-open="true"]')!;
+    const barStart = Number(bar.getAttribute("x"));
+    const barEnd = barStart + Number(bar.getAttribute("width"));
+    const xs = [
+      ...(container.querySelector("path[data-lane-open-arrow]")!.getAttribute("d") ?? "").matchAll(
+        /[ML](-?[\d.]+)/g,
+      ),
+    ].map((m) => Number(m[1]));
+    expect(Math.min(...xs)).toBeGreaterThanOrEqual(barStart);
+    expect(Math.min(...xs)).toBeCloseTo(barEnd, 5);
+  });
+
   it("nested intervals in one lane are both drawn", () => {
     const { container } = render(<IntervalLanes data={data} />);
     const h2 = [

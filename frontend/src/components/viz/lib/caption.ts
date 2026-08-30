@@ -307,8 +307,15 @@ export function buildCaptionLines(args: {
         : `lanes: ${fmtInt(l.lanesShown)}`,
     );
     if (l.pairing === "next_end") {
+      // Two sentences because they are two scopes, and one sentence carrying
+      // both is arithmetic nobody can reconcile: `starts`/`ends` are counted
+      // over the whole union, before the lane cap, while the pairing runs only
+      // over the lanes that survived it.
       lines.push(
-        `starts: ${fmtInt(l.starts)} · ends: ${fmtInt(l.ends)} — ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
+        `starts: ${fmtInt(l.starts)} · ends: ${fmtInt(l.ends)} — matched across all ${fmtInt(l.lanesTotal)} lane${l.lanesTotal === 1 ? "" : "s"}, before the caps`,
+      );
+      lines.push(
+        `paired over the ${fmtInt(l.lanesShown)} lane${l.lanesShown === 1 ? "" : "s"} drawn: ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
       );
       if (l.rowsTruncated) {
         lines.push(

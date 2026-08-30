@@ -4,7 +4,61 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 209 — second review round on #332).
+Last updated: 2026-08-30 (session 210 — third review round on #332).
+
+## Session 210 — 2026-08-30: twelve review findings on the Visualize round (#332)
+
+A third `/code-review 332` pass. All twelve fixed; the ones with a testable surface carry
+the test that catches them.
+
+**Two figures asserted in the caption what they never sent to the server.** A Cumulative step
+offered *Group into ranges*, stored the derivation and never put `derive` on the wire — while
+the caption (and therefore the PNG/SVG export and any Story snapshot) printed `derived:
+grouped into 8 log-spaced ranges`. Switching away from Ranked change onto a pie left
+`compare.mode: "baseline"` in the config, where all three Compare radios render unchecked
+*and* disabled — invisible and unreachable — under a caption naming a comparison layer that
+was never fetched. Both are now gated twice: the rail offers a derivation only when the figure
+that would *result* sends one (`deriveOptionsForChart` / `resolveDeriveTarget` — a histogram
+still offers it and lands on a bar), drops a comparison the newly picked figure cannot draw
+with its own notice, and `normalizeChartConfig` runs on every way a config enters the app —
+a URL, a saved chart, a Story snapshot — so the rail is not the only thing keeping the two
+honest.
+
+**A Table figure fired the grouped-numeric scan on a categorical X.** `groupedOn` read
+`acceptsSecondField && fieldY`, and `table` declares an optional second field, so every table
+with a "count distinct of" field also ran `viz/field-numeric-grouped` — a heavy ClickHouse
+scan on every render and every knob change, whose result and error nothing on the page reads.
+It is a modifier on the *numeric* kind only.
+
+**Two options outlived the field they needed and answered 422.** "No field — count every
+event" cleared `field` and left `options.quantity: "sum"`; clearing a table's grouping field
+left `tableSortBy: "distinct_second"`. Both preconditions are now enforced where the value is
+resolved (`resolveChartOptions`), which is also what the request and the Sort-by control read,
+rather than at the one mutation site that happened to be found.
+
+**Bin-edge labels named numbers that were not the edges.** `_fmt_edges` escalated precision
+only on *collisions*, so edges `4000.125` / `4000.875` labelled `4,000` / `4,001` — and the
+label is what a reader checks a value against, so 4000.05 sat in the bin below a label saying
+it was above it. Precision now rises twice for two reasons: until every label names its own
+edge (relative 1e-6, capped at six decimals — a log-spaced edge is irrational), then uncapped
+until no two collide. The echo carries `edge_labels` so the caption prints the server's text
+instead of rounding the floats a second time client-side.
+
+**The calendar clipped its most recent weeks.** A `Math.max(3, …)` floor on the cell broke the
+`weeks × step ≤ innerWidth` guarantee: 53 columns needed 265px, and below that the `<svg>`
+clipped the overflow — which, weeks running left→right, is the newest days, under a caption
+still claiming 53 weeks. The step is derived from the width, so the fit is exact at every size.
+
+**The lanes caption mixed two scopes in one sentence.** `starts`/`ends` are counted over the
+whole union; `unpaired_starts`/`orphan_ends` come from the pairing over the *kept* lanes. Two
+sentences now, each naming its own scope.
+
+**Four smaller ones.** An open interval starting within 7px of the panel's right edge drew its
+arrowhead to the left of its own start, pointing at time it does not cover (the arrowhead sits
+at the bar's end now, never wider than half of it). A negative bucket delta on a signed sum
+rendered as `+-3.5`. Two baseline suspect windows with identical bounds collided on a React
+key and one band vanished. And the Highlight box split on commas, so a DN or a user-agent
+could never be highlighted — it is one value per line.
 
 ## Session 209 — 2026-08-30: five more review findings on the Visualize round (#332)
 

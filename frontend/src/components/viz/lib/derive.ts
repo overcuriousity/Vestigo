@@ -8,7 +8,7 @@
 import type { DeriveEcho } from "@/api/types";
 import type { ChartType, DeriveSpec, Scale, TimePart } from "./chartConfig";
 import { CHART_META, chartTypesFor } from "./chartMeta";
-import { chartTypesForField } from "./chartOptions";
+import { chartTypesForField, defaultChartTypeForScale } from "./chartOptions";
 import { isTimeField } from "./timeFields";
 
 export type { DeriveEcho };
@@ -30,6 +30,43 @@ export function deriveOptionsFor(scale: Scale, field: string | null): DeriveKind
   if (scale === "ratio") return ["bins"];
   if (scale === "interval") return ["bins", "timePart"];
   return [];
+}
+
+/** The figure a derivation would leave selected: *target* when it is still
+ * legal at the derived scale, else the default figure for that scale. */
+export function resolveDeriveTarget(
+  target: ChartType,
+  scale: Scale,
+  field: string | null,
+  next: DeriveSpec | null,
+): ChartType {
+  const eff = effectiveScale(scale, next);
+  return chartTypesForField(eff, field).includes(target)
+    ? target
+    : defaultChartTypeForScale(eff, field);
+}
+
+/** The derivations the rail may offer on *chartType* — each one the figure it
+ * would leave selected actually sends.
+ *
+ * Not simply `CHART_META[chartType].derives`. Applying a derivation is a
+ * change of scale, and the rail re-picks the figure when the current one is
+ * illegal at the derived one: a histogram admits no derivation of its own, yet
+ * "Group into ranges" on a histogram is legal and lands on a bar, which does.
+ * The figures that admit none *and* are legal at every scale (cumulative,
+ * calendar, punchcard, time, corr) stay selected instead — they would carry a
+ * `derive` they never put on the wire, while the caption, the export and a
+ * Story snapshot all named it. Those are the ones withheld. */
+export function deriveOptionsForChart(
+  chartType: ChartType,
+  scale: Scale,
+  field: string | null,
+): DeriveKind[] {
+  return deriveOptionsFor(scale, field).filter((kind) =>
+    CHART_META[
+      resolveDeriveTarget(chartType, scale, field, defaultDerive(kind, scale))
+    ].derives.includes(kind),
+  );
 }
 
 /** A derived field is ordered categories, whatever it was treated as. */
@@ -80,9 +117,14 @@ const fmt = (n: number) =>
  * response echoed them (width/log bins are computed from the data's range). */
 export function describeDerive(d: DeriveSpec, echo?: DeriveEcho | null): string {
   if (d.kind === "timePart") return `calendar part: ${TIME_PART_LABELS[d.part]} (UTC)`;
-  if (d.mode === "custom") return `grouped by your edges: ${d.edges.map(fmt).join(" · ")}`;
-  const edges = echo?.edges ?? [];
-  const tail = edges.length ? ` (edges: ${edges.map(fmt).join(" · ")})` : "";
+  // The server formats the edges (`db/derive.py::_fmt_edges`) to the precision
+  // that names each one rather than a number near it, and cuts the bin labels
+  // at the same place. Rounding the floats here instead is how a caption comes
+  // to say `4,000 – 4,001` under a bin that starts at 4000.125.
+  const texts = echo?.edge_labels ?? echo?.edges?.map(fmt) ?? [];
+  if (d.mode === "custom")
+    return `grouped by your edges: ${(texts.length ? texts : d.edges.map(fmt)).join(" · ")}`;
+  const tail = texts.length ? ` (edges: ${texts.join(" · ")})` : "";
   const neg = echo?.negative_bin ? "; values ≤ 0 in their own range" : "";
   return `grouped into ${d.count} ${d.mode === "log" ? "log-spaced" : "equal-width"} ranges${tail}${neg}`;
 }

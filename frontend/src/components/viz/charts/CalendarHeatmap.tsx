@@ -78,8 +78,15 @@ export function CalendarHeatmap({ data, svgRef }: CalendarHeatmapProps) {
         margin={{ top: 18, right: 8, bottom: 8, left: 36 }}
       >
         {({ innerWidth, margin }) => {
-          const cell = Math.max(3, Math.min(MAX_CELL, Math.floor(innerWidth / weeks) - GAP));
-          const step = cell + GAP;
+          // The columns must span `innerWidth` and never overflow it. A
+          // floored integer cell with a 3px floor broke that below ~265px (a
+          // thumbnail, a Story snapshot, a narrow panel): 53 columns needed
+          // more room than the <svg> had and the overflow was clipped — and
+          // weeks run left→right, so what vanished was the *most recent* days
+          // while the caption still claimed 53 weeks. Deriving the step from
+          // the width instead makes the fit exact at every size.
+          const step = Math.min(MAX_CELL + GAP, innerWidth / weeks);
+          const cell = Math.max(1, step - GAP);
           const cells: React.ReactNode[] = [];
           const monthLabels: React.ReactNode[] = [];
           let lastMonth = -1;

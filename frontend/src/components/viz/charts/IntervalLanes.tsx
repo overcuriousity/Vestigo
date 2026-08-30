@@ -149,6 +149,14 @@ export function IntervalLanes({ data, svgRef, height, marks = [] }: IntervalLane
                         ? innerWidth
                         : Math.min(innerWidth, x(new Date(interval.end!)));
                       const width = Math.max(2, x2 - x1);
+                      // The arrowhead sits at the bar's own end, not at the
+                      // panel's: pinned to `innerWidth` it was drawn to the
+                      // *left* of an interval that opens within 7px of the
+                      // right edge, pointing at time the interval does not
+                      // cover. Never wider than half the bar, so the two never
+                      // cross whatever the interval's width.
+                      const arrow = open ? Math.min(ARROW, width / 2) : 0;
+                      const barW = width - arrow;
                       return (
                         <g
                           key={`${interval.start_event_id}-${i}`}
@@ -167,7 +175,7 @@ export function IntervalLanes({ data, svgRef, height, marks = [] }: IntervalLane
                             data-open={open ? "true" : "false"}
                             x={x1}
                             y={top}
-                            width={open ? Math.max(2, width - ARROW) : width}
+                            width={barW}
                             height={barH}
                             rx={2}
                             fill={BAR_COLOR}
@@ -176,7 +184,7 @@ export function IntervalLanes({ data, svgRef, height, marks = [] }: IntervalLane
                           {open && (
                             <path
                               data-lane-open-arrow
-                              d={`M${innerWidth - ARROW} ${top} L${innerWidth} ${top + barH / 2} L${innerWidth - ARROW} ${top + barH} Z`}
+                              d={`M${x1 + barW} ${top} L${x1 + width} ${top + barH / 2} L${x1 + barW} ${top + barH} Z`}
                               fill={BAR_COLOR}
                               opacity={OPEN_OPACITY}
                             />

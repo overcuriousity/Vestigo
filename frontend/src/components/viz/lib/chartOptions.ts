@@ -181,9 +181,14 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     topN: clampTopN(options.topN, config.chartType),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
+    // "sum" and "distinct" both aggregate a field. A stored one outlives the
+    // field that justified it — "No field — count every event" clears `field`
+    // and leaves `options.quantity` — and the endpoint answers 422 rather than
+    // drawing anything, so the resolution is what enforces the precondition.
     quantity:
-      options.quantity ??
-      (config.field == null ? "events" : config.scale === "ratio" ? "sum" : "distinct"),
+      config.field == null
+        ? "events"
+        : (options.quantity ?? (config.scale === "ratio" ? "sum" : "distinct")),
     layout: options.layout ?? "dumbbell",
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
@@ -197,7 +202,14 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     groups: Math.min(options.groups ?? 6, 8),
     showDensity: options.showDensity ?? true,
     showPoints: options.showPoints ?? false,
-    tableSortBy: options.tableSortBy ?? "count",
+    // Same shape: "distinct_second" ranks by the second field's distinct count
+    // and the endpoint refuses it without one, but clearing the grouping field
+    // leaves the sort behind — and the sort control is not where an analyst
+    // looks when the table stops rendering.
+    tableSortBy:
+      options.tableSortBy === "distinct_second" && config.fieldY == null
+        ? "count"
+        : (options.tableSortBy ?? "count"),
     tableSortDir: options.tableSortDir ?? "desc",
     highlight: options.highlight ?? [],
   };

@@ -22,8 +22,12 @@ export function MarksOverlay({ marks, x, innerWidth, innerHeight }: Props): JSX.
   if (layout.instants.length === 0 && layout.ranges.length === 0) return null;
   return (
     <g data-marks pointerEvents="none">
-      {layout.ranges.map((r) => (
-        <g key={`${r.mark.source}-${r.mark.start}-${r.mark.end}`}>
+      {/* Keyed by position, not by (source, start, end): one baseline source
+          emits its baseline window and every suspect window under the same
+          index, and nothing dedupes two suspect windows declared with
+          identical bounds — a duplicate key drops one band silently. */}
+      {layout.ranges.map((r, i) => (
+        <g key={`${r.mark.source}-${i}`}>
           <rect
             data-mark-range
             x={r.x0}

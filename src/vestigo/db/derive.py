@@ -106,12 +106,17 @@ def bin_edges(mode: Literal["width", "log"], count: int, lo: float, hi: float) -
     return [10 ** (llo + k * step) for k in range(1, count)]
 
 
+def _sig3(x: float) -> float:
+    """The number three significant digits name — exactly what :func:`_fmt` prints."""
+    if float(x).is_integer():
+        return float(x)
+    digits = 3 - int(math.floor(math.log10(abs(x)))) - 1
+    return round(x, max(digits, 0))
+
+
 def _fmt(x: float) -> str:
     """``1024.0`` → ``1,024``; ``0.123456`` → ``0.123`` (three significant digits)."""
-    if float(x).is_integer():
-        return f"{int(x):,}"
-    digits = 3 - int(math.floor(math.log10(abs(x)))) - 1
-    rounded = round(x, max(digits, 0))
+    rounded = _sig3(x)
     if float(rounded).is_integer():
         return f"{int(rounded):,}"
     return f"{rounded:,}"
@@ -123,17 +128,46 @@ def _fmt_fixed(x: float, decimals: int) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
+#: How far the fidelity escalation goes. A log-spaced edge is irrational and
+#: has no finite decimal, so "print it exactly" would print seventeen places;
+#: six names ``3.162278`` where the edge is ``3.1622776601683795``.
+EDGE_MAX_DECIMALS = 6
+#: When a label is close enough to *be* the edge's name rather than a rounding
+#: of it. Relative, so it holds at every magnitude.
+EDGE_REL_TOL = 1e-6
+
+
+def _names(edge: float, shown: float) -> bool:
+    """Whether a label printing *shown* names *edge* rather than a nearby number."""
+    return shown == edge or math.isclose(shown, edge, rel_tol=EDGE_REL_TOL, abs_tol=0.0)
+
+
 def _fmt_edges(edges: list[float]) -> list[str]:
-    """Format *edges* so no two read the same.
+    """Format *edges* so each names its own value and no two read the same.
 
     Three significant digits is the readable default, but it names ``4000.125``
-    and ``4000.875`` both ``4,000`` — and a label is also the ``multiIf``
-    literal the rows are grouped by, so two edges with one label are one bin
-    in the result and two in the caption. The edges are strictly increasing,
-    so some finite precision separates them; take the first that does.
+    ``4,000`` — a boundary at 4000.125 presented as one at 4000, so a value of
+    4000.05 falls in the bin below a label that says it is above it. And it
+    names ``4000.125`` and ``4000.875`` *both* ``4,000``, which is worse: a
+    label is also the ``multiIf`` literal the rows are grouped by, so two edges
+    with one label are one bin in the result and two in the caption.
+
+    So precision is raised twice, for two different reasons. First until every
+    label names its own edge (:data:`EDGE_REL_TOL`), capped at
+    :data:`EDGE_MAX_DECIMALS` — an irrational edge has no finite decimal and
+    six places is where readability wins. Then, uncapped, until no two labels
+    collide: the edges are strictly increasing, so some finite precision
+    separates them, and that one is not negotiable against readability.
     """
     labels = [_fmt(e) for e in edges]
+    shown = [_sig3(e) for e in edges]
     decimals = 0
+    while decimals < EDGE_MAX_DECIMALS and not all(
+        _names(e, v) for e, v in zip(edges, shown, strict=True)
+    ):
+        decimals += 1
+        labels = [_fmt_fixed(e, decimals) for e in edges]
+        shown = [round(e, decimals) for e in edges]
     while len(set(labels)) < len(labels) and decimals <= 15:
         decimals += 1
         labels = [_fmt_fixed(e, decimals) for e in edges]
@@ -222,6 +256,11 @@ class ResolvedDerive:
         if self.spec.kind == "bins":
             out["mode"] = self.spec.mode
             out["edges"] = list(self.edges or [])
+            # The caption prints these rather than rounding the floats itself:
+            # they are cut to the same precision the bin labels are, so the
+            # sentence naming the edges and the axis naming the bins can never
+            # disagree about where a boundary is.
+            out["edge_labels"] = _fmt_edges(list(self.edges or []))
             out["negative_bin"] = self.negative_bin
         else:
             out["part"] = self.spec.part

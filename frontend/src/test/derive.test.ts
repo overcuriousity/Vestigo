@@ -47,6 +47,24 @@ describe("derivations", () => {
     expect(describeDerive({ kind: "timePart", part: "hour" })).toBe("calendar part: hour of day (UTC)");
   });
 
+  it("prints the server's edge labels rather than rounding the floats itself", () => {
+    // `db/derive.py::_fmt_edges` cuts these to the precision that names each
+    // edge, and cuts the bin labels at the same place. Three significant
+    // digits here instead said `4,000 · 4,001` under bins starting at
+    // 4000.125 — the caption and the axis naming different boundaries.
+    expect(
+      describeDerive(
+        { kind: "bins", mode: "width", count: 3 },
+        {
+          kind: "bins",
+          labels: [],
+          edges: [4000.125, 4000.875],
+          edge_labels: ["4,000.125", "4,000.875"],
+        },
+      ),
+    ).toBe("grouped into 3 equal-width ranges (edges: 4,000.125 · 4,000.875)");
+  });
+
   it("finds the single fix that lights a greyed figure, and refuses to guess between two", () => {
     // Bar is illegal at ratio; bins is the only derivation ratio offers.
     expect(singleFixFor("bar", "ratio", "attr:bytes")).toEqual(defaultDerive("bins", "ratio"));

@@ -375,7 +375,11 @@ export function VisualizePage() {
   // The correlation matrix charts a LIST of fields instead of field/fieldY.
   const multiField = !!CHART_META[chartType].multiField;
   const selectedFields = config.fields ?? [];
-  const groupedOn = acceptsSecondField && !!fieldY;
+  // A modifier on the *numeric* kind only. `table` also declares an optional
+  // second field, but it counts that field's distinct values in a column —
+  // it has its own endpoint, and `field-numeric-grouped` on a categorical X is
+  // a heavy scan whose result nothing on the page ever reads.
+  const groupedOn = dataKind === "numeric" && acceptsSecondField && !!fieldY;
   // "time" and "punchcard" chart the whole event count — no field involved.
   const fieldFree = dataKind === "time" || dataKind === "punchcard";
   // "cumulative" and "calendar" take an optional field: every event without

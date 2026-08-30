@@ -1275,6 +1275,9 @@ export interface DeriveEcho {
   labels: string[];
   mode?: string;
   edges?: number[];
+  /** `edges` formatted by `db/derive.py::_fmt_edges` — the precision the bin
+   * labels are cut at, so the caption and the axis name the same boundary. */
+  edge_labels?: string[];
   negative_bin?: boolean;
   part?: string;
   timezone?: string;

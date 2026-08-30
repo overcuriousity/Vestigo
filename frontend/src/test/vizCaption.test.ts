@@ -685,8 +685,11 @@ describe("buildCaptionLines — interval lanes", () => {
       "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn",
     );
     expect(lines).toContain("lanes: 2 shown of 3 (top by event count); 1 more not drawn");
+    // Two scopes, two sentences: the start/end counts are the whole union,
+    // the open/orphan counts belong to the lanes that survived the cap.
+    expect(lines).toContain("starts: 4 · ends: 3 — matched across all 3 lanes, before the caps");
     expect(lines).toContain(
-      "starts: 4 · ends: 3 — 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+      "paired over the 2 lanes drawn: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
     );
     expect(lines).toContain("1 undated event not drawn");
     expect(lines.some((l) => l?.startsWith("first "))).toBe(false);

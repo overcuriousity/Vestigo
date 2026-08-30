@@ -98,6 +98,16 @@ and export captions all derive from it.
   namespace (like `c_fields`), so `chartConfigToParams` clears them by construction and a
   malformed value is dropped field-by-field, never guessed at. Filters inside `inputs` and
   `marks` use the View payload shape, like `compare.filters`.
+- **Normalized on the way in.** Every entry point — a URL (`paramsToChartConfig`), a saved
+  chart and a Story snapshot (`parseStoredChartConfig`) — runs `normalizeChartConfig`, which
+  drops a `compare` layer the figure cannot draw and a `derive` its registry row does not
+  admit. Both are invisible in the rail (the Compare radios render unchecked *and* disabled;
+  the Derive section is absent) and unreachable to clear there, but the caption reads the
+  *config*, not the request — so a pie carrying a stale `compare: baseline` printed
+  "comparison: all timeline events" over one layer it never fetched, and a cumulative step
+  carrying a stale `derive` claimed a binning it never sent. The rail drops both at the moment
+  the figure is picked and says so in `autoNotice`; the normalizer is what makes that not the
+  only thing keeping them honest.
 - **`scale` is "treat as".** The Stevens term is the wire format the agent, the URL and
   saved charts share; the plain phrase (`lib/scaleDisplay.ts`) exists only in the UI and the
   caption.
@@ -126,9 +136,16 @@ Read top-down, in dependency order:
 
    The field probe pre-selects one and explains itself (`treatAsNotice`); it never overrides a
    `scale` that arrived from the URL, a saved chart or the agent.
-3. **Derive** — shown only when the treat-as admits a change of scale (`lib/derive.ts`
-   `deriveOptionsFor`): *Measure* offers ranges; *Number or time* offers ranges or a calendar
-   part; a `time:` field, already a calendar part, offers nothing and the section is absent.
+3. **Derive** — shown only when the treat-as admits a change of scale *and* the figure that
+   would result actually sends one (`lib/derive.ts` `deriveOptionsForChart`, over
+   `deriveOptionsFor` and `resolveDeriveTarget`): *Measure* offers ranges; *Number or time*
+   offers ranges or a calendar part; a `time:` field, already a calendar part, offers nothing
+   and the section is absent. The figure gate is not simply `CHART_META[c].derives` —
+   deriving is a change of scale and the rail re-picks the figure when the current one is
+   illegal at the derived one, so a histogram (which admits none) still offers *Group into
+   ranges* and lands on a bar. Withheld from the figures that admit none *and* stay selected
+   because they are legal at every scale (cumulative, calendar, punchcard, time, corr): those
+   would carry a `derive` they never put on the wire while the caption named it.
    Three radios — *Use the value as is* / *Group into ranges* (equal-width, log-spaced, or my
    own edges) / *Calendar part* (hour of day, day of week, day of month, ISO week, month —
    all UTC). With one active the rail states "now treated as ordered categories": the figure
@@ -198,9 +215,15 @@ link all carry it the same way (`lib/derive.ts` `deriveSourceScale`, Python
 `chart_meta.DERIVE_SOURCE_SCALES`; an omitted or "ordinal" scale resolves to the derivation's
 natural one). Picking a figure that admits no derivation drops the active one and says so —
 legality is judged at the effective scale, so such a figure lights up under a derivation it
-cannot carry. Bin labels take the first precision that tells every edge apart (`_fmt_edges`):
-a label is also the `multiIf` literal rows are grouped by, so two edges with one label were
-one bin in the result and two in the caption.
+cannot carry. Picking a figure that cannot draw a *comparison* drops that the same way, for
+the same reason and with its own notice ("Pie / Donut charts one layer — the comparison was
+dropped."). Bin labels are cut by `_fmt_edges`, which raises the precision twice for two
+different reasons. First until every label *names its own edge* — three significant digits
+called a boundary at 4000.125 `4,000`, which puts a value of 4000.05 in the bin below a label
+saying it is above it — capped at six decimals, because a log-spaced edge is irrational and
+readability wins past a relative 1e-6. Then, uncapped, until no two labels collide: a label is
+also the `multiIf` literal rows are grouped by, so two edges under one label were one bin in
+the result and two in the caption.
 
 **Computed in ClickHouse, before aggregation** (`db/derive.py`, threaded by
 `EventQueryService._resolve_derive`):
@@ -210,9 +233,8 @@ one bin in the result and two in the caption.
   are the *slice's* edges and the response echoes them — a chart of ranges that did not say
   where its bins are would be a chart nobody could check. `log` cannot place a value ≤ 0, so
   those get their own, disclosed bin (`negative_bin`). `custom` takes the analyst's edges,
-  open-ended at both ends. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`;
-  three significant digits for non-integers); the bins SQL is one `multiIf` over
-  `_finite_float_cast`.
+  open-ended at both ends. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`); the
+  bins SQL is one `multiIf` over `_finite_float_cast`.
 - `time_part` reuses `TIME_FIELD_SPECS` over `parseDateTimeBestEffortOrNull(…, 'UTC')`, so a
   derived hour and a `time:hour_of_day` chart can never disagree — same zero-padding, same
   ISO weekday, same UTC. A `time:` field itself is refused (HTTP 422 / `propose_chart`
@@ -231,11 +253,14 @@ empty range is a finding). The endpoints take `derive` (`field-terms`, `field-ti
 "terms"` only); malformed → 422 with the validator's words. A derived `field-terms` request
 never answers from the M24a field-stats cache, which holds raw values.
 
-The response echo — `derive` (or `derive_x`): `{kind, labels, mode, edges, negative_bin}` for
-bins, `{kind, labels, part, timezone: "UTC"}` for a calendar part. The frontend uses
-`labels` as the bar axis's value order (`BarChart.valueOrder`) and `edges` /
-`negative_bin` for the caption's `derived:` line, which always names what was done and what
-could not be counted (`lib/caption.ts`).
+The response echo — `derive` (or `derive_x`): `{kind, labels, mode, edges, edge_labels,
+negative_bin}` for bins, `{kind, labels, part, timezone: "UTC"}` for a calendar part. The
+frontend uses `labels` as the bar axis's value order (`BarChart.valueOrder`) and
+`edge_labels` / `negative_bin` for the caption's `derived:` line, which always names what was
+done and what could not be counted (`lib/caption.ts`). `edge_labels` is `edges` run through
+the same `_fmt_edges` the bin labels are cut by — the caption naming a boundary and the axis
+naming the bin either side of it are then the same text, and rounding the floats a second time
+client-side (which said `4,000 – 4,001` over bins starting at 4000.125) cannot happen.
 
 ## Table figure
 
@@ -282,9 +307,11 @@ plus the shared filter parameters. 422 when `second_field == field`, when
 `highlight`. `ChartLimits.table_rows` caps the rows — agent (20, 30), analyst (50, 500).
 
 **Options.** `topN` (the slider stops at 50, the exact box reaches 500); `tableSortBy` /
-`tableSortDir`; `highlight` — a list of values whose rows get a faint band. Highlighting is
-presentation only and the caption says which rows were highlighted, so a report reader can
-tell an analyst's emphasis from the data's.
+`tableSortDir`; `highlight` — a list of values whose rows get a faint band, entered **one per
+line** (a field value carries commas of its own — a DN, a user-agent — and splitting on them
+turned one value nothing matches into two). Highlighting is presentation only and the caption
+says which rows were highlighted, so a report reader can tell an analyst's emphasis from the
+data's.
 
 **Two renderings, one row model.** `lib/tableRows.ts` decides which columns show
 (`effectiveColumns`), how each cell reads (`tableRowModels`: `en-US` integers, `45.5%`,
@@ -607,10 +634,13 @@ layer lines: the pairing rule verbatim (`pairing: start → next end — an end 
 recent open start in its lane; an open start runs to the slice end; an end with no open
 start before it is an orphan, counted and not drawn`, or `pairing: first to last — one bar
 per lane, from its first event to its last`); `lanes: N shown of M (top by event count); K
-more not drawn` when the cap bit, else `lanes: N`; under `next_end` `starts: S · ends: E —
-U open-ended (no end seen, drawn to <slice end>), O orphan ends not drawn` and, when the
-row cap bit, the `first N start/end events (by time) paired` line; and `U undated events
-not drawn` whenever any were.
+more not drawn` when the cap bit, else `lanes: N`; under `next_end` **two** lines, because
+they are two scopes and one sentence carrying both is arithmetic nobody can reconcile —
+`starts: S · ends: E — matched across all M lanes, before the caps` (the whole union) and
+`paired over the N lanes drawn: U open-ended (no end seen, drawn to <slice end>), O orphan
+ends not drawn` (only the lanes that survived the cap); then, when the row cap bit, the
+`first N start/end events (by time) paired` line; and `U undated events not drawn` whenever
+any were.
 
 ## 5. Parity
 

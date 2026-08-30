@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { CalendarHeatmap } from "@/components/viz/charts/CalendarHeatmap";
 import type { CalendarResponse } from "@/api/types";
+import { ChartStaticWidthContext } from "@/components/viz/primitives/chartStaticWidth";
 import { installFakeResizeObserver } from "./helpers/resizeObserver";
 
 beforeAll(() => installFakeResizeObserver());
@@ -45,6 +46,37 @@ describe("CalendarHeatmap", () => {
     expect(mon2.getAttribute("y")).toBe(mon1.getAttribute("y"));
     expect(tue2.getAttribute("x")).toBe(mon2.getAttribute("x"));
     expect(Number(tue2.getAttribute("y"))).toBeGreaterThan(Number(mon2.getAttribute("y")));
+  });
+
+  it("fits 53 weeks inside a narrow panel instead of clipping the newest ones", () => {
+    // A thumbnail, a Story snapshot or a narrow panel: the columns used to be
+    // sized to a 3px floor and overflow the <svg>, which clips — and weeks run
+    // left→right, so what disappeared was the most recent days while the
+    // caption still claimed 53 weeks.
+    const year: CalendarResponse = {
+      ...data,
+      start: "2025-07-14", // Monday
+      end: "2026-07-19",
+      days: [],
+      weeks: 53,
+      weeks_total: 53,
+    };
+    const { container } = render(
+      <ChartStaticWidthContext.Provider value={220}>
+        <CalendarHeatmap data={year} />
+      </ChartStaticWidthContext.Provider>,
+    );
+    const cells = [...container.querySelectorAll("rect[data-cal-day]")];
+    expect(cells).toHaveLength(53 * 7);
+    const svg = container.querySelector("svg")!;
+    const inner =
+      Number(svg.getAttribute("width")) -
+      36 - // the frame's left margin
+      8; // …and its right one
+    const right = Math.max(
+      ...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))),
+    );
+    expect(right).toBeLessThanOrEqual(inner + 0.001);
   });
 
   it("renders the empty state without dated events", () => {

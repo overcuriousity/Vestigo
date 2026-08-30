@@ -210,3 +210,32 @@ describe("resolveChartOptions — ranked change", () => {
     expect(TOPN_SLIDER_MAX.change).toBe(20);
   });
 });
+
+describe("resolveChartOptions — options that outlive their precondition", () => {
+  it("falls back to counting events when the field a quantity aggregates is gone", () => {
+    // "No field — count every event" clears `field` and leaves `quantity`;
+    // `/viz/cumulative` answers 422 for `sum` without one, which is a blank
+    // figure with nothing on screen to explain it.
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative" as const,
+      scale: "ratio" as const,
+      options: { quantity: "sum" as const },
+    };
+    expect(resolveChartOptions({ ...stored, field: "attr:bytes" }).quantity).toBe("sum");
+    expect(resolveChartOptions({ ...stored, field: null }).quantity).toBe("events");
+  });
+
+  it("falls back to the count sort when the second field the sort ranks by is gone", () => {
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "table" as const,
+      field: "attr:host",
+      options: { tableSortBy: "distinct_second" as const },
+    };
+    expect(resolveChartOptions({ ...stored, fieldY: "attr:user" }).tableSortBy).toBe(
+      "distinct_second",
+    );
+    expect(resolveChartOptions({ ...stored, fieldY: null }).tableSortBy).toBe("count");
+  });
+});

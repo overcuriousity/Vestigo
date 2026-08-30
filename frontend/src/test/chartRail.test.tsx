@@ -233,6 +233,20 @@ describe("ChartRail — Derive", () => {
     expect(sectionOrder()).not.toContain("derive");
   });
 
+  it("withholds Derive from a figure that would keep it and never send it", () => {
+    // Cumulative is legal at every scale, so it stays selected under a
+    // derivation — and its registry entry admits none, so the query would drop
+    // it while the caption (and a Story export) still named the ranges.
+    renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative",
+      field: "attr:bytes",
+      scale: "ratio",
+    });
+    expect(sectionOrder()).not.toContain("derive");
+    expect(screen.queryByRole("radio", { name: "Group into ranges" })).toBeNull();
+  });
+
   it("grouping into ranges makes the field ordered categories and lights the category figures", () => {
     const { updateConfig } = renderRail({
       ...DEFAULT_CHART_CONFIG,
@@ -345,10 +359,38 @@ describe("ChartRail — table", () => {
     expect(screen.getByRole("combobox", { name: "Sort by" })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "Direction" })).toBeTruthy();
     expect(screen.getByLabelText("Top values (exact)")).toBeTruthy();
+    // One value per line, so a value carrying a comma of its own — a DN, a
+    // user-agent — is one highlighted value and not two that match nothing.
     const highlight = screen.getByRole("textbox", { name: "Highlight values" });
-    fireEvent.change(highlight, { target: { value: "alice, bob" } });
+    fireEvent.change(highlight, { target: { value: "alice\nCN=bob,OU=staff" } });
     fireEvent.blur(highlight);
-    expect(updateConfig).toHaveBeenCalledWith({ options: { highlight: ["alice", "bob"] } });
+    expect(updateConfig).toHaveBeenCalledWith({
+      options: { highlight: ["alice", "CN=bob,OU=staff"] },
+    });
+  });
+});
+
+describe("ChartRail — Compare", () => {
+  it("drops a comparison the newly picked figure cannot draw, and says so", () => {
+    // Left in the config it is invisible *and* unreachable — all three radios
+    // render unchecked and disabled — while the caption names a comparison
+    // layer that was never fetched.
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "artifact",
+      scale: "nominal",
+      compare: { mode: "baseline" },
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: "Pie / Donut" }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      chartType: "pie",
+      compare: { mode: "off" },
+    });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      "Pie / Donut charts one layer — the comparison was dropped.",
+    );
   });
 });
 

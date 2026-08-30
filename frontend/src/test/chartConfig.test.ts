@@ -7,6 +7,7 @@ import {
   DEFAULT_CHART_CONFIG,
   paramsToChartConfig,
   parseStoredChartConfig,
+  normalizeChartConfig,
   parseStoredChartFilters,
   unrepresentableFilterMembers,
   type ChartConfig,
@@ -429,5 +430,43 @@ describe("table columns", () => {
     expect(paramsToChartConfig(chartConfigToParams(table)).inputs.columns).toEqual([]);
     const stored = chartConfigToStored(table, undefined);
     expect(parseStoredChartConfig(stored)?.inputs.columns).toEqual([]);
+  });
+});
+
+describe("normalizeChartConfig", () => {
+  it("drops a comparison and a derivation the figure cannot honour, wherever the config came from", () => {
+    // Both are invisible in the rail and unreachable to clear there, and both
+    // are read by the caption — which is how a pie printed "comparison: all
+    // timeline events" over one layer it never fetched.
+    const stale: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "pie",
+      field: "artifact",
+      scale: "nominal",
+      compare: { mode: "baseline" },
+      derive: { kind: "bins", mode: "log", count: 8 },
+    };
+    expect(normalizeChartConfig(stale).compare).toEqual({ mode: "off" });
+    expect(normalizeChartConfig(stale).derive).toBeNull();
+    // The same config carried by a URL and by a saved chart — a Story snapshot
+    // renders through the second one.
+    const viaUrl = paramsToChartConfig(chartConfigToParams(stale));
+    expect(viaUrl.compare).toEqual({ mode: "off" });
+    expect(viaUrl.derive).toBeNull();
+    const viaStore = parseStoredChartConfig(chartConfigToStored(stale, undefined));
+    expect(viaStore?.compare).toEqual({ mode: "off" });
+    expect(viaStore?.derive).toBeNull();
+  });
+
+  it("leaves a figure that does honour them untouched", () => {
+    const kept: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "attr:bytes",
+      scale: "ratio",
+      compare: { mode: "baseline" },
+      derive: { kind: "bins", mode: "log", count: 8 },
+    };
+    expect(normalizeChartConfig(kept)).toBe(kept);
   });
 });
