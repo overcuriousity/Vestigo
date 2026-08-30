@@ -13,12 +13,19 @@
  * string cannot carry. Reviewing wording still means reading one file.
  */
 import type { ReactNode } from "react";
+import { useCapabilities } from "@/api/health";
+import type { Capabilities } from "@/api/types";
 
 /**
  * The suggested workflow is a genuine sequence — each step depends on the one
  * before — so the numbering encodes something true rather than decorating a list.
  */
-const CASE_OVERVIEW_STEPS = [
+const CASE_OVERVIEW_STEPS: {
+  title: string;
+  body: string;
+  /** Only shown where this optional subsystem is configured. */
+  capability?: keyof Capabilities;
+}[] = [
   {
     title: "Normalize your input data",
     body:
@@ -51,8 +58,35 @@ const CASE_OVERVIEW_STEPS = [
       "Run the embedding wizard on a timeline to enable semantic search and " +
       "similarity analysis on top of the statistical anomaly detectors, which work " +
       "without any embedding step.",
+    /** Dropped entirely where nothing can embed: the step describes a wizard
+     * that renders no entry point on such an instance. */
+    capability: "embeddings",
   },
 ];
+
+/** A component rather than inline JSX so the embeddings step can be gated on
+ * the health capability — the numbering renumbers itself when it is dropped. */
+function CaseOverviewSteps() {
+  const capabilities = useCapabilities();
+  const steps = CASE_OVERVIEW_STEPS.filter(
+    (step) => step.capability === undefined || capabilities[step.capability],
+  );
+  return (
+    <ol className="space-y-2">
+      {steps.map((step, i) => (
+        <li key={step.title} className="flex gap-2">
+          <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
+          <span>
+            <span className="font-medium text-[var(--color-fg-secondary)]">
+              {step.title}.
+            </span>{" "}
+            {step.body}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
 
 // `satisfies` rather than a type annotation: the annotation would widen the keys
 // to `string` and `GuidanceId` would stop constraining anything.
@@ -72,21 +106,7 @@ export const guidance = {
 
   "case-overview": {
     title: "Suggested workflow",
-    body: (
-      <ol className="space-y-2">
-        {CASE_OVERVIEW_STEPS.map((step, i) => (
-          <li key={step.title} className="flex gap-2">
-            <span className="shrink-0 font-mono opacity-60">{i + 1}.</span>
-            <span>
-              <span className="font-medium text-[var(--color-fg-secondary)]">
-                {step.title}.
-              </span>{" "}
-              {step.body}
-            </span>
-          </li>
-        ))}
-      </ol>
-    ),
+    body: <CaseOverviewSteps />,
   },
 
   "investigate-anomalies": {
