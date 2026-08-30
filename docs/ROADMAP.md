@@ -4,8 +4,9 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-08-29, v1.15.1):** three open issues, listed below. Phase 3 is complete
-and the queue is feature-shaped. Priority, roughly by payoff-per-effort:
+**State (verified 2026-08-30, v1.17.0):** one open GitHub issue — #307, converters for AI
+agent telemetry — which is tracked there and not duplicated below. Phase 3 is complete and
+the queue is feature-shaped. Priority, roughly by payoff-per-effort:
 
 1. **D11** entropy bigram variant — closes a capability gap the docs used to overclaim;
    truth of what we ship outranks new surface.
@@ -55,9 +56,10 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   degrading the query is the one wrong option.
 - [ ] **Generate frontend API types from OpenAPI** (`openapi-typescript`) to replace the
   hand-mirrored `frontend/src/api/types.ts`. The duplication compounds: 1240 lines when
-  filed, 1549 today.
+  filed, 2007 on 2026-08-30.
 - [ ] **Split `api/routers/events.py`** along the read/aggregate/export seams — 3100 lines
-  on 2026-07-20, 3319 on 2026-07-29, growing without anyone touching it deliberately.
+  on 2026-07-20, 3319 on 2026-07-29, 3836 on 2026-08-30, growing without anyone touching it
+  deliberately.
 - [ ] **README screenshot grid.** The README is laid out for a 2×2 grid but ships one
   Explorer shot. Capture at one window size: Analysis with findings and the Method panel,
   a Story with a live view embed, the Agent with an applied finding, a re-shot Explorer.
@@ -70,11 +72,18 @@ primitive, so every author re-decides at the call site.
 
 The ratchet exists — `frontend/src/test/designSystem.test.ts`. Undefined `var(--…)` is a
 hard check at zero; arbitrary `text-[Npx]` and raw `<button>` outside `components/ui/` are
-budgeted per file in `designSystemBudget.ts`, seeded at 119 each. The budget only falls:
-exceeding an entry fails, and so does *beating* one without lowering it. **Every item below
-burns its numbers out of that file**; the migration is done when the file is `{}`.
+budgeted per file in `designSystemBudget.ts`, seeded at 119 each on 2026-07-30. The budget
+only falls: exceeding an entry fails, and so does *beating* one without lowering it. **Every
+item below burns its numbers out of that file**; the migration is done when the file is `{}`.
 
-- [ ] **Type scale in `@theme`, and burn down the 118 arbitrary font sizes.** A correctness
+**The ratchet has not held on font sizes.** Totals on 2026-08-30 are 127 arbitrary font
+sizes (up 8 from the seed) and 117 raw `<button>`s (down 2). The check only guards files
+already listed, so each new component adds its own entry and the total climbs while every
+individual budget is respected — the mechanism is working as written and the written rule is
+wrong. Fixing that is part of the two migration items below, not a separate task: seed no
+new entries, and require a new component to use the primitives instead.
+
+- [ ] **Type scale in `@theme`, and burn down the 127 arbitrary font sizes.** A correctness
   item: `html[data-density="compact"]` rebases `font-size` to scale the UI, and every
   `text-[10px]`-style escape ignores it — compact density does not do what it claims on
   those sites. Pick five named steps for *this* app (`micro / body / lead / section /
@@ -96,14 +105,16 @@ burns its numbers out of that file**; the migration is done when the file is `{}
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand
   store, so it is per-browser. The backend half exists (`User.preferences`,
   `update_user_preferences`); the work is a preferences passthrough on `PATCH /auth/me`.
-- [ ] **`IconButton` primitive / the 119 raw `<button>`s** across 46 files, against 57 that
-  import `Button`. Burn down opportunistically, lowering budgets as files are cleaned.
+- [ ] **`IconButton` primitive / the raw `<button>`s** — 122 occurrences across 46 files on
+  2026-08-30 (117 of them budgeted), against 67 files that import `Button`. Burn down
+  opportunistically, lowering budgets as files are cleaned.
 - [ ] **Icon size scale.** Ten distinct values in use; 11 vs 12 vs 13 is drift, not a
   decision. Collapse to three (`inline` 12, `control` 16, `feature` 20) during the
   `Card`/`SectionLabel` passes.
-- [ ] **`aria-live` for background work.** Exactly one `aria-live` in the frontend: the job
-  tray, toasts and streaming agent output announce nothing. Follow the event grid's
-  `aria-rowcount` pattern.
+- [ ] **`aria-live` for background work.** Two `aria-live` regions in the whole frontend
+  (`ExplorerPage`, `EmbedWizard`) — and the job tray, which this item used to credit with
+  the only one, is not among them. Toasts, the job tray and streaming agent output announce
+  nothing. Follow the event grid's `aria-rowcount` pattern.
 - [ ] **Heading structure.** 39 heading elements across 211 component files. Mostly resolved
   for free by `SectionLabel` — verify after that migration rather than scheduling it.
 
