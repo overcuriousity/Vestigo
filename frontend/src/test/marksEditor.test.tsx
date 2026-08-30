@@ -65,6 +65,23 @@ describe("MarksEditor", () => {
     expect(onChange).toHaveBeenLastCalledWith([{ kind: "events", filters: { ids: ["e42"] }, label: "event e42" }]);
   });
 
+  it("refuses a custom-filter mark whose filter narrows nothing", async () => {
+    // A mark is a source resolved at render time, so an empty filter is not
+    // an empty mark: it matches every event in the timeline and draws one
+    // rule per event, up to the cap (#332).
+    const { onChange } = renderEditor();
+    await pick("Custom filter");
+    const add = screen.getByRole("button", { name: "Add" });
+    expect(add).toBeDisabled();
+    expect(screen.getByText(/an empty one marks every event/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("Search text…"), {
+      target: { value: "beacon" },
+    });
+    expect(screen.getByRole("button", { name: "Add" })).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    expect(onChange).toHaveBeenLastCalledWith([{ kind: "events", filters: { q: "beacon" } }]);
+  });
+
   it("turns confirmed findings into one events mark over their ids", async () => {
     const { onChange } = renderEditor();
     await pick("Confirmed findings");

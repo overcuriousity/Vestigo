@@ -380,7 +380,48 @@ describe("ChartConfig v2", () => {
   });
 
   it("round-trips derive, inputs and marks through storage", () => {
-    expect(parseStoredChartConfig(chartConfigToStored(v2Extras))).toEqual(v2Extras);
+    // `lanes` is the figure that honours all three of them at once.
+    const lanes: ChartConfig = { ...v2Extras, chartType: "lanes", derive: null };
+    expect(parseStoredChartConfig(chartConfigToStored(lanes))).toEqual(lanes);
+  });
+
+  it("stores no mark or input the figure cannot honour", () => {
+    // The carry across a figure switch is deliberate on the page and in the
+    // URL, but `chart_exec` refuses a mark or an `inputs` key the figure does
+    // not declare *by name* — so a bar chart saved with lane inputs and marks
+    // still on it drew here and failed to resolve as a Story block (#332).
+    const stored = chartConfigToStored(v2Extras);
+    expect(stored.marks).toEqual([]);
+    expect(stored.inputs).toEqual({});
+    // What the bar figure does honour is untouched.
+    expect(stored.derive).toEqual(v2Extras.derive);
+  });
+
+  it("keeps marks and inputs in the URL, so a figure switch and back loses nothing", () => {
+    const params = chartConfigToParams(v2Extras);
+    expect(params.has("c_marks")).toBe(true);
+    expect(params.has("c_inputs")).toBe(true);
+    expect(paramsToChartConfig(params)).toEqual(v2Extras);
+  });
+
+  it("drops a quantity the field and treat-as no longer admit", () => {
+    // "Running sum" outlives the measure that justified it: changing Treat-as
+    // or picking "No field" leaves it in `options`, the page drew it (the
+    // endpoint knows no scale) and the same chart failed to execute (#332).
+    const cumulative: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative",
+      scale: "ratio",
+      field: "attr:bytes",
+      options: { quantity: "sum" },
+    };
+    expect(normalizeChartConfig(cumulative).options.quantity).toBe("sum");
+    expect(
+      normalizeChartConfig({ ...cumulative, scale: "nominal" }).options.quantity,
+    ).toBeUndefined();
+    expect(
+      normalizeChartConfig({ ...cumulative, field: null }).options.quantity,
+    ).toBeUndefined();
   });
 
   it("upgrades a stored v1 config losslessly", () => {

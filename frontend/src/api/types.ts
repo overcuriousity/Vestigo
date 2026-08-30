@@ -1424,6 +1424,12 @@ export interface FieldTimeseriesResponse {
   min: string | null;
   max: string | null;
   series: FieldTimeseriesSeries[];
+  /** Distinct values of the field, of which `series` draws the top N. */
+  distinct: number;
+  /** Events across the values the series cap left out — 0 when nothing was cut. */
+  other_count: number;
+  /** True when more values exist than the series cap draws. */
+  series_truncated: boolean;
 }
 
 /** One (day-of-week × hour-of-day) cell; `dow` is ISO (1=Mon … 7=Sun), UTC. */

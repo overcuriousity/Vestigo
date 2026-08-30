@@ -66,10 +66,13 @@ import { CHART_HOW_TO_READ } from "./lib/explainers";
 import { SCALE_DISPLAY, scaleTooltip } from "./lib/scaleDisplay";
 import { galleryEntries } from "./lib/figureGallery";
 import {
+  BINS_MAX,
+  BINS_MIN,
   defaultDerive,
   deriveOptionsFor,
   deriveOptionsForChart,
   describeDerive,
+  EDGES_MAX,
   effectiveScale,
   resolveDeriveTarget,
   singleFixFor,
@@ -371,6 +374,15 @@ function EdgesInput({
     if (!ok) {
       setProblem(
         "Edges must be numbers in increasing order, e.g. 0, 1024, 10240",
+      );
+      return;
+    }
+    // The server's own ceiling (`db/derive.py`: "at most 49 custom edges"),
+    // said here instead: past it the request is a 422 the page has no way to
+    // explain, so the chart simply stops redrawing over a pasted list.
+    if (parsed.length > EDGES_MAX) {
+      setProblem(
+        `At most ${EDGES_MAX} edges (${BINS_MAX} ranges) — that is ${parsed.length}.`,
       );
       return;
     }
@@ -934,8 +946,8 @@ export function ChartRail({
                   <input
                     type="range"
                     aria-label="Number of ranges"
-                    min={2}
-                    max={50}
+                    min={BINS_MIN}
+                    max={BINS_MAX}
                     step={1}
                     value={derive.count}
                     onChange={(e) =>

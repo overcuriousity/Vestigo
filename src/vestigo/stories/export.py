@@ -347,6 +347,7 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     round trip, because a config written in the wrong shape produces a chart
     that is silently undrawable in every consumer rather than an error.
     """
+    from vestigo.agent.chart_meta import CHART_META
     from vestigo.agent.tools import ChartSpec
 
     spec: dict[str, Any] = {}
@@ -368,6 +369,18 @@ def _stored_chart_to_spec(config: dict[str, Any]):
     if derive:
         spec["derive"] = derive
 
+    # The figure the stored config names, when it names one this build knows.
+    # Both blocks below drop what it cannot honour: `ChartInputs` and `marks`
+    # are deliberately carried across a figure switch on the Visualize page
+    # (see its `ChartInputs`), and a chart saved before that carry was cleaned
+    # up at the storage boundary holds inputs and marks for a figure it is no
+    # longer set to. `execute_chart_spec` refuses those by name, so the chart
+    # drew on the page and then failed to resolve here — as a Story block, or
+    # re-run through the agent — naming a control the analyst cannot see. A
+    # spec the agent writes by hand still gets that refusal, which is the
+    # right answer there; a persisted chart gets the figure it was saved as.
+    meta = CHART_META.get(spec.get("chart_type", ""))
+
     stored_inputs = config.get("inputs")
     if isinstance(stored_inputs, dict):
         spec_inputs: dict[str, Any] = {}
@@ -380,11 +393,13 @@ def _stored_chart_to_spec(config: dict[str, Any]):
                 spec_inputs[spec_key] = _filter_payload_to_spec(
                     stored_inputs[stored_key]
                 ).model_dump(exclude_none=True)
+        if meta is not None:
+            spec_inputs = {k: v for k, v in spec_inputs.items() if k in meta.inputs}
         if spec_inputs:
             spec["inputs"] = spec_inputs
 
     marks = _stored_marks_to_spec(config.get("marks"))
-    if marks:
+    if marks and (meta is None or meta.supports_marks):
         spec["marks"] = marks
 
     # The primary filter layer — the Explorer filters the chart was saved

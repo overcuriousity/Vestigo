@@ -79,6 +79,7 @@ import {
   CHART_ID_PARAM,
   chartUrlParams,
   histogramToCompare,
+  normalizeChartConfig,
   paramsToChartConfig,
   parseStoredChartConfig,
   parseStoredChartFilters,
@@ -307,9 +308,15 @@ export function VisualizePage() {
     [setSearchParams],
   );
 
+  // Normalized on the way *out*, not only on the way back in: an edit that
+  // makes a stored knob illegal (changing Treat-as under a running sum,
+  // picking "No field") would otherwise write it into the URL, and the URL is
+  // what a shared link, a take-over and a save all read. Dropping it here
+  // means the config the analyst edits, the one in the address bar and the
+  // one that gets stored are the same chart. See `normalizeChartConfig`.
   const updateConfig = useCallback(
     (patch: Partial<ChartConfig>) =>
-      takeOver({ ...config, ...patch }, urlFilters),
+      takeOver(normalizeChartConfig({ ...config, ...patch }), urlFilters),
     [takeOver, config, urlFilters],
   );
 
@@ -1080,6 +1087,15 @@ export function VisualizePage() {
   } else if (dataKind === "timeseries" && timeseriesQuery.data) {
     facts.shownValues = timeseriesQuery.data.series.length;
     facts.intervalSeconds = timeseriesQuery.data.interval_seconds;
+    // The series cap is a cut like every other top-N in this page, and the
+    // endpoint pays an extra aggregate to report it — so the caption says how
+    // many values there were and how many events fell outside the drawn ones.
+    // A derived axis makes the cut routine rather than exotic: 53 ISO weeks
+    // against a default cap of 12, with `derive` echoing all 53 labels.
+    facts.distinct = timeseriesQuery.data.distinct;
+    facts.otherCount = timeseriesQuery.data.other_count;
+    // One series per value: there is no "Other" line to roll the rest into.
+    facts.otherDrawn = false;
   } else if (dataKind === "punchcard" && punchcardQuery.data) {
     facts.primaryTotal = punchcardQuery.data.total;
   } else if (dataKind === "cumulative" && cumulativeQuery.data) {

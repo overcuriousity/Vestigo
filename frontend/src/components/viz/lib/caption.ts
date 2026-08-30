@@ -79,6 +79,11 @@ export interface CaptionFacts {
   distinct?: number;
   shownValues?: number;
   otherCount?: number;
+  /** Whether the events outside the drawn values are rolled into a visible
+   * "Other" bucket (terms figures) or simply not drawn (a value-over-time
+   * chart draws one series per value and has nowhere to put the rest).
+   * Defaults to true — the terms case, which is where this line started. */
+  otherDrawn?: boolean;
   /** kind=numeric: bin count over the value range. */
   binCount?: number;
   valueMin?: number | null;
@@ -469,10 +474,13 @@ export function buildCaptionLines(args: {
     facts.shownValues != null &&
     facts.distinct > facts.shownValues
   ) {
+    const outside = facts.distinct - facts.shownValues;
     lines.push(
       `showing top ${fmtInt(facts.shownValues)} of ${fmtInt(facts.distinct)} distinct values (capped` +
         (facts.otherCount != null && facts.otherCount > 0
-          ? `; ${fmtInt(facts.otherCount)} events in "Other")`
+          ? facts.otherDrawn === false
+            ? `; ${fmtInt(facts.otherCount)} events across the ${fmtInt(outside)} value${outside === 1 ? "" : "s"} not drawn)`
+            : `; ${fmtInt(facts.otherCount)} events in "Other")`
           : ")"),
     );
   }

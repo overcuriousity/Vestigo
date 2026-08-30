@@ -59,7 +59,7 @@ export interface ChartOptions {
   showDensity?: boolean;
   buckets?: number;
   /** cumulative: what accumulates — resolved from field/scale when omitted. */
-  quantity?: "events" | "sum" | "distinct";
+  quantity?: Quantity;
   /** change: one row per value (dumbbell) or two columns (slope). Default dumbbell. */
   layout?: "dumbbell" | "slope";
   /** pivot/sankey: per-axis top-N caps. */
@@ -76,6 +76,42 @@ export interface ChartOptions {
   tableSortDir?: "asc" | "desc";
   /** table: values whose rows are highlighted — presentation only, captioned. */
   highlight?: string[];
+}
+
+/** What a cumulative chart can accumulate. */
+export const QUANTITIES = ["events", "sum", "distinct"] as const;
+export type Quantity = (typeof QUANTITIES)[number];
+
+/** The quantity a cumulative chart accumulates when its config names none. */
+export function defaultQuantity(scale: Scale, field: string | null): Quantity {
+  if (field == null) return "events";
+  return scale === "ratio" ? "sum" : "distinct";
+}
+
+/**
+ * The stored quantity if this `(field, scale)` pair admits it, else undefined.
+ *
+ * The three preconditions are `chart_exec`'s, stated once here so the page and
+ * the executor cannot drift: only `"events"` counts without a field, a running
+ * sum is a sum of a *measure*, and distinct values of a measure are not a
+ * count of anything. The rail already disables the illegal items in the
+ * Quantity picker — but an option outlives the field and the treat-as that
+ * justified it, and the picker is not on screen for the figure the analyst is
+ * looking at when they change either. Left behind, it drew on the page (the
+ * `/viz/cumulative` endpoint knows no scale, so it never refused) while the
+ * same chart failed to resolve as a Story block or through the agent.
+ */
+export function legalQuantity(
+  value: unknown,
+  scale: Scale,
+  field: string | null,
+): Quantity | undefined {
+  if (!(QUANTITIES as readonly unknown[]).includes(value)) return undefined;
+  const quantity = value as Quantity;
+  if (quantity !== "events" && field == null) return undefined;
+  if (quantity === "sum" && scale !== "ratio") return undefined;
+  if (quantity === "distinct" && scale !== "nominal" && scale !== "ordinal") return undefined;
+  return quantity;
 }
 
 export type DeriveSpec =
@@ -416,12 +452,47 @@ export function normalizeChartConfig(config: ChartConfig): ChartConfig {
   const dropCompare = config.compare.mode !== "off" && !meta.supportsCompare;
   const dropDerive =
     config.derive != null && !meta.derives.includes(config.derive.kind);
-  if (!dropCompare && !dropDerive) return config;
+  // An illegal `quantity` is the same shape of dead state, reached by a
+  // control the analyst *can* see but not while it matters: changing Treat-as
+  // or picking "No field" leaves a stored "sum" behind, and the Quantity
+  // picker only renders for the cumulative figure. See `legalQuantity`.
+  const dropQuantity =
+    config.options.quantity !== undefined &&
+    legalQuantity(config.options.quantity, config.scale, config.field) === undefined;
+  if (!dropCompare && !dropDerive && !dropQuantity) return config;
+  const options = { ...config.options };
+  if (dropQuantity) delete options.quantity;
   return {
     ...config,
+    ...(dropQuantity ? { options } : {}),
     ...(dropCompare ? { compare: { mode: "off" as const } } : {}),
     ...(dropDerive ? { derive: null } : {}),
   };
+}
+
+/**
+ * The marks and figure-inputs *this* figure can honour.
+ *
+ * `ChartInputs` and `marks` are deliberately carried across a figure switch
+ * so switching back loses nothing (see `ChartInputs`), which is why
+ * `normalizeChartConfig` — run on every config entering the app, including
+ * the URL the page rewrites on every edit — does not drop them. Storage is
+ * the other side of that: `chart_exec` refuses a mark or an `inputs` key the
+ * figure does not declare *by name*, so a chart saved with the carry still on
+ * it drew on the page and then failed to resolve as a Story block or through
+ * the agent, naming a control the analyst could no longer see. Dropped here,
+ * at the boundary where the config stops being editable state and becomes a
+ * record — driven by the same registry both sides read.
+ */
+function honouredFor(config: ChartConfig): { inputs: ChartInputs; marks: MarkSource[] } {
+  const meta = CHART_META[config.chartType];
+  const inputs: ChartInputs = {};
+  for (const key of Object.keys(config.inputs) as (keyof ChartInputs)[]) {
+    if (meta.inputs[key] !== undefined) {
+      (inputs as Record<string, unknown>)[key] = config.inputs[key];
+    }
+  }
+  return { inputs, marks: meta.supportsMarks ? config.marks : [] };
 }
 
 /**
@@ -615,14 +686,20 @@ export function chartConfigToStored(
   filters?: EventFilters,
 ): Record<string, unknown> {
   const storedFilters = filters ? chartFiltersToStored(filters) : null;
+  // Everything the figure cannot honour is dropped first: the compare layer,
+  // the derivation and an illegal quantity by `normalizeChartConfig`, the
+  // carried marks/inputs by `honouredFor`. What is stored is what the figure
+  // draws — which is what every consumer of a saved chart re-executes.
+  const normalized = normalizeChartConfig(config);
+  const honoured = honouredFor(normalized);
   const stored: Record<string, unknown> = {
-    ...config,
+    ...normalized,
     compare:
-      config.compare.mode === "custom"
-        ? { mode: "custom", filters: filtersToViewPayload(config.compare.filters) }
-        : config.compare,
-    inputs: inputsToPayload(config.inputs),
-    marks: marksToPayload(config.marks),
+      normalized.compare.mode === "custom"
+        ? { mode: "custom", filters: filtersToViewPayload(normalized.compare.filters) }
+        : normalized.compare,
+    inputs: inputsToPayload(honoured.inputs),
+    marks: marksToPayload(honoured.marks),
   };
   // `filters` is *this function's* key, never `ChartConfig`'s. Cleared before
   // writing rather than merely overwritten: a future `ChartConfig.filters`

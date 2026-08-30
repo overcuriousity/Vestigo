@@ -59,6 +59,26 @@ describe("buildCaptionLines", () => {
     );
   });
 
+  it("says the values a value-over-time chart cut are not drawn, not in an \"Other\"", () => {
+    // One series per value, so there is nowhere to roll the rest into — and
+    // the cut is routine on a derived axis (53 ISO weeks against a cap of 12)
+    // where `derive` echoes all 53 labels (#332).
+    const config: ChartConfig = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "heatmap",
+      field: "attr:src_ip",
+    };
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Heatmap",
+      config,
+      facts: { distinct: 53, shownValues: 12, otherCount: 4120, otherDrawn: false },
+    });
+    expect(lines).toContain(
+      "showing top 12 of 53 distinct values (capped; 4,120 events across the 41 values not drawn)",
+    );
+  });
+
   it("states the metric formula and undefined-bin caveats", () => {
     const config: ChartConfig = {
       ...DEFAULT_CHART_CONFIG,

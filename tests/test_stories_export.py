@@ -382,6 +382,40 @@ def test_stored_chart_config_translates_to_spec():
     assert spec.compare.filters.q == "ssh"
 
 
+def test_stored_chart_drops_controls_the_figure_cannot_honour():
+    """A saved chart resolves as the figure it was saved as.
+
+    `ChartInputs` and `marks` are deliberately carried across a figure switch
+    on the Visualize page, so a chart could be saved as a bar chart with lane
+    inputs and marks still attached. ``execute_chart_spec`` refuses both by
+    name, so that chart drew on the page and then failed to resolve as a Story
+    block — naming a control the analyst could no longer see (#332). A spec
+    the agent writes by hand still gets that refusal, which is the right
+    answer there.
+    """
+    from vestigo.stories.export import _stored_chart_to_spec
+
+    stored = {
+        "v": 2,
+        "chartType": "bar",
+        "scale": "nominal",
+        "field": "user",
+        "metric": "count",
+        "compare": {"mode": "off"},
+        "options": {},
+        "inputs": {"pairing": "nextEnd", "startFilter": {"q": "4624"}},
+        "marks": [{"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": "first"}],
+    }
+    spec = _stored_chart_to_spec(stored)
+    assert spec.inputs is None or spec.inputs.pairing is None
+    assert not spec.marks
+
+    # The figure that declares them keeps every one.
+    lanes = _stored_chart_to_spec({**stored, "chartType": "lanes"})
+    assert lanes.inputs is not None and lanes.inputs.pairing == "next_end"
+    assert lanes.marks and lanes.marks[0].kind == "instant"
+
+
 def test_stored_chart_config_minimal_and_compare_off():
     from vestigo.stories.export import _stored_chart_to_spec
 

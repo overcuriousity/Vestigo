@@ -114,6 +114,21 @@ and export captions all derive from it.
   carrying a stale `derive` claimed a binning it never sent. The rail drops both at the moment
   the figure is picked and says so in `autoNotice`; the normalizer is what makes that not the
   only thing keeping them honest.
+  It also drops an `options.quantity` the `(field, treat-as)` pair no longer admits — the
+  same shape of dead state reached through a control that *is* on screen, but not for the
+  figure the analyst is looking at when they change either: switching Treat-as under a
+  running sum left `quantity: "sum"` behind, `/viz/cumulative` knows no scale and drew it,
+  and the same chart failed to execute as a Story block with `quantity="sum" needs
+  scale="ratio"`. `resolveChartOptions` masks it as well, for a config that reaches it
+  without the page's URL round trip (the agent's proposal card).
+- **Cleaned on the way out, too.** `marks` and `inputs` are deliberately *carried* across a
+  figure switch so switching back loses nothing, which is why the normalizer leaves them
+  alone — but `execute_chart_spec` refuses a mark or an `inputs` key the figure does not
+  declare *by name*. So `chartConfigToStored` drops what the target figure cannot honour at
+  the boundary where the config stops being editable state and becomes a record, and
+  `_stored_chart_to_spec` does the same on the way back for a chart saved before that (both
+  from the same registry). A spec the agent writes by hand still gets the refusal, which is
+  the right answer there; a persisted chart resolves as the figure it was saved as.
 - **`scale` is "treat as".** The Stevens term is the wire format the agent, the URL and
   saved charts share; the plain phrase (`lib/scaleDisplay.ts`) exists only in the UI and the
   caption.
@@ -243,7 +258,9 @@ the result and two in the caption.
   are the *slice's* edges and the response echoes them — a chart of ranges that did not say
   where its bins are would be a chart nobody could check. `log` cannot place a value ≤ 0, so
   those get their own, disclosed bin (`negative_bin`). `custom` takes the analyst's edges,
-  open-ended at both ends. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`); the
+  open-ended at both ends, at most `BINS_MAX - 1` = 49 of them — a ceiling the rail states at
+  the Edges box (`EDGES_MAX`) rather than leaving a long pasted list to 422 with nothing on
+  screen to explain why the chart stopped redrawing. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`); the
   bins SQL is one `multiIf` over `_finite_float_cast`. The edges are **strictly increasing
   or absent**: over a range narrow relative to its magnitude — an epoch-nanosecond attribute
   binned across a few hours — float64 absorbs `lo + k * step` back to `lo` and then repeats
@@ -287,7 +304,12 @@ than the domain has must say so. `field_value_timeseries` caps at `series_limit`
 derivation routinely exceeds it — 49 custom edges are 51 bin labels, an ISO-week part is 53 —
 so the response carries `series_truncated`, `distinct` and `other_count` beside `series`. The
 cap is detected by fetching one row past it; the exact `distinct`/`other_count` cost a second
-aggregate and are only paid for when the probe says the cap was actually hit.
+aggregate and are only paid for when the probe says the cap was actually hit. Both consumers
+read them: the page's caption says `showing top 12 of 53 distinct values (capped; N events
+across the 41 values not drawn)` — *not* `in "Other"`, since a value-over-time figure draws
+one series per value and has nowhere to roll the rest into — and `execute_chart_spec` carries
+them in its `summary` plus a warning, so a model reasoning over twelve series knows whether
+that was all of them.
 
 ## Table figure
 
@@ -445,6 +467,11 @@ chart windowed away from its marks would otherwise caption rules the reader cann
 The two agree at the edges by construction: a range meeting the axis at a single instant is
 *drawn*, as a minimum-width band widened inwards (a range starting on the domain's last
 instant has no room to its right), and `outsideDomain` is `end < lo || start > hi` to match.
+
+**A filter mark has to narrow something.** The rail's *Custom filter* entry refuses to add
+a source whose filter is empty (the same question `hasActiveFilters` answers for the filter
+chips) and says why. An empty filter is not an empty mark: it matches every event in the
+timeline and draws one rule per event, up to the cap.
 
 **Confirmed findings are an `events` mark over ids.** The rail's *Confirmed findings*
 entry lists the timeline's `kind="confirmed"` dispositions and writes one
@@ -718,6 +745,11 @@ any were.
   `inputs.columns` on any other figure, and `distinct_second` (as a column or a sort)
   without `field_y`; rows capped by `ChartLimits.table_rows` (agent 20/30, analyst 50/500);
   the echo carries `resolved.inputs`, and `summary` the first five rows and the remainder.
+  A `field_y` that repeats `field` is refused for every figure that takes one: the HTTP
+  endpoints answer 422 and the rail refuses it at the picker, but `execute_chart_spec` calls
+  the query service directly, and one field named twice does not fail — it draws a diagonal
+  pivot, a `y=x` scatter, one group per value, or a table whose `distinct field_y` column is
+  1 on every row, each presented as a real answer.
   `ChartSpec.marks` is a list of one `ChartMarkSpec` — one model with a kind-validator
   rather than a five-member union, because the tool schema is budgeted and five `$defs`
   would spend most of a step's headroom on prose the validator states once; refused on a

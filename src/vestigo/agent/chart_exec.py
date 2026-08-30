@@ -367,6 +367,19 @@ async def execute_chart_spec(
             f'chart_type="{chart_type}" takes no field_y. '
             f"Two-field chart types: {', '.join(two_field)}.{hint}"
         )
+    if spec.field_y is not None and spec.field_y == spec.field:
+        # Every HTTP endpoint that takes a second field refuses this (422:
+        # "field_x and field_y must differ", "second_field must differ from
+        # field", "field and group_field must differ for a grouped chart"),
+        # and the rail refuses it at the picker — but this function calls the
+        # query service directly, so nothing stopped a spec that names one
+        # field twice. It does not fail: it draws a diagonal pivot, a y=x
+        # scatter, one group per value, or a table whose "distinct field_y"
+        # column is 1 on every row — each presented as a real answer.
+        raise ValueError(
+            f'field_y must differ from field — "{spec.field}" against itself charts '
+            "nothing a single-field figure does not already show."
+        )
 
     if meta.multi_field:
         if not spec.fields or len(spec.fields) < 2:
@@ -620,10 +633,22 @@ async def execute_chart_spec(
             applied["buckets"],
             applied["top_n"],
         )
+        # `distinct`/`other_count` like every other top-N figure here: the
+        # endpoint pays an extra aggregate to report the series cut, and a
+        # model reasoning over twelve drawn series has to know whether that
+        # was all of them or the visible slice of fifty-three.
         summary = {
             "series_count": len(result["series"]),
             "interval_seconds": result["interval_seconds"],
+            "distinct": result["distinct"],
+            "other_count": result["other_count"],
         }
+        if result["series_truncated"]:
+            warnings.append(
+                f"showing the top {len(result['series'])} of {result['distinct']} distinct "
+                f"values of {spec.field}; {result['other_count']} events fall in values the "
+                'chart does not draw (there is no "Other" series).'
+            )
     elif data_kind == "time":
         applied["buckets"] = _capped(opts.buckets, limits.time_buckets, "buckets", floor=4)
         if comparison_query is not None:

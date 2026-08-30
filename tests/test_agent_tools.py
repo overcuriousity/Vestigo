@@ -659,7 +659,16 @@ class _FakeVizService:
 
     def field_value_timeseries(self, query, field, buckets, series_limit):
         self.calls.append(("field_value_timeseries", (field, buckets, series_limit), {}))
-        return {"field": field, "series": [], "interval_seconds": 3600, "min": None, "max": None}
+        return {
+            "field": field,
+            "series": [],
+            "interval_seconds": 3600,
+            "min": None,
+            "max": None,
+            "distinct": 0,
+            "other_count": 0,
+            "series_truncated": False,
+        }
 
     def time_punchcard(self, query):
         self.calls.append(("time_punchcard", (), {}))
@@ -2117,6 +2126,62 @@ async def test_group_field_is_rejected_for_charts_that_take_no_second_field(stor
             "propose_chart",
             _chart({"chart_type": "ecdf", "field": "attr:bytes", "field_y": "attr:user"}),
         )
+
+
+async def test_a_cut_series_list_is_disclosed_to_the_model(store, monkeypatch):
+    """One series per value, and the rest simply not drawn.
+
+    ``field_value_timeseries`` pays an extra aggregate to report the cut, and
+    a model reasoning over twelve drawn series has to know whether that was
+    all of them or the visible slice of fifty-three — a derived axis makes
+    that routine (53 ISO weeks against a default cap of 12), and ``derive``
+    echoes all 53 labels either way (#332).
+    """
+    fake = _patch_chart_service(monkeypatch)
+
+    def _truncated(query, field, buckets, series_limit):
+        return {
+            "field": field,
+            "series": [{"value": str(i), "buckets": []} for i in range(12)],
+            "interval_seconds": 3600,
+            "min": None,
+            "max": None,
+            "distinct": 53,
+            "other_count": 4120,
+            "series_truncated": True,
+        }
+
+    fake.field_value_timeseries = _truncated
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server,
+        "propose_chart",
+        _chart({"chart_type": "heatmap", "field": "attr:status"}),
+    )
+    assert result["summary"]["distinct"] == 53
+    assert result["summary"]["other_count"] == 4120
+    assert any("top 12 of 53" in w and "4120 events" in w for w in result["warnings"])
+
+
+async def test_a_second_field_that_repeats_the_first_is_rejected(store, monkeypatch):
+    """One field named twice is not a two-field chart.
+
+    Every HTTP endpoint that takes a second field refuses it with a 422, and
+    the rail refuses it at the picker — but ``execute_chart_spec`` calls the
+    query service directly, so nothing stopped a spec that names one field
+    twice. It does not fail: a table's "distinct field_y" column is 1 on every
+    row, a pivot is diagonal, a scatter is y=x — each presented as a real
+    answer (#332).
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    for chart_type in ("table", "pivot", "violin"):
+        with pytest.raises(ToolError, match="field_y must differ from field"):
+            await _call(
+                server,
+                "propose_chart",
+                _chart({"chart_type": chart_type, "field": "attr:user", "field_y": "attr:user"}),
+            )
 
 
 async def test_pie_with_too_many_slices_is_warned_not_rejected(store, monkeypatch):

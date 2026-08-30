@@ -654,3 +654,33 @@ describe("ChartRail — dropping a derivation drops the effective scale with it"
     );
   });
 });
+
+describe("ChartRail — custom bin edges", () => {
+  const custom = (edges: number[]): ChartConfig => ({
+    ...DEFAULT_CHART_CONFIG,
+    chartType: "bar",
+    field: "attr:bytes",
+    scale: "ratio",
+    derive: { kind: "bins", mode: "custom", edges },
+  });
+
+  it("refuses more edges than the server admits, with the reason on screen", () => {
+    // `db/derive.py` allows at most `BINS_MAX - 1` = 49 interior edges. Past
+    // that the request is a 422 the page cannot explain, so a long pasted
+    // list simply stopped the chart from redrawing (#332).
+    const { updateConfig } = renderRail(custom([0, 1024]));
+    const box = screen.getByLabelText("Range edges");
+    const tooMany = Array.from({ length: 50 }, (_, i) => i + 1).join(", ");
+    fireEvent.change(box, { target: { value: tooMany } });
+    fireEvent.blur(box);
+    expect(updateConfig).not.toHaveBeenCalled();
+    expect(screen.getByText(/At most 49 edges/)).toBeInTheDocument();
+
+    const ok = Array.from({ length: 49 }, (_, i) => i + 1).join(", ");
+    fireEvent.change(box, { target: { value: ok } });
+    fireEvent.blur(box);
+    expect(updateConfig).toHaveBeenCalledWith({
+      derive: { kind: "bins", mode: "custom", edges: Array.from({ length: 49 }, (_, i) => i + 1) },
+    });
+  });
+});

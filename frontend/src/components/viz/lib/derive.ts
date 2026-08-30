@@ -15,6 +15,14 @@ export type { DeriveEcho };
 
 export type DeriveKind = "bins" | "timePart";
 
+/** Bin-count bounds, mirroring `db/derive.py`'s `BINS_MIN, BINS_MAX`. A custom
+ * binning states the interior edges, so it takes one fewer than the ranges
+ * they cut — the server refuses more with "at most 49 custom edges", which is
+ * a 422 and a blank chart if the rail let the analyst paste them. */
+export const BINS_MIN = 2;
+export const BINS_MAX = 50;
+export const EDGES_MAX = BINS_MAX - 1;
+
 export const TIME_PART_LABELS: Record<TimePart, string> = {
   hour: "hour of day",
   weekday: "day of week",

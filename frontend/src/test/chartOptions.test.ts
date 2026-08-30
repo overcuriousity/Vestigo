@@ -226,6 +226,29 @@ describe("resolveChartOptions — options that outlive their precondition", () =
     expect(resolveChartOptions({ ...stored, field: null }).quantity).toBe("events");
   });
 
+  it("falls back when the treat-as no longer admits the quantity", () => {
+    // The other half of the same shape: a running sum is a sum of a *measure*,
+    // so switching Treat-as to Categories under it leaves a quantity the
+    // executor refuses (`quantity="sum" needs scale="ratio"`) while
+    // `/viz/cumulative`, which knows no scale, drew it anyway (#332).
+    const stored = {
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "cumulative" as const,
+      field: "attr:bytes",
+      options: { quantity: "sum" as const },
+    };
+    expect(resolveChartOptions({ ...stored, scale: "ratio" }).quantity).toBe("sum");
+    expect(resolveChartOptions({ ...stored, scale: "nominal" }).quantity).toBe("distinct");
+    // And the mirror image: distinct values of a measure are not a count.
+    expect(
+      resolveChartOptions({
+        ...stored,
+        scale: "ratio",
+        options: { quantity: "distinct" },
+      }).quantity,
+    ).toBe("sum");
+  });
+
   it("falls back to the count sort when the second field the sort ranks by is gone", () => {
     const stored = {
       ...DEFAULT_CHART_CONFIG,
@@ -287,6 +310,8 @@ describe("resolveChartOptions — untrusted enum options", () => {
   it("keeps every legal value it is given", () => {
     const opts = resolveChartOptions({
       ...table,
+      // "sum" accumulates a measure, so it is legal only under scale "ratio".
+      scale: "ratio",
       fieldY: "attr:user",
       options: { tableSortBy: "distinct_second", tableSortDir: "asc", quantity: "sum" },
     });
@@ -294,6 +319,7 @@ describe("resolveChartOptions — untrusted enum options", () => {
     expect(opts.tableSortDir).toBe("asc");
     expect(opts.quantity).toBe("sum");
   });
+
 });
 
 describe("resolveChartOptions — a derived bar axis reads in value order", () => {

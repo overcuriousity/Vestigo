@@ -15,8 +15,15 @@
  */
 import { CHART_META, chartTypesFor } from "./chartMeta";
 import { isTimeField } from "./timeFields";
-import { TABLE_COLUMNS } from "./chartConfig";
-import type { ChartConfig, ChartOptions, ChartType, Scale, TableSortColumn } from "./chartConfig";
+import { TABLE_COLUMNS, defaultQuantity, legalQuantity } from "./chartConfig";
+import type {
+  ChartConfig,
+  ChartOptions,
+  ChartType,
+  Quantity,
+  Scale,
+  TableSortColumn,
+} from "./chartConfig";
 
 /**
  * Preference order for "the chart type to land on for this scale".
@@ -63,7 +70,7 @@ export interface ResolvedChartOptions {
   /** null = automatic bin count (server-side Freedman–Diaconis). */
   bins: number | null;
   buckets: number;
-  quantity: "events" | "sum" | "distinct";
+  quantity: Quantity;
   layout: "dumbbell" | "slope";
   limitX: number;
   limitY: number;
@@ -187,7 +194,6 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback
   return allowed.includes(value as T) ? (value as T) : fallback;
 }
 
-const QUANTITIES = ["events", "sum", "distinct"] as const;
 const LAYOUTS = ["dumbbell", "slope"] as const;
 const ORIENTATIONS = ["horizontal", "vertical"] as const;
 const SORTS = ["count", "value"] as const;
@@ -204,14 +210,15 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     topN: clampTopN(options.topN, config.chartType),
     bins: options.bins ?? null,
     buckets: options.buckets ?? 60,
-    // "sum" and "distinct" both aggregate a field. A stored one outlives the
-    // field that justified it — "No field — count every event" clears `field`
-    // and leaves `options.quantity` — and the endpoint answers 422 rather than
-    // drawing anything, so the resolution is what enforces the precondition.
+    // "sum" and "distinct" both aggregate a field, and "sum" aggregates a
+    // *measure*. A stored one outlives both the field and the treat-as that
+    // justified it, so `legalQuantity` re-checks all three of `chart_exec`'s
+    // preconditions here — masking, on top of `normalizeChartConfig` dropping
+    // it from the config, because a config also reaches this function from
+    // the agent's proposal card without passing the page's URL round trip.
     quantity:
-      config.field == null
-        ? "events"
-        : oneOf(options.quantity, QUANTITIES, config.scale === "ratio" ? "sum" : "distinct"),
+      legalQuantity(options.quantity, config.scale, config.field) ??
+      defaultQuantity(config.scale, config.field),
     layout: oneOf(options.layout, LAYOUTS, "dumbbell"),
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,

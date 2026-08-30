@@ -22,6 +22,7 @@ import { dispositionsApi } from "@/api/dispositions";
 import type { EventFilters, ResolvedMarksResponse, VizFieldInfo } from "@/api/types";
 import type { MarkSource } from "@/components/viz/lib/chartConfig";
 import { describeFilters } from "@/components/viz/lib/caption";
+import { hasActiveFilters } from "@/lib/fieldFilters";
 import { CompareFilterEditor } from "./CompareFilterEditor";
 
 type AddKind = "event" | "tag" | "confirmed" | "filter" | "baseline" | "view" | "instant" | "range";
@@ -244,15 +245,25 @@ export function MarksEditor({ caseId, timelineId, marks, onChange, fields, resol
             onChange={(e) => setLabel(e.target.value)}
             placeholder="optional"
           />
+          {/* A mark is a *source* resolved at render time, so an empty filter
+              is not an empty mark: it matches every event in the timeline and
+              draws one rule per event. Refused here rather than drawn — the
+              same question `hasActiveFilters` answers for the filter chips. */}
           <Button
             size="sm"
             variant="outline"
+            disabled={!hasActiveFilters(filters)}
             onClick={() =>
               add({ kind: "events", filters, ...(label.trim() ? { label: label.trim() } : {}) })
             }
           >
             Add
           </Button>
+          {!hasActiveFilters(filters) && (
+            <p className="text-xs text-[var(--color-fg-muted)]">
+              Narrow the filter first — an empty one marks every event.
+            </p>
+          )}
         </div>
       )}
       {adding === "baseline" && (

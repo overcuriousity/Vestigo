@@ -87,6 +87,9 @@ const HIST_BUCKETS: HistogramBucket[] = [
 const TIMESERIES: FieldTimeseriesResponse = {
   field: "attr:status_code",
   interval_seconds: 3600,
+  distinct: 2,
+  other_count: 0,
+  series_truncated: false,
   min: "2024-01-01T00:00:00Z",
   max: "2024-01-01T01:00:00Z",
   series: [
@@ -480,6 +483,9 @@ describe("time-field labelling", () => {
   const DOW_TIMESERIES: FieldTimeseriesResponse = {
     field: "time:day_of_week",
     interval_seconds: 3600,
+    distinct: 2,
+    other_count: 0,
+    series_truncated: false,
     min: "2024-01-01T00:00:00Z",
     max: "2024-01-01T01:00:00Z",
     series: [
