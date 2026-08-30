@@ -13,7 +13,7 @@ import type {
 } from "@/api/types";
 import type { ChartConfig } from "./chartConfig";
 import { describeDerive } from "./derive";
-import { markCaptionLines } from "./marks";
+import { markCaptionLines, type MarksDomain } from "./marks";
 import { TABLE_COLUMN_LABELS } from "./tableRows";
 import { METRIC_INFO } from "./transforms";
 
@@ -133,6 +133,10 @@ export interface CaptionFacts {
   corrMaxPairN?: number;
   /** Time-axis figures: the server's resolution of `config.marks`. */
   marks?: ResolvedMarksResponse;
+  /** The time interval the figure actually draws (`lib/timeDomain.ts`) — what
+   * lets the mark lines say how many marks fall outside it and are not
+   * drawn. Omitted while the figure's own query has not answered. */
+  marksDomain?: MarksDomain | null;
 }
 
 /** Distinct grouping values past which the grouping field reads as an
@@ -424,7 +428,7 @@ export function buildCaptionLines(args: {
     }
   }
   if (facts.marks && facts.marks.sources.length > 0) {
-    lines.push(...markCaptionLines(facts.marks));
+    lines.push(...markCaptionLines(facts.marks, facts.marksDomain));
   }
   if (
     chartType !== "table" &&

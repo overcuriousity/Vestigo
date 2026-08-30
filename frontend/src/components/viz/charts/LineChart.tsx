@@ -15,6 +15,7 @@ import { buildSeriesColorMap } from "@/components/viz/lib/colors";
 import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
 import type { ChartValueClickHandler } from "@/components/viz/lib/interaction";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
+import { timeseriesChartDomain } from "@/components/viz/lib/timeDomain";
 import type { FieldTimeseriesResponse, ResolvedMark } from "@/api/types";
 
 const fmtCount = formatNum(",d");
@@ -116,7 +117,7 @@ export function LineChart({
       <ChartFrame height={height} svgRef={ref}>
         {({ innerWidth, innerHeight, margin }) => {
           const x = scaleTime()
-            .domain([dates[0], dates[dates.length - 1]])
+            .domain(timeseriesChartDomain(data)!)
             .range([0, innerWidth]);
           const y = scaleLinear().domain([0, maxCount]).nice().range([innerHeight, 0]);
           const lineGen = d3line<{ start: string; count: number }>()

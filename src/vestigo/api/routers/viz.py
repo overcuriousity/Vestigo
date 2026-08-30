@@ -11,7 +11,6 @@ notion of "current filters".
 
 from __future__ import annotations
 
-import functools
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Literal
@@ -1104,9 +1103,21 @@ async def resolve_viz_marks(
         _validate_field_modes(fspec.exclusions, fspec.exclusion_modes)
         return fspec
 
-    any_regex = any(
-        m.kind == "events" and m.filters is not None and bool(m.filters.q_regex) for m in specs
-    )
+    # Per mark, off the query that is about to run: an events mark can carry a
+    # regex in `filter_modes` rather than in `q_regex`, and a `view` mark's
+    # pattern lives in the saved view and is not known until `resolve_marks`
+    # has loaded it. Deciding once, from `q_regex` alone, left both of those
+    # unguarded — an RE2-only rejection surfaced as a 500 where every other viz
+    # endpoint answers 400.
+    async def run_mark_scan(fn: Any, query: Any, /, *args: Any, **kwargs: Any) -> Any:
+        return await _run_regex_guarded(
+            _uses_regex(query.q_regex, query.filter_modes, query.exclusion_modes),
+            fn,
+            query,
+            *args,
+            **kwargs,
+        )
+
     try:
         return await resolve_marks(
             scope,
@@ -1114,7 +1125,7 @@ async def resolve_viz_marks(
             service=_get_query_service(),
             store=get_store(),
             cap=get_settings().viz_marks_max,
-            run=functools.partial(_run_regex_guarded, any_regex),
+            run=run_mark_scan,
             validated=validated,
         )
     except ValueError as exc:

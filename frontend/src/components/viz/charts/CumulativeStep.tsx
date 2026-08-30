@@ -12,6 +12,7 @@ import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { seriesColorVar } from "@/components/viz/lib/colors";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
+import { cumulativeChartDomain } from "@/components/viz/lib/timeDomain";
 import type { CumulativeResponse, ResolvedMark } from "@/api/types";
 
 const fmtInt = formatNum(",d");
@@ -57,23 +58,26 @@ export function CumulativeStep({ data, svgRef, height = 260, marks = [] }: Cumul
   }
 
   const dates = data.buckets.map((b) => new Date(b.start));
-  // The step holds through the last bucket, so the axis ends one bucket
-  // after the last start (or at `max` if that is later).
-  const lastEnd = new Date(
-    Math.max(
-      dates[dates.length - 1].getTime() + data.interval_seconds * 1000,
-      Date.parse(data.max),
-    ),
-  );
-  const yMax = Math.max(1e-9, data.total);
+  // The drawn axis, computed once in lib/timeDomain so the caption can reason
+  // about the same interval. The step holds through the last bucket, so it
+  // ends one bucket after the last start (or at `max` if that is later).
+  const domain = cumulativeChartDomain(data)!;
+  const lastEnd = domain[1];
+  // The ceiling is the highest running value, not the final one: `sum` over a
+  // signed measure is not monotonic, and a series that peaks at 500 before
+  // settling at 20 would otherwise be drawn against a [0, 20] axis. The floor
+  // is 0 unless the running total actually goes below it.
+  const values = data.buckets.map((b) => b.value).concat(data.total);
+  const yMax = Math.max(1e-9, ...values);
+  const yMin = Math.min(0, ...values);
   const noun = quantityNoun(data);
 
   return (
     <div className="relative">
       <ChartFrame height={height} svgRef={ref}>
         {({ innerWidth, innerHeight, margin }) => {
-          const x = scaleTime().domain([dates[0], lastEnd]).range([0, innerWidth]);
-          const y = scaleLinear().domain([0, yMax]).nice().range([innerHeight, 0]);
+          const x = scaleTime().domain(domain).range([0, innerWidth]);
+          const y = scaleLinear().domain([yMin, yMax]).nice().range([innerHeight, 0]);
           const points: [Date, number][] = data.buckets.map((b, i) => [dates[i], b.value]);
           points.push([lastEnd, data.total]);
           const path = d3line<[Date, number]>()

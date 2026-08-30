@@ -163,6 +163,31 @@ def test_a_derived_field_tabulates_its_ranges(service):
     assert sum(r["count"] for r in result["rows"]) == 11
 
 
+def test_a_derived_table_sorted_by_value_is_in_value_order_not_lexical_order(service):
+    """Bin labels do not sort as strings: `'<'` and `'\u2265'` land after the digits.
+
+    Ascending lexical order here would be ["500 - 1,000", "< 500", ">= 1,000"],
+    which reads as a chart whose ranges are shuffled.
+    """
+    derive = DeriveSpec(kind="bins", mode="custom", edges=[500, 1000])
+    labels = ["< 500", "500 \u2013 1,000", "\u2265 1,000"]
+
+    asc = service.field_table(_query(), "attr:bytes", 50, sort_by="value", derive=derive)
+    assert [r["value"] for r in asc["rows"]] == labels[::-1]  # desc is the default direction
+
+    asc = service.field_table(
+        _query(), "attr:bytes", 50, sort_by="value", sort_dir="asc", derive=derive
+    )
+    assert [r["value"] for r in asc["rows"]] == labels
+
+    # The order also decides which rows the LIMIT keeps — the lowest range,
+    # not the one whose label happens to start with a digit.
+    first = service.field_table(
+        _query(), "attr:bytes", 1, sort_by="value", sort_dir="asc", derive=derive
+    )
+    assert [r["value"] for r in first["rows"]] == ["< 500"]
+
+
 def test_table_and_inventory_agree_on_every_shared_cell(service):
     """The table is the inventory made bounded: same values, counts and seen
     range, from one SELECT core."""

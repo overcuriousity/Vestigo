@@ -1365,3 +1365,54 @@ async def test_viz_marks_rejects_an_invalid_regex_in_an_events_mark_with_400(mon
         await viz.resolve_viz_marks("c1", "t1", body, case=None, user=user)
     assert info.value.status_code == 400
     assert svc.calls == []
+
+
+async def test_viz_marks_maps_an_re2_rejection_to_400_for_every_regex_path(monkeypatch):
+    """The RE2 guard is decided per mark, off the query that is about to run.
+
+    A pattern can live in three places — ``qRegex``, a per-field ``regex``
+    match mode, or a saved view's own filter — and only the first is visible
+    on the request body. Deciding once from ``q_regex`` left the other two
+    unguarded, so an RE2-only rejection surfaced as a 500 where every other
+    viz endpoint answers 400.
+    """
+    from types import SimpleNamespace
+
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    view = SimpleNamespace(
+        id="v1",
+        name="Beacons",
+        view_filter={"q": "(?<=x)beacon", "qRegex": True},
+    )
+
+    class _Store:
+        async def get_view(self, case_id, view_id):
+            return view
+
+    def re2_failure(query, limit):
+        raise DatabaseError("Code: 427. DB::Exception: OK, but cannot compile re2: (?<=x)")
+
+    for marks in (
+        # A per-field match mode, not `qRegex`.
+        [
+            {
+                "kind": "events",
+                "filters": {
+                    "filters": {"attr:msg": ["(?<=x)b"]},
+                    "filterModes": {"attr:msg": "regex"},
+                },
+            }
+        ],
+        # A saved view whose own query is a regex — not on the request at all.
+        [{"kind": "view", "viewId": "v1"}],
+    ):
+        svc = _patch_agg(monkeypatch)
+        monkeypatch.setattr(svc, "mark_instants", re2_failure)
+        monkeypatch.setattr(viz, "get_store", _Store)
+        user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+        with pytest.raises(HTTPException) as info:
+            await viz.resolve_viz_marks(
+                "c1", "t1", viz.MarksRequest(marks=marks), case=None, user=user
+            )
+        assert info.value.status_code == 400, marks

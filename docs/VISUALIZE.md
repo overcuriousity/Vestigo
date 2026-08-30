@@ -266,6 +266,10 @@ Absent exactly when nothing was cut. The shown shares plus the remainder's sum t
 and `sort_dir` is `asc` or `desc`. Time sorts are `NULLS LAST` in either direction, as the
 inventory's are, and every ordering breaks ties on `val ASC`, so a re-run over unchanged
 sources reproduces the same rows in the same order. The default is count, descending.
+On a **derived** field, `value` means *value order*, not lexical order: `<`, `≥` and `≤` all
+sort after the digits, so the string order would interleave the ranges (`1,000 – 2,000`
+before `< 1,000`). The rank in the derivation's own label list is the key
+(`derive.label_order_expr`), in SQL, because it also decides which rows the `LIMIT` keeps.
 
 **Derivations** are accepted (`bins`, `time_part`) exactly as on a bar: the rows are the
 ranges or calendar parts, and the response echoes `derive`.
@@ -342,13 +346,16 @@ guardrails*, default 50, 1–500) bounds what one source may draw on the page; t
 `ChartLimits.marks_per_source = 20`, because every resolved mark is summarised into the
 model's context. Past it the earliest N are drawn and the caption says how many were not.
 
-**Rendering** (`primitives/MarksOverlay.tsx`, inside `CompareHistogram` and `LineChart`):
-instants are numbered dashed rules with `#n` beside them, ranges tinted bands with their
+**Rendering** (`primitives/MarksOverlay.tsx`, inside `CompareHistogram`, `LineChart`,
+`CumulativeStep` and `IntervalLanes`): instants are numbered dashed rules with `#n` beside
+them, ranges tinted bands with their
 label; both use `--color-warning` and its dim, never a Compare layer colour, so a mark cannot
 be mistaken for a series. `lib/marks.ts` is the pure module both the overlay and the caption
 read — instants are numbered in time order across every source, labels alternate a tier
 when two rules are closer than 48px, overlapping bands stack, an instant outside the drawn
-axis is counted as `offscreen` — so `#3` on the figure is `#3` in the caption.
+axis is counted as `offscreen` — so `#3` on the figure is `#3` in the caption. The axis
+itself comes from `lib/timeDomain.ts`, one pure function per time-axis figure, which the
+chart builds its x scale from *and* the caption reasons about, so the two cannot drift.
 
 **Caption lines** (`markCaptionLines`, pinned in `marks.test.ts`), one per source, in
 source order: `marks #1, #3, #4: "beacons" — 3 events matching a filter; 1 undated event
@@ -356,7 +363,15 @@ not drawn`; `marks #1–#7: "Beacons" — 40 events of saved view; the earliest 
 7), 33 not drawn`; `marks: baseline "Quiet" — its baseline window and 1 suspect window, as
 declared`; `mark #2: "first" at 2026-07-20 01:30:00Z — analyst-placed`; `mark: "w"
 … → … — analyst-placed`. More than five instants from one source are listed as a range of
-numbers rather than one by one.
+numbers rather than one by one — but only when that source's numbers are actually
+contiguous: numbering runs across every source in time order, so two interleaved sources
+read `marks 6 of #1–#11`, never `marks #1–#11`.
+
+**Marks off the drawn axis are disclosed, never silently dropped.** Given the figure's
+domain, each source's line ends in `; N outside the drawn time axis, not drawn` (`;
+outside the drawn time axis, not drawn` for a single-mark source) — an instant outside the
+axis or a range with no overlap at all, exactly what `layoutMarks` declines to draw. A
+chart windowed away from its marks would otherwise caption rules the reader cannot find.
 
 **Confirmed findings are an `events` mark over ids.** The rail's *Confirmed findings*
 entry lists the timeline's `kind="confirmed"` dispositions and writes one
@@ -368,7 +383,11 @@ Explorer's own `ids` stay session-only, as before.
 **The endpoint.** `POST /{case}/timelines/{tl}/viz/marks` takes `{marks: MarkSource[]}`
 — the stored shape verbatim, so the page posts what it holds — under `require_case_read`,
 writes nothing, and answers 422 for a malformed mark (the `ChartMarkSpec` validator's
-message) or an unknown baseline definition / saved view (`marks[i]: … not found`).
+message) or an unknown baseline definition / saved view (`marks[i]: … not found`). Each
+`events`/`view` scan runs under the foreground gate with the same pre-checks every viz GET
+applies, and the RE2 guard is decided **per mark, off the query about to run** — a pattern
+can sit in `qRegex`, in a per-field `regex` match mode, or inside the saved view, and only
+the first is visible on the request body, so an RE2-only rejection answers 400 on all three.
 
 ## Cumulative step
 
@@ -404,8 +423,12 @@ summed" / "… with an empty attr:user not counted"). `buckets` is bounded by
 **Drawing** (`charts/CumulativeStep.tsx`): a `curveStepAfter` path — the value holds until
 the next bucket changes it and the line never interpolates, because a diagonal would assert
 growth inside a bucket nobody measured (`cumulativeStep.test.tsx` parses the path and
-forbids a diagonal segment). The tooltip shows the running value and the bucket's own
-contribution. Marks are supported (`MarksOverlay` on the same time axis); Compare is not —
+forbids a diagonal segment). The y axis spans the running series' own minimum and maximum,
+not `[0, total]`: `sum` over a *signed* measure is not monotonic, so a series that peaks at
+500 before settling at 20 would otherwise be drawn against a `[0, 20]` axis, most of it above
+the plot area. The floor stays 0 unless the running total actually goes below it. The
+tooltip shows the running value and the bucket's own contribution. Marks are supported
+(`MarksOverlay` on the same time axis); Compare is not —
 two cumulatives on one axis is a shared-axis trap — and there is no metric. The caption
 names the quantity and the field in its header line ("cumulative sum of attr:bytes (measure)
 over time", "distinct values of attr:user seen so far", "cumulative event count over

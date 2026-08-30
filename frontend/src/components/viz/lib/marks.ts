@@ -42,7 +42,9 @@ export interface RangeLayout {
 export interface MarksLayout {
   instants: InstantLayout[];
   ranges: RangeLayout[];
-  /** Instants outside the drawn axis — disclosed, not silently dropped. */
+  /** Instants outside the drawn axis. Disclosed, not silently dropped: the
+   * caption says so per source via `markCaptionLines(resp, domain)`, which
+   * reaches the same verdict from the axis domain (`lib/timeDomain.ts`). */
   offscreen: number;
 }
 
@@ -90,36 +92,79 @@ function numbersFor(source: number, numbered: NumberedInstant[]): string {
   const ns = numbered.filter((i) => i.mark.source === source).map((i) => i.n);
   if (ns.length === 0) return "";
   if (ns.length <= 5) return ns.map((n) => `#${n}`).join(", ");
-  return `#${ns[0]}–#${ns[ns.length - 1]}`;
+  // Numbering runs across every source in time order, so a source's numbers
+  // need not be contiguous — two interleaved sources give #1,#3,#5,… A bare
+  // `#1–#11` would name five rules that belong to the other source, so the
+  // count leads and the span is stated as the span it is.
+  const span = ns[ns.length - 1] - ns[0] + 1;
+  if (span === ns.length) return `#${ns[0]}–#${ns[ns.length - 1]}`;
+  return `${ns.length} of #${ns[0]}–#${ns[ns.length - 1]}`;
+}
+
+/** The interval a time-axis figure actually draws (`lib/timeDomain.ts`). */
+export type MarksDomain = readonly [Date, Date];
+
+/** Whether a mark falls entirely outside *domain*, and so is never drawn.
+ * Mirrors `layoutMarks`: an instant is placed only inside the axis, and a
+ * range is drawn only where its clipped width is positive. */
+function outsideDomain(mark: ResolvedMark, domain: MarksDomain): boolean {
+  const [lo, hi] = [domain[0].getTime(), domain[1].getTime()];
+  if (mark.kind === "instant") {
+    const t = Date.parse(mark.at);
+    return !Number.isFinite(t) || t < lo || t > hi;
+  }
+  const start = Date.parse(mark.start);
+  const end = Date.parse(mark.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return true;
+  return end <= lo || start >= hi;
+}
+
+/** The "not drawn" clause for one source's marks, empty when all are drawn. */
+function offAxisClause(own: ResolvedMark[], domain: MarksDomain | null | undefined): string {
+  if (!domain || own.length === 0) return "";
+  const n = own.filter((m) => outsideDomain(m, domain)).length;
+  if (n === 0) return "";
+  return own.length === 1
+    ? "; outside the drawn time axis, not drawn"
+    : `; ${n} outside the drawn time axis, not drawn`;
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-/** One caption line per source, in source order — provenance, numbers, cap. */
-export function markCaptionLines(resp: ResolvedMarksResponse): string[] {
+/**
+ * One caption line per source, in source order — provenance, numbers, cap,
+ * and (given the figure's *domain*) how many of the source's marks fall
+ * outside the drawn axis. Without that last clause a chart windowed away
+ * from its marks captions rules it never draws.
+ */
+export function markCaptionLines(
+  resp: ResolvedMarksResponse,
+  domain?: MarksDomain | null,
+): string[] {
   const numbered = numberInstants(resp.marks);
   const bySource = new Map<number, ResolvedMark[]>();
   for (const m of resp.marks) bySource.set(m.source, [...(bySource.get(m.source) ?? []), m]);
   return resp.sources.map((s: ResolvedMarkSource) => {
     const own = bySource.get(s.index) ?? [];
+    const offAxis = offAxisClause(own, domain);
     switch (s.kind) {
       case "instant": {
         const m = own[0] as ResolvedInstantMark | undefined;
-        return `mark ${numbersFor(s.index, numbered)}: "${s.label}" at ${m ? fmtMarkTime(m.at) : "?"} — analyst-placed`;
+        return `mark ${numbersFor(s.index, numbered)}: "${s.label}" at ${m ? fmtMarkTime(m.at) : "?"} — analyst-placed${offAxis}`;
       }
       case "range": {
         const m = own[0] as ResolvedRangeMark | undefined;
-        return `mark: "${s.label}" ${m ? `${fmtMarkTime(m.start)} → ${fmtMarkTime(m.end)}` : ""} — analyst-placed`;
+        return `mark: "${s.label}" ${m ? `${fmtMarkTime(m.start)} → ${fmtMarkTime(m.end)}` : ""} — analyst-placed${offAxis}`;
       }
       case "baseline":
-        return `marks: baseline "${s.label}" — its baseline window and ${plural(Math.max(0, s.count - 1), "suspect window")}, as declared`;
+        return `marks: baseline "${s.label}" — its baseline window and ${plural(Math.max(0, s.count - 1), "suspect window")}, as declared${offAxis}`;
       default: {
         const origin = s.kind === "view" ? "of saved view" : "matching a filter";
         let line = `marks ${numbersFor(s.index, numbered)}: "${s.label}" — ${plural(s.count, "event")} ${origin}`;
         if (s.overflow)
           line += `; the earliest ${s.shown} drawn (cap ${resp.cap}), ${s.count - s.shown} not drawn`;
         if (s.undated > 0) line += `; ${plural(s.undated, "undated event")} not drawn`;
-        return line;
+        return line + offAxis;
       }
     }
   });

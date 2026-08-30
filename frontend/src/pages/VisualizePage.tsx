@@ -96,6 +96,12 @@ import {
 import { fieldTokenLabel } from "@/components/viz/lib/fieldDisplay";
 import { isTimeField, TIME_FIELDS } from "@/components/viz/lib/timeFields";
 import {
+  cumulativeChartDomain,
+  lanesChartDomain,
+  timeChartDomain,
+  timeseriesChartDomain,
+} from "@/components/viz/lib/timeDomain";
+import {
   buildCaptionLines,
   type CaptionFacts,
 } from "@/components/viz/lib/caption";
@@ -1147,7 +1153,22 @@ export function VisualizePage() {
       ? barReadabilityWarning(barCount, resolved.orientation)
       : null;
   if (barWarning) facts.readabilityWarning = barWarning;
-  if (marksQuery.data) facts.marks = marksQuery.data;
+  if (marksQuery.data) {
+    facts.marks = marksQuery.data;
+    // The axis the figure actually draws, from the same helpers the charts
+    // build their x scale with — so the mark lines can say how many marks
+    // fall outside it and are therefore not drawn.
+    facts.marksDomain =
+      dataKind === "time" && timeQuery.data
+        ? timeChartDomain(timeQuery.data)
+        : dataKind === "timeseries" && timeseriesQuery.data
+          ? timeseriesChartDomain(timeseriesQuery.data)
+          : dataKind === "cumulative" && cumulativeQuery.data
+            ? cumulativeChartDomain(cumulativeQuery.data)
+            : dataKind === "lanes" && lanesQuery.data
+              ? lanesChartDomain(lanesQuery.data)
+              : null;
+  }
 
   const captionLines = buildCaptionLines({
     caseId,

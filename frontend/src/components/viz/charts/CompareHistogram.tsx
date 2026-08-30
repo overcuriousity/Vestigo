@@ -11,6 +11,7 @@ import { Legend } from "@/components/viz/primitives/Legend";
 import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { svgLocalPoint } from "@/components/viz/lib/pointer";
+import { timeChartDomain } from "@/components/viz/lib/timeDomain";
 import { applyMetric, METRIC_INFO, type Metric } from "@/components/viz/lib/transforms";
 import type { CompareTimeResponse, ResolvedMark } from "@/api/types";
 
@@ -102,7 +103,7 @@ export function CompareHistogram({
   const dataMax = isRatio ? Math.max(100, ...allValues, 0) : Math.max(1, ...allValues);
 
   const dates = buckets.map((b) => new Date(b.start));
-  const domainMax = dates.length > 1 ? dates[dates.length - 1] : dates[0];
+  const domain = timeChartDomain(data)!;
 
   /** Snap a dragged [t0, t1] outward to the epoch-aligned bucket grid the
    * server used, so the zoomed range never cuts a bucket in half. */
@@ -131,7 +132,7 @@ export function CompareHistogram({
       <div className="relative">
         <ChartFrame height={height} svgRef={ref}>
           {({ innerWidth, innerHeight, margin }) => {
-            const x = scaleTime().domain([dates[0], domainMax]).range([0, innerWidth]);
+            const x = scaleTime().domain(domain).range([0, innerWidth]);
             const y = scaleLinear().domain([dataMin, dataMax]).nice().range([innerHeight, 0]);
             const barWidth = Math.max(1, innerWidth / buckets.length - 1);
             const yZero = y(0);

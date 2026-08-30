@@ -157,6 +157,22 @@ def _lit(s: str) -> str:
     return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def label_order_expr(value_expr: str, labels: list[str]) -> str:
+    """``indexOf`` mapping a derived label onto its position in value order.
+
+    A bin label is not sortable as a string: ``'<'`` (0x3C) and ``'≥'`` sort
+    after every digit, so lexical order puts ``< 1,000`` and ``≤ 0`` *after*
+    ``1,000 – 2,000``. Sorting a derived figure "by value" therefore orders by
+    the label's rank in :func:`bin_labels`' own ordering, not by the string.
+    (``time_part`` labels are zero-padded numbers and already sort correctly;
+    this expression leaves their order unchanged.) A label the array does not
+    contain yields 0 and sorts first ascending — the callers only ever pass the
+    labels the same ``ResolvedDerive`` produced the values with.
+    """
+    array = "[" + ", ".join(_lit(label) for label in labels) + "]"
+    return f"indexOf({array}, {value_expr})"
+
+
 def bins_expr(value_expr: str, edges: list[float], *, negative_bin: bool) -> str:
     """``multiIf`` mapping the float-cast *value_expr* onto :func:`bin_labels`.
 

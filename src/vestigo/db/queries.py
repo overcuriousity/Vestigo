@@ -64,6 +64,7 @@ from vestigo.db.derive import (
     bin_edges,
     bin_labels,
     bins_expr,
+    label_order_expr,
     time_part_expr,
 )
 from vestigo.db.field_mappings import (
@@ -4309,6 +4310,13 @@ class EventQueryService:
         scope = f"WHERE {where} AND {col_expr} != ''"
         direction = "ASC" if sort_dir == "asc" else "DESC"
         key = _TABLE_SORT_SQL[sort_by]
+        # "By value" on a derived field means *value order*, not lexical order:
+        # a bin label starts with "<", "≥" or "≤", which all sort after the
+        # digits, so the string order interleaves the ranges. The rank in the
+        # derivation's own label list is the order — and it has to be in SQL,
+        # since it also decides which rows the LIMIT keeps.
+        if sort_by == "value" and resolved is not None:
+            key = label_order_expr("val", resolved.labels)
         nulls = " NULLS LAST" if sort_by in ("first_seen", "last_seen") else ""
         tie_break = "" if key == "val" else ", val ASC"
         order_sql = f"{key} {direction}{nulls}{tie_break}"

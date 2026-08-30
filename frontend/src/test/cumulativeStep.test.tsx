@@ -57,6 +57,35 @@ describe("CumulativeStep", () => {
     expect(container.querySelectorAll("line[data-mark-instant]")).toHaveLength(1);
   });
 
+  it("scales the y axis to the peak, not the final value, for a signed sum", () => {
+    // `sum` over a signed measure is not monotonic: this one peaks at 500 and
+    // settles at 20. A [0, total] domain would draw most of the step above the
+    // plot area.
+    const signed: CumulativeResponse = {
+      ...data,
+      quantity: "sum",
+      field: "attr:delta",
+      buckets: [
+        { start: "2026-07-20T00:00:00+00:00", delta: 100, value: 100 },
+        { start: "2026-07-20T01:00:00+00:00", delta: 400, value: 500 },
+        { start: "2026-07-20T02:00:00+00:00", delta: -520, value: -20 },
+        { start: "2026-07-20T03:00:00+00:00", delta: 40, value: 20 },
+      ],
+      total: 20,
+    };
+    const { container } = render(<CumulativeStep data={signed} height={260} />);
+    const path = container.querySelector("path[data-cumulative-step]")!;
+    const ys = (path.getAttribute("d")!.match(/-?[\d.]+,(-?[\d.]+)/g) ?? []).map((p) =>
+      Number(p.split(",")[1]),
+    );
+    // Every plotted point sits inside the plot area — nothing above the top
+    // edge (y < 0) and nothing below the bottom of the frame.
+    expect(Math.min(...ys)).toBeGreaterThanOrEqual(0);
+    expect(Math.max(...ys)).toBeLessThanOrEqual(260);
+    // The peak and the trough are distinct heights, so both are readable.
+    expect(new Set(ys.map((y) => Math.round(y))).size).toBeGreaterThan(2);
+  });
+
   it("renders the empty state without dated events", () => {
     const { getByText } = render(
       <CumulativeStep

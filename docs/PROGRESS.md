@@ -4,7 +4,41 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 208 — review findings on #332).
+Last updated: 2026-08-30 (session 209 — second review round on #332).
+
+## Session 209 — 2026-08-30: five more review findings on the Visualize round (#332)
+
+A second `/code-review 332` pass; all five fixed, each with the test that catches it.
+
+**Marks off the drawn axis were counted and never disclosed.** `layoutMarks` computed
+`offscreen` and documented it as "disclosed, not silently dropped", but nothing read it: the
+overlay drew only what fit, and `markCaptionLines` built its lines from the unfiltered
+server response — a chart windowed to August captioned four July marks it never drew. The
+axis a figure draws is now one pure function per figure (`lib/timeDomain.ts`), which the
+chart builds its x scale from *and* the caption reasons about, so the two cannot drift; each
+source's caption line ends in `; N outside the drawn time axis, not drawn`. Ranges count
+too — a baseline whose windows fall outside the slice drew nothing and said nothing.
+
+**A number range that named other sources' marks.** Instant numbering is global and by time,
+so two interleaved sources give one of them `#1,#3,#5,#7,#9,#11` — captioned `marks #1–#11`,
+which names five rules belonging to the other source. Non-contiguous runs now read `marks 6
+of #1–#11`.
+
+**A derived table sorted by value came back in lexical order.** `field_table` ordered on the
+raw `multiIf` output, and `<`, `≥` and `≤` all sort after the digits, so the ranges
+interleaved (`1,000 – 2,000` before `< 1,000`) — and the `LIMIT` kept the wrong rows.
+`derive.label_order_expr` orders by the label's rank in the derivation's own list, in SQL.
+
+**The RE2 guard on `POST …/viz/marks` covered one of three regex paths.** It inspected
+`m.filters.q_regex` only, so a per-field `regex` match mode, and a `view` mark whose saved
+view carries a regex, ran unguarded — an RE2-only rejection surfaced as a 500. The guard is
+now decided per mark, off the query about to run.
+
+**The cumulative step's y axis assumed a monotonic total.** `yMax` was the *final* value, but
+`quantity="sum"` over a signed measure is not monotonic: a series peaking at 500 and settling
+at 20 was drawn against a `[0, 20]` axis. The domain is the running series' own min and max.
+
+`docs/VISUALIZE.md` updated alongside (table sorting, marks, the cumulative axis).
 
 ## Session 208 — 2026-08-30: eleven review findings on the Visualize round (#332)
 

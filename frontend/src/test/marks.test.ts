@@ -85,4 +85,56 @@ describe("markCaptionLines", () => {
     });
     expect(lines).toEqual(['marks #1–#7: "Beacons" — 40 events of saved view; the earliest 7 drawn (cap 7), 33 not drawn']);
   });
+  it("does not claim a contiguous range when two sources interleave", () => {
+    // Numbering is global and by time, so source 0 owns #1,#3,#5,#7,#9,#11 —
+    // "#1–#11" would name five rules that belong to source 1.
+    const interleaved: ResolvedMark[] = Array.from({ length: 12 }, (_, i) => ({
+      kind: "instant" as const,
+      at: `2026-07-20T${String(i).padStart(2, "0")}:00:00+00:00`,
+      label: i % 2 === 0 ? "X" : "Y",
+      source: i % 2,
+      provenance: { kind: "analyst" as const },
+    }));
+    const lines = markCaptionLines({
+      marks: interleaved,
+      cap: 50,
+      sources: [
+        { index: 0, kind: "events", label: "X", count: 6, shown: 6, overflow: false, undated: 0 },
+        { index: 1, kind: "events", label: "Y", count: 6, shown: 6, overflow: false, undated: 0 },
+      ],
+    });
+    expect(lines[0]).toBe('marks 6 of #1–#11: "X" — 6 events matching a filter');
+    expect(lines[1]).toBe('marks 6 of #2–#12: "Y" — 6 events matching a filter');
+  });
+  it("says how many of a source's marks fall outside the drawn axis", () => {
+    // The axis of `layoutMarks` above: 2026-07-20 00:00 → 24:00. Instant #4
+    // (the 21st) and the "yesterday" range are outside it, and the caption
+    // has to say so — nothing draws them.
+    const domain: [Date, Date] = [
+      new Date("2026-07-20T00:00:00Z"),
+      new Date("2026-07-21T00:00:00Z"),
+    ];
+    const lines = markCaptionLines(resp, domain);
+    expect(lines[0]).toBe(
+      'marks #1, #3, #4: "beacons" — 3 events matching a filter; 1 undated event not drawn; 1 outside the drawn time axis, not drawn',
+    );
+    expect(lines[1]).not.toContain("outside the drawn time axis");
+    expect(lines[2]).not.toContain("outside the drawn time axis");
+    expect(lines[3]).toBe(
+      'mark: "yesterday" 2026-07-19 00:00:00Z → 2026-07-19 12:00:00Z — analyst-placed; outside the drawn time axis, not drawn',
+    );
+  });
+  it("counts exactly what the layout dropped", () => {
+    const domain: [Date, Date] = [
+      new Date("2026-07-20T00:00:00Z"),
+      new Date("2026-07-21T00:00:00Z"),
+    ];
+    const layout = layoutMarks(marks, x, 24);
+    const disclosed = markCaptionLines(resp, domain)
+      .join(" ")
+      .match(/outside the drawn time axis/g);
+    // One instant (#4) and one range (source 3) — the layout drops both.
+    expect(layout.offscreen).toBe(1);
+    expect(disclosed).toHaveLength(2);
+  });
 });

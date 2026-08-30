@@ -9,6 +9,7 @@ import { Legend } from "@/components/viz/primitives/Legend";
 import { MarksOverlay } from "@/components/viz/primitives/MarksOverlay";
 import { useChartRef } from "@/components/viz/primitives/useChartRef";
 import { valueLabeller } from "@/components/viz/lib/fieldDisplay";
+import { lanesChartDomain } from "@/components/viz/lib/timeDomain";
 import type { LaneInterval, LanesResponse, ResolvedMark } from "@/api/types";
 
 // utcFormat, not timeFormat — instants are UTC (see LineChart, CumulativeStep).
@@ -62,8 +63,7 @@ export function IntervalLanes({ data, svgRef, height, marks = [] }: IntervalLane
     );
   }
 
-  const sliceStart = new Date(data.slice_start);
-  const sliceEnd = new Date(data.slice_end);
+  const [sliceStart, sliceEnd] = lanesChartDomain(data)!;
   const frameHeight = height ?? lanes.length * ROW_H + 44;
   const legend = (
     <Legend
