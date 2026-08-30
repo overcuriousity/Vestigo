@@ -190,7 +190,8 @@ export const CHART_ID_PARAM = "c_chart";
 const DERIVE_MODES = ["width", "log"] as const;
 const TIME_PARTS: TimePart[] = ["hour", "weekday", "day", "week", "month"];
 const PAIRINGS = ["nextEnd", "firstLast"] as const;
-const TABLE_COLUMNS: TableColumn[] = ["count", "share", "first_seen", "last_seen", "distinct_second"];
+/** Also `chartOptions.ts`, which validates `tableSortBy` against these plus "value". */
+export const TABLE_COLUMNS: TableColumn[] = ["count", "share", "first_seen", "last_seen", "distinct_second"];
 
 const isRecord = (x: unknown): x is Record<string, unknown> =>
   !!x && typeof x === "object" && !Array.isArray(x);

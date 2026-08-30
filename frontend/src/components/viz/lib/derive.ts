@@ -126,7 +126,17 @@ export function describeDerive(d: DeriveSpec, echo?: DeriveEcho | null): string 
     return `grouped by your edges: ${(texts.length ? texts : d.edges.map(fmt)).join(" · ")}`;
   const tail = texts.length ? ` (edges: ${texts.join(" · ")})` : "";
   const neg = echo?.negative_bin ? "; values ≤ 0 in their own range" : "";
-  return `grouped into ${d.count} ${d.mode === "log" ? "log-spaced" : "equal-width"} ranges${tail}${neg}`;
+  // The edges the server could actually place, which over a range narrow
+  // relative to its magnitude is fewer than asked for — float64 cannot
+  // separate them (`db/derive.py::bin_edges`). Naming the requested count
+  // under an axis with fewer ranges on it is the one thing this sentence
+  // must not do.
+  const actual = echo?.edges ? echo.edges.length + 1 : d.count;
+  const short =
+    actual < d.count
+      ? ` — ${d.count} asked for; the values in this slice do not separate more`
+      : "";
+  return `grouped into ${actual} ${d.mode === "log" ? "log-spaced" : "equal-width"} range${actual === 1 ? "" : "s"}${tail}${neg}${short}`;
 }
 
 /** The one derivation that would make *chartType* legal for this field, or

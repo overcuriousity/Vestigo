@@ -256,28 +256,54 @@ def _spec_derive_to_stored(derive: Any) -> dict[str, Any] | None:
 _MARK_KEYS = {"definitionId": "definition_id", "viewId": "view_id"}
 
 
-def _stored_marks_to_spec(raw: Any) -> list[dict[str, Any]] | None:
+def _mark_key(item: dict[str, Any], key: str, kind: type, *, index: int, strict: bool) -> bool:
+    """Whether *item* carries *key* with the right type — raising under ``strict``.
+
+    An absent key is not a defect at either strictness; a present one of the
+    wrong type is, and only ``strict`` says so out loud.
+    """
+    value = item.get(key)
+    if isinstance(value, kind):
+        return True
+    if value is not None and strict:
+        raise ValueError(f"mark {index}: `{key}` must be a {kind.__name__}")
+    return False
+
+
+def _stored_marks_to_spec(raw: Any, *, strict: bool = False) -> list[dict[str, Any]] | None:
     """Stored ``marks`` (the frontend's ``MarkSource[]``) → ``ChartSpec.marks`` payload.
 
-    A malformed entry is dropped rather than failing the whole chart; the
-    spec's own validator refuses anything that survives without its fields.
+    A malformed entry — or a malformed key within one — is dropped rather than
+    failing the whole chart; the spec's own validator refuses anything that
+    survives without its fields. That is right for *reading stored state*: a
+    chart saved by an older build should still render what it can.
+
+    ``strict`` raises :class:`ValueError` instead, naming the entry and the key.
+    A request body is not stored state: silently drawing fewer marks than the
+    caller asked for, with nothing in ``sources`` or the caption to say so,
+    is exactly the undisclosed answer this subsystem exists not to give.
     """
     if not isinstance(raw, list):
+        if strict:
+            raise ValueError("marks must be a list")
         return None
     out: list[dict[str, Any]] = []
-    for item in raw:
+    for index, item in enumerate(raw):
         if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+            if strict:
+                raise ValueError(f"mark {index}: not an object with a string `kind`")
             continue
+
         spec: dict[str, Any] = {"kind": item["kind"]}
-        if isinstance(item.get("label"), str):
+        if _mark_key(item, "label", str, index=index, strict=strict):
             spec["label"] = item["label"]
         for stored_key, spec_key in _MARK_KEYS.items():
-            if isinstance(item.get(stored_key), str):
+            if _mark_key(item, stored_key, str, index=index, strict=strict):
                 spec[spec_key] = item[stored_key]
         for key in ("at", "start", "end"):
-            if isinstance(item.get(key), str):
+            if _mark_key(item, key, str, index=index, strict=strict):
                 spec[key] = item[key]
-        if isinstance(item.get("filters"), dict):
+        if _mark_key(item, "filters", dict, index=index, strict=strict):
             spec["filters"] = _filter_payload_to_spec(item["filters"]).model_dump(exclude_none=True)
         out.append(spec)
     return out or None

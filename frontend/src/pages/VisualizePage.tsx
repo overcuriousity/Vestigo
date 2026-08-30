@@ -450,9 +450,25 @@ export function VisualizePage() {
   // very next render, and not cosmetically: with a field set, `/viz/calendar`
   // counts only events whose field is non-empty and the quantity flips back to
   // sum/distinct, so the analyst gets a filtered chart they did not ask for.
+  //
+  // And only *once*. `field == null` is two different states — nobody has
+  // chosen yet, and the analyst chose "No field — count every event" — and
+  // this effect cannot tell them apart, because the fresh-load default figure
+  // is itself field-free (`time`). Without the latch, clearing the field on a
+  // bar chart lands on `time` and the highest-coverage field is written
+  // straight back into the URL: invisible in the combo, which renders
+  // `NO_FIELD` for a field-free figure, until the next gallery pick charts a
+  // field nobody chose.
+  const fieldDefaulted = useRef(false);
   useEffect(() => {
     if (chartRefLive || fieldOptional) return;
-    if (field == null && fieldsQuery.data?.fields.length) {
+    if (field != null) {
+      fieldDefaulted.current = true;
+      return;
+    }
+    if (fieldDefaulted.current) return;
+    if (fieldsQuery.data?.fields.length) {
+      fieldDefaulted.current = true;
       updateConfig({ field: fieldsQuery.data.fields[0].token });
     }
   }, [field, fieldsQuery.data, updateConfig, chartRefLive, fieldOptional]);
@@ -512,6 +528,10 @@ export function VisualizePage() {
         (!chartRefLive &&
           !fieldFree &&
           !requiresSecondField &&
+          // The consuming effect returns early for the table (the analyst
+          // chose it; a numeric probe must not re-pick the figure under
+          // them), so the scan's answer would be discarded on arrival.
+          chartType !== "table" &&
           field !== autoProbedField.current)),
     ...busyRetry,
   });
@@ -1103,7 +1123,12 @@ export function VisualizePage() {
     const d = lanesQuery.data;
     facts.lanes = {
       pairing: d.pairing,
-      lanesShown: d.lanes.length,
+      // What `IntervalLanes` actually draws, not what the response carried:
+      // under `next_end` a lane whose events are all orphan ends legitimately
+      // pairs nothing, and the figure filters it out. `lanesEmpty` is the
+      // difference, disclosed rather than left to be read off the canvas.
+      lanesShown: d.lanes.filter((l) => l.intervals.length > 0).length,
+      lanesEmpty: d.lanes.filter((l) => l.intervals.length === 0).length,
       lanesTotal: d.lanes_total,
       laneCapHit: d.lane_cap_hit,
       otherLanes: d.other_lanes,

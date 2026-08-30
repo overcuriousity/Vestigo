@@ -98,6 +98,12 @@ and export captions all derive from it.
   namespace (like `c_fields`), so `chartConfigToParams` clears them by construction and a
   malformed value is dropped field-by-field, never guessed at. Filters inside `inputs` and
   `marks` use the View payload shape, like `compare.filters`.
+- **`options` is resolved, not trusted.** `c_opts` is `JSON.parse`d without validation, so a
+  shared or hand-edited link carries whatever it says. `resolveChartOptions` is the one place
+  that turns it into concrete values, and every option that reaches a `Literal`-typed query
+  parameter or drives a `switch` is coerced onto its allowlist there (`oneOf`), the way `topN`
+  is clamped and `highlight` is filtered: `{"tableSortBy":"Count"}` otherwise reached the
+  endpoint as a 422 and a permanently blank chart with nothing on screen to explain it.
 - **Normalized on the way in.** Every entry point — a URL (`paramsToChartConfig`), a saved
   chart and a Story snapshot (`parseStoredChartConfig`) — runs `normalizeChartConfig`, which
   drops a `compare` layer the figure cannot draw and a `derive` its registry row does not
@@ -217,7 +223,11 @@ natural one). Picking a figure that admits no derivation drops the active one an
 legality is judged at the effective scale, so such a figure lights up under a derivation it
 cannot carry. Picking a figure that cannot draw a *comparison* drops that the same way, for
 the same reason and with its own notice ("Pie / Donut charts one layer — the comparison was
-dropped."). Bin labels are cut by `_fmt_edges`, which raises the precision twice for two
+dropped.") — and so does **every** other path that re-picks the figure: a Treat-as change that
+clamps it, a field picked on a field-free figure, and a derivation applied by clicking a greyed
+tile (which conversely *bootstraps* Compare to Baseline for a figure that requires two
+windows). Dropping the derivation moves the treat-as to the effective scale the gallery judged
+the figure at, since the raw one may not admit it. Bin labels are cut by `_fmt_edges`, which raises the precision twice for two
 different reasons. First until every label *names its own edge* — three significant digits
 called a boundary at 4000.125 `4,000`, which puts a value of 4000.05 in the bin below a label
 saying it is above it — capped at six decimals, because a log-spaced edge is irrational and
@@ -234,7 +244,14 @@ the result and two in the caption.
   where its bins are would be a chart nobody could check. `log` cannot place a value ≤ 0, so
   those get their own, disclosed bin (`negative_bin`). `custom` takes the analyst's edges,
   open-ended at both ends. Labels are human (`< 1,024` · `1,024 – 10,240` · `≥ 10,240`); the
-  bins SQL is one `multiIf` over `_finite_float_cast`.
+  bins SQL is one `multiIf` over `_finite_float_cast`. The edges are **strictly increasing
+  or absent**: over a range narrow relative to its magnitude — an epoch-nanosecond attribute
+  binned across a few hours — float64 absorbs `lo + k * step` back to `lo` and then repeats
+  it, so `bin_edges` drops the collapsed ones and the chart carries fewer ranges than were
+  asked for. It cannot do otherwise: every consumer takes the edges to be increasing (two
+  edges under one label are one bin in the result and two in the caption, `bins_expr` emits
+  arms no row can reach, `label_order_expr` collapses the repeats onto one rank). The caption
+  names the ranges there are and says how many were asked for.
 - `time_part` reuses `TIME_FIELD_SPECS` over `parseDateTimeBestEffortOrNull(…, 'UTC')`, so a
   derived hour and a `time:hour_of_day` chart can never disagree — same zero-padding, same
   ISO weekday, same UTC. A `time:` field itself is refused (HTTP 422 / `propose_chart`
@@ -255,7 +272,10 @@ never answers from the M24a field-stats cache, which holds raw values.
 
 The response echo — `derive` (or `derive_x`): `{kind, labels, mode, edges, edge_labels,
 negative_bin}` for bins, `{kind, labels, part, timezone: "UTC"}` for a calendar part. The
-frontend uses `labels` as the bar axis's value order (`BarChart.valueOrder`) and
+frontend uses `labels` as the bar axis's value order (`BarChart.valueOrder`, which applies
+it only under `options.sort: "value"` — so `resolveChartOptions` *resolves* `sort` to "value"
+for every derived bar rather than the rail writing one into the config, and the page, the
+agent's card, a Story snapshot and the HTML export order the same ranges the same way) and
 `edge_labels` / `negative_bin` for the caption's `derived:` line, which always names what was
 done and what could not be counted (`lib/caption.ts`). `edge_labels` is `edges` run through
 the same `_fmt_edges` the bin labels are cut by — the caption naming a boundary and the axis
@@ -420,8 +440,11 @@ read `marks 6 of #1–#11`, never `marks #1–#11`.
 **Marks off the drawn axis are disclosed, never silently dropped.** Given the figure's
 domain, each source's line ends in `; N outside the drawn time axis, not drawn` (`;
 outside the drawn time axis, not drawn` for a single-mark source) — an instant outside the
-axis or a range with no overlap at all, exactly what `layoutMarks` declines to draw. A
+axis or a range clipped away to nothing, exactly what `layoutMarks` declines to draw. A
 chart windowed away from its marks would otherwise caption rules the reader cannot find.
+The two agree at the edges by construction: a range meeting the axis at a single instant is
+*drawn*, as a minimum-width band widened inwards (a range starting on the domain's last
+instant has no room to its right), and `outsideDomain` is `end < lo || start > hi` to match.
 
 **Confirmed findings are an `events` mark over ids.** The rail's *Confirmed findings*
 entry lists the timeline's `kind="confirmed"` dispositions and writes one
@@ -433,7 +456,10 @@ Explorer's own `ids` stay session-only, as before.
 **The endpoint.** `POST /{case}/timelines/{tl}/viz/marks` takes `{marks: MarkSource[]}`
 — the stored shape verbatim, so the page posts what it holds — under `require_case_read`,
 writes nothing, and answers 422 for a malformed mark (the `ChartMarkSpec` validator's
-message) or an unknown baseline definition / saved view (`marks[i]: … not found`). Each
+message) or an unknown baseline definition / saved view (`marks[i]: … not found`). It reads
+the body with `_stored_marks_to_spec(..., strict=True)`: the lenient reading that lets a
+chart saved by an older build still render what it can would here draw fewer marks than the
+caller asked for, with nothing in `sources` or the caption to say so. Each
 `events`/`view` scan runs under the foreground gate with the same pre-checks every viz GET
 applies, and the RE2 guard is decided **per mark, off the query about to run** — a pattern
 can sit in `qRegex`, in a per-field `regex` match mode, or inside the saved view, and only
@@ -666,11 +692,15 @@ layer lines: the pairing rule verbatim (`pairing: start → next end — an end 
 recent open start in its lane; an open start runs to the slice end; an end with no open
 start before it is an orphan, counted and not drawn`, or `pairing: first to last — one bar
 per lane, from its first event to its last`); `lanes: N shown of M (top by event count); K
-more not drawn` when the cap bit, else `lanes: N`; under `next_end` **two** lines, because
-they are two scopes and one sentence carrying both is arithmetic nobody can reconcile —
+more not drawn` when the cap bit, else `lanes: N` — *N is what the figure draws*, since a
+lane that survived the cap can still pair no interval (under `next_end`, one whose events are
+all orphan ends) and `IntervalLanes` filters it out, so the difference is disclosed as `; K
+lanes with no interval to draw`; under `next_end` **two** further lines, because they are two
+scopes and one sentence carrying both is arithmetic nobody can reconcile —
 `starts: S · ends: E — matched across all M lanes, before the caps` (the whole union) and
-`paired over the N lanes drawn: U open-ended (no end seen, drawn to <slice end>), O orphan
-ends not drawn` (only the lanes that survived the cap); then, when the row cap bit, the
+`paired over the P lanes kept: U open-ended (no end seen, drawn to <slice end>), O orphan
+ends not drawn` (every lane that survived the cap, drawn or not — an orphan end in an empty
+lane is counted here and nowhere on screen); then, when the row cap bit, the
 `first N start/end events (by time) paired` line; and `U undated events not drawn` whenever
 any were.
 

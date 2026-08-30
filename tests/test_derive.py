@@ -32,6 +32,24 @@ def test_bins_degenerate_range_has_no_edges() -> None:
     assert bin_edges("log", 8, 5.0, 5.0) == []
 
 
+def test_bins_edges_are_strictly_increasing_when_float64_runs_out() -> None:
+    """A range narrow relative to its magnitude cannot carry ``count - 1`` edges.
+
+    ``lo + k * step`` is absorbed back to ``lo`` for the first few *k* and then
+    repeats itself — an epoch-nanosecond attribute binned over a few hours. Every
+    consumer takes the edges to be strictly increasing: duplicate labels are one
+    bin in the result and several in the caption, ``bins_expr`` emits arms no row
+    can reach and ``label_order_expr`` collapses the repeats onto one rank. So
+    the collapsed bins are dropped rather than passed on.
+    """
+    lo = 1.7e18
+    edges = bin_edges("width", 50, lo, lo + 10_000)
+    assert edges == sorted(set(edges))
+    assert all(lo < e < lo + 10_000 for e in edges)
+    assert len(edges) < 49  # fewer than asked for — the point of the test
+    assert len(set(bin_labels(edges, negative_bin=False))) == len(edges) + 1
+
+
 def test_bin_labels_are_open_ended_and_human() -> None:
     assert bin_labels([1024.0, 10240.0], negative_bin=False) == [
         "< 1,024",

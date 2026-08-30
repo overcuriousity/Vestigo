@@ -258,7 +258,6 @@ describe("ChartRail — Derive", () => {
     expect(updateConfig).toHaveBeenCalledWith({
       derive: { kind: "bins", mode: "log", count: 8 },
       chartType: "bar",
-      options: { sort: "value" },
     });
   });
 
@@ -288,7 +287,6 @@ describe("ChartRail — Derive", () => {
     expect(updateConfig).toHaveBeenCalledWith({
       chartType: "bar",
       derive: { kind: "bins", mode: "log", count: 8 },
-      options: { sort: "value" },
     });
     expect(setAutoNotice).toHaveBeenCalledWith(
       "Bar needs categories — grouped attr:bytes into 8 log-spaced ranges.",
@@ -562,5 +560,97 @@ describe("ChartRail — a figure pick and the active derivation", () => {
     fireEvent.focus(combo);
     fireEvent.mouseDown(screen.getByRole("option", { name: /No field/ }));
     expect(updateConfig).toHaveBeenCalledWith({ field: null, chartType: "time", derive: null });
+  });
+});
+
+describe("ChartRail — a re-picked figure carries its Compare layer with it", () => {
+  // The gallery has guarded this since #332's first round; the other two paths
+  // that re-pick the figure did not. Left behind, the layer is invisible *and*
+  // unreachable — all three radios render unchecked and disabled — while the
+  // caption names a comparison that is never fetched.
+  it("drops it when Treat-as clamps the figure", () => {
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "artifact",
+      scale: "nominal",
+      compare: { mode: "baseline" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: /Number or time/ }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      scale: "interval",
+      chartType: "heatmap",
+      compare: { mode: "off" },
+    });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      expect.stringContaining("the comparison was dropped"),
+    );
+  });
+
+  it("drops it when a field is picked on a field-free figure", () => {
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "time",
+      field: null,
+      scale: "ratio",
+      compare: { mode: "baseline" },
+    });
+    // `FieldCombo` opens its list on focus and commits on mousedown.
+    fireEvent.focus(screen.getByRole("combobox", { name: /^Field/ }));
+    fireEvent.mouseDown(screen.getByRole("option", { name: /attr:bytes/ }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      field: "attr:bytes",
+      chartType: "line",
+      compare: { mode: "off" },
+    });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      expect.stringContaining("the comparison was dropped"),
+    );
+  });
+
+  it("bootstraps one when a greyed figure that needs two windows is clicked", () => {
+    // The derivation lights the tile; without the same Baseline bootstrap the
+    // gallery's legal branch does, the click lands on the canvas's "needs a
+    // second window" dead end instead of on a chart.
+    const { updateConfig } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "histogram",
+      field: "attr:bytes",
+      scale: "ratio",
+      compare: { mode: "off" },
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: CHART_META.change.label }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      chartType: "change",
+      derive: { kind: "bins", mode: "log", count: 8 },
+      compare: { mode: "baseline" },
+    });
+  });
+});
+
+describe("ChartRail — dropping a derivation drops the effective scale with it", () => {
+  it("moves Treat-as to the scale the gallery judged the figure at", () => {
+    // Legality is judged at the *effective* scale, which the derivation makes
+    // ordinal. Dropping the derivation and keeping `ratio` left the selected
+    // tile `aria-checked` and `aria-disabled` at once, with a second click
+    // inert and the caption calling the lane key a Measure (#332).
+    const { updateConfig, setAutoNotice } = renderRail({
+      ...DEFAULT_CHART_CONFIG,
+      chartType: "bar",
+      field: "attr:bytes",
+      scale: "ratio",
+      derive: { kind: "bins", mode: "log", count: 8 },
+    });
+    const gallery = screen.getByRole("radiogroup", { name: "Figure" });
+    fireEvent.click(within(gallery).getByRole("radio", { name: CHART_META.lanes.label }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      chartType: "lanes",
+      derive: null,
+      scale: "ordinal",
+    });
+    expect(setAutoNotice).toHaveBeenCalledWith(
+      `${CHART_META.lanes.label} charts attr:bytes as ordered categories — the derivation was dropped.`,
+    );
   });
 });

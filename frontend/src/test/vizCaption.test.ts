@@ -693,6 +693,7 @@ describe("buildCaptionLines — interval lanes", () => {
   const lanes = {
     pairing: "next_end" as const,
     lanesShown: 2,
+    lanesEmpty: 0,
     lanesTotal: 3,
     laneCapHit: true,
     otherLanes: 1,
@@ -730,10 +731,33 @@ describe("buildCaptionLines — interval lanes", () => {
     // the open/orphan counts belong to the lanes that survived the cap.
     expect(lines).toContain("starts: 4 · ends: 3 — matched across all 3 lanes, before the caps");
     expect(lines).toContain(
-      "paired over the 2 lanes drawn: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+      "paired over the 2 lanes kept: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
     );
     expect(lines).toContain("1 undated event not drawn");
     expect(lines.some((l) => l?.startsWith("first "))).toBe(false);
+  });
+
+  it("counts the lanes drawn, not the lanes returned, and discloses the difference", () => {
+    // Under `next_end` a lane whose events are all orphan ends pairs nothing
+    // and `IntervalLanes` filters it out, so counting the response's lanes
+    // named more rows than the canvas has (#332).
+    const lines = buildCaptionLines({
+      ...base,
+      chartLabel: "Interval lanes",
+      config: {
+        ...DEFAULT_CHART_CONFIG,
+        chartType: "lanes",
+        field: "attr:host",
+        inputs: { pairing: "nextEnd" },
+      },
+      facts: { lanes: { ...lanes, lanesShown: 4, lanesEmpty: 1, lanesTotal: 5, laneCapHit: false } },
+    });
+    expect(lines).toContain("lanes: 4; 1 lane with no interval to draw");
+    // The pairing still ran over all five: the orphan end in the empty lane is
+    // counted there and nowhere on screen.
+    expect(lines).toContain(
+      "paired over the 5 lanes kept: 1 open-ended (no end seen, drawn to 2026-07-20T14:00:00+00:00), 1 orphan end not drawn",
+    );
   });
 
   it("first-to-last states its own rule and skips the start/end line; the row cap is disclosed", () => {

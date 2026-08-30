@@ -65,6 +65,20 @@ describe("derivations", () => {
     ).toBe("grouped into 3 equal-width ranges (edges: 4,000.125 · 4,000.875)");
   });
 
+  it("names the ranges there are, not the ranges asked for", () => {
+    // Over a range narrow relative to its magnitude float64 cannot separate
+    // the edges, so `db/derive.py::bin_edges` places fewer than `count - 1`
+    // and the axis carries fewer ranges than the analyst asked for (#332).
+    expect(
+      describeDerive(
+        { kind: "bins", mode: "width", count: 8 },
+        { kind: "bins", labels: [], edges: [10, 20], edge_labels: ["10", "20"] },
+      ),
+    ).toBe(
+      "grouped into 3 equal-width ranges (edges: 10 · 20) — 8 asked for; the values in this slice do not separate more",
+    );
+  });
+
   it("finds the single fix that lights a greyed figure, and refuses to guess between two", () => {
     // Bar is illegal at ratio; bins is the only derivation ratio offers.
     expect(singleFixFor("bar", "ratio", "attr:bytes")).toEqual(defaultDerive("bins", "ratio"));

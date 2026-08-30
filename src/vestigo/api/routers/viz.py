@@ -1085,8 +1085,16 @@ async def resolve_viz_marks(
     # string, a `TypeError` when it is a number). All four are the client sending
     # a malformed body, which is a 422 — only a bare `ValidationError` catch let
     # them escape as a 500.
+    #
+    # `strict=True` because this is a request body, not stored state: the lenient
+    # reading drops an entry whose `kind` is not a string (a hand-edited `c_marks`
+    # reaches here verbatim) and the figure then draws fewer marks with nothing in
+    # `sources` or the caption disclosing it.
     try:
-        specs = [ChartMarkSpec.model_validate(m) for m in (_stored_marks_to_spec(body.marks) or [])]
+        specs = [
+            ChartMarkSpec.model_validate(m)
+            for m in (_stored_marks_to_spec(body.marks, strict=True) or [])
+        ]
     except (ValueError, TypeError, AttributeError) as exc:  # ValidationError is a ValueError
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)

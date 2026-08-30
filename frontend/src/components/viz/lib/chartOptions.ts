@@ -15,6 +15,7 @@
  */
 import { CHART_META, chartTypesFor } from "./chartMeta";
 import { isTimeField } from "./timeFields";
+import { TABLE_COLUMNS } from "./chartConfig";
 import type { ChartConfig, ChartOptions, ChartType, Scale, TableSortColumn } from "./chartConfig";
 
 /**
@@ -172,6 +173,28 @@ export function clampTopN(value: unknown, chartType: ChartType): number {
   return Math.max(TOPN_MIN, Math.min(n, topNMax(chartType)));
 }
 
+/**
+ * Coerce an untrusted enum-typed option onto one of *allowed*, or the default.
+ *
+ * Same argument as `clampTopN`: `c_opts` arrives from the URL as `JSON.parse`d,
+ * unvalidated data (see `chartConfig.ts`), and these options are forwarded to
+ * `Literal`-typed query parameters. A hand-edited or mangled link carrying
+ * `{"tableSortBy":"Count"}` reached the endpoint as a 422 — a permanently blank
+ * chart with nothing on screen to explain it, which is the failure mode the
+ * `highlight` note below exists to prevent for arrays.
+ */
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+const QUANTITIES = ["events", "sum", "distinct"] as const;
+const LAYOUTS = ["dumbbell", "slope"] as const;
+const ORIENTATIONS = ["horizontal", "vertical"] as const;
+const SORTS = ["count", "value"] as const;
+const SERIES_MODES = ["overlay", "stacked"] as const;
+const TABLE_SORT_COLUMNS: TableSortColumn[] = ["value", ...TABLE_COLUMNS];
+const TABLE_SORT_DIRS = ["asc", "desc"] as const;
+
 export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
   const { options } = config;
   return {
@@ -188,15 +211,22 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     quantity:
       config.field == null
         ? "events"
-        : (options.quantity ?? (config.scale === "ratio" ? "sum" : "distinct")),
-    layout: options.layout ?? "dumbbell",
+        : oneOf(options.quantity, QUANTITIES, config.scale === "ratio" ? "sum" : "distinct"),
+    layout: oneOf(options.layout, LAYOUTS, "dumbbell"),
     limitX: options.limitX ?? 10,
     limitY: options.limitY ?? 10,
     sampleLimit: options.sampleLimit ?? 5000,
-    orientation: options.orientation ?? "horizontal",
-    sort: options.sort ?? "count",
+    orientation: oneOf(options.orientation, ORIENTATIONS, "horizontal"),
+    // A derived bar axis has no lexical order — "< 1,024" and "≥ 10,240" sort
+    // as strings before every digit — so `ChartCanvas` hands `BarChart` the
+    // derivation's own label order, which `BarChart` applies only under
+    // `sort: "value"`. Defaulted here rather than written into the config by
+    // the rail: a config that never passed through the rail (an agent's
+    // `propose_chart`, a deep link) drew the ranges in count order on the
+    // card, the snapshot and the HTML export while the page had them ordered.
+    sort: oneOf(options.sort, SORTS, config.derive && config.chartType === "bar" ? "value" : "count"),
     logScale: options.logScale ?? false,
-    seriesMode: options.seriesMode ?? "overlay",
+    seriesMode: oneOf(options.seriesMode, SERIES_MODES, "overlay"),
     legend: options.legend ?? true,
     // Grouped box/violin cap mirrors the backend's VIZ_GROUPS_MAX.
     groups: Math.min(options.groups ?? 6, 8),
@@ -209,8 +239,8 @@ export function resolveChartOptions(config: ChartConfig): ResolvedChartOptions {
     tableSortBy:
       options.tableSortBy === "distinct_second" && config.fieldY == null
         ? "count"
-        : (options.tableSortBy ?? "count"),
-    tableSortDir: options.tableSortDir ?? "desc",
+        : oneOf(options.tableSortBy, TABLE_SORT_COLUMNS, "count"),
+    tableSortDir: oneOf(options.tableSortDir, TABLE_SORT_DIRS, "desc"),
     // `c_opts` is `JSON.parse`d, unvalidated URL data (see `clampTopN` above,
     // which exists for the same reason): a hand-edited or mangled link can
     // carry `"highlight": "admin"`. `.length` is then truthy and `.join` is

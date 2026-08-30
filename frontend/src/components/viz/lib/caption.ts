@@ -58,7 +58,10 @@ export interface CaptionFacts {
   /** kind=lanes: the pairing rule's inputs and every cap. */
   lanes?: {
     pairing: "first_last" | "next_end";
+    /** Lanes with at least one interval — what the figure draws. */
     lanesShown: number;
+    /** Lanes returned but drawn empty (every event an orphan end). */
+    lanesEmpty: number;
     lanesTotal: number;
     laneCapHit: boolean;
     otherLanes: number;
@@ -301,10 +304,17 @@ export function buildCaptionLines(args: {
         ? "pairing: start → next end — an end closes the most recent open start in its lane; an open start runs to the slice end; an end with no open start before it is an orphan, counted and not drawn"
         : "pairing: first to last — one bar per lane, from its first event to its last",
     );
+    // A lane can survive the cap and still draw nothing — under `next_end`,
+    // one whose events are all orphan ends pairs no interval. Counting those
+    // in "lanes: N" made the caption name more rows than the canvas has.
+    const empty =
+      l.lanesEmpty > 0
+        ? `; ${fmtInt(l.lanesEmpty)} lane${l.lanesEmpty === 1 ? "" : "s"} with no interval to draw`
+        : "";
     lines.push(
       l.laneCapHit
-        ? `lanes: ${fmtInt(l.lanesShown)} shown of ${fmtInt(l.lanesTotal)} (top by event count); ${fmtInt(l.otherLanes)} more not drawn`
-        : `lanes: ${fmtInt(l.lanesShown)}`,
+        ? `lanes: ${fmtInt(l.lanesShown)} shown of ${fmtInt(l.lanesTotal)} (top by event count); ${fmtInt(l.otherLanes)} more not drawn${empty}`
+        : `lanes: ${fmtInt(l.lanesShown)}${empty}`,
     );
     if (l.pairing === "next_end") {
       // Two sentences because they are two scopes, and one sentence carrying
@@ -314,8 +324,11 @@ export function buildCaptionLines(args: {
       lines.push(
         `starts: ${fmtInt(l.starts)} · ends: ${fmtInt(l.ends)} — matched across all ${fmtInt(l.lanesTotal)} lane${l.lanesTotal === 1 ? "" : "s"}, before the caps`,
       );
+      // The pairing ran over every lane that survived the cap, drawn or not —
+      // an orphan end in an empty lane is counted here and nowhere on screen.
+      const paired = l.lanesShown + l.lanesEmpty;
       lines.push(
-        `paired over the ${fmtInt(l.lanesShown)} lane${l.lanesShown === 1 ? "" : "s"} drawn: ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
+        `paired over the ${fmtInt(paired)} lane${paired === 1 ? "" : "s"} kept: ${fmtInt(l.unpairedStarts)} open-ended (no end seen, drawn to ${l.sliceEnd ?? "the slice end"}), ${fmtInt(l.orphanEnds)} orphan end${l.orphanEnds === 1 ? "" : "s"} not drawn`,
       );
       if (l.rowsTruncated) {
         lines.push(

@@ -95,15 +95,40 @@ def parse_derive(raw: str | None) -> DeriveSpec | None:
 
 
 def bin_edges(mode: Literal["width", "log"], count: int, lo: float, hi: float) -> list[float]:
-    """The ``count - 1`` interior edges over ``[lo, hi]`` — none when the range is a point."""
+    """The interior edges over ``[lo, hi]`` — at most ``count - 1``, strictly increasing.
+
+    Usually exactly ``count - 1``. Fewer when float64 cannot separate them: over
+    a range narrow relative to its magnitude — an epoch-nanosecond attribute
+    binned across a few hours, say — ``lo + k * step`` is absorbed back to
+    ``lo`` for the first few *k* and repeats itself for the rest, so asking for
+    50 edges yields 38 distinct values.
+
+    Duplicates cannot be passed on. Every consumer here takes the edges to be
+    strictly increasing: :func:`_fmt_edges`' collision loop can never separate
+    two labels for one value however far it raises precision, :func:`bins_expr`
+    emits ``multiIf`` arms no row can ever reach, and
+    :func:`label_order_expr`'s ``indexOf`` collapses the repeats onto one rank.
+    So the collapsed bins are dropped instead: the chart draws the ranges the
+    data's precision actually distinguishes, and the caption says how many were
+    asked for (``lib/derive.ts::describeDerive`` reads the echoed edges).
+
+    Edges landing on ``lo`` or ``hi`` are dropped for the same reason — an
+    interior edge at either end delimits a bin no value can fall in.
+    """
     if not (hi > lo):
         return []
     if mode == "width":
         step = (hi - lo) / count
-        return [lo + k * step for k in range(1, count)]
-    llo, lhi = math.log10(lo), math.log10(hi)
-    step = (lhi - llo) / count
-    return [10 ** (llo + k * step) for k in range(1, count)]
+        raw = [lo + k * step for k in range(1, count)]
+    else:
+        llo, lhi = math.log10(lo), math.log10(hi)
+        step = (lhi - llo) / count
+        raw = [10 ** (llo + k * step) for k in range(1, count)]
+    out: list[float] = []
+    for edge in raw:
+        if lo < edge < hi and (not out or edge > out[-1]):
+            out.append(edge)
+    return out
 
 
 def _sig3(x: float) -> float:

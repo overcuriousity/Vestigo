@@ -78,23 +78,30 @@ export function layoutMarks(
     .filter((m): m is ResolvedRangeMark => m.kind === "range")
     .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
   for (const mark of sorted) {
-    const x0 = Math.max(0, x(new Date(mark.start)));
-    const x1 = Math.min(innerWidth, x(new Date(mark.end)));
-    if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 < x0) continue;
+    let a = Math.max(0, x(new Date(mark.start)));
+    let b = Math.min(innerWidth, x(new Date(mark.end)));
+    // `b < a` is exactly a range clipped away to nothing — one lying wholly
+    // before the domain or wholly after it. That, and only that, is what
+    // `outsideDomain` reports, so the two agree by construction.
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) continue;
     // A zero-length range — or one whose whole span is sub-pixel at this
     // width — used to be dropped by `x1 > x0` while `outsideDomain` still
-    // called it drawn (it only reports a range fully outside the domain), so
-    // the caption described a band that was not on the canvas. Give it the
-    // minimum width instead: the band is real, and one pixel is a smaller lie
-    // about its extent than not drawing it at all.
-    const end = Math.min(innerWidth, Math.max(x1, x0 + MIN_RANGE_PX));
-    // Only a range starting at the very right edge survives that clamp with
-    // no width — and `outsideDomain` already reports it as off-axis.
-    if (end <= x0) continue;
-    let tier = tierEnds.findIndex((e) => e <= x0);
+    // called it drawn, so the caption described a band that was not on the
+    // canvas. Give it the minimum width instead: the band is real, and two
+    // pixels are a smaller lie about its extent than not drawing it at all.
+    //
+    // Widened rightwards, then pulled back inside the axis — a range starting
+    // at the very last instant of the domain has no room to its right, and
+    // clamping only the right edge left it zero-width and dropped, which is
+    // the same disagreement at the other end.
+    if (b - a < MIN_RANGE_PX) {
+      b = Math.min(innerWidth, a + MIN_RANGE_PX);
+      a = Math.max(0, b - MIN_RANGE_PX);
+    }
+    let tier = tierEnds.findIndex((e) => e <= a);
     if (tier === -1) tier = tierEnds.length;
-    tierEnds[tier] = end;
-    ranges.push({ mark, x0, x1: end, tier });
+    tierEnds[tier] = b;
+    ranges.push({ mark, x0: a, x1: b, tier });
   }
   return { instants, ranges, offscreen };
 }
@@ -118,8 +125,12 @@ function numbersFor(source: number, numbered: NumberedInstant[]): string {
 export type MarksDomain = readonly [Date, Date];
 
 /** Whether a mark falls entirely outside *domain*, and so is never drawn.
+ *
  * Mirrors `layoutMarks`: an instant is placed only inside the axis, and a
- * range is drawn only where its clipped width is positive. */
+ * range is drawn wherever it meets the axis at all — including at an edge,
+ * where the minimum-width clamp gives it a visible band. `end <= lo` counted
+ * a range ending exactly on the first bucket start as not drawn while a 2 px
+ * band and its label sat on the canvas. */
 function outsideDomain(mark: ResolvedMark, domain: MarksDomain): boolean {
   const [lo, hi] = [domain[0].getTime(), domain[1].getTime()];
   if (mark.kind === "instant") {
@@ -129,7 +140,7 @@ function outsideDomain(mark: ResolvedMark, domain: MarksDomain): boolean {
   const start = Date.parse(mark.start);
   const end = Date.parse(mark.end);
   if (!Number.isFinite(start) || !Number.isFinite(end)) return true;
-  return end <= lo || start >= hi;
+  return end < lo || start > hi;
 }
 
 /** The "not drawn" clause for one source's marks, empty when all are drawn. */

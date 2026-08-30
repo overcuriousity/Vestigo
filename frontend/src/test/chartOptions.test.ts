@@ -262,3 +262,62 @@ describe("resolveChartOptions — untrusted highlight", () => {
     expect(resolveChartOptions(config).highlight).toEqual(["admin", "root"]);
   });
 });
+
+describe("resolveChartOptions — untrusted enum options", () => {
+  // Same argument as `highlight` above and `clampTopN`: these three are
+  // forwarded to `Literal`-typed query params, so a hand-edited `c_opts`
+  // produced a 422 and a permanently blank chart with nothing on screen to
+  // explain it (#332).
+  const table = { ...DEFAULT_CHART_CONFIG, chartType: "table" as const, field: "attr:host" };
+
+  it("falls back to the default for a bogus tableSortBy, tableSortDir or quantity", () => {
+    const opts = resolveChartOptions({
+      ...table,
+      options: {
+        tableSortBy: "Count",
+        tableSortDir: "up",
+        quantity: "total",
+      } as unknown as (typeof table)["options"],
+    });
+    expect(opts.tableSortBy).toBe("count");
+    expect(opts.tableSortDir).toBe("desc");
+    expect(opts.quantity).toBe("distinct");
+  });
+
+  it("keeps every legal value it is given", () => {
+    const opts = resolveChartOptions({
+      ...table,
+      fieldY: "attr:user",
+      options: { tableSortBy: "distinct_second", tableSortDir: "asc", quantity: "sum" },
+    });
+    expect(opts.tableSortBy).toBe("distinct_second");
+    expect(opts.tableSortDir).toBe("asc");
+    expect(opts.quantity).toBe("sum");
+  });
+});
+
+describe("resolveChartOptions — a derived bar axis reads in value order", () => {
+  // `BarChart` applies the derivation's own label order only under
+  // `sort: "value"`, and only the rail used to write one. An agent's
+  // `propose_chart` or a deep link drew the ranges in count order on the card,
+  // the snapshot and the HTML export while the page had them ordered (#332).
+  const derived = {
+    ...DEFAULT_CHART_CONFIG,
+    chartType: "bar" as const,
+    field: "attr:bytes",
+    scale: "ratio" as const,
+    derive: { kind: "bins", mode: "log", count: 8 } as const,
+  };
+
+  it("defaults sort to value with no option in the config", () => {
+    expect(resolveChartOptions(derived).sort).toBe("value");
+  });
+
+  it("still lets the analyst ask for count order", () => {
+    expect(resolveChartOptions({ ...derived, options: { sort: "count" } }).sort).toBe("count");
+  });
+
+  it("leaves an underived bar in count order", () => {
+    expect(resolveChartOptions({ ...derived, derive: null }).sort).toBe("count");
+  });
+});

@@ -1240,6 +1240,49 @@ async def test_viz_marks_answers_422_for_a_structurally_malformed_filter(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mark",
+    [
+        # A non-dict entry is already refused by `MarksRequest` itself.
+        {"kind": 7, "at": "2026-07-20T09:41:00Z"},
+        {"kind": "instant", "at": "2026-07-20T09:41:00Z", "label": 7},
+        {"kind": "baseline", "definitionId": 7},
+        {"kind": "instant", "at": 1_753_000_000},
+    ],
+)
+async def test_viz_marks_refuses_a_mark_it_would_otherwise_drop_in_silence(monkeypatch, mark):
+    """A request body is not stored state.
+
+    ``_stored_marks_to_spec`` drops a malformed entry — or a malformed key
+    within one — so that a chart saved by an older build still renders what it
+    can. Here that silently drew fewer marks than the caller asked for, with
+    nothing in ``sources`` or the caption to say so (#332), and a hand-edited
+    ``c_marks`` reaches this endpoint verbatim.
+    """
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    _patch_agg(monkeypatch)
+
+    class _Store:
+        async def get_baseline_definition(self, case_id, timeline_id, baseline_id):
+            return None
+
+        async def get_view(self, case_id, view_id):
+            return None
+
+    monkeypatch.setattr(viz, "get_store", lambda: _Store())
+    user = SimpleNamespace(id="u1", username="t", is_admin=True, is_active=True)
+    with pytest.raises(HTTPException) as exc:
+        await viz.resolve_viz_marks(
+            "c1", "t1", viz.MarksRequest(marks=[mark]), case=None, user=user
+        )
+    assert exc.value.status_code == 422
+    assert "mark 0" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_viz_cumulative_resolves_quantity_and_passes_field_and_buckets(monkeypatch):
     svc = _patch_agg(monkeypatch)
     result = await viz.get_cumulative(

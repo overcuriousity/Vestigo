@@ -572,6 +572,7 @@ export function ChartRail({
     sampleLimit,
     groups,
     showPoints,
+    sort,
     tableSortBy,
   } = resolved;
 
@@ -585,6 +586,16 @@ export function ChartRail({
   const derive = config.derive;
   const deriveKinds = deriveOptionsForChart(chartType, scale, field);
   const effScale = effectiveScale(scale, derive);
+
+  /** The patch that clears a Compare layer *next* cannot draw, or nothing.
+   *
+   * Every path that re-picks the figure owes this. A layer left behind on a
+   * figure with `supportsCompare: false` renders its three radios unchecked
+   * *and* disabled — nothing on screen to see it by, nothing to clear it with
+   * — while `caption.ts` still writes `primary:` / `comparison:` lines for a
+   * layer that is never fetched. */
+  const dropCompareFor = (next: ChartType): boolean =>
+    config.compare.mode !== "off" && !CHART_META[next].supportsCompare;
 
   // Keep chartType valid when the analyst changes what the field is treated
   // as — clamped at event time rather than in an effect, so there is never a
@@ -600,14 +611,17 @@ export function ChartRail({
     if (nextDerive !== derive) patch.derive = nextDerive;
     if (!chartTypesForField(eff, field).includes(chartType)) {
       const next = defaultChartTypeForScale(eff, field);
+      const dropCompare = dropCompareFor(next);
+      if (dropCompare) patch.compare = { mode: "off" };
       updateConfig({ ...patch, chartType: next });
       // Say which of the two reasons forced the re-pick: blaming the scale for
       // a clamp the *field* forced is a false statement about the chart.
       const legalForScale = chartTypesFor(eff).includes(chartType);
       setAutoNotice(
-        legalForScale && field
+        (legalForScale && field
           ? `Figure switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} can't plot ${fieldTokenLabel(field)}.`
-          : `Figure switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available for a field treated as ${SCALE_DISPLAY[s].label.toLowerCase()}.`,
+          : `Figure switched to ${CHART_META[next].label} — ${CHART_META[chartType].label} isn't available for a field treated as ${SCALE_DISPLAY[s].label.toLowerCase()}.`) +
+          (dropCompare ? " It charts one layer — the comparison was dropped." : ""),
       );
     } else {
       updateConfig(patch);
@@ -616,9 +630,19 @@ export function ChartRail({
   };
 
   /** Apply *next* (or none). A derived field is ordered categories, so the
-   * figure is re-picked at that scale when the current one is illegal there,
-   * and the bar axis defaults to value order — ranges read in order. */
-  const applyDerive = (next: DeriveSpec | null, chartOverride?: ChartType) => {
+   * figure is re-picked at that scale when the current one is illegal there.
+   * (The bar axis then reads in value order: `resolveChartOptions` defaults
+   * `sort` to "value" for a derived bar, so the page, the agent card, the
+   * snapshot and the HTML export order the same ranges the same way without
+   * anyone writing a sort into the config here.)
+   *
+   * *notice* is the caller's own sentence, if it has one; whatever this had to
+   * change beyond the derivation is appended to it. */
+  const applyDerive = (
+    next: DeriveSpec | null,
+    chartOverride?: ChartType,
+    notice?: string,
+  ) => {
     const resolvedType = resolveDeriveTarget(
       chartOverride ?? chartType,
       scale,
@@ -631,11 +655,27 @@ export function ChartRail({
     // while the caption — and a Story export — asserts a binning that never ran.
     if (next && !CHART_META[resolvedType].derives.includes(next.kind)) return;
     const patch: Partial<ChartConfig> = { derive: next };
-    if (resolvedType !== chartType) patch.chartType = resolvedType;
-    if (next && resolvedType === "bar" && config.options.sort == null) {
-      patch.options = { ...config.options, sort: "value" };
+    let extra = "";
+    if (resolvedType !== chartType) {
+      patch.chartType = resolvedType;
+      // The same two Compare obligations the gallery's own branch carries. A
+      // figure reached by clicking a greyed tile is the same figure reached by
+      // clicking it once it is lit: without the bootstrap, the derivation that
+      // lights `change` lands the analyst on its "needs a second window" dead
+      // end instead of on a chart.
+      if (dropCompareFor(resolvedType)) {
+        patch.compare = { mode: "off" };
+        extra = " It charts one layer — the comparison was dropped.";
+      } else if (
+        CHART_META[resolvedType].requiresCompare &&
+        config.compare.mode === "off"
+      ) {
+        patch.compare = { mode: "baseline" };
+        extra = ` Compare set to Baseline — ${CHART_META[resolvedType].label} needs two windows.`;
+      }
     }
     updateConfig(patch);
+    if (notice || extra) setAutoNotice((notice ?? "") + extra);
   };
 
   const fieldOptions: FieldComboOption[] = [
@@ -732,19 +772,27 @@ export function ChartRail({
             // A derivation the new field does not offer goes with the old one.
             if (derive && !deriveOptionsFor(scale, v).includes(derive.kind))
               patch.derive = null;
+            let droppedCompare = false;
             if (fieldFree) {
               // Leaving a field-free figure: land on the first figure that
               // charts a field, and say so — the analyst picked a field, not
               // a figure.
               const next = firstFieldChartingType(scale, v);
-              if (next) patch.chartType = next;
+              if (next) {
+                patch.chartType = next;
+                // Re-picking the figure owes the same Compare check the
+                // gallery and the Treat-as radios owe (`dropCompareFor`):
+                // Events over time compares, `line` does not.
+                droppedCompare = dropCompareFor(next);
+                if (droppedCompare) patch.compare = { mode: "off" };
+              }
             }
             updateConfig(patch);
             setAutoNotice(
               takesOverY
                 ? `${acceptsSecondField ? "Group by" : "Field (Y)"} cleared — ${fieldTokenLabel(v)} is now the X field.`
                 : fieldFree && patch.chartType
-                  ? `Figure set to ${CHART_META[patch.chartType].label} — the ${CHART_META[chartType].label} charts no field of its own.`
+                  ? `Figure set to ${CHART_META[patch.chartType].label} — the ${CHART_META[chartType].label} charts no field of its own.${droppedCompare ? " It charts one layer — the comparison was dropped." : ""}`
                   : null,
             );
           }}
@@ -980,15 +1028,20 @@ export function ChartRail({
                       // (and a Story export) still claimed it.
                       const dropDerive =
                         !!derive && !CHART_META[c].derives.includes(derive.kind);
-                      // Same argument one control over: a Compare layer the
-                      // new figure cannot draw stays in the config, where its
-                      // three radios render unchecked *and* disabled — nothing
-                      // on screen to see it by, nothing to clear it with — and
-                      // the caption names a comparison layer never fetched.
-                      const dropCompare =
-                        config.compare.mode !== "off" && !CHART_META[c].supportsCompare;
+                      // Same argument one control over (`dropCompareFor`).
+                      const dropCompare = dropCompareFor(c);
                       const patch: Partial<ChartConfig> = { chartType: c };
-                      if (dropDerive) patch.derive = null;
+                      if (dropDerive) {
+                        patch.derive = null;
+                        // Dropping the derivation drops the *effective* scale
+                        // with it, and the figure may be illegal at the raw one
+                        // — the tile would then render `aria-checked` and
+                        // `aria-disabled` at once, with a second click inert.
+                        // The effective scale is the one the analyst has been
+                        // reading the axis at, so the treat-as moves there.
+                        if (!chartTypesForField(scale, field).includes(c))
+                          patch.scale = effScale;
+                      }
                       if (dropCompare) patch.compare = { mode: "off" };
                       if (CHART_META[c].requiresCompare && config.compare.mode === "off") {
                         // The figure is defined by two windows; Baseline is the
@@ -1000,11 +1053,15 @@ export function ChartRail({
                         return;
                       }
                       updateConfig(patch);
+                      // "as is" only when the treat-as really did stay put.
+                      const asWhat = patch.scale
+                        ? `as ${SCALE_DISPLAY[patch.scale].label.toLowerCase()}`
+                        : "as is";
                       setAutoNotice(
                         dropDerive && dropCompare && field
-                          ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is, in one layer — the derivation and the comparison were dropped.`
+                          ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} ${asWhat}, in one layer — the derivation and the comparison were dropped.`
                           : dropDerive && field
-                            ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} as is — the derivation was dropped.`
+                            ? `${CHART_META[c].label} charts ${fieldTokenLabel(field)} ${asWhat} — the derivation was dropped.`
                             : dropCompare
                               ? `${CHART_META[c].label} charts one layer — the comparison was dropped.`
                               : null,
@@ -1012,8 +1069,9 @@ export function ChartRail({
                       return;
                     }
                     if (!fix || !field) return;
-                    applyDerive(fix, c);
-                    setAutoNotice(
+                    applyDerive(
+                      fix,
+                      c,
                       `${CHART_META[c].label} needs categories — ${
                         fix.kind === "timePart"
                           ? `took the ${TIME_PART_LABELS[fix.part]} (UTC) of ${fieldTokenLabel(field)}`
@@ -1642,7 +1700,12 @@ export function ChartRail({
                     Sort
                   </label>
                   <Select
-                    value={config.options.sort ?? "count"}
+                    // The resolved value, not the raw one: a derived bar
+                    // sorts by value without anything written into the
+                    // config (`resolveChartOptions`), and a control reading
+                    // the raw option would say "count" under an axis that is
+                    // ordered by value.
+                    value={sort}
                     onValueChange={(v) =>
                       updateConfig({
                         options: {

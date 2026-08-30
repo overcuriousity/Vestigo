@@ -177,3 +177,69 @@ describe("layoutMarks — degenerate ranges", () => {
     expect(layoutMarks(offEdge, x, 24).ranges).toHaveLength(0);
   });
 });
+
+describe("layoutMarks and the caption's off-axis verdict, at the edges", () => {
+  // Two ranges that touch the domain at exactly one instant: one ending on the
+  // first bucket start, one starting on the last. `layoutMarks` drew both as
+  // minimum-width bands while `outsideDomain` (`end <= lo || start >= hi`)
+  // called them not drawn, so the caption said "outside the drawn time axis,
+  // not drawn" under a band visibly on the canvas (#332).
+  const domain = [new Date(T0), new Date(T0 + 24 * 3_600_000)] as const;
+  const touching: ResolvedMark[] = [
+    {
+      kind: "range",
+      start: "2026-07-19T20:00:00+00:00",
+      end: "2026-07-20T00:00:00+00:00",
+      label: "ends on the first bucket",
+      source: 0,
+      provenance: { kind: "analyst" },
+    },
+    {
+      kind: "range",
+      start: "2026-07-21T00:00:00+00:00",
+      end: "2026-07-21T04:00:00+00:00",
+      label: "starts on the last",
+      source: 1,
+      provenance: { kind: "analyst" },
+    },
+  ];
+  const resp: ResolvedMarksResponse = {
+    marks: touching,
+    cap: 50,
+    sources: [
+      { index: 0, kind: "range", label: "ends on the first bucket", count: 1, shown: 1, overflow: false, undated: 0 },
+      { index: 1, kind: "range", label: "starts on the last", count: 1, shown: 1, overflow: false, undated: 0 },
+    ],
+  };
+
+  it("draws both, at the edge they touch", () => {
+    const ranges = layoutMarks(touching, x, 24).ranges;
+    expect(ranges.map((r) => [r.mark.label, r.x0, r.x1])).toEqual([
+      ["ends on the first bucket", 0, 2],
+      ["starts on the last", 22, 24],
+    ]);
+  });
+
+  it("and the caption calls neither of them off-axis", () => {
+    for (const line of markCaptionLines(resp, domain)) {
+      expect(line).not.toContain("outside the drawn time axis");
+    }
+  });
+
+  it("still calls a range wholly outside off-axis, and does not draw it", () => {
+    const away: ResolvedMark[] = [
+      {
+        kind: "range",
+        start: "2026-07-18T00:00:00+00:00",
+        end: "2026-07-19T00:00:00+00:00",
+        label: "the day before",
+        source: 0,
+        provenance: { kind: "analyst" },
+      },
+    ];
+    expect(layoutMarks(away, x, 24).ranges).toHaveLength(0);
+    expect(
+      markCaptionLines({ ...resp, marks: away, sources: [resp.sources[0]] }, domain)[0],
+    ).toContain("outside the drawn time axis, not drawn");
+  });
+});

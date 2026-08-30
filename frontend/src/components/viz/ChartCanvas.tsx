@@ -191,10 +191,11 @@ export function ChartMarks({
           sort={opts.sort}
           // A derived axis has no lexical order — "< 1,024" and "≥ 10,240"
           // sort as strings before every digit — which is why `BarChart` takes
-          // an explicit order and why `applyDerive` sets `sort: "value"` on
-          // every derived bar chart. Omitting it here made the snapshot, the
-          // HTML export and the agent card disagree with the live page about
-          // the order of the same ranges.
+          // an explicit order and why `resolveChartOptions` resolves `sort` to
+          // "value" for every derived bar chart, whether or not the config
+          // carries one. Omitting either half made the snapshot, the HTML
+          // export and the agent card disagree with the live page about the
+          // order of the same ranges.
           valueOrder={data.data.derive?.labels}
           logScale={opts.logScale}
         />
