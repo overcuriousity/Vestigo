@@ -4,9 +4,9 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 201 — the converter sample is condensed to line shapes).
+Last updated: 2026-08-30 (session 201 — the converter sample is small on purpose).
 
-## Session 201 — 2026-08-30: the converter excerpt sends shapes, not repetition
+## Session 201 — 2026-08-30: the converter excerpt shrinks to a few dozen lines
 
 A converter generation over a 348 KB / 3006-line nginx access log failed four times in a
 row with `TimeoutError`, then `502 ... upstream command exited prematurely`. The llama.cpp
@@ -17,53 +17,32 @@ cap upstream (not ours: `converter_generation_timeout_seconds` is 180 and the cl
 timeout was 300) that the request could never fit inside.
 
 The prompt was that big because the excerpt was 64 KiB of a log that says the same thing
-3000 times: three Uptime-Kuma probe lines a minute, all one format. About fifteen distinct
-line shapes carried every fact the converter needed.
+3000 times. A first cut of this fix condensed the excerpt to distinct line *shapes* (masked
+quoted runs / hex / digits, five lines per shape per block). Review found eight defects in
+that machinery — a clamp that produced a phantom empty line for files just over budget, a
+tail walk that orphaned stack-trace continuations, per-line request ids defeating the
+masking entirely, quoted delimiters and apostrophes confusing the shape, a sample-run input
+skewed toward unparseable lines, and two tests that never exercised the path they named —
+and the conclusion was that the cleverness was the problem. Generated converters are best
+effort by design: a frictionless start on a standard log, or a first try at a format nothing
+else covers, and if that fails the analyst takes the longer route anyway.
 
-**`converters/sample.py` now condenses each block.** A line's *shape* is the line with its
-quoted runs, long hex tokens and digit runs masked; at most `CONDENSE_KEEP_PER_SHAPE` (5)
-lines of each shape survive, per block. To spend the budget on variety rather than
-repetition, each window reads `CONDENSE_SCAN_FACTOR` (4) times its share off disk first,
-clamped so an enlarged head cannot swallow the middle or the tail. On a synthetic copy of
-the offending log the task message went from ~23k tokens to ~700, and *more* of the file is
-now read (~2200 lines of 3006, against ~600 before).
+**So the fix is just a smaller sample.** `converter_sample_bytes` defaults to **4 KiB** (floor
+1 KiB, was 64 KiB / 4 KiB) — a few dozen lines, still split 70/15/15 across the head, a middle
+window and the tail so the newest timestamps are in it. `converters/sample.py` is the
+streaming reader `main` already had, unchanged; no masking, no dedup. The system message now
+says the excerpt is deliberately short and that the converter is for the whole file
+(`SYSTEM_PROMPT_VERSION` → `"4"`), and `sample_as_file` writes **every** block rather than the
+head alone, so the guarded sample run sees the middle and the tail too. On the offending log
+the task message drops from ~23k tokens to ~1.4k (35 lines).
 
-Four things the masking had to get right, each of them a way to lose evidence:
-
-- **A quoted run masks to three kinds, not one** — empty, ordinary text, and escaped/control
-  bytes. Collapsing every `"…"` to `"S"` made `"" 400 0` (an empty request) and
-  `"\x16\x03\x02…"` (a TLS handshake sent to the HTTP port) the same shape as an ordinary
-  `GET`, and they are exactly the lines a naive access-log regex dies on.
-- **The tail keeps the *last* of each shape**, walking backwards, so it still ends at EOF —
-  the whole reason the excerpt has a tail is the newest timestamps.
-- **An indented line is never separated from the line above it**, so a stack trace or a
-  wrapped message stays whole rather than leaving its continuation attached to something
-  else.
-- **A file that already fits in the budget is sent whole.** Condensing it would throw
-  information away and buy nothing.
-
-`Sample.blocks` is now `list[Block]` with `(absolute line number, text)` pairs, because
-condensing punches holes in the numbering and the model is asked to cite those numbers.
-`prompt.py` renders the gap explicitly (`… N repeated line(s) elided …`) and the system
-message says the excerpt is condensed and that the converter is for the whole file — a
-change in substance, so `SYSTEM_PROMPT_VERSION` is `"4"`.
-
-`sample_as_file` now writes **every** block rather than the head alone. The excerpt is small
-now, and running the guarded sample-phase script over the middle and the tail is how the
-lines that break parsers get exercised before the full run rather than after it.
-
-`build_sample(..., condense=False)` returns the raw contiguous windows, which is what
-`test_streaming_scan_matches_reference` compares against its offset-list oracle — the
-streaming reader is unchanged and still tested as such.
-
-Doc and UI copy followed the behaviour: the upload dialog's egress disclosure now says "an
-excerpt of **at most** 64 KiB … condensed to the file's distinct line shapes" and no longer
-guesses a line count it cannot know, and `INPUT_FORMATS.md` §"What leaves the host" and the
-`converter_sample_bytes` setting help say the same.
+Docs and copy followed: `INPUT_FORMATS.md` §"The loop" step 1 states the size and why,
+`DEPLOYMENT.md` and the setting help say "small on purpose", and the upload dialog's
+disclosure quotes the new default.
 
 **Not fixed here:** the 240 s cap that killed the requests is in the llama.cpp/llama-swap
-deployment, not in this repo. A genuinely high-entropy file can still fill the 64 KiB budget
-and hit it; lower `converter_sample_bytes` or raise the server cap for those.
+deployment, not in this repo; a file of very wide lines (minified JSON) can still be a large
+prompt at 4 KiB — lower the setting further for those.
 
 ## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
 
