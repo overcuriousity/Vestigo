@@ -58,7 +58,9 @@ class SampleLike(Protocol):
     """What the renderers need from a sample: labelled, line-numbered blocks.
 
     ``record_lines`` (optional) numbers every shown line when a block's lines are
-    not consecutive in the file — a pretty-printed JSON record shown compact.
+    not consecutive in the file — a pretty-printed JSON record shown compact —
+    with ``None`` for a line the file has no counterpart for. ``line_spans``
+    (optional) is the first and last *file* line each block's records span.
     """
 
     blocks: list[tuple[str, int, str]]
@@ -194,22 +196,44 @@ def _render_sample(sample: SampleLike, line_count: int) -> str:
     The header is derived from the blocks, never a literal: a head-only file has
     no middle or end to promise, and the shortening rule is stated where it applies.
     """
-    numbering: list[list[int]] | None = getattr(sample, "record_lines", None)
+    numbering: list[list[int | None]] | None = getattr(sample, "record_lines", None)
+    extents: list[tuple[int, int]] | None = getattr(sample, "line_spans", None)
     spans: list[str] = []
     body: list[str] = []
     shown = 0
+    unnumbered = False
     for i, (label, first, text) in enumerate(sample.blocks):
         lines = text.split("\n")
-        numbers = numbering[i] if numbering else [first + j for j in range(len(lines))]
+        numbers: list[int | None] = (
+            numbering[i] if numbering else [first + j for j in range(len(lines))]
+        )
         shown += len(lines)
-        lo, hi = numbers[0], numbers[-1]
+        unnumbered = unnumbered or any(n is None for n in numbers)
+        if extents:
+            lo, hi = extents[i]
+        else:
+            known = [n for n in numbers if n is not None] or [first]
+            lo, hi = known[0], known[-1]
         spans.append(f"{label} {lo}" if lo == hi else f"{label} {lo}-{hi}")
-        body.append(f"--- {label} (line numbers are absolute) ---")
-        body.extend(f"{n:>4} | {line}" for n, line in zip(numbers, lines, strict=True))
+        body.append(f"--- {label} ---")
+        # A record shown re-formatted has more shown lines than file lines, so
+        # the gutter is blank for the ones that are not a line of the file —
+        # never a number the model would cite for the wrong text.
+        body.extend(
+            f"{n:>4} | {line}" if n is not None else f"{'':>4} | {line}"
+            for n, line in zip(numbers, lines, strict=True)
+        )
+    note = (
+        " A record is shown re-formatted with long values cut, so it has more lines here than "
+        "in the file: the number in the gutter is the file line its first line came from, and "
+        "its remaining lines have none."
+        if unnumbered
+        else ""
+    )
     header = (
-        f"SAMPLE ({shown} of {line_count} lines: {', '.join(spans)})\n"
-        "Values shown as …[N more chars] or …[N more items] are shortened here only; "
-        "the file has them whole."
+        f"SAMPLE ({shown} lines shown, drawn from {', '.join(spans)} of {line_count} lines)\n"
+        "Line numbers in the gutter are absolute. Values shown as …[N more chars] or "
+        f"…[N more items] are shortened here only; the file has them whole.{note}"
     )
     return header + "\n" + "\n".join(body)
 

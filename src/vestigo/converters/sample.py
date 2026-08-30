@@ -20,7 +20,8 @@ Two things are bounded, and they are not the same thing:
 A *record* starts after a marker: ``\\n`` for line-oriented text (syslog, CLF,
 JSON per line), ``\\n<indent>{`` for pretty-printed JSON objects or the elements
 of a pretty-printed top-level array. A one-line ``[{…},{…}]`` array has no
-markers; its head is the first elements, decoded, and nothing else. All
+markers; its head is the first elements, decoded, and nothing else. A leading
+``[`` alone never makes a file an array — plain logs start with one too. All
 positions come from one streaming pass over the file (O(1) memory).
 """
 
@@ -64,8 +65,16 @@ class Sample:
     blocks: list[tuple[str, int, str]]
     #: The same blocks as whole raw records — the sample-run input.
     raw_blocks: list[tuple[str, int, str]]
-    #: Per block, the absolute line number of each shown line.
-    record_lines: list[list[int]]
+    #: Per block, the absolute line number of each shown line — ``None`` for a
+    #: line that has none, because its record is shown re-formatted (a
+    #: pretty-printed JSON record with values shortened has fewer lines than the
+    #: file's, so only its first line maps onto one).
+    record_lines: list[list[int | None]]
+    #: Per block, the first and last *file* line its raw records span. The
+    #: header states this, never the shown-line count: a re-formatted record
+    #: makes the two differ, and claiming the wider one as a shown range is a
+    #: lie the model cannot check.
+    line_spans: list[tuple[int, int]]
     text: str
     size_bytes: int
     line_count: int
@@ -125,13 +134,19 @@ def _leading_ws(line: bytes) -> bytes:
     return line[: len(line) - len(line.lstrip(b" \t"))]
 
 
+def _lines_layout(probe: bytes) -> _Layout:
+    lines = probe.split(b"\n")[:-1]
+    return _Layout(LAYOUT_LINES, b"\n", quoted=any(line.count(b'"') % 2 for line in lines))
+
+
 def _detect_layout(probe: bytes, total: int) -> _Layout:
     """Decide how records are delimited from the first 8 KiB alone.
 
     ``{`` first: one object per line when the first line is complete JSON,
-    else pretty-printed objects starting at column 0. ``[`` first: one
-    element per ``\\n<indent>{`` when the array spans lines, else one inline
-    array. Anything else is lines.
+    else pretty-printed objects starting at column 0. ``[`` first *and* the
+    next non-space character opens a container: one element per
+    ``\\n<indent>{`` when the array spans lines, else one inline array.
+    Anything else is lines.
     """
     stripped = probe.lstrip(b" \t\r\n")
     first_line, _, _rest = stripped.partition(b"\n")
@@ -142,6 +157,14 @@ def _detect_layout(probe: bytes, total: int) -> _Layout:
         inner = _leading_ws(lines[1]) if len(lines) > 1 else b""
         return _Layout(LAYOUT_JSON_OBJECTS, b"\n{", inner_indent=inner.decode() or None)
     if stripped[:1] == b"[":
+        # A leading ``[`` is not evidence of JSON: bracket-prefixed plain logs
+        # are everywhere (Apache ``error_log``, ``[2026-03-01T10:00:00Z] INFO
+        # …``), and ``raw_decode`` at the byte after it happily reads ``2026``
+        # as the array's first element — which used to reduce the whole excerpt
+        # to a handful of numbers. Only an element that opens a container makes
+        # this an array; anything else is lines, which is what it reads as.
+        if stripped[1:].lstrip(b" \t\r\n")[:1] not in (b"{", b"["):
+            return _lines_layout(probe)
         if len(first_line) >= total - (len(probe) - len(stripped)) or _is_json(first_line):
             return _Layout(LAYOUT_JSON_ARRAY_INLINE, b"")
         if first_line.strip() == b"[":
@@ -157,8 +180,7 @@ def _detect_layout(probe: bytes, total: int) -> _Layout:
                         inner_indent=inner.decode() or None,
                     )
         return _Layout(LAYOUT_JSON_ARRAY_INLINE, b"")
-    lines = probe.split(b"\n")[:-1]
-    return _Layout(LAYOUT_LINES, b"\n", quoted=any(line.count(b'"') % 2 for line in lines))
+    return _lines_layout(probe)
 
 
 _SCAN_CHUNK = 1 << 20
@@ -389,9 +411,14 @@ def build_sample(path: Path, budget_bytes: int, *, mtime: float | None = None) -
     size_bytes = path.stat().st_size
 
     if layout.kind == LAYOUT_JSON_ARRAY_INLINE:
-        raw_blocks, blocks, lines = _inline_array_head(path, total, budget_bytes)
+        raw_blocks, blocks, lines, spans, decoded = _inline_array_head(path, total, budget_bytes)
         line_count = first.line_count if first else count_lines(path)
-        return _finish(raw_blocks, blocks, lines, size_bytes, line_count, mtime_iso, layout)
+        # Nothing decoded: the head is raw text, not array elements. Saying so
+        # keeps ``sample_as_file`` from wrapping it in a second pair of
+        # brackets the real file never has.
+        if not decoded:
+            layout = _lines_layout(probe)
+        return _finish(raw_blocks, blocks, lines, spans, size_bytes, line_count, mtime_iso, layout)
 
     head_b = int(budget_bytes * 0.70)
     mid_b = int(budget_bytes * 0.15)
@@ -445,7 +472,8 @@ def build_sample(path: Path, budget_bytes: int, *, mtime: float | None = None) -
     raw_blocks = [(b.label, b.first, b.raw) for b in blocks_]
     blocks = [(b.label, b.first, b.shown) for b in blocks_]
     lines = [b.numbers for b in blocks_]
-    return _finish(raw_blocks, blocks, lines, size_bytes, line_count, mtime_iso, layout)
+    spans = [(b.first, b.first + max(b.lines, 1) - 1) for b in blocks_]
+    return _finish(raw_blocks, blocks, lines, spans, size_bytes, line_count, mtime_iso, layout)
 
 
 @dataclass
@@ -454,7 +482,7 @@ class _Block:
     first: int
     raw: str
     shown: str
-    numbers: list[int]
+    numbers: list[int | None]
     #: Lines of the file the raw records span, and where the record after them starts.
     lines: int
     next_off: int | None
@@ -560,10 +588,19 @@ def _take_block(
         _rec, lines, _shown, size = items.pop(0)
         first_line += lines
         used -= size
-    numbers: list[int] = []
+    numbers: list[int | None] = []
     lines = 0
     for _rec, rec_lines, shown, _size in items:
-        numbers.extend(first_line + lines + j for j in range(shown.count("\n") + 1))
+        shown_lines = shown.count("\n") + 1
+        if shown_lines == rec_lines:
+            numbers.extend(first_line + lines + j for j in range(shown_lines))
+        else:
+            # A pretty-printed record is re-dumped with its long arrays and
+            # strings shortened, so shown line *j* is not the file's line *j*
+            # and every line after the first shortening would be mislabelled.
+            # Only the record's own first line has an absolute number.
+            numbers.append(first_line + lines)
+            numbers.extend([None] * (shown_lines - 1))
         lines += rec_lines
     if next_off is not None and next_off >= total:
         next_off = None
@@ -597,14 +634,29 @@ def _first_boundary(
 
 def _inline_array_head(
     path: Path, total: int, budget_bytes: int
-) -> tuple[list[tuple[str, int, str]], list[tuple[str, int, str]], list[list[int]]]:
-    """The first elements of a one-line array, decoded one by one."""
+) -> tuple[
+    list[tuple[str, int, str]],
+    list[tuple[str, int, str]],
+    list[list[int | None]],
+    list[tuple[int, int]],
+    bool,
+]:
+    """The first elements of a one-line array, decoded one by one.
+
+    The trailing flag is False when no element decoded and the head is the raw
+    text instead — the caller must then stop calling this an array.
+    """
     with _open(path) as fh:
         text = fh.read(min(total, _MAX_RECORD_BYTES)).decode("utf-8", errors="replace")
     dec = json.JSONDecoder()
     pos = text.find("[") + 1
     raws: list[str] = []
     shown: list[str] = []
+    starts: list[int] = []
+    # The elements of an array written over several lines do not share one line
+    # number, so each one's is counted as the decoder walks past it (forward
+    # only, so the whole head is still scanned once).
+    line, scanned = 1, 0
     used = 0
     layout = _Layout(LAYOUT_JSON_ARRAY_INLINE, b"")
     while True:
@@ -620,26 +672,43 @@ def _inline_array_head(
         s = _show_record(raw, layout, budget_bytes)
         if raws and used + len(s) + 1 > budget_bytes:
             break
+        line += text.count("\n", scanned, pos)
+        scanned = pos
         raws.append(raw)
         shown.append(s)
+        starts.append(line)
         used += len(s) + 1
         pos = end
     if not raws:  # not decodable element by element: show the head as text
-        raws = [text[:budget_bytes]]
-        shown = [_cut(text, budget_bytes)]
-    head_line = text[: text.find("[") + 1].count("\n") + 1
-    numbers = [head_line + i for i in range(sum(s.count("\n") + 1 for s in shown))]
+        head = text[:budget_bytes]
+        return (
+            [("head", 1, head)],
+            [("head", 1, _cut(text, budget_bytes))],
+            [[1 + i for i in range(head.count("\n") + 1)]],
+            [(1, 1 + head.count("\n"))],
+            False,
+        )
+    numbers: list[int | None] = []
+    for start, s in zip(starts, shown, strict=True):
+        # An element is re-dumped shortened, so only its own first line maps
+        # onto a line of the file.
+        numbers.append(start)
+        numbers.extend([None] * s.count("\n"))
+    span = (starts[0], starts[-1] + raws[-1].count("\n"))
     return (
-        [("head", head_line, ",".join(raws))],
-        [("head", head_line, "\n".join(shown))],
+        [("head", starts[0], ",".join(raws))],
+        [("head", starts[0], "\n".join(shown))],
         [numbers],
+        [span],
+        True,
     )
 
 
 def _finish(
     raw_blocks: list[tuple[str, int, str]],
     blocks: list[tuple[str, int, str]],
-    lines: list[list[int]],
+    lines: list[list[int | None]],
+    spans: list[tuple[int, int]],
     size_bytes: int,
     line_count: int,
     mtime_iso: str | None,
@@ -650,6 +719,7 @@ def _finish(
         blocks=blocks,
         raw_blocks=raw_blocks,
         record_lines=lines,
+        line_spans=spans,
         text=text,
         size_bytes=size_bytes,
         line_count=line_count,

@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 
 from vestigo.converters.sample import (
+    LAYOUT_JSON_ARRAY,
+    LAYOUT_JSON_ARRAY_INLINE,
+    LAYOUT_LINES,
     NotTextError,
     assert_text_file,
     build_sample,
@@ -237,6 +240,67 @@ def test_one_line_array_is_a_head_of_whole_elements(tmp_path):
     out = sample_as_file(s, tmp_path / "in", "export.json")
     items = json.loads(out.read_text())
     assert isinstance(items, list) and 1 <= len(items) < 500 and items[0]["seq"] == 0
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[2026-03-01T10:00:0{i}Z] INFO worker started job {i}",
+        "[Wed Oct 11 14:32:0{i} 2000] [error] client denied: /x{i}",
+        "[{i}] plain bracketed counter line",
+    ],
+)
+def test_a_bracket_prefixed_text_log_is_lines_not_a_json_array(tmp_path, line):
+    # A leading "[" is not evidence of JSON. raw_decode at the byte after it
+    # reads "2026" as the array's first element, which reduced the whole excerpt
+    # to a handful of numbers and could never produce a working converter.
+    p = tmp_path / "app.log"
+    p.write_text("".join(line.format(i=i % 10) + "\n" for i in range(500)))
+    s = build_sample(p, budget_bytes=4096)
+    assert s.layout == LAYOUT_LINES
+    file_lines = p.read_text().split("\n")
+    for _label, first, raw in s.raw_blocks:
+        records = raw.split("\n")
+        assert all(r.startswith("[") for r in records)
+        assert file_lines[first - 1 : first - 1 + len(records)] == records
+    body = sample_as_file(s, tmp_path / "in", "app.log").read_text()
+    assert all(line.startswith("[") for line in body.rstrip("\n").split("\n"))
+
+
+def test_an_undecodable_bracketed_head_is_written_verbatim(tmp_path):
+    # It opens like an array but no element decodes (truncated export). The head
+    # is raw text then, so it must not be wrapped in a second pair of brackets
+    # the file never had — the sample run would see a first line the real file
+    # does not have and an otherwise-correct converter could fail its floor.
+    text = '[{"seq": 0, "body": "' + "b" * 5000
+    p = tmp_path / "truncated.json"
+    p.write_text(text)
+    s = build_sample(p, budget_bytes=4096)
+    assert s.layout == LAYOUT_LINES
+    out = sample_as_file(s, tmp_path / "in", "truncated.json")
+    body = out.read_text()
+    assert body.startswith('[{"seq": 0') and not body.startswith("[[")
+    assert text.startswith(body.rstrip("\n"))
+
+
+def test_a_real_inline_array_is_still_an_array(tmp_path):
+    p = tmp_path / "export.json"
+    p.write_text(json.dumps([{"seq": i} for i in range(50)]))
+    assert build_sample(p, budget_bytes=4096).layout == LAYOUT_JSON_ARRAY_INLINE
+    p.write_text("[\n" + ",\n".join(f'  {{"seq": {i}}}' for i in range(400)) + "\n]\n")
+    assert build_sample(p, budget_bytes=4096).layout == LAYOUT_JSON_ARRAY
+
+
+def test_an_arrays_elements_carry_their_own_line_numbers(tmp_path):
+    # An array written over several lines whose elements are arrays: the inline
+    # path decodes them, and each one's line number is its own, not the head's.
+    p = tmp_path / "rows.json"
+    p.write_text("[\n" + ",\n".join(f'  [{i}, "row {i}"]' for i in range(200)) + "\n]\n")
+    s = build_sample(p, budget_bytes=4096)
+    assert s.layout == LAYOUT_JSON_ARRAY_INLINE
+    numbers = [n for n in s.record_lines[0] if n is not None]
+    assert numbers == list(range(2, 2 + len(numbers)))
+    assert s.line_spans[0][0] == 2
 
 
 def test_quoted_csv_seam_blocks_are_dropped(tmp_path):

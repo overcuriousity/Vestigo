@@ -58,7 +58,26 @@ help say "small on purpose"; the upload dialog's disclosure waits for the server
 
 **Not fixed here:** the 240 s cap that killed the requests is in the llama.cpp/llama-swap
 deployment, not in this repo; a file of very wide lines (minified JSON) can still be a large
-prompt at 4 KiB — lower the setting further for those.
+prompt at 4 KiB, and the setting cannot go below it — 4 KiB is both the default and the floor,
+because below it the 70/15/15 split cannot hold a whole ordinary line per block, and a block
+holds at least one record however long. Such a file is what the longer route is for.
+
+A second review of the excerpt found three more defects, all in how a leading `[` was read.
+`_detect_layout` treated *any* file whose first non-space byte was `[` as a JSON array, so a
+bracket-prefixed plain log — Apache `error_log`, `[2026-03-01T10:00:00Z] INFO …`, the
+commonest shape there is — had `raw_decode` called at the byte after it, which happily read
+`2026` as the array's first element: the whole excerpt became five numbers and the sample run
+got `[2026,-0,3,-0,1]`, so generation could never succeed and it *looked* like it had sampled
+the file. A leading `[` is now only an array when the next non-space character opens a
+container; anything else is lines, which is what it is. When nothing decodes after that (a
+truncated export), the head is raw text, and `sample_as_file` no longer wraps it in a second
+pair of brackets the file never had. And `record_lines` assumed shown line *j* was raw line
+*j*, which is false for a pretty-printed record re-dumped with its arrays and strings
+shortened: every line after the first shortening carried a number pointing at unrelated text,
+under a header that promised the numbers were absolute. A re-formatted record now numbers only
+its own first line and leaves the rest of the gutter blank, the elements of a multi-line array
+carry their own line numbers, and the header states the file lines each block spans
+(`Sample.line_spans`) rather than counting shown lines against file lines.
 
 ## Session 200 — 2026-08-29: the top-values list stops being a dead end (#296, #297)
 

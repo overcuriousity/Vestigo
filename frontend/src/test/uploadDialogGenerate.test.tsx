@@ -201,4 +201,23 @@ describe("UploadDialog — disclosure waits for the server", () => {
     await waitFor(() => expect(note.textContent).toContain("64"));
     await waitFor(() => expect(submit.disabled).toBe(false));
   });
+
+  it("says so and offers a retry when the sample size cannot be loaded", async () => {
+    // Without this the dialog sits on "Loading…" forever with submit disabled:
+    // no error, no way out, and the analyst cannot tell a slow server from a
+    // dead one.
+    capsMock.mockReturnValue({ converter_generation: true });
+    listMock.mockRejectedValue(new Error("500"));
+    renderDialog();
+    openAndSwitch();
+    pickFile("app.log");
+    const note = await screen.findByRole("note");
+    await waitFor(() => expect(note.textContent).toMatch(/could not load/i));
+    const submit = screen.getByRole("button", { name: "Generate & ingest" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    listMock.mockResolvedValue({ scripts: [], sample_bytes: 65536 });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(note.textContent).toContain("64"));
+    await waitFor(() => expect(submit.disabled).toBe(false));
+  });
 });

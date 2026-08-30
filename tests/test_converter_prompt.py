@@ -108,7 +108,23 @@ def test_sample_header_states_the_real_block_ranges_not_a_literal():
     )
     system, task = P.render_generation_prompt(**{**KW, "sample": three, "line_count": 1000})
     assert "few dozen" not in system and "the end of the file" not in system
-    assert "SAMPLE (8 of 1000 lines: head 1-3, middle 500-501, tail 998-1000)" in task
+    assert (
+        "SAMPLE (8 lines shown, drawn from head 1-3, middle 500-501, tail 998-1000 of 1000 lines)"
+        in task
+    )
     assert "more chars]" in task  # the shortening rule is stated where it applies
     _system, task = P.render_generation_prompt(**KW)
-    assert "SAMPLE (2 of 2 lines: head 1-2)" in task
+    assert "SAMPLE (2 lines shown, drawn from head 1-2 of 2 lines)" in task
+
+
+def test_a_reformatted_record_gets_a_blank_gutter_not_a_wrong_line_number():
+    # A pretty-printed record is re-dumped shortened, so only its first line is a
+    # line of the file — the rest must not claim one, and the header must state
+    # the file lines the block covers rather than the count of shown lines.
+    one = _S(blocks=[("head", 1, '{\n  "a": 1,\n  "b": 2\n}')])
+    one.record_lines = [[1, None, None, None]]
+    one.line_spans = [(1, 9)]
+    _system, task = P.render_generation_prompt(**{**KW, "sample": one, "line_count": 90})
+    assert "SAMPLE (4 lines shown, drawn from head 1-9 of 90 lines)" in task
+    assert "re-formatted with long values cut" in task
+    assert '   1 | {\n     |   "a": 1,\n     |   "b": 2\n     | }' in task

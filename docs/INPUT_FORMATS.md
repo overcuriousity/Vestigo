@@ -545,14 +545,22 @@ year, and to say which in `timezone_assumption`.
    line-oriented text, `\n<indent>{` for pretty-printed JSON objects or the elements of
    a pretty-printed top-level array (a one-line `[{…},{…}]` array yields a head of decoded
    elements and nothing else), and where the probe shows quoted multi-line CSV fields a
-   boundary is a newline with an even number of `"` before it in the file. A block holds
+   boundary is a newline with an even number of `"` before it in the file. A leading `[`
+   alone is not read as an array — bracket-prefixed plain logs are everywhere, and decoding
+   `[2026-03-01T10:00:00Z] INFO …` element by element yields the number `2026` — so the
+   next non-space character must open a container, and when no element decodes after that
+   the head is raw text written verbatim rather than re-wrapped in brackets. A block holds
    at least one record even when that record alone is longer than its share (a 20 KB
    session-log line at 4 KiB), and the tail is the last record when none starts inside the
    last 15 %. What the model sees is the same records shortened to the budget: a JSON
    record with every key and level of nesting but strings over 160 chars and arrays over 8
    items cut as `…[N more chars]` / `…[N more items]`, any other line cut at its block's
    share the same way. The task header names the block line ranges and that rule, so the
-   prompt never claims a middle or an end the excerpt does not have. The sample-phase run
+   prompt never claims a middle or an end the excerpt does not have. A record shown
+   re-formatted has more lines than the file's, so only its first line carries an absolute
+   number and the rest of the gutter is blank — a number the model would cite for the wrong
+   text is worse than none, and the header says which file lines each block spans rather
+   than counting shown lines against the file's. The sample-phase run
    gets the whole raw records of every block (a top-level array written back as one).
 2. **Generate.** One typed model call (`converters/generator.py`) returns `{name, artifact,
    script}`, under `converter_generation_timeout_seconds` (default 180) for the whole

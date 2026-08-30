@@ -44,7 +44,12 @@ export function UploadDialog({ caseId }: Props) {
   // Fetched whenever the dialog is open and the feature is on at all: the
   // saved converters decide whether the converter mode is worth offering
   // when only reuse is possible, plus the sample budget the server will send.
-  const { data: caseConverters } = useQuery({
+  const {
+    data: caseConverters,
+    isError: convertersFailed,
+    isFetching: convertersFetching,
+    refetch: refetchConverters,
+  } = useQuery({
     queryKey: ["converters", caseId],
     queryFn: () => convertersApi.listForCase(caseId),
     enabled: open && canReuse,
@@ -300,7 +305,26 @@ export function UploadDialog({ caseId }: Props) {
                   className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-fg-primary)]"
                 >
                   {sampleBytes === undefined ? (
-                    <p>Loading what will be sent to the model…</p>
+                    convertersFailed ? (
+                      // The disclosure states what leaves the host, so it is
+                      // never guessed — but a failed fetch must say so and
+                      // offer the retry, not sit on "Loading…" forever with
+                      // submit disabled and nothing to act on.
+                      <p className="flex flex-wrap items-center gap-2">
+                        Could not load what will be sent to the model, so this cannot be
+                        submitted yet.
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={convertersFetching}
+                          onClick={() => void refetchConverters()}
+                        >
+                          {convertersFetching ? "Retrying…" : "Retry"}
+                        </Button>
+                      </p>
+                    ) : (
+                      <p>Loading what will be sent to the model…</p>
+                    )
                   ) : (
                     <p>
                       A {fmtBytes(sampleBytes)} excerpt
