@@ -514,8 +514,8 @@ says so instead of a bare "completed".
 ### What leaves the host
 
 Exactly this, and the dialog says so before the analyst confirms: a bounded excerpt of the raw
-file (`converter_sample_bytes`, default 4 KiB — the head, a middle window and the tail, with
-absolute line numbers), the filename, its size, line count and mtime, the version — and,
+file (`converter_sample_bytes`, default 4 KiB — whole records from the head, a middle window
+and the tail, with absolute line numbers, long values shortened), the filename, its size, line count and mtime, the version — and,
 once known, the name — the script must declare, and the analyst's optional hint. No case, source, timeline or user identifier,
 no key, no host name. Reusing a saved converter sends nothing. `tests/test_converter_prompt.py`
 asserts the rendered prompt against this list.
@@ -531,15 +531,29 @@ year, and to say which in `timezone_assumption`.
 ### The loop
 
 1. **Sample.** Binary files are refused up front (NUL bytes / mostly non-printable). The
-   excerpt is deliberately small — 4 KiB, a few dozen lines split 70/15/15 across the head,
-   a middle window and the tail. A log is mostly the same handful of lines over and over,
+   excerpt is deliberately small — 4 KiB (the floor), split 70/15/15 across the head, a
+   middle window and the tail. A log is mostly the same handful of lines over and over,
    so a few dozen teach the format as well as a few thousand do, and the earlier 64 KiB
    default was ~50k tokens of prompt on a repetitive nginx log: 91 s of prefill on a local
    model, killed by its server's 240 s cap on every attempt. Generated converters are best
    effort by design — a frictionless start on a standard log, or a first try at a format
    nothing else covers — and a format the excerpt does not show is what the longer route
-   (a saved converter, or a proper parser producing CSV/Parquet) is for. The sample-phase
-   run executes the script over the whole excerpt — head, middle and tail.
+   (a saved converter, or a proper parser producing CSV/Parquet) is for.
+
+   The budget bounds what is *shown*, never what a block may hold. Every block is whole
+   **records** (`converters/sample.py`): a record starts after a marker — `\n` for
+   line-oriented text, `\n<indent>{` for pretty-printed JSON objects or the elements of
+   a pretty-printed top-level array (a one-line `[{…},{…}]` array yields a head of decoded
+   elements and nothing else), and where the probe shows quoted multi-line CSV fields a
+   boundary is a newline with an even number of `"` before it in the file. A block holds
+   at least one record even when that record alone is longer than its share (a 20 KB
+   session-log line at 4 KiB), and the tail is the last record when none starts inside the
+   last 15 %. What the model sees is the same records shortened to the budget: a JSON
+   record with every key and level of nesting but strings over 160 chars and arrays over 8
+   items cut as `…[N more chars]` / `…[N more items]`, any other line cut at its block's
+   share the same way. The task header names the block line ranges and that rule, so the
+   prompt never claims a middle or an end the excerpt does not have. The sample-phase run
+   gets the whole raw records of every block (a top-level array written back as one).
 2. **Generate.** One typed model call (`converters/generator.py`) returns `{name, artifact,
    script}`, under `converter_generation_timeout_seconds` (default 180) for the whole
    round — availability probe, config resolution and the model request together. A model
@@ -568,8 +582,8 @@ year, and to say which in `timezone_assumption`.
    script can look for another path through the object graph: what stands behind it is the
    runner (below), the fact that the script only ever sees a private *copy* of its input,
    and the dedicated app user (`docs/DEPLOYMENT.md`).
-4. **Sample run.** The script runs on the head excerpt, staged under the upload's own
-   basename and — for a `.gz` upload — re-gzipped, so `-i` looks exactly as it will in the
+4. **Sample run.** The script runs on the excerpt — the whole raw records of the head, the
+   middle and the tail — staged under the upload's own basename and — for a `.gz` upload — re-gzipped, so `-i` looks exactly as it will in the
    full run (a script that handles `.gz` by suffix behaves the same in both phases, and the
    `source_file` it records is the evidence file's name, never the retention hash). The
    uploaded filename is reduced to a basename before it touches any path. The run is

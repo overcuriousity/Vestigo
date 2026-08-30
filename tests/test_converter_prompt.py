@@ -94,3 +94,21 @@ def test_prompt_endpoint(client, admin_bootstrap):
     body = client.get("/api/converters/prompt").json()
     assert body["parquet"] == P.render_human_prompt_parquet()
     assert body["csv"] == P.render_human_prompt_csv()
+
+
+def test_sample_header_states_the_real_block_ranges_not_a_literal():
+    # The system message stays generic; the task names what the excerpt actually holds
+    # (a head-only file has no "middle" or "end" to promise) and the shortening rule.
+    three = _S(
+        blocks=[
+            ("head", 1, "a\nb\nc"),
+            ("middle", 500, "d\ne"),
+            ("tail", 998, "f\ng\nh"),
+        ]
+    )
+    system, task = P.render_generation_prompt(**{**KW, "sample": three, "line_count": 1000})
+    assert "few dozen" not in system and "the end of the file" not in system
+    assert "SAMPLE (8 of 1000 lines: head 1-3, middle 500-501, tail 998-1000)" in task
+    assert "more chars]" in task  # the shortening rule is stated where it applies
+    _system, task = P.render_generation_prompt(**KW)
+    assert "SAMPLE (2 of 2 lines: head 1-2)" in task

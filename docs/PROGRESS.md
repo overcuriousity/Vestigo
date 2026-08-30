@@ -4,9 +4,9 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 201 — the converter sample is small on purpose).
+Last updated: 2026-08-30 (session 201 — the converter sample is small on purpose, and whole records).
 
-## Session 201 — 2026-08-30: the converter excerpt shrinks to a few dozen lines
+## Session 201 — 2026-08-30: the converter excerpt shrinks to a few dozen records
 
 A converter generation over a 348 KB / 3006-line nginx access log failed four times in a
 row with `TimeoutError`, then `502 ... upstream command exited prematurely`. The llama.cpp
@@ -27,18 +27,34 @@ and the conclusion was that the cleverness was the problem. Generated converters
 effort by design: a frictionless start on a standard log, or a first try at a format nothing
 else covers, and if that fails the analyst takes the longer route anyway.
 
-**So the fix is just a smaller sample.** `converter_sample_bytes` defaults to **4 KiB** (floor
-1 KiB, was 64 KiB / 4 KiB) — a few dozen lines, still split 70/15/15 across the head, a middle
-window and the tail so the newest timestamps are in it. `converters/sample.py` is the
-streaming reader `main` already had, unchanged; no masking, no dedup. The system message now
-says the excerpt is deliberately short and that the converter is for the whole file
-(`SYSTEM_PROMPT_VERSION` → `"4"`), and `sample_as_file` writes **every** block rather than the
-head alone, so the guarded sample run sees the middle and the tail too. On the offending log
-the task message drops from ~23k tokens to ~1.4k (35 lines).
+**So the fix is a smaller sample.** `converter_sample_bytes` defaults to **4 KiB** (also the
+floor, as before) — split 70/15/15 across the head, a middle window and the tail so the newest
+timestamps are in it. The system message says the excerpt is deliberately short and that the
+converter is for the whole file (`SYSTEM_PROMPT_VERSION` → `"4"`), and `sample_as_file` writes
+**every** block rather than the head alone, so the guarded sample run sees the middle and the
+tail too. On the offending log the task message drops from ~23k tokens to ~1.4k (35 lines).
 
-Docs and copy followed: `INPUT_FORMATS.md` §"The loop" step 1 states the size and why,
-`DEPLOYMENT.md` and the setting help say "small on purpose", and the upload dialog's
-disclosure quotes the new default.
+Review of that cut found the byte split had no notion of a record: at 4 KiB the blocks are
+2867/614/615 bytes, so a 1.5 KB JSONL line came out as a fragment with an absolute line number
+and no marker, a 3 KB line made even the head a fragment (0/2 valid records — no converter
+could ever pass the 50 % floor), a last line longer than 615 bytes meant no tail at all, and a
+middle block could start inside a quoted multi-line CSV field. **The budget now bounds what is
+shown, not what a block may hold.** `converters/sample.py` reads whole *records* — a marker
+(`\n`; `\n<indent>{` for pretty-printed JSON objects and array elements; a quote-parity-aware
+newline when the probe shows multi-line quoted fields) found at C speed in the same O(1)
+streaming scan — at least one per block however long, with the last record as the tail
+fallback, and a one-line `[{…},{…}]` array yields a head of decoded elements. `Sample.raw_blocks`
+are those records (the sample-run input, a top-level array written back as one);
+`Sample.blocks` are what the model sees: a JSON record with every key but long strings and
+arrays cut as `…[N more chars]` / `…[N more items]`, any other line cut at its block's share.
+The task header names the real block line ranges and that rule instead of a literal in the
+system message. Measured on an 85-record Claude session transcript (2.8 KB median, 20 KB max
+line): head/middle/tail all whole records, prompt ~4k tokens.
+
+Docs and copy followed: `INPUT_FORMATS.md` §"The loop" steps 1 and 4 state the size, the
+record rule and that the sample run sees the whole excerpt; `DEPLOYMENT.md` and the setting
+help say "small on purpose"; the upload dialog's disclosure waits for the server's
+`sample_bytes` (submit is disabled until then) instead of rendering a guessed default.
 
 **Not fixed here:** the 240 s cap that killed the requests is in the llama.cpp/llama-swap
 deployment, not in this repo; a file of very wide lines (minified JSON) can still be a large

@@ -53,7 +53,9 @@ export function UploadDialog({ caseId }: Props) {
     () => (caseConverters?.scripts ?? []).filter((c) => c.status === "working"),
     [caseConverters],
   );
-  const sampleBytes = caseConverters?.sample_bytes ?? 4096;
+  // Undefined until the server answers: the disclosure states what leaves the
+  // host, so it is never rendered from a guessed default, and submit waits for it.
+  const sampleBytes = caseConverters?.sample_bytes;
   const converterMode = canGenerate || (canReuse && reusable.length > 0);
   const generating = mode === "generate" && converterMode;
   // Reuse-only: the select has no "generate a new one" entry, so a script must
@@ -171,7 +173,11 @@ export function UploadDialog({ caseId }: Props) {
   })();
   const modelName = agentInfo?.model ?? "the configured model";
   // Rough: the disclosure quotes bytes exactly and lines approximately.
-  const approxLines = file ? Math.max(1, Math.round(Math.min(file.size, sampleBytes) / 80)) : 0;
+  const approxLines =
+    file && sampleBytes !== undefined
+      ? Math.max(1, Math.round(Math.min(file.size, sampleBytes) / 80))
+      : 0;
+  const disclosurePending = generating && !reuseId && sampleBytes === undefined;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -293,15 +299,20 @@ export function UploadDialog({ caseId }: Props) {
                   role="note"
                   className="rounded border border-[var(--color-warning)]/40 bg-[var(--color-warning-dim)] px-3 py-2 text-xs text-[var(--color-fg-primary)]"
                 >
-                  <p>
-                    A {fmtBytes(sampleBytes)} excerpt
-                    {file ? ` of “${file.name}” (about ${approxLines.toLocaleString()} lines)` : " of the file"}{" "}
-                    — taken from its beginning, its middle and its end, so newest entries are
-                    included — will be sent to <span className="font-mono">{modelName}</span> at{" "}
-                    <span className="font-mono">{endpointHost}</span>. Nothing else about this case
-                    is sent. The script it writes runs on this server in a guarded subprocess, and
-                    every attempt is recorded with the converter.
-                  </p>
+                  {sampleBytes === undefined ? (
+                    <p>Loading what will be sent to the model…</p>
+                  ) : (
+                    <p>
+                      A {fmtBytes(sampleBytes)} excerpt
+                      {file ? ` of “${file.name}” (about ${approxLines.toLocaleString()} lines)` : " of the file"}{" "}
+                      — whole records from its beginning, its middle and its end, so the newest
+                      entries are included; long values are shortened — will be sent to{" "}
+                      <span className="font-mono">{modelName}</span> at{" "}
+                      <span className="font-mono">{endpointHost}</span>. Nothing else about this
+                      case is sent. The script it writes runs on this server in a guarded
+                      subprocess, and every attempt is recorded with the converter.
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -365,7 +376,7 @@ export function UploadDialog({ caseId }: Props) {
                 variant="accent"
                 size="sm"
                 data-tour="upload-submit"
-                disabled={!file || active || needsReuseChoice}
+                disabled={!file || active || needsReuseChoice || disclosurePending}
                 onClick={() => convert.submit()}
               >
                 {convert.active

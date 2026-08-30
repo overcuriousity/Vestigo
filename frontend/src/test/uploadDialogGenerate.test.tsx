@@ -170,6 +170,7 @@ describe("UploadDialog — AI converter mode", () => {
     renderDialog();
     openAndSwitch();
     pickFile("app.log");
+    await screen.findByText(/64/); // the disclosure has loaded; submit is live
     fireEvent.click(screen.getByRole("button", { name: "Generate & ingest" }));
     await waitFor(() => expect(convertMock).toHaveBeenCalledTimes(1));
     const other = screen.getByRole("button", { name: /Upload timeline/ }) as HTMLButtonElement;
@@ -179,5 +180,25 @@ describe("UploadDialog — AI converter mode", () => {
     expect(screen.getByRole("button", { name: /Cancel upload/ })).toBeTruthy();
     resolve({ job_id: "job-3", converter_script_id: null });
     await waitFor(() => expect(useJobsStore.getState().jobs["job-3"]).toBeTruthy());
+  });
+});
+
+describe("UploadDialog — disclosure waits for the server", () => {
+  it("discloses nothing and blocks submit until the sample size has loaded", async () => {
+    capsMock.mockReturnValue({ converter_generation: true });
+    let resolveList!: (v: unknown) => void;
+    listMock.mockReturnValue(new Promise((r) => { resolveList = r; }));
+    renderDialog();
+    openAndSwitch();
+    pickFile("app.log");
+    const note = await screen.findByRole("note");
+    // The disclosure is the statement of what leaves the host: never a guessed default.
+    expect(note.textContent).toMatch(/loading/i);
+    expect(note.textContent).not.toContain("KB");
+    const submit = screen.getByRole("button", { name: "Generate & ingest" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    resolveList({ scripts: [], sample_bytes: 65536 });
+    await waitFor(() => expect(note.textContent).toContain("64"));
+    await waitFor(() => expect(submit.disabled).toBe(false));
   });
 });
