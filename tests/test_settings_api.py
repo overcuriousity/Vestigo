@@ -266,3 +266,34 @@ async def test_invalid_stored_value_is_ignored_not_fatal(store, caplog):
     applied = await load_runtime_settings()
     assert applied == {"stat_rarity_floor": 5}
     assert get_settings().stat_scan_concurrency == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["vestigo.example.org", "vestigo.example.org/cases", "ftp://vestigo.example.org", "https://"],
+)
+def test_public_base_url_refuses_a_link_a_client_would_read_as_relative(value):
+    """A scheme-less base URL is itself a relative path — the failure this
+    setting exists to prevent, and silent, since the result still looks like a
+    URL."""
+    with pytest.raises(ValueError):
+        Settings(public_base_url=value)
+
+
+@pytest.mark.parametrize("value", ["https://vestigo.example.org", "http://10.0.0.5:8080/vestigo"])
+def test_public_base_url_accepts_an_absolute_url(value):
+    assert Settings(public_base_url=value).public_base_url == value
+
+
+def test_public_base_url_treats_empty_as_unset():
+    """The admin console clears a text field by sending "", not null."""
+    assert Settings(public_base_url="  ").public_base_url is None
+
+
+def test_put_rejects_a_scheme_less_public_base_url(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/settings", json={"values": {"public_base_url": "vestigo.example.org"}}
+    )
+    assert resp.status_code == 422
+    assert get_settings().public_base_url is None

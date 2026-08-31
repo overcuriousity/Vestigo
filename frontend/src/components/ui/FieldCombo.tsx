@@ -43,6 +43,8 @@ interface Props {
   variant?: "bordered" | "inline";
   /** `sm` matches the Investigate toolbars' compact row; `md` the sidebars'. */
   size?: "sm" | "md";
+  /** Put on the text input, so a caller's `<label htmlFor>` focuses it. */
+  id?: string;
   className?: string;
   "aria-label"?: string;
   "data-testid"?: string;
@@ -57,6 +59,7 @@ export function FieldCombo({
   allowFreeText = true,
   variant = "bordered",
   size = "md",
+  id,
   className,
   "aria-label": ariaLabel,
   "data-testid": testId,
@@ -211,6 +214,7 @@ export function FieldCombo({
     <div ref={containerRef} className={cn("relative", className)}>
       <div className="relative">
         <input
+          id={id}
           role="combobox"
           aria-expanded={open}
           aria-autocomplete="list"

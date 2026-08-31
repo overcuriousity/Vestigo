@@ -113,6 +113,33 @@ describe("suggestBindings", () => {
     expect(missingRoles(s, { bytes: "attr:bytes_out" })).toEqual([]);
   });
 
+  it("matches a role hint at a word boundary, not mid-token", () => {
+    // `security` contains "uri", `filepath` contains "path" — and both would
+    // outrank the real request field, which is the whole failure mode.
+    const decoys: VizFieldInfo[] = [
+      { token: "attr:security_id", distinct: 20, coverage: 0.99 },
+      { token: "attr:filepath", distinct: 800, coverage: 0.98 },
+      { token: "attr:abuser", distinct: 10, coverage: 0.97 },
+      { token: "attr:url_path", distinct: 3000, coverage: 0.5 },
+    ];
+    const b = suggestBindings(byId("sql-injection"), decoys);
+    expect(b.target).toBe("attr:url_path");
+    expect(suggestBindings(byId("lateral-movement"), decoys).account).toBeUndefined();
+  });
+
+  it("reads a camelCase token as separated words, so Windows fields still match", () => {
+    const windows: VizFieldInfo[] = [
+      { token: "attr:TargetUserName", distinct: 90, coverage: 0.9 },
+      { token: "attr:CommandLine", distinct: 900, coverage: 0.8 },
+    ];
+    expect(suggestBindings(byId("rdp-interaction"), windows).account).toBe(
+      "attr:TargetUserName",
+    );
+    expect(suggestBindings(byId("sql-injection"), windows).target).toBe(
+      "attr:CommandLine",
+    );
+  });
+
   it("needs no binding at all for a field-free scenario", () => {
     const s = byId("off-hours-activity");
     expect(missingRoles(s, {})).toEqual([]);

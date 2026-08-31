@@ -67,13 +67,50 @@ export interface Scenario {
   filter?: ScenarioFilterSpec;
 }
 
-/** Substrings that read as "the address that connected". */
-const ADDRESS = /(src|source|client|remote|peer|caller)[._-]?(ip|addr|address|host|name)|(^|[.:_])(ip|addr|address)([._-]|$)/i;
-const TARGET = /(dst|dest|destination|target|server|computer|machine|workstation|host)[._-]?(ip|addr|address|host|name)?/i;
-const ACCOUNT = /(user|username|account|subject|principal|logon|samaccountname|upn)/i;
-const BYTES = /(bytes|octets|size|length|volume|transferred|sent|received|payload)/i;
-const REQUEST = /(url|uri|path|query|querystring|request|referer|body|message|cmd|command|args)/i;
-const EVENT_ID = /(event[._-]?id|eventcode|event[._-]?code|record[._-]?id)/i;
+/**
+ * A role hint matches at a *word* boundary, never mid-word.
+ *
+ * Unanchored substrings read far too much into a token: `uri` is inside
+ * `security`, `path` inside `filepath`, `user` inside `abuser`. Fields arrive
+ * sorted by coverage descending and the first hit wins, so one of those
+ * accidents pre-fills a role with a well-covered field that has nothing to do
+ * with it — always visible and always overridable, but a bad default that a
+ * hurried analyst confirms with one click.
+ *
+ * `B` anchors the left side to the start of the token or a separator. The
+ * right side stays open on purpose: `querystring`, `cmdline` and
+ * `bytes_out` are all the field the role means.
+ */
+const B = "(?:^|[._:-])";
+
+/** `token`, with camelCase read as separated words and lowercased.
+ *
+ * Left-anchoring alone would drop `TargetUserName` and `CommandLine`, which
+ * are exactly the Windows fields the account and request roles exist for.
+ * Splitting the camel hump first makes them `target_user_name` and
+ * `command_line`, where the boundary is real. */
+function normalizeToken(token: string): string {
+  return token.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/** Reads as "the address that connected". */
+const ADDRESS = new RegExp(
+  `${B}(?:src|source|client|remote|peer|caller)[._-]?(?:ip|addr|address|host|name)` +
+    `|${B}(?:ip|addr|address)(?:[._-]|$)`,
+);
+const TARGET = new RegExp(
+  `${B}(?:dst|dest|destination|target|server|computer|machine|workstation|host)`,
+);
+const ACCOUNT = new RegExp(
+  `${B}(?:user|account|subject|principal|logon|samaccountname|upn)`,
+);
+const BYTES = new RegExp(
+  `${B}(?:bytes|octets|size|length|volume|transferred|sent|received|payload)`,
+);
+const REQUEST = new RegExp(
+  `${B}(?:url|uri|path|query|request|referer|body|message|msg|cmd|command|arg)`,
+);
+const EVENT_ID = new RegExp(`${B}(?:event[._-]?id|event[._-]?code|record[._-]?id)`);
 
 export const SCENARIOS: Scenario[] = [
   {
@@ -247,13 +284,18 @@ export const SCENARIOS: Scenario[] = [
  * hint matches is also the best-covered one. A role whose hint matches nothing
  * is left out of the result — an unbound role is reported to the analyst, not
  * filled with whatever was closest.
+ *
+ * Matching runs against the normalized token (see `normalizeToken`), so a hint
+ * anchored at a word boundary still finds `TargetUserName`.
  */
 export function suggestBindings(scenario: Scenario, fields: VizFieldInfo[]): RoleBinding {
   const bindings: RoleBinding = {};
   const taken = new Set<string>();
   for (const role of scenario.roles) {
     if (!role.suggest) continue;
-    const hit = fields.find((f) => !taken.has(f.token) && role.suggest!.test(f.token));
+    const hit = fields.find(
+      (f) => !taken.has(f.token) && role.suggest!.test(normalizeToken(f.token)),
+    );
     if (hit) {
       bindings[role.key] = hit.token;
       taken.add(hit.token);

@@ -26,8 +26,10 @@
  * both `attr:src_ip` and a mapped canonical `src_ip`, and stripping would
  * render them identically.
  */
+import type { VizFieldInfo } from "@/api/types";
+import type { FieldComboOption } from "@/components/ui/FieldCombo";
 import { OTHER_KEY, OTHER_LABEL } from "./colors";
-import { TIME_FIELDS, timeFieldValueLabel } from "./timeFields";
+import { TIME_FIELDS, isTimeField, timeFieldValueLabel } from "./timeFields";
 
 /** Human label for a field token — the virtual `time:` name, else the token. */
 export function fieldTokenLabel(token: string): string {
@@ -54,4 +56,51 @@ export function fieldValueLabel(token: string | null | undefined, value: string)
  */
 export function valueLabeller(token: string | null | undefined): (value: string) => string {
   return (value: string) => fieldValueLabel(token, value);
+}
+
+/**
+ * One field-picker row: the display name plus a muted qualifier.
+ *
+ * Every surface that asks "which field?" builds its rows here, so a token
+ * reads the same in the rail, the compare editor and the scenario modal — a
+ * picker that showed the raw `time:hour` beside pickers showing "Hour of day
+ * (UTC)" would look like a different field.
+ *
+ * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
+ * virtual field has no measured distinct count, and "time field" tells the
+ * analyst more about why than an empty parenthetical would. Ordinary fields
+ * guard on null anyway, so an absent count renders nothing rather than
+ * "(null distinct)".
+ *
+ * `fieldComboOptionWithCoverage` is for the one caller that ranks by it: the
+ * scenario modal pre-fills a role with the best-covered field its hint
+ * matched, so the number that made the choice belongs on the row the analyst
+ * is overriding. It is a second export rather than a flag because every other
+ * caller passes this straight to `.map`, where a second parameter would eat
+ * the index.
+ */
+export function fieldComboOption(f: VizFieldInfo): FieldComboOption {
+  return comboOption(f, false);
+}
+
+/** `fieldComboOption`, plus the field's coverage in the qualifier. */
+export function fieldComboOptionWithCoverage(f: VizFieldInfo): FieldComboOption {
+  return comboOption(f, true);
+}
+
+function comboOption(f: VizFieldInfo, withCoverage: boolean): FieldComboOption {
+  const parts: string[] = [];
+  if (f.distinct != null) parts.push(`${f.distinct} distinct`);
+  if (withCoverage && f.coverage != null) {
+    parts.push(`${Math.round(f.coverage * 100)}% coverage`);
+  }
+  return {
+    value: f.token,
+    label: fieldTokenLabel(f.token),
+    hint: isTimeField(f.token)
+      ? "(time field)"
+      : parts.length > 0
+        ? `(${parts.join(" · ")})`
+        : undefined,
+  };
 }

@@ -3720,6 +3720,26 @@ async def test_propose_finding_is_in_app_only(store, monkeypatch):
     assert "propose_chart" in external and "search_events" in external
 
 
+async def test_external_instructions_do_not_steer_at_a_tool_that_is_not_served(store):
+    """The prose an external client reads has to describe the surface it got.
+
+    ``instructions`` reach /mcp clients only, so they are the one place that can
+    tell a model how to work here — and the one place that can send it looking
+    for `propose_finding`, which this transport does not register.
+    """
+    await store.init_schema()
+    server = build_tool_server(_scope("c1", "t1"))
+    async with FastMCPClient(server) as client:
+        served = {t.name for t in await client.list_tools()}
+    text = server.instructions or ""
+    # The iterate-then-what sentence, which is what used to name findings.
+    assert "return refined filters as findings" not in text
+    for name in ("propose_finding", "propose_annotation", "propose_story_block"):
+        assert name not in served
+        assert name not in text
+    assert "propose_chart" in text and "propose_chart" in served
+
+
 async def test_propose_chart_is_described_for_the_surface_it_is_on(store, monkeypatch):
     """The docstring promises a card, a Save button and an analyst. Over /mcp
     none of the three exist, and a tool description is what the model plans

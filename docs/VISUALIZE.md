@@ -747,8 +747,15 @@ chart input it fills (`field` / `fieldY` / `filter`), and an optional `suggest` 
 field *tokens*. `suggestBindings` pre-fills what it can from the timeline's own
 `VizFieldInfo` list (which arrives sorted by coverage, so the first match is also the
 best-covered one) and leaves the rest empty — a role it cannot fill is reported to the
-analyst, never guessed at. The analyst binds each role in `ScenarioModal`, and the modal is
+analyst, never guessed at. A hint matches at a **word boundary** over the token with its
+camel humps split (`TargetUserName` → `target_user_name`): "first match wins over a
+coverage-sorted list" is exactly what makes a mid-word accident — `uri` inside `security`,
+`path` inside `filepath` — pre-fill a well-covered field with nothing to do with the role,
+one click from confirmed. The analyst binds each role in `ScenarioModal`, and the modal is
 where every piece of the scenario's domain knowledge is on screen before anything renders.
+The modal derives its suggestion from the field list on every render and layers the
+analyst's own bindings over it per role, so a scenario opened before the field inventory
+lands still fills in when it does, and a refetch never overwrites a binding they chose.
 
 Two scenarios also carry a **suggested filter**, which is what makes them more than a figure
 choice: SQL injection wildcard-matches injection syntax in the bound request field, and RDP

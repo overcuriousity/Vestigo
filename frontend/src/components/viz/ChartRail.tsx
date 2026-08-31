@@ -63,7 +63,7 @@ import {
   type ResolvedChartOptions,
 } from "./lib/chartOptions";
 import { METRIC_INFO, type Metric } from "./lib/transforms";
-import { fieldTokenLabel } from "./lib/fieldDisplay";
+import { fieldComboOption, fieldTokenLabel } from "./lib/fieldDisplay";
 import { isTimeField } from "./lib/timeFields";
 import { CHART_HOW_TO_READ } from "./lib/explainers";
 import { SCALE_DISPLAY, scaleTooltip } from "./lib/scaleDisplay";
@@ -126,25 +126,6 @@ const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
 /** Radix Select forbids an empty-string item value, so "no grouping" needs a
  * sentinel that cannot collide with a real field token. */
 const CLEAR_GROUP = "__viz_no_group__";
-
-/** One field picker option: display name plus a muted qualifier.
- *
- * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
- * virtual field has no measured distinct count, and "time field" tells the
- * analyst more about why than an empty parenthetical would. Ordinary fields
- * guard on null anyway, so an absent count renders nothing rather than
- * "(null distinct)". */
-function fieldComboOption(f: VizFieldInfo): FieldComboOption {
-  return {
-    value: f.token,
-    label: fieldTokenLabel(f.token),
-    hint: isTimeField(f.token)
-      ? "(time field)"
-      : f.distinct != null
-        ? `(${f.distinct} distinct)`
-        : undefined,
-  };
-}
 
 /** The chart type to switch to when the analyst wants to chart a field and the
  * current one charts none. `defaultChartTypeForScale` is not enough on its own:

@@ -4,7 +4,35 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 214 — scenario presets return to Visualize, bound to roles rather than fields).
+Last updated: 2026-08-31 (session 215 — review pass over the `/mcp` chart surface and the scenario modal).
+
+## Session 215 — 2026-08-31: review pass over `/mcp` charts and the scenario modal
+
+Seven findings from the review of PR #334, all fixed in place. Two mattered:
+
+- **The scenario modal seeded its bindings once, from a field list that was usually empty.**
+  The rail passes `fields` from a query still in flight, and the scenarios section is open on
+  a fresh page, so the ordinary first click produced a modal with every role unbound, the
+  "nothing matched" message, and a disabled confirm — recoverable only by closing and
+  reopening. It now derives the suggestion from `fields` on every render and layers the
+  analyst's own bindings over it per role, so a late field list fills in and a refetch still
+  cannot overwrite what they chose.
+- **`public_base_url` took any string.** A scheme-less `vestigo.example.org` produced an
+  `open_url` an MCP client resolves as a *relative* path — precisely the confidently wrong
+  link the setting exists to prevent, and silently, since the value still looks like a URL. A
+  `field_validator` now requires an `http(s)://` scheme and a host, so the admin console
+  refuses it at set-time and a mistyped env var stops the process.
+
+The rest: the external FastMCP `instructions` no longer steer a client at `propose_finding`,
+which that transport does not serve (they describe `propose_chart` returning the figure
+instead); scenario role hints match at a word boundary over a camel-split token, so `uri`
+inside `security` and `path` inside `filepath` stop pre-filling a role while `TargetUserName`
+and `CommandLine` still match; the modal's field picker uses the rail's own
+`fieldComboOption` (moved to `lib/fieldDisplay.ts`, plus a coverage-showing variant for the
+modal, which ranks by it) rather than a private copy showing raw tokens; `FieldCombo` takes
+an `id` so the modal's role labels actually focus their input; and `_columnar_deep`'s
+docstring stops claiming it leaves a row's nested structures alone when it recurses into
+them.
 
 ## Session 214 — 2026-08-31: scenario presets, bound to roles rather than fields
 

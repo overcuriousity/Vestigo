@@ -15,7 +15,7 @@ import { useMemo, useState } from "react";
 import { Dialog, DialogContent } from "@/components/ui/Dialog";
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
-import { FieldCombo, type FieldComboOption } from "@/components/ui/FieldCombo";
+import { FieldCombo } from "@/components/ui/FieldCombo";
 import {
   buildScenarioConfig,
   missingRoles,
@@ -24,6 +24,7 @@ import {
   type RoleBinding,
   type Scenario,
 } from "@/components/viz/lib/scenarios";
+import { fieldComboOptionWithCoverage } from "@/components/viz/lib/fieldDisplay";
 import type { ChartConfig } from "@/components/viz/lib/chartConfig";
 import type { EventFilters, VizFieldInfo } from "@/api/types";
 
@@ -37,25 +38,23 @@ interface Props {
   onApply: (patch: Partial<ChartConfig>, filters: EventFilters | null) => void;
 }
 
-function comboOption(f: VizFieldInfo): FieldComboOption {
-  const hint =
-    f.distinct == null
-      ? "time field"
-      : `${f.distinct.toLocaleString()} values${
-          f.coverage == null ? "" : ` · ${Math.round(f.coverage * 100)}% coverage`
-        }`;
-  return { value: f.token, label: f.token, hint };
-}
-
 export function ScenarioModal({ scenario, fields, open, onOpenChange, onApply }: Props) {
-  // Seeded once per opening: re-suggesting under the analyst would undo the
-  // binding they just typed the moment the field list refetched.
-  const [bindings, setBindings] = useState<RoleBinding>(() =>
-    suggestBindings(scenario, fields),
-  );
+  // Two layers rather than one seeded state. The suggestion is derived from
+  // `fields` on every render, because `fields` is `[]` while the page's field
+  // inventory is in flight and the scenario list is open on a fresh page — a
+  // scenario clicked that early would otherwise spend its one suggestion on an
+  // empty list, report every role unbound and stay that way until the analyst
+  // closed and reopened the modal. What the analyst types goes in `overrides`,
+  // which wins per role: a refetch can fill a role nobody has touched, and can
+  // never undo the binding they just chose. An explicit `undefined` there is
+  // the analyst clearing a role, and shadows the suggestion like any other.
+  const [overrides, setOverrides] = useState<RoleBinding>({});
   const [useFilter, setUseFilter] = useState(true);
 
-  const options = useMemo(() => fields.map(comboOption), [fields]);
+  const suggested = useMemo(() => suggestBindings(scenario, fields), [scenario, fields]);
+  const bindings: RoleBinding = { ...suggested, ...overrides };
+
+  const options = useMemo(() => fields.map(fieldComboOptionWithCoverage), [fields]);
   const unbound = missingRoles(scenario, bindings);
   const filters = scenarioFilters(scenario, bindings);
 
@@ -83,12 +82,13 @@ export function ScenarioModal({ scenario, fields, open, onOpenChange, onApply }:
                 )}
               </label>
               <FieldCombo
+                id={`scenario-role-${role.key}`}
                 aria-label={role.label}
                 data-testid={`scenario-role-${role.key}`}
                 options={options}
                 value={bindings[role.key] ?? ""}
                 onChange={(v) =>
-                  setBindings((b) => ({ ...b, [role.key]: v || undefined }))
+                  setOverrides((b) => ({ ...b, [role.key]: v || undefined }))
                 }
                 placeholder="Choose a field…"
                 size="sm"
@@ -129,9 +129,10 @@ export function ScenarioModal({ scenario, fields, open, onOpenChange, onApply }:
               className="text-xs text-[var(--color-fg-muted)]"
             >
               Bind {unbound.map((r) => r.label).join(" and ")} to a field in this
-              timeline to render this scenario. Nothing here matched
-              automatically — the field may be named differently, or this timeline
-              may not carry it.
+              timeline to render this scenario.{" "}
+              {fields.length === 0
+                ? "This timeline's field list is still loading — the suggestion fills in when it lands."
+                : "Nothing here matched automatically — the field may be named differently, or this timeline may not carry it."}
             </p>
           )}
 

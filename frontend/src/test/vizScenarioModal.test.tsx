@@ -32,7 +32,7 @@ function byId(id: string) {
 
 function open(scenarioId: string, fields = FIELDS) {
   const onApply = vi.fn();
-  render(
+  const view = render(
     <TooltipProvider>
       <ScenarioModal
         scenario={byId(scenarioId)}
@@ -43,7 +43,21 @@ function open(scenarioId: string, fields = FIELDS) {
       />
     </TooltipProvider>,
   );
-  return { onApply };
+  /** Re-render with a different field list — the page's inventory landing. */
+  function rerender(next: VizFieldInfo[]) {
+    view.rerender(
+      <TooltipProvider>
+        <ScenarioModal
+          scenario={byId(scenarioId)}
+          fields={next}
+          open
+          onOpenChange={vi.fn()}
+          onApply={onApply}
+        />
+      </TooltipProvider>,
+    );
+  }
+  return { onApply, rerender };
 }
 
 describe("ScenarioModal", () => {
@@ -89,6 +103,46 @@ describe("ScenarioModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /render/i }));
     const [, filters] = onApply.mock.calls[0];
     expect(filters).toBeNull();
+  });
+
+  it("suggests once the field list lands, when it was still loading on open", () => {
+    // The scenario list is open on a fresh page, so this is the ordinary first
+    // click — not a corner case. An empty `fields` must not spend the one
+    // suggestion the modal gets.
+    const { rerender } = open("sql-injection", []);
+    expect(
+      (screen.getByLabelText("Request or message field") as HTMLInputElement).value,
+    ).toBe("");
+    expect(screen.getByTestId("scenario-unbound").textContent).toContain(
+      "still loading",
+    );
+    rerender(FIELDS);
+    expect(
+      (screen.getByLabelText("Request or message field") as HTMLInputElement).value,
+    ).toBe("attr:url_path");
+    expect(screen.queryByTestId("scenario-unbound")).toBeNull();
+  });
+
+  it("does not re-suggest over a binding the analyst chose themselves", () => {
+    const { rerender } = open("sql-injection", []);
+    const combo = screen.getByLabelText("Request or message field") as HTMLInputElement;
+    fireEvent.change(combo, { target: { value: "attr:raw_line" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+    rerender(FIELDS);
+    expect(
+      (screen.getByLabelText("Request or message field") as HTMLInputElement).value,
+    ).toBe("attr:raw_line");
+  });
+
+  it("labels each role's picker, so clicking the label focuses the input", () => {
+    open("rdp-interaction");
+    const label = document.querySelector<HTMLLabelElement>(
+      'label[for="scenario-role-account"]',
+    );
+    expect(label).not.toBeNull();
+    expect(document.getElementById(label!.htmlFor)).toBe(
+      screen.getByTestId("scenario-role-account"),
+    );
   });
 
   it("offers no filter row for a scenario that suggests none", () => {

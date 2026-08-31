@@ -1141,10 +1141,12 @@ def _columnar_deep(value: Any) -> Any:
     the structure costs a traversal of an already-capped payload and cannot
     miss one.
 
-    Lossless, like every other transform at this boundary: values pass through
-    untouched, and a row's nested dicts/lists stay in their cell. Row caps stay
-    where they belong (``AGENT_CHART_LIMITS``), so a compact result is never
-    also a truncated one.
+    Lossless, like every other transform at this boundary: scalars pass
+    through untouched, and the walk descends *into* a row's cells too — a
+    nested list-of-dicts inside a cell is re-encoded columnar like any other,
+    which is the point of doing this deeply rather than at the top level. Row
+    caps stay where they belong (``AGENT_CHART_LIMITS``), so a compact result
+    is never also a truncated one.
     """
     if isinstance(value, dict):
         return {key: _columnar_deep(item) for key, item in value.items()}
@@ -1435,8 +1437,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         "vestigo-investigation",
         instructions=(
             "Read-only forensic log investigation tools, scoped to one case "
-            "timeline. Iterate: inspect fields, search, aggregate, then "
-            "return refined filters as findings.\n\n"
+            "timeline. Iterate: inspect fields, search, aggregate, then chart "
+            "what you found with propose_chart — over this transport it "
+            "executes the chart and returns the figure's data plus the link "
+            "that opens it in Vestigo. Nothing here writes; the proposal tools "
+            "the in-app agent uses to hand a card to an analyst are not served "
+            "on this transport, so report your conclusions in your own "
+            "answer.\n\n"
             f"{RESULT_FORMAT_NOTE}\n{SCALE_VOCABULARY_NOTE}\n{SPEC_REFERENCE}"
         ),
     )

@@ -365,7 +365,9 @@ list used only by the correlation matrix.
   a link, so it costs no row, needs no write permission, and works for a read-only
   case member. Set `VESTIGO_PUBLIC_BASE_URL` to the deployment's outside-facing URL
   and the link is absolute; unset it stays the relative path the in-app card uses,
-  which an MCP client has no origin to complete. Deliberately not derived from the
+  which an MCP client has no origin to complete. The setting requires an `http(s)://`
+  scheme — a scheme-less host is itself a relative URL, so it is refused rather than
+  silently producing the broken form. Deliberately not derived from the
   request `Host` header: behind a proxy that is whatever the proxy forwarded, and a
   confidently wrong link is worse than a relative one.
 - **The `/mcp` chart result is the figure, not a description of it.** In-app,
@@ -572,7 +574,7 @@ analyst sees, not a heuristic fallback.
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). Edited on `Admin → Settings`, not the Agent tab. |
 | `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Edited on `Admin → Settings`. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
-| `VESTIGO_PUBLIC_BASE_URL` | Outside-facing URL of this deployment (e.g. `https://vestigo.example.org`). Makes `propose_chart`'s `open_url` absolute; unset leaves it a relative path. |
+| `VESTIGO_PUBLIC_BASE_URL` | Outside-facing URL of this deployment (e.g. `https://vestigo.example.org`), scheme required. Makes `propose_chart`'s `open_url` absolute; unset leaves it a relative path. |
 
 Works with any OpenAI-compatible endpoint (ollama, vllm, llama.cpp server,
 LocalAI, OpenRouter, `api.moonshot.ai/v1`) or Anthropic-compatible endpoint.
