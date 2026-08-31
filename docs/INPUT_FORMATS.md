@@ -479,6 +479,17 @@ therefore reports `accept_date_skew_ms_min` (what the conclusion rests on) along
 `_p05` and `_median` (so a reader can judge whether that minimum is an isolated outlier).
 A whole-hour minimum is the tell that the host was logging local time.
 
+The vendored `haproxy2timesketch.py` (upstream 1.2.0) parses the same envelopes and the same
+four payload shapes into CSV/JSONL, and measures the clock the same way — the conclusion and
+the `min`/`p05`/`median` skews land in the `--report` JSON and the run summary instead of a
+Parquet footer. Three differences follow from the target format rather than the source:
+attributes are flat columns (a fixed 63-column header, `dst_ip` omitted since HAProxy names a
+backend *server*, not an address); a row cannot carry a null timestamp, so a startup/reload or
+unmodeled line in a bare envelope — which has no clock at all — is anchored to its nearest
+dated neighbour and marked `timestamp_inferred`, rather than written with `timestamp: null`;
+and `--year` supplies the year the BSD syslog prefix omits, for those same lines when they
+arrive over syslog. Like every `*2timesketch` script it has no per-row provenance.
+
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —

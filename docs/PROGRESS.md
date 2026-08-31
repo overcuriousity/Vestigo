@@ -4,7 +4,90 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 215 — review pass over the `/mcp` chart surface and the scenario modal).
+Last updated: 2026-08-31 (session 217 — HAProxy gets a stdlib-only converter).
+
+## Session 217 — 2026-08-31: HAProxy gets a stdlib-only converter
+
+HAProxy was the only source with a native Parquet converter and no `*2timesketch`
+counterpart — an analyst without pyarrow had nothing for it, and an analyst who wanted a
+Timesketch timeline had to go through Vestigo. `haproxy2timesketch` now exists upstream
+(`overcuriousity/2timesketch` at `c19905d`, version 1.2.0) and is vendored here, taking the
+suite to 14 vendored scripts beside the 8 native ones.
+
+The parsing core is the native converter's, minus Parquet: both envelopes (Docker
+`json-file`, BSD syslog, bare) auto-detected per line, the four payload shapes plus the
+`haproxy:message` catch-all behind the same 200-line sniff gate, the termination state
+decoded, captures split with a bare-IP capture promoted to `client_real_ip`. The
+multiprocessing, RAM-budget and batching machinery did not come along: it exists because
+Parquet writing is CPU-bound, and stdlib CSV streaming is not.
+
+**The timezone stays measured rather than assumed** — that property is why the native
+converter was worth writing, and dropping it in the port would have made the stdlib path
+quietly worse than the Parquet one. The smallest observed `envelope − accept_date` skew
+(with `p05`/`median` beside it) goes to the run summary and the `--report` JSON instead of
+the Parquet footer, and a whole-hour minimum still reads as "this host was logging local
+time".
+
+One thing the port had to decide differently. Parquet takes a null timestamp; a Timesketch
+row does not. A startup/reload line or an unmodeled shape in a *bare* envelope has no clock
+at all, so the first cut dropped them — and "Server app_backend/app02 is DOWN" is exactly the
+line an investigation wants. They are now anchored to their nearest dated neighbour with the
+inference disclosed three ways: `timestamp_inferred` on the row, a `timestamp_desc` naming
+which neighbour it borrowed from, and a count in the summary. `--year` covers the same lines
+when they arrive over syslog, where the prefix omits it.
+
+Verified by running the CLI over fixtures for every envelope, every line kind, a `.gz`, a
+directory (with a non-HAProxy file correctly refused), `--since/--until`, `--split` and
+`--report`, plus a synthetic UTC+2 capture that the skew note reads back as `7200060 ms
+(2.00 h)`. The vendored single-file build produces byte-identical output to the upstream
+package.
+
+## Session 216 — 2026-08-31: the agent's configuration becomes ordinary configuration
+
+The AI agent kept its own everything: a wide `agent_settings` singleton row (migrations
+0011/0012/0013/0015), a second resolver merging it against the env layer by hand, its own
+`GET`/`PUT /admin/agent-settings`, its own `Admin → Agent` tab, and its own secret switch
+`VESTIGO_AGENT_SECRET_MODE`. All of it predates the generic `app_settings` layer, and all
+eleven knobs it stored are already `VESTIGO_AGENT_*` fields on `Settings` — the registry
+listed them only to keep the coverage test honest, marked `managed_by="agent"`, and the
+settings page rendered them read-only behind a badge pointing at the other tab.
+
+Migration `0033` copies the row into `app_settings` (the API key with it — same plaintext-
+at-rest contract on both sides, and dropping it would break a working instance on upgrade;
+the exception is an instance that ran `VESTIGO_AGENT_SECRET_MODE=env-only`, where the key
+was being ignored and copying it would revive a credential the operator switched off)
+and drops the table. `resolve_agent_config()` is now a projection of the already-merged
+settings object onto `AgentConfig`: no DB read, no best-effort fallback, no second
+precedence rule to keep in step, and synchronous, since it does no I/O. `SettingSpec`
+lost `managed_by` entirely — it had one user.
+
+`VESTIGO_AGENT_SECRET_MODE` is retired rather than carried: the LLM key now follows the
+instance-wide `VESTIGO_SECRETS_MODE` like every other secret. Because `Settings` ignores
+unknown `VESTIGO_*` variables, a deployment that still pins the old one would silently
+start allowing DB storage again, so startup logs a warning naming the replacement — asked
+of the whole environment layer, `.env` included, since that is how `.env.example` documents
+setting it.
+
+The `Admin → Agent` tab is gone and `/admin/agent` redirects to `/admin/settings`. Its
+widgets were worth keeping and moved into the settings page's **AI agent** group as custom
+controls over the same draft — the endpoint-fed model dropdown, the tool deny-list
+checkboxes, the headers textarea — so the page keeps exactly one Save covering agent and
+non-agent fields alike. The two agent routes that persist nothing survive on their own:
+`POST /admin/agent/models` (the listing behind the dropdown) and a new
+`POST /admin/agent/probe` for "Test connection", which drops the cached availability
+result rather than overloading an empty PUT to do it.
+
+Two checks the retired PUT carried had to land somewhere, and neither belongs on
+`Settings`: whitespace trimming on pasted credentials, and rejecting a tool name the
+catalogue does not know (`core/config.py` must not import `agent/tools.py`). Both now run
+in the admin router, on the only surface that writes those fields.
+
+Audit of the second half of the ask — whether everything settable is actually exposed —
+found nothing else missing: `test_registry_covers_every_settings_field` already enforces
+registry/`Settings` parity both ways, `_settings_payload()` emits every spec unfiltered,
+and the only other non-editable fields are the `env_only` bootstrap ones, read-only by
+design. The `os.environ` reads outside `config.py` are all in `assets/converters/*.py`,
+standalone subprocess scripts rather than app config.
 
 ## Session 215 — 2026-08-31: review pass over `/mcp` charts and the scenario modal
 

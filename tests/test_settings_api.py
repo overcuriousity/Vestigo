@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import as_admin, login
+from vestigo.agent.config import resolve_agent_config
 from vestigo.core.config import Settings, get_settings
 from vestigo.core.settings_registry import (
     GROUPS,
@@ -149,11 +150,55 @@ def test_put_rejects_env_pinned_field(client, admin_bootstrap):
     assert "environment" in resp.json()["detail"]
 
 
-def test_put_rejects_env_only_and_agent_managed_fields(client, admin_bootstrap):
+def test_put_rejects_env_only_fields(client, admin_bootstrap):
     as_admin(client, admin_bootstrap)
-    for field, value in (("postgres_url", "postgresql://x/y"), ("agent_model", "gpt-4o")):
-        resp = client.put("/api/admin/settings", json={"values": {field: value}})
-        assert resp.status_code == 422, field
+    resp = client.put("/api/admin/settings", json={"values": {"postgres_url": "postgresql://x/y"}})
+    assert resp.status_code == 422
+
+
+def test_put_persists_agent_fields(client, admin_bootstrap):
+    """The agent knobs are ordinary settings (0033), not a second surface.
+
+    They were rendered read-only here for as long as the ``agent_settings``
+    row owned them; this endpoint is now the only thing that writes them.
+    """
+    as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/settings",
+        json={"values": {"agent_model": "  gpt-4o  ", "agent_max_turns": 7}},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body["applied"]) >= {"agent_model", "agent_max_turns"}
+
+    by_field = {s["field"]: s for s in body["settings"]}
+    # Whitespace around a pasted value is trimmed, not stored — it silently
+    # breaks the endpoint probe otherwise.
+    assert by_field["agent_model"]["value"] == "gpt-4o"
+    assert by_field["agent_model"]["source"] == "db"
+    assert by_field["agent_model"]["editable"] is True
+    assert get_settings().agent_model == "gpt-4o"
+    assert resolve_agent_config().model == "gpt-4o"
+    assert resolve_agent_config().sources["model"] == "db"
+
+
+def test_put_rejects_an_unknown_tool_name(client, admin_bootstrap):
+    """The tool catalogue lives in agent/tools.py, which Settings cannot import."""
+    as_admin(client, admin_bootstrap)
+    resp = client.put(
+        "/api/admin/settings", json={"values": {"agent_disabled_tools": ["search_events", "nope"]}}
+    )
+    assert resp.status_code == 422
+    assert "nope" in resp.json()["detail"]
+
+
+def test_settings_payload_carries_the_agent_tool_catalogue(client, admin_bootstrap):
+    """`agent_disabled_tools` is a checkbox list, so the page needs the names."""
+    as_admin(client, admin_bootstrap)
+    body = client.get("/api/admin/settings").json()
+    assert body["agent"]["tools"]
+    assert {"name", "description"} <= set(body["agent"]["tools"][0])
+    assert body["agent"]["warnings"] == []
 
 
 def test_settings_require_admin(client, admin_bootstrap):

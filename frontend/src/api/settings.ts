@@ -1,4 +1,5 @@
 import { get, put } from "./client";
+import type { AdminAgentTool } from "./admin";
 
 /** How the admin console renders one setting's editor. Derived server-side from
  * the pydantic annotation, so it never drifts from what validation accepts. */
@@ -29,8 +30,6 @@ export interface InstanceSetting {
   /** Optional subsystem this field configures; unconfigured ones are hidden
    * from the analyst UI (see `useCapabilities`). */
   subsystem: string | null;
-  /** Non-null when a dedicated page owns this field, e.g. "agent". */
-  managed_by: string | null;
   editable: boolean;
   /** Null for secrets — the backend never returns their plaintext. */
   value: unknown;
@@ -44,11 +43,20 @@ export interface SettingGroup {
   description: string;
 }
 
+/** The two things the agent group needs that no single field carries: the tool
+ * catalogue `agent_disabled_tools` toggles against, and advisory warnings about
+ * the *combination* of resolved values (full fidelity, underpowered window). */
+export interface InstanceAgentMeta {
+  tools: AdminAgentTool[];
+  warnings: string[];
+}
+
 export interface InstanceSettingsResponse {
   groups: SettingGroup[];
   settings: InstanceSetting[];
   /** "env-only" means the backend refuses to store any secret in the database. */
   secrets_mode: "db" | "env-only";
+  agent: InstanceAgentMeta;
   /** Present on a PUT response: the fields whose overrides are now applied. */
   applied?: string[];
 }

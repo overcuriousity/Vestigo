@@ -93,7 +93,7 @@ async def generate_script(system: str, task: str, *, timeout_s: float) -> Genera
     async with asyncio.timeout(timeout_s):
         if not await agent_available():
             raise GenerationUnavailable("no configured or reachable model endpoint")
-        config = await resolve_agent_config()
+        config = resolve_agent_config()
         if not config.model:
             raise GenerationUnavailable("no model configured")
         draft = await _complete(config, system, task, timeout_s)

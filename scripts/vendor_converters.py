@@ -66,6 +66,15 @@ CONVERTERS = {
         "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
         ["filter.log (syslog filterlog lines)"],
     ),
+    "haproxy2timesketch": (
+        "haproxy",
+        "haproxy2timesketch.py",
+        "HAProxy HTTP/TCP logs, connection/SSL errors and startup/reload lines "
+        "(plain or .gz, file or directory) to Timesketch timeline. Auto-detects a "
+        "Docker json-file, syslog, or bare envelope and measures the accept_date "
+        "timezone rather than assuming it.",
+        ["haproxy.log*", "*-json.log (Docker json-file)"],
+    ),
     "journal2timesketch": (
         "journal",
         "journal2timesketch.py",

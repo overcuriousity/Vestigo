@@ -3,7 +3,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Lock, RotateCcw } from "lucide-react";
 import { ApiError } from "@/api/client";
 import { useHealth } from "@/api/health";
-import { settingsApi, type InstanceSetting, type InstanceSettingsResponse } from "@/api/settings";
+import { adminApi } from "@/api/admin";
+import {
+  settingsApi,
+  type InstanceAgentMeta,
+  type InstanceSetting,
+  type InstanceSettingsResponse,
+} from "@/api/settings";
+import { AGENT_FIELD_CONTROLS, AgentSectionHeader } from "@/components/admin/AgentSettingFields";
 import { ScanBudgetCard } from "@/components/admin/ScanBudgetCard";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -84,18 +91,38 @@ function SettingRow({
   draft,
   onChange,
   secretsDisabled,
+  siblings,
+  agent,
 }: {
   setting: InstanceSetting;
   draft: Draft;
   onChange: (field: string, value: unknown) => void;
   secretsDisabled: boolean;
+  siblings: Map<string, InstanceSetting>;
+  agent: InstanceAgentMeta;
 }) {
-  const disabled =
-    !setting.editable || (setting.kind === "secret" && secretsDisabled) || !!setting.managed_by;
+  const disabled = !setting.editable || (setting.kind === "secret" && secretsDisabled);
   const edited = setting.field in draft;
   const draftValue = draft[setting.field];
 
   const control = () => {
+    // A few fields have an editor no annotation can imply — a model list the
+    // endpoint itself serves, a deny-list over the tool catalogue. They still
+    // write into the same draft, so the page keeps one Save.
+    const Custom = AGENT_FIELD_CONTROLS[setting.field];
+    if (Custom) {
+      return (
+        <Custom
+          setting={setting}
+          value={edited ? draftValue : setting.value}
+          disabled={disabled}
+          onChange={(v) => onChange(setting.field, v)}
+          siblings={siblings}
+          draft={draft}
+          agent={agent}
+        />
+      );
+    }
     if (setting.kind === "bool") {
       const checked = edited ? !!draftValue : !!setting.value;
       return (
@@ -152,7 +179,6 @@ function SettingRow({
           </span>
           <SourceBadge setting={setting} />
           {setting.restart_required && <Badge variant="muted">restart required</Badge>}
-          {setting.managed_by === "agent" && <Badge variant="muted">set on the Agent tab</Badge>}
         </div>
         <p className="mt-1 text-xs text-[var(--color-fg-muted)]">{setting.help}</p>
         <p className="mt-1 font-mono text-[11px] text-[var(--color-fg-muted)]">{setting.env_var}</p>
@@ -217,32 +243,57 @@ export function AdminSettingsPage() {
 
   if (isLoading || !data) return <Spinner />;
 
+  const settingsByField = new Map(data.settings.map((s) => [s.field, s]));
+
   const setField = (field: string, value: unknown) => {
     setSaved(null);
     setDraft((prev) => ({ ...prev, [field]: value }));
   };
 
-  const save = () => {
-    const settings = new Map(data.settings.map((s) => [s.field, s]));
+  const buildValues = (): Record<string, unknown> => {
     const values: Record<string, unknown> = {};
-    try {
-      for (const [field, raw] of Object.entries(draft)) {
-        const setting = settings.get(field)!;
-        if (raw === null) {
-          values[field] = null;
-        } else if (setting.kind === "bool") {
-          values[field] = !!raw;
-        } else if (setting.kind === "choice") {
-          values[field] = raw;
-        } else {
-          values[field] = parseValue(setting, String(raw));
-        }
+    for (const [field, raw] of Object.entries(draft)) {
+      const setting = settingsByField.get(field)!;
+      if (raw === null) {
+        values[field] = null;
+      } else if (setting.kind === "bool") {
+        values[field] = !!raw;
+      } else if (setting.kind === "choice") {
+        values[field] = raw;
+      } else if (typeof raw !== "string") {
+        // A custom control (the tool deny-list) writes the value itself
+        // rather than editor text; there is nothing to parse.
+        values[field] = raw;
+      } else {
+        values[field] = parseValue(setting, raw);
       }
+    }
+    return values;
+  };
+
+  const save = () => {
+    let values: Record<string, unknown>;
+    try {
+      values = buildValues();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return;
     }
     mutation.mutate(values);
+  };
+
+  /** "Test connection": commit what the admin typed, then force a fresh probe.
+   * Probing the stored config while the form holds unsaved edits would answer
+   * a question nobody asked. The save goes through the same mutation as the Save
+   * button rather than calling the API directly, so `isPending` covers it too —
+   * otherwise Save stays live during the test's own write and sends the identical
+   * PUT a second time. */
+  const testAgentEndpoint = async () => {
+    const values = buildValues();
+    if (Object.keys(values).length > 0) await mutation.mutateAsync(values);
+    const { available } = await adminApi.probeAgent();
+    qc.invalidateQueries({ queryKey: ["health"] });
+    return available;
   };
 
   const dirty = Object.keys(draft).length;
@@ -284,6 +335,16 @@ export function AdminSettingsPage() {
                 editing the scan budget is the person who needs to know it does
                 not currently fit. */}
             {group.key === "scans" && <ScanBudgetCard budget={health.data?.scan_budget} />}
+            {/* Same reasoning for the agent: "is this endpoint reachable" is
+                the question its knobs exist to answer, so the test sits with
+                them rather than on a page of its own. */}
+            {group.key === "agent" && (
+              <AgentSectionHeader
+                agent={data.agent}
+                onTest={testAgentEndpoint}
+                dirty={dirty > 0}
+              />
+            )}
             <div className="rounded-lg border border-[var(--color-border)] px-4">
               {settings.map((s) => (
                 <SettingRow
@@ -292,6 +353,8 @@ export function AdminSettingsPage() {
                   draft={draft}
                   onChange={setField}
                   secretsDisabled={data.secrets_mode === "env-only"}
+                  siblings={settingsByField}
+                  agent={data.agent}
                 />
               ))}
             </div>
