@@ -242,8 +242,9 @@ async def test_init_schema_adopts_pre_alembic_db(blank_pg_database):
         await conn.execute(text("DROP TABLE agent_tokens"))
         # 0010 adds the agent-proposed annotation table.
         await conn.execute(text("DROP TABLE agent_proposals"))
-        # 0011 adds the instance-wide agent settings table.
-        await conn.execute(text("DROP TABLE agent_settings"))
+        # 0011 added an instance-wide agent settings table; 0033 folded it
+        # into app_settings and dropped the model, so create_all no longer
+        # makes one. The upgrade below still creates and drops it in order.
         # 0020 adds the instance settings table.
         await conn.execute(text("DROP TABLE app_settings"))
         # 0026 adds the analysis result cache and the verdict's analysis scope.
