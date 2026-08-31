@@ -41,10 +41,14 @@ management) and `api/routers/agent.py` (HTTP/SSE layer).
   - Every decision is audited (`agent.annotation_confirm` /
     `agent.annotation_reject`, `agent.story_block_confirm` /
     `agent.story_block_reject`, keyed to `target_type="agent_proposal"`).
-  - `propose_annotation`, `propose_story_block` and the decide endpoints are
-    **absent from the external `/mcp` transport** — only an in-app conversation
-    binds the `conversation_id` that gates the tools' registration. Story
-    *read* tools are exposed there like every other read tool.
+  - `propose_annotation`, `propose_story_block`, `propose_finding` and the
+    decide endpoints are **absent from the external `/mcp` transport** — only
+    an in-app conversation binds the `conversation_id` that gates the tools'
+    registration. Story *read* tools are exposed there like every other read
+    tool. `propose_finding` joined them in 1.17.1: its entire product is a card
+    in the agent panel, so over `/mcp` it wrote nothing, showed nothing, and
+    returned a hit count `search_events` already gives — under a docstring
+    telling the model an analyst was looking at it.
 - **Invisible unless configured.** `/api/health` reports `agent_available` only
   when `VESTIGO_AGENT_*` is set **and** the endpoint answered a cached probe
   (`agent/availability.py`, TTL `VESTIGO_AGENT_PROBE_TTL_SECONDS`). Otherwise
@@ -165,8 +169,8 @@ small-context local models.
 | `field_scatter` | | Sampled (x, y) numeric pairs for two fields, plus full-data correlation/regression. Samples are drawn in a stable hash order, so an identical query redraws identical points. |
 | `compare` | | Two filtered layers of the same timeline (time/terms/numeric). |
 | `run_anomaly_detector` | core | Run a statistical detector; persists a `DetectorRun`. Exposes the same tuning surface and bounds as the HTTP endpoint. |
-| `propose_finding` | core | Finding card with applicable Explorer filters. |
-| `propose_chart` | | Chart card, validated by executing the underlying query. |
+| `propose_finding` | core | Finding card with applicable Explorer filters; conversation-bound only. |
+| `propose_chart` | | Chart card, validated by executing the underlying query. On `/mcp` it is described as, and returns, the figure itself — see `open_url` below. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
 | `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
 | `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
@@ -357,6 +361,26 @@ list used only by the correlation matrix.
   (`filtersToParams` then `chartConfigToParams`, same order and encodings);
   `frontend/src/test/fixtures/viz-deep-link.json` is the contract, asserted by
   `tests/test_deep_link.py` on the way out and by `agent.test.ts` parsing it back.
+  The figure lives entirely in the query string — nothing is persisted to produce
+  a link, so it costs no row, needs no write permission, and works for a read-only
+  case member. Set `VESTIGO_PUBLIC_BASE_URL` to the deployment's outside-facing URL
+  and the link is absolute; unset it stays the relative path the in-app card uses,
+  which an MCP client has no origin to complete. The setting requires an `http(s)://`
+  scheme — a scheme-less host is itself a relative URL, so it is refused rather than
+  silently producing the broken form. Deliberately not derived from the
+  request `Host` header: behind a proxy that is whatever the proxy forwarded, and a
+  confidently wrong link is worse than a relative one.
+- **The `/mcp` chart result is the figure, not a description of it.** In-app,
+  `propose_chart` drops the aggregation payload because the card fetches its own copy
+  and the model only needs `summary`. Externally there is no card, and a `summary` of
+  `{"buckets": 48, "interval_seconds": 3600}` describes a chart the caller cannot draw,
+  tabulate or quote. So on that transport the tool keeps `result` (and `marks`),
+  columnar via `_columnar_deep`, with a timeseries' shared axis hoisted by
+  `_compact_timeseries` exactly as `field_timeseries` does. Sizes are the ones
+  `AGENT_CHART_LIMITS` already bounds — ~1–3 KB typical, ~12 KB worst case (a
+  1,000-point scatter), the same order as a routine `field_timeseries` call. The tool
+  is also *described* differently there (`EXTERNAL_CHART_DESCRIPTION`): same name, same
+  validation, but no card, no Save button and nobody being proposed to.
 - **Statistics are server-computed, never eyeballed.** ClickHouse natives supply
   the descriptive side (`corr`, `rankCorr`, `simpleLinearRegression`, `skewPop`,
   quantiles) over the **full** filtered data; `vestigo/stats.py` (pure Python, no
@@ -550,6 +574,7 @@ analyst sees, not a heuristic fallback.
 | `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). Edited on `Admin → Settings`, not the Agent tab. |
 | `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Edited on `Admin → Settings`. |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
+| `VESTIGO_PUBLIC_BASE_URL` | Outside-facing URL of this deployment (e.g. `https://vestigo.example.org`), scheme required. Makes `propose_chart`'s `open_url` absolute; unset leaves it a relative path. |
 
 Works with any OpenAI-compatible endpoint (ollama, vllm, llama.cpp server,
 LocalAI, OpenRouter, `api.moonshot.ai/v1`) or Anthropic-compatible endpoint.
@@ -912,6 +937,8 @@ with pydantic-ai's `FunctionModel`.
   schema slimming and the serialized-size budget guard.
 - `tests/test_agent_tokens.py` / `test_mcp_http.py` — token model and management
   API, scope binding, an end-to-end tool call, off-by-default 404, admin deny list
-  on the external `tools/list`, and the propose-* tools' absence from `/mcp`.
+  on the external `tools/list`, the propose-* tools' absence from `/mcp`, and the
+  chart round trip that surface actually gets (columnar `result` + an absolute
+  `open_url`).
 - `tests/test_chart_meta.py` — chart-meta legality table and regeneration
   stability. Frontend: `frontend/src/test/agent.test.ts`.

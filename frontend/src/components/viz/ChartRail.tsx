@@ -11,7 +11,7 @@
  */
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { Link } from "react-router-dom";
-import { ArrowLeft, HelpCircle, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, HelpCircle, X } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Tooltip } from "@/components/ui/Tooltip";
 import {
@@ -28,6 +28,8 @@ import type {
   VizFieldInfo,
 } from "@/api/types";
 import { ExportControls } from "./ExportControls";
+import { ScenarioModal } from "./ScenarioModal";
+import { SCENARIOS, type Scenario } from "./lib/scenarios";
 import { CompareFilterEditor } from "./CompareFilterEditor";
 import { MarksEditor } from "./MarksEditor";
 import { SavedChartsRail } from "./SavedChartsRail";
@@ -43,6 +45,7 @@ import type {
   TableSortColumn,
   TimePart,
 } from "./lib/chartConfig";
+import { DEFAULT_CHART_CONFIG } from "./lib/chartConfig";
 import { DEFAULT_TABLE_COLUMNS, TABLE_COLUMN_LABELS } from "./lib/tableRows";
 import {
   CHART_META,
@@ -60,7 +63,7 @@ import {
   type ResolvedChartOptions,
 } from "./lib/chartOptions";
 import { METRIC_INFO, type Metric } from "./lib/transforms";
-import { fieldTokenLabel } from "./lib/fieldDisplay";
+import { fieldComboOption, fieldTokenLabel } from "./lib/fieldDisplay";
 import { isTimeField } from "./lib/timeFields";
 import { CHART_HOW_TO_READ } from "./lib/explainers";
 import { SCALE_DISPLAY, scaleTooltip } from "./lib/scaleDisplay";
@@ -109,6 +112,9 @@ export interface ChartRailProps {
   captionLines: string[];
   /** CSV text for the table figure, else null — adds a CSV export format. */
   csv?: string | null;
+  /** A confirmed scenario: the chart patch, and the filter to merge (or null).
+   * The rail cannot merge filters itself — they live in the page's URL. */
+  onApplyScenario?: (patch: Partial<ChartConfig>, filters: EventFilters | null) => void;
 }
 
 /** Radix Select and the field combo forbid an empty value, so "count every
@@ -120,25 +126,6 @@ const METRICS: Metric[] = ["count", "delta", "rate", "ratio", "cumulative"];
 /** Radix Select forbids an empty-string item value, so "no grouping" needs a
  * sentinel that cannot collide with a real field token. */
 const CLEAR_GROUP = "__viz_no_group__";
-
-/** One field picker option: display name plus a muted qualifier.
- *
- * The qualifier is driven off `isTimeField`, not off a null `distinct`: a
- * virtual field has no measured distinct count, and "time field" tells the
- * analyst more about why than an empty parenthetical would. Ordinary fields
- * guard on null anyway, so an absent count renders nothing rather than
- * "(null distinct)". */
-function fieldComboOption(f: VizFieldInfo): FieldComboOption {
-  return {
-    value: f.token,
-    label: fieldTokenLabel(f.token),
-    hint: isTimeField(f.token)
-      ? "(time field)"
-      : f.distinct != null
-        ? `(${f.distinct} distinct)`
-        : undefined,
-  };
-}
 
 /** The chart type to switch to when the analyst wants to chart a field and the
  * current one charts none. `defaultChartTypeForScale` is not enough on its own:
@@ -554,8 +541,16 @@ export function ChartRail({
   exportFilename,
   captionLines,
   csv = null,
+  onApplyScenario,
 }: ChartRailProps) {
   const { field, fieldY, scale, chartType, metric } = config;
+  // Open on a fresh page — a chart the URL already describes has no use for
+  // the starting points, and the rail's own controls should be what is on
+  // screen when the analyst comes back to a chart they built.
+  const [scenariosOpen, setScenariosOpen] = useState(
+    () => config.field == null && config.chartType === DEFAULT_CHART_CONFIG.chartType,
+  );
+  const [activeScenario, setActiveScenario] = useState<Scenario | null>(null);
   const dataKind = CHART_META[chartType].dataKind;
   const requiresSecondField = CHART_META[chartType].requiresSecondField;
   const acceptsSecondField = CHART_META[chartType].acceptsSecondField;
@@ -746,6 +741,58 @@ export function ChartRail({
           </p>
         )}
       </div>
+
+      {/* Scenarios — an investigation named in the analyst's language, above
+          the field picker because a scenario answers "which field?" as well as
+          "which figure?". Nothing is applied from here: the card opens the
+          binding modal, which is where the scenario's domain knowledge (its
+          roles, its suggested filter) is shown before anything renders. */}
+      <div data-rail-section="scenarios">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setScenariosOpen((v) => !v)}
+          className="h-auto w-full justify-start gap-1 px-0 py-0 font-medium uppercase tracking-wide"
+        >
+          {scenariosOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          Start from a scenario
+        </Button>
+        {scenariosOpen && (
+          <div className="mt-2 flex flex-col gap-1">
+            {SCENARIOS.map((s) => (
+              <Button
+                key={s.id}
+                variant="outline"
+                size="sm"
+                onClick={() => setActiveScenario(s)}
+                className="h-auto flex-col items-start gap-0.5 whitespace-normal px-2 py-1.5 text-left"
+              >
+                <span className="block text-xs font-medium text-[var(--color-fg-primary)]">
+                  {s.label}
+                </span>
+                <span className="block text-xs font-normal leading-snug text-[var(--color-fg-muted)]">
+                  {s.question}
+                </span>
+              </Button>
+            ))}
+          </div>
+        )}
+      </div>
+      {activeScenario && (
+        <ScenarioModal
+          scenario={activeScenario}
+          fields={fields}
+          open
+          onOpenChange={(open) => {
+            if (!open) setActiveScenario(null);
+          }}
+          onApply={(patch, scenarioFilters) => {
+            if (onApplyScenario) onApplyScenario(patch, scenarioFilters);
+            else updateConfig(patch);
+            setActiveScenario(null);
+          }}
+        />
+      )}
 
       {/* Field — always live. The field-free figures are reached through the
           first entry rather than by an inert box, so the topmost control is

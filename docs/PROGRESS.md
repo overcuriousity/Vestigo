@@ -4,7 +4,108 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-30 (session 212 — embeddings UI is absent, not disabled, where nothing can embed).
+Last updated: 2026-08-31 (session 215 — review pass over the `/mcp` chart surface and the scenario modal).
+
+## Session 215 — 2026-08-31: review pass over `/mcp` charts and the scenario modal
+
+Seven findings from the review of PR #334, all fixed in place. Two mattered:
+
+- **The scenario modal seeded its bindings once, from a field list that was usually empty.**
+  The rail passes `fields` from a query still in flight, and the scenarios section is open on
+  a fresh page, so the ordinary first click produced a modal with every role unbound, the
+  "nothing matched" message, and a disabled confirm — recoverable only by closing and
+  reopening. It now derives the suggestion from `fields` on every render and layers the
+  analyst's own bindings over it per role, so a late field list fills in and a refetch still
+  cannot overwrite what they chose.
+- **`public_base_url` took any string.** A scheme-less `vestigo.example.org` produced an
+  `open_url` an MCP client resolves as a *relative* path — precisely the confidently wrong
+  link the setting exists to prevent, and silently, since the value still looks like a URL. A
+  `field_validator` now requires an `http(s)://` scheme and a host, so the admin console
+  refuses it at set-time and a mistyped env var stops the process.
+
+The rest: the external FastMCP `instructions` no longer steer a client at `propose_finding`,
+which that transport does not serve (they describe `propose_chart` returning the figure
+instead); scenario role hints match at a word boundary over a camel-split token, so `uri`
+inside `security` and `path` inside `filepath` stop pre-filling a role while `TargetUserName`
+and `CommandLine` still match; the modal's field picker uses the rail's own
+`fieldComboOption` (moved to `lib/fieldDisplay.ts`, plus a coverage-showing variant for the
+modal, which ranks by it) rather than a private copy showing raw tokens; `FieldCombo` takes
+an `id` so the modal's role labels actually focus their input; and `_columnar_deep`'s
+docstring stops claiming it leaves a row's nested structures alone when it recurses into
+them.
+
+## Session 214 — 2026-08-31: scenario presets, bound to roles rather than fields
+
+The 2026-08-29 Visualize round folded the task presets into `ChartMeta.question`, which kept
+their prose and dropped what they did — the metric, the compare mode, the options a preset set
+in one click. This brings them back one level up, as **scenarios**: six investigations named
+the way an analyst names them (DDoS / flood, data exfiltration, SQL injection, RDP
+interaction, lateral movement, off-hours activity), each resolving to exactly one legal
+`ChartConfig`.
+
+The design problem was that "SQL injection" is domain knowledge and the page's first standing
+rule is that the core knows nothing about what a field is. The answer is that **a scenario
+names roles, not fields**: "the field holding the request text", bound by the analyst in a
+modal that pre-fills what it can from their own timeline's tokens and reports what it could
+not. Two scenarios also suggest a filter — injection syntax, the RDP event IDs — keyed on the
+field the analyst bound, shown as a pre-checked droppable row, and merged per field into the
+page's URL filters, so it arrives as removable chips and as caption prose rather than as a
+silent narrowing.
+
+Applying a scenario adds no render path: it is the same `takeOver(config, filters)` the rail's
+own controls make. A scenario is never withheld from the gallery over a role its timeline
+cannot fill — it opens and says which role that is. `vizScenarios.test.ts` holds every
+scenario against the figure registry (scale legal, options read, required inputs covered by
+required roles), so a registry change cannot leave one emitting a config the rail refuses.
+
+New: `frontend/src/components/viz/lib/scenarios.ts`, `ScenarioModal.tsx`. `docs/VISUALIZE.md`
+§4a records it; §5 records why there is no scenario tool for the agent.
+
+## Session 213 — 2026-08-31: `/mcp` gets the chart, not a description of one (1.17.1)
+
+Three defects on the external transport, all the same shape: tools written for the agent
+panel, advertised to a client that has no panel.
+
+- **`propose_chart` returned no data.** In-app it drops `result` because the analyst's card
+  fetches its own copy and the model only needs `summary`. Over `/mcp` there is no card, so a
+  client asking for a time histogram got `{"buckets": 48, "interval_seconds": 3600}` — a
+  figure it could not draw, tabulate or quote, leaving it to re-derive the same numbers
+  through `histogram`/`field_terms` by hand. That surface now keeps `result` (and `marks`),
+  through a new generic `_columnar_deep` plus the existing `_compact_timeseries`, so it reads
+  like every other tabular result. `_columnar_deep` walks the structure instead of naming row
+  keys the way `_columnize` does: one tool covers twenty chart types over a dozen aggregation
+  shapes, and a named list would silently stop covering a new figure. Sizes were never the
+  problem once the payload is columnar — `AGENT_CHART_LIMITS` already bounds every shape to
+  ~1–3 KB typical, ~12 KB worst case (a 1,000-point scatter), the same order as a routine
+  `field_timeseries` call.
+- **`open_url` was a relative path.** It is the one thing that shows a human the real,
+  interactive figure, and an MCP client has no origin to complete it against. New optional
+  `VESTIGO_PUBLIC_BASE_URL` makes it absolute; unset, nothing changes. Not taken from the
+  request `Host` header on purpose — behind a proxy that is whatever the proxy forwarded, and
+  a confidently wrong link is worse than a relative one. Worth recording why nothing had to be
+  persisted for this: the figure lives entirely in the query string (`agent/deep_link.py`
+  mirrors the page's codec), so a link costs no row, needs no write permission, and works for
+  a read-only case member — which a save-the-chart-first design would not.
+- **`propose_finding` was advertised there at all.** Its whole product is a card; over `/mcp`
+  it wrote nothing, showed nothing, and returned a hit count `search_events` already gives,
+  under a docstring telling the model an analyst was looking at it. Now `requires_conversation`
+  like the other two proposal tools.
+
+`propose_chart` keeps its name on both surfaces (renaming breaks existing clients) but is
+*described* differently where there is no card and no Save button — `EXTERNAL_CHART_DESCRIPTION`.
+
+**Considered and rejected: rendering the chart server-side.** The obvious read is that the
+Visualize page's SVG/PNG export could be called from the server, but it is not a renderer —
+`downloadChartSvg`/`downloadChartPng` take an `SVGSVGElement` the browser has *already*
+painted, and every step after that is browser-bound (`getComputedStyle` to resolve the
+`var(--viz-*)` palette, `XMLSerializer`, a `<canvas>` to rasterize). The drawing is the 22
+React components in `components/viz/charts/`. They *can* render outside a live page —
+`renderToStaticMarkup` plus `ChartStaticWidthContext` is exactly how story exports work
+(#197) — but only in a JS runtime, which would mean Node at runtime, a second SSR bundle, a
+build-extracted palette, and a rasterizer. That is a deployment-story change
+(`docs/DEPLOYMENT.md`), not a patch. The alternative, a Python re-implementation, puts two
+renderers that can disagree about the same `ChartConfig` in a product where the card is
+evidence. Neither belongs in 1.17.1; the deep link is what shows a human the figure.
 
 ## Session 212 — 2026-08-30: every embeddings entry point is gated on the capability
 

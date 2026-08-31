@@ -15,6 +15,7 @@ import {
 } from "@/components/viz/lib/chartConfig";
 import { resolveChartOptions } from "@/components/viz/lib/chartOptions";
 import { CHART_META, INPUT_KEYS } from "@/components/viz/lib/chartMeta";
+import { SCENARIOS } from "@/components/viz/lib/scenarios";
 import { installFakeResizeObserver } from "./helpers/resizeObserver";
 import { installRadixJsdomStubs } from "./helpers/radix";
 
@@ -103,8 +104,9 @@ describe("ChartRail", () => {
       field: "artifact",
       scale: "nominal",
     });
-    expect(sectionOrder().slice(0, 6)).toEqual([
+    expect(sectionOrder().slice(0, 7)).toEqual([
       "header",
+      "scenarios",
       "field",
       "scale",
       "figure",
@@ -227,7 +229,7 @@ describe("ChartRail", () => {
 describe("ChartRail — Derive", () => {
   it("offers Derive only where the treat-as admits one, between Treat as and Figure", () => {
     renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "histogram", field: "attr:bytes", scale: "ratio" });
-    expect(sectionOrder().slice(1, 4)).toEqual(["field", "scale", "derive"]);
+    expect(sectionOrder().slice(2, 5)).toEqual(["field", "scale", "derive"]);
     document.body.innerHTML = "";
     renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "bar", field: "artifact", scale: "nominal" });
     expect(sectionOrder()).not.toContain("derive");
@@ -682,5 +684,60 @@ describe("ChartRail — custom bin edges", () => {
     expect(updateConfig).toHaveBeenCalledWith({
       derive: { kind: "bins", mode: "custom", edges: Array.from({ length: 49 }, (_, i) => i + 1) },
     });
+  });
+});
+
+describe("ChartRail — scenarios", () => {
+  function scenarioCards(): HTMLElement[] {
+    const section = document.querySelector(
+      '[data-rail-section="scenarios"]',
+    ) as HTMLElement;
+    return within(section)
+      .getAllByRole("button")
+      .filter((b) => b.textContent !== "Start from a scenario");
+  }
+
+  it("offers the scenarios above the field picker, since a scenario answers 'which field?' too", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG });
+    expect(scenarioCards().map((b) => b.textContent)).toEqual(
+      SCENARIOS.map((s) => expect.stringContaining(s.label)),
+    );
+  });
+
+  it("opens a scenario's binding modal rather than applying it blind", () => {
+    const { updateConfig } = renderRail({ ...DEFAULT_CHART_CONFIG });
+    fireEvent.click(screen.getByRole("button", { name: /Lateral movement/ }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(
+      within(screen.getByRole("dialog")).getByText(SCENARIOS[4].question),
+    ).toBeTruthy();
+    expect(updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("hands the page both halves when a scenario is confirmed", () => {
+    const onApplyScenario = vi.fn();
+    renderRail(
+      { ...DEFAULT_CHART_CONFIG },
+      {
+        onApplyScenario,
+        fields: [
+          { token: "attr:username", distinct: 90, coverage: 0.9 },
+          { token: "attr:dst_host", distinct: 40, coverage: 0.8 },
+        ],
+      },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Lateral movement/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Render figure/ }));
+    expect(onApplyScenario).toHaveBeenCalledTimes(1);
+    const [patch, filters] = onApplyScenario.mock.calls[0];
+    expect(patch.chartType).toBe("sankey");
+    expect(patch.field).toBe("attr:username");
+    expect(patch.fieldY).toBe("attr:dst_host");
+    expect(filters).toBeNull();
+  });
+
+  it("stays out of the way once the URL already describes a chart", () => {
+    renderRail({ ...DEFAULT_CHART_CONFIG, chartType: "bar", field: "artifact" });
+    expect(scenarioCards()).toEqual([]);
   });
 });

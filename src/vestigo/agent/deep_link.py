@@ -81,8 +81,15 @@ def visualize_url(
     timeline_id: str,
     stored_config: dict[str, Any],
     filters_payload: dict[str, Any] | None,
+    base_url: str | None = None,
 ) -> str:
-    """Return the Visualize page URL that opens *stored_config* under *filters_payload*."""
+    """Return the Visualize page URL that opens *stored_config* under *filters_payload*.
+
+    *base_url* (``public_base_url``) prefixes the path so the link resolves for
+    a client that is not the browser — an external ``/mcp`` client has no
+    origin to complete a relative path against. Unset returns the path alone,
+    which is what the in-app card has always used.
+    """
     c = stored_config
     params = _filter_params(filters_payload)
     chart_type = str(c["chartType"])
@@ -111,4 +118,7 @@ def visualize_url(
         params.append(("c_inputs", _json(c["inputs"])))
     if c.get("marks"):
         params.append(("c_marks", _json(c["marks"])))
-    return f"/cases/{case_id}/timelines/{timeline_id}/visualize?{urlencode(params)}"
+    path = f"/cases/{case_id}/timelines/{timeline_id}/visualize?{urlencode(params)}"
+    # Prefix only — the query string is the figure's identity, so the absolute
+    # form has to be the relative one unchanged.
+    return f"{base_url.rstrip('/')}{path}" if base_url else path

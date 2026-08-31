@@ -20,8 +20,9 @@ Which fields may be overridden, and how they are presented, is declared in
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -463,6 +464,20 @@ class Settings(BaseSettings):
     # MCP needs no LLM endpoint).
     mcp_enabled: bool = False
 
+    # Outside-facing base URL of this deployment, e.g.
+    # "https://vestigo.example.org" — scheme included, which the validator
+    # below enforces because a scheme-less host is itself a relative URL. Links Vestigo hands to a consumer that is
+    # not the browser are relative paths, which an external /mcp client has no
+    # origin to resolve — `propose_chart`'s Visualize deep link is the one that
+    # matters today, and over MCP it *is* the figure. Set this and such links
+    # become absolute; unset (the default) keeps the relative form, so nothing
+    # changes for a deployment that only ever serves its own SPA.
+    #
+    # Deliberately not derived from the request's Host header: behind a reverse
+    # proxy that is whatever the proxy forwarded, and a confidently wrong link
+    # is worse than a relative one the reader knows to complete.
+    public_base_url: str | None = None
+
     # ── Generated converters (docs/INPUT_FORMATS.md §"Generated converters") ──
     # Off by default: enabling it lets LLM-authored Python run in a guarded
     # subprocess on this host. Needs a configured, reachable agent endpoint too.
@@ -485,6 +500,36 @@ class Settings(BaseSettings):
     converter_run_memory_mb: int = Field(default=2048, ge=2048, le=65536)
     # RLIMIT_FSIZE for the subprocess: the produced Parquet cannot grow past this.
     converter_run_output_mb: int = Field(default=4096, ge=64, le=1048576)
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _public_base_url_is_absolute(cls, value: str | None) -> str | None:
+        """Refuse a base URL that an MCP client would resolve as a relative path.
+
+        The setting exists because a consumer that is not the browser has no
+        origin to complete a path against, so "vestigo.example.org" typed
+        without a scheme produces exactly the confidently wrong link the field
+        was added to avoid — and does it silently, since the result still looks
+        like a URL. Fail at set-time instead: the settings API hands the
+        message back to the admin console, and a mistyped
+        ``VESTIGO_PUBLIC_BASE_URL`` stops the process rather than serving
+        broken links for the life of the deployment.
+
+        An empty string is the console's "cleared", not a bad value; it means
+        the same as unset.
+        """
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        parsed = urlparse(text)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "must be an absolute URL including the scheme, e.g. "
+                f"'https://vestigo.example.org' (got {value!r})"
+            )
+        return text
 
 
 @lru_cache

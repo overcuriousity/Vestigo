@@ -85,3 +85,26 @@ def test_unrepresentable_filter_members_names_the_three_url_less_members() -> No
         FilterSpec(event_ids=["e1"], run_id="r1", collapse_routine=True)
     )
     assert members == ["a fixed event set", "a detector run", "routine collapse"]
+
+
+def test_public_base_url_makes_the_link_absolute() -> None:
+    """An external MCP client has no host to resolve a path against.
+
+    The absolute form must be the relative one with a prefix and nothing else:
+    a link that reorders or re-encodes a parameter is a different figure.
+    """
+    spec = ChartSpec.model_validate({"chart_type": "time"})
+    config = spec_to_stored_chart_config(spec)
+    relative = visualize_url("c", "t", config, None)
+    assert relative.startswith("/cases/")
+    absolute = visualize_url("c", "t", config, None, base_url="https://vestigo.example.org")
+    assert absolute == f"https://vestigo.example.org{relative}"
+
+
+def test_public_base_url_trailing_slash_does_not_double_up() -> None:
+    """`https://host/` is what an operator pastes out of a browser bar."""
+    spec = ChartSpec.model_validate({"chart_type": "time"})
+    config = spec_to_stored_chart_config(spec)
+    assert visualize_url("c", "t", config, None, base_url="https://host//") == visualize_url(
+        "c", "t", config, None, base_url="https://host"
+    )

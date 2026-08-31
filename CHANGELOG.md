@@ -5,6 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.1] — 2026-08-31
+
+### Fixed
+
+- **The external `/mcp` surface no longer offers tools that only work inside the web app,
+  and hands back the chart it was asked for.** `propose_chart` used to drop the aggregation
+  payload before returning, because in-app the analyst's card fetches its own copy and the
+  model only needs the summary. Over `/mcp` there is no card, so a client asking for a time
+  histogram got `{"buckets": 48, "interval_seconds": 3600}` — a figure it could not draw,
+  tabulate or quote a number from, leaving it to re-derive the same numbers through
+  `histogram`/`field_terms` by hand. On that transport the tool now keeps `result` (and
+  `marks`), columnar like every other tabular result and with a timeseries' shared axis
+  hoisted exactly as `field_timeseries` does; sizes stay inside the bounds
+  `AGENT_CHART_LIMITS` already applied. It is also *described* differently there: same name,
+  same validation, but no card, no Save button and nobody being proposed to. In-app behaviour
+  is unchanged.
+- **`propose_finding` is in-app only**, joining `propose_annotation` and `propose_story_block`.
+  Its entire product is a card in the agent panel; over `/mcp` it wrote nothing, showed
+  nothing, and returned a hit count `search_events` already gives — while its description told
+  the model an analyst was looking at a card.
+  The transport's own `instructions` no longer steer a client at it either.
+- **`VESTIGO_PUBLIC_BASE_URL` refuses a value that is not an absolute URL.** A scheme-less
+  `vestigo.example.org` produced a link an MCP client resolves as a *relative path* — exactly
+  the confidently wrong link the setting exists to prevent, and silently, since the value
+  still looks like a URL. It is now rejected at set-time, in the admin console and in the
+  environment.
+- **A scenario opened before the timeline's field list had loaded stayed unbound.** The
+  scenario section is open on a fresh Visualize page, so the ordinary first click seeded its
+  suggestions from an empty list and left every role unbound with no recovery but reopening
+  the modal. The suggestion now follows the field list, while a binding the analyst chose
+  still wins over it. Role hints also match at a word boundary, so a field like `security_id`
+  is no longer pre-filled as the request field.
+
+### Added
+
+- **Scenario presets on Visualize.** Six investigations named the way an analyst names them —
+  DDoS / flood, data exfiltration, SQL injection, RDP interaction, lateral movement, off-hours
+  activity — each resolving to exactly one legal chart. A scenario names **roles**, never
+  fields ("the field holding the request text"), and the analyst binds each role to their own
+  timeline's tokens in a modal that pre-fills what it can and reports what it could not; the
+  page's rule that the core knows nothing about what a field *is* is untouched. Two scenarios
+  also suggest a filter — injection syntax, the remote-desktop event IDs — keyed on the field
+  the analyst bound, shown as a pre-checked droppable row and merged into the page's URL
+  filters, so it arrives as removable chips and as caption prose rather than as a silent
+  narrowing. Applying one adds no render path, and a scenario whose role its timeline cannot
+  fill still opens and says so.
+- **`VESTIGO_PUBLIC_BASE_URL`** — the deployment's outside-facing URL. `propose_chart`'s
+  `open_url` is the Visualize page link for that exact figure, and over `/mcp` it is how a
+  client hands its human the real, interactive chart; as a relative path it was not something
+  an external client could resolve. Set this and the link is absolute, unset it stays as it
+  was. The figure still lives entirely in the query string — no row is written to produce a
+  link, so it needs no write permission and works for a read-only case member. Deliberately
+  not derived from the request `Host` header: behind a proxy that is whatever the proxy
+  forwarded, and a confidently wrong link is worse than a relative one. Editable in the admin
+  console like every other setting.
+
 ## [1.17.0] — 2026-08-30
 
 ### Added

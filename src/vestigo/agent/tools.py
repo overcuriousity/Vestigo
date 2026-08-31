@@ -179,7 +179,10 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         "run_anomaly_detector", "Run a statistical anomaly detector over the timeline.", tier="core"
     ),
     ToolInfo(
-        "propose_finding", "Propose a distilled finding card with applicable filters.", tier="core"
+        "propose_finding",
+        "Propose a distilled finding card with applicable filters.",
+        requires_conversation=True,
+        tier="core",
     ),
     ToolInfo("propose_chart", "Propose a chart card, validated by executing the underlying query."),
     ToolInfo(
@@ -893,6 +896,32 @@ are in this payload). When they differ the list was capped — say so rather
 than reasoning as if you had seen all of them.
 """
 
+#: What ``propose_chart`` says on the external ``/mcp`` transport, where the
+#: docstring's card, Save button and analyst do not exist. Same tool, same
+#: validation, different product: the figure comes back as data plus the link
+#: that opens it in Vestigo, and nothing is proposed to anybody.
+EXTERNAL_CHART_DESCRIPTION = """Build and run a chart over this timeline.
+
+Validates `spec` against the same legality rules the Visualize page enforces
+through its dropdowns, then executes the underlying query. Writes nothing.
+
+An illegal spec errors with a message naming the legal alternatives, so you
+can correct it. A legal one returns:
+
+- `resolved` — the chart_type, scale, metric, comparison mode and options that
+  were actually used. Read it. Do not report what a chart shows without
+  checking `resolved` matches what you asked for.
+- `result` — the figure's data, columnar (see "Reading tabular results"). This
+  is the chart: read it, quote it, or render it yourself. `marks` alongside it
+  carries the resolved overlay instants when the spec asked for any.
+- `summary` — the same data compressed to its headline numbers.
+- `warnings` — options this chart type ignores, and any limit that was clamped.
+- `open_url` — the Visualize page link for this exact figure. Hand it to a
+  human: it opens the real, interactive chart, which is more than the numbers
+  here can show them.
+"""
+
+
 SCALE_VOCABULARY_NOTE = """## Scale vocabulary
 
 The analyst's Visualize page calls `scale` "treat as": nominal = *Categories*, ordinal =
@@ -1100,6 +1129,32 @@ def _listing(key: str, rows: list[dict[str, Any]], total: int) -> dict[str, Any]
     """
     capped = rows[:MAX_LIST_ROWS]
     return {"total": total, "returned": len(capped), key: columnar_auto(capped)}
+
+
+def _columnar_deep(value: Any) -> Any:
+    """Re-encode every list-of-dicts anywhere inside *value* columnar (A13).
+
+    :func:`_columnize` names the keys it reshapes because its callers know
+    their result's shape. ``propose_chart`` does not: one tool covers twenty
+    chart types over a dozen aggregation shapes, and naming the row key of
+    each would be a list that silently stops covering a new figure. Walking
+    the structure costs a traversal of an already-capped payload and cannot
+    miss one.
+
+    Lossless, like every other transform at this boundary: scalars pass
+    through untouched, and the walk descends *into* a row's cells too — a
+    nested list-of-dicts inside a cell is re-encoded columnar like any other,
+    which is the point of doing this deeply rather than at the top level. Row
+    caps stay where they belong (``AGENT_CHART_LIMITS``), so a compact result
+    is never also a truncated one.
+    """
+    if isinstance(value, dict):
+        return {key: _columnar_deep(item) for key, item in value.items()}
+    if isinstance(value, list):
+        if value and all(isinstance(row, Mapping) for row in value):
+            return columnar_auto([{k: _columnar_deep(v) for k, v in row.items()} for row in value])
+        return [_columnar_deep(item) for item in value]
+    return value
 
 
 def _compact_timeseries(result: Any) -> Any:
@@ -1382,12 +1437,23 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         "vestigo-investigation",
         instructions=(
             "Read-only forensic log investigation tools, scoped to one case "
-            "timeline. Iterate: inspect fields, search, aggregate, then "
-            "return refined filters as findings.\n\n"
+            "timeline. Iterate: inspect fields, search, aggregate, then chart "
+            "what you found with propose_chart — over this transport it "
+            "executes the chart and returns the figure's data plus the link "
+            "that opens it in Vestigo. Nothing here writes; the proposal tools "
+            "the in-app agent uses to hand a card to an analyst are not served "
+            "on this transport, so report your conclusions in your own "
+            "answer.\n\n"
             f"{RESULT_FORMAT_NOTE}\n{SCALE_VOCABULARY_NOTE}\n{SPEC_REFERENCE}"
         ),
     )
     service = _get_query_service()
+
+    # No conversation means no analyst watching: this server is being built for
+    # an external /mcp client (`agent/mcp_http.py`), which has no proposal cards
+    # and no Visualize page open beside it. The same discriminator the two
+    # confirm-first proposal tools have always gated on.
+    external = scope.conversation_id is None
 
     def _validated(spec: FilterSpec | None) -> FilterSpec:
         spec = spec or FilterSpec()
@@ -1971,22 +2037,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         # sweep from tens of thousands of tokens back inside a small window.
         return _columnize(_deflate_findings(payload, scope.fidelity), "results")
 
-    @server.tool()
-    async def propose_finding(title: str, description: str, filters: FilterSpec) -> dict[str, Any]:
-        """Propose a distilled finding to the analyst.
-
-        Call this when a filter set isolates something worth attention. The
-        analyst sees a card with your title/description and an "apply to
-        Explorer" button carrying exactly these filters. The returned total
-        is the filter's current hit count — verify it is what you expect.
-        Propose only filters you have actually run via search_events.
-        """
-        spec = _validated(filters)
-        query = await _build_query(scope, spec, limit=1)
-        page = await run_in_threadpool(service.query, query)
-        return {"accepted": True, "title": title, "total": page.total}
-
-    @server.tool()
+    @server.tool(description=EXTERNAL_CHART_DESCRIPTION if external else None)
     async def propose_chart(title: str, description: str, spec: ChartSpec) -> dict[str, Any]:
         """Propose a chart to the analyst.
 
@@ -2013,25 +2064,41 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         payload = await execute_chart_spec(
             scope, spec, service=service, validated=_validated, check_field=_check_chart_field
         )
-        # The full aggregation payload is for server-side consumers (Stories
-        # export resolver); the model gets the compressed summary only.
-        payload.pop("result", None)
-        # The card resolves its own marks through POST …/viz/marks from the
-        # same config; the summary carries what the model needs.
-        payload.pop("marks", None)
+        if external:
+            # No card exists on this transport, so the payload *is* the figure:
+            # a caller told only `{"buckets": 48}` cannot draw it, tabulate it,
+            # or quote a number out of it, and re-deriving the same numbers
+            # through histogram/field_terms is the round trip this tool exists
+            # to save. Sizes are the ones AGENT_CHART_LIMITS already bounds —
+            # the same order as a routine field_timeseries result.
+            payload["result"] = _columnar_deep(_compact_timeseries(payload["result"]))
+        else:
+            # In-app the full aggregation payload is for server-side consumers
+            # (Stories export resolver); the model gets the compressed summary
+            # only, because the card fetches its own copy.
+            payload.pop("result", None)
+            # The card resolves its own marks through POST …/viz/marks from the
+            # same config; the summary carries what the model needs.
+            payload.pop("marks", None)
 
         from vestigo.agent.deep_link import unrepresentable_filter_members, visualize_url
+        from vestigo.core.config import get_settings
         from vestigo.stories.export import _spec_filters_to_payload, spec_to_stored_chart_config
 
-        # External /mcp clients get no card: this is the figure, as a link —
-        # except that three filter members have no URL form, and each only
-        # narrows, so a link that lost one would draw a wider chart than the
-        # summary above describes, with nothing on the page to say so.
+        # The link is how a human sees the actual figure — the in-app card's
+        # "Open in Visualize", and the whole product of the tool over /mcp.
+        # Absolute when the deployment declares its public URL, since a client
+        # that is not the browser has no origin to complete a path against.
+        #
+        # Three filter members have no URL form, and each only narrows, so a
+        # link that lost one would draw a wider chart than the result above
+        # describes, with nothing on the page to say so.
         payload["open_url"] = visualize_url(
             scope.case_id,
             scope.timeline_id,
             spec_to_stored_chart_config(spec),
             _spec_filters_to_payload(spec.filters),
+            base_url=get_settings().public_base_url,
         )
         dropped = unrepresentable_filter_members(spec.filters)
         if dropped:
@@ -2042,7 +2109,24 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             )
         return payload
 
-    if scope.conversation_id is not None:
+    if not external:
+
+        @server.tool()
+        async def propose_finding(
+            title: str, description: str, filters: FilterSpec
+        ) -> dict[str, Any]:
+            """Propose a distilled finding to the analyst.
+
+            Call this when a filter set isolates something worth attention. The
+            analyst sees a card with your title/description and an "apply to
+            Explorer" button carrying exactly these filters. The returned total
+            is the filter's current hit count — verify it is what you expect.
+            Propose only filters you have actually run via search_events.
+            """
+            spec = _validated(filters)
+            query = await _build_query(scope, spec, limit=1)
+            page = await run_in_threadpool(service.query, query)
+            return {"accepted": True, "title": title, "total": page.total}
 
         @server.tool()
         async def propose_annotation(
