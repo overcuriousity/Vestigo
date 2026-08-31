@@ -12,9 +12,14 @@ disabled one.
 
 So availability is both arms, each actually probed:
 
-- **The vector store.** Qdrant answering ``get_collections()``. Configuration
-  alone cannot stand in for this: ``qdrant_url`` has a non-null default, so
-  every instance looks configured whether or not anything is listening.
+- **The vector store.** A server Qdrant answering ``get_collections()``.
+  Configuration alone cannot stand in for this: ``qdrant_url`` has a non-null
+  default, so every instance looks configured whether or not anything is
+  listening. The *embedded on-disk* mode (``VESTIGO_QDRANT_PATH``) is the one
+  arm that stays a check rather than a call, because qdrant-client locks the
+  storage folder exclusively and this process already holds that lock whenever
+  an embedding job or the similarity service is alive — see
+  :func:`_probe_local_store`.
 - **The embedding model.** A remote endpoint is probed with a one-token
   ``/embeddings`` request — reachable, authenticated and actually serving the
   configured model. The *local* arm stays a configuration check
@@ -44,7 +49,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
+from pathlib import Path
 
 import httpx
 
@@ -109,6 +116,30 @@ def vector_store_configured() -> bool:
     return bool(settings.qdrant_url or settings.qdrant_path)
 
 
+def _probe_local_store(path: str) -> bool:
+    """Whether the embedded on-disk Qdrant at ``path`` is usable.
+
+    Deliberately a directory check and **not** a client construction.
+    qdrant-client's local mode takes an exclusive lock on the storage folder
+    for the lifetime of the client, and this process already holds one
+    whenever a :class:`~vestigo.db.qdrant.QdrantStore` is alive — the
+    similarity service is a process-lifetime singleton, and every embedding
+    job builds a store for its duration. A probe client would therefore start
+    raising as soon as anyone used embeddings once, flipping the capability
+    off on a perfectly healthy instance until restart; and in the window it
+    *did* hold the lock it would make a starting embed job fail. Neither is a
+    trade a health poll gets to make.
+
+    So the local arm claims only what it can check for free: the storage
+    directory exists and is writable, or its parent is, so the client can
+    create it. That is weaker than the server arm's "it answered", and the
+    module docstring says so.
+    """
+    target = Path(path)
+    probe = target if target.exists() else target.parent
+    return probe.is_dir() and os.access(probe, os.W_OK | os.X_OK)
+
+
 def _probe_vector_store() -> bool:
     """Ask Qdrant to list its collections. Blocking; run in a thread.
 
@@ -116,19 +147,22 @@ def _probe_vector_store() -> bool:
     so the probe can impose its own timeout: the store is built for ingest and
     query paths that may legitimately wait, while a probe that hangs would hold
     the cold-cache path of ``/api/health`` open for as long as the socket does.
-    """
-    from qdrant_client import QdrantClient
 
+    Local (on-disk) mode cannot be probed this way at all — see
+    :func:`_probe_local_store`.
+    """
     settings = get_settings()
     try:
         if settings.qdrant_path:
-            client = QdrantClient(path=settings.qdrant_path)
-        else:
-            client = QdrantClient(
-                url=settings.qdrant_url,
-                api_key=settings.qdrant_api_key,
-                timeout=int(_PROBE_TIMEOUT),
-            )
+            return _probe_local_store(settings.qdrant_path)
+
+        from qdrant_client import QdrantClient
+
+        client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+            timeout=int(_PROBE_TIMEOUT),
+        )
         try:
             client.get_collections()
         finally:
@@ -160,7 +194,10 @@ async def _probe_embedding_endpoint() -> bool:
                 headers=headers,
                 json={"model": settings.embedding_model, "input": "ping"},
             )
-    except httpx.HTTPError as exc:
+    except Exception as exc:
+        # Not just httpx.HTTPError: httpx.InvalidURL is not one of those, and a
+        # misconfigured base URL must read as "unavailable", never as a 500 on
+        # /api/health.
         logger.warning("Embedding endpoint probe failed (%s): %s", url, exc)
         return False
     if response.status_code >= 400:
@@ -170,12 +207,22 @@ async def _probe_embedding_endpoint() -> bool:
 
 
 async def _probe() -> bool:
-    """Both arms. Either one missing means no embedding job can complete."""
-    if not model_configured() or not vector_store_configured():
+    """Both arms. Either one missing means no embedding job can complete.
+
+    Nothing escapes: this runs behind ``get_capabilities()``, so an exception
+    here would take ``/api/health`` to a 500 and cost the frontend its gating
+    for *every* subsystem — agent, OIDC, transfer, MCP — over one optional one.
+    A failure to answer is an answer: unavailable.
+    """
+    try:
+        if not model_configured() or not vector_store_configured():
+            return False
+        if get_settings().embedding_api_base_url and not await _probe_embedding_endpoint():
+            return False
+        return await asyncio.to_thread(_probe_vector_store)
+    except Exception:
+        logger.warning("Embeddings availability probe failed", exc_info=True)
         return False
-    if get_settings().embedding_api_base_url and not await _probe_embedding_endpoint():
-        return False
-    return await asyncio.to_thread(_probe_vector_store)
 
 
 async def _refresh_cache(fingerprint: str) -> None:
@@ -192,9 +239,23 @@ async def _refresh_cache(fingerprint: str) -> None:
 
 
 def _schedule_refresh(fingerprint: str) -> None:
+    """Start a background re-probe unless one is already running *on this loop*.
+
+    The loop check is not paranoia: a task created on a loop that is torn down
+    before it ever ran stays ``done() == False`` forever, and a bare
+    "is one in flight?" guard would then refuse to schedule another for the
+    life of the process — silently downgrading stale-while-revalidate to
+    "only the synchronous paths ever refresh". Test clients and any loop
+    replacement hit exactly that.
+    """
     global _refresh_task
     if _refresh_task is not None and not _refresh_task.done():
-        return
+        try:
+            same_loop = _refresh_task.get_loop() is asyncio.get_running_loop()
+        except RuntimeError:  # no running loop — nothing to schedule on anyway
+            return
+        if same_loop:
+            return
     _refresh_task = asyncio.create_task(_refresh_cache(fingerprint))
 
 
@@ -264,19 +325,35 @@ def unavailable_detail() -> str:
             "No vector store is configured, so there is nowhere to put embeddings. "
             "Set VESTIGO_QDRANT_URL (or VESTIGO_QDRANT_PATH for local mode)."
         )
-    if settings.embedding_api_base_url and _cache is not None and not _cache[0]:
+    target = settings.qdrant_url or settings.qdrant_path
+    # cached_result(), not _cache: a record left over from the settings that
+    # were in force before an admin's PUT would name the wrong endpoint.
+    if cached_result() is False:
+        if settings.embedding_api_base_url:
+            return (
+                "The embedding backend did not answer. Check that the vector store "
+                f"({target}) and the embedding endpoint "
+                f"({settings.embedding_api_base_url}) are reachable from this host."
+            )
         return (
-            "The embedding backend did not answer. Check that the vector store "
-            f"({settings.qdrant_url or settings.qdrant_path}) and the embedding endpoint "
-            f"({settings.embedding_api_base_url}) are reachable from this host."
+            f"The vector store did not answer. Check that Qdrant ({target}) is "
+            "reachable from this host."
         )
+    # Nothing has probed these settings yet, so name the parts without
+    # claiming a probe result this function does not have.
+    endpoint = (
+        f" and the embedding endpoint ({settings.embedding_api_base_url})"
+        if settings.embedding_api_base_url
+        else ""
+    )
     return (
-        "The vector store did not answer. Check that Qdrant "
-        f"({settings.qdrant_url or settings.qdrant_path}) is reachable from this host."
+        "Embedding features are not available right now. Check that the vector "
+        f"store ({target}){endpoint} are reachable from this host."
     )
 
 
 def reset_probe_cache() -> None:
-    """Forget the cached probe result (test helper)."""
-    global _cache
+    """Forget the cached probe result and any in-flight refresh (test helper)."""
+    global _cache, _refresh_task
     _cache = None
+    _refresh_task = None

@@ -40,7 +40,9 @@ Special cases:
   `VESTIGO_SIGMA_RULES_PATH` is meaningful (it disables the global ruleset). One asymmetry:
   `VESTIGO_QDRANT_URL` cannot be unset from the console — clearing it restores the default
   endpoint. Select an embedded on-disk Qdrant with `VESTIGO_QDRANT_PATH` (environment-only),
-  which takes precedence over the URL.
+  which takes precedence over the URL. In that mode the health probe checks the storage
+  directory rather than opening a client, because qdrant-client locks the folder exclusively
+  and the app holds that lock while embedding work runs.
 
 **Back up accordingly.** Any secret an admin stores through the console lives in
 `app_settings` in plaintext, so every Postgres dump, replica and snapshot of the metadata

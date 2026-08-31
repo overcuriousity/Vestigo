@@ -163,9 +163,21 @@ async def _refresh_cache(config: AgentConfig, fingerprint: str) -> None:
 
 
 def _schedule_refresh(config: AgentConfig, fingerprint: str) -> None:
+    """Start a background re-probe unless one is already running *on this loop*.
+
+    A task created on a loop that is torn down before it ran stays
+    ``done() == False`` forever, so a bare in-flight guard would refuse to
+    schedule another for the life of the process and quietly downgrade
+    stale-while-revalidate to "only the synchronous paths refresh".
+    """
     global _refresh_task
     if _refresh_task is not None and not _refresh_task.done():
-        return
+        try:
+            same_loop = _refresh_task.get_loop() is asyncio.get_running_loop()
+        except RuntimeError:  # no running loop — nothing to schedule on anyway
+            return
+        if same_loop:
+            return
     _refresh_task = asyncio.create_task(_refresh_cache(config, fingerprint))
 
 
@@ -210,6 +222,7 @@ async def agent_available(*, force: bool = False) -> bool:
 
 
 def reset_probe_cache() -> None:
-    """Forget the cached probe result (test helper)."""
-    global _cache
+    """Forget the cached probe result and any in-flight refresh (test helper)."""
+    global _cache, _refresh_task
     _cache = None
+    _refresh_task = None

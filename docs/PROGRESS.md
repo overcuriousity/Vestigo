@@ -41,9 +41,31 @@ And clearing `VESTIGO_QDRANT_URL` and `VESTIGO_QDRANT_PATH` is now the documente
 way to declare a deployment embedding-free (`.env.example`, `TECH_STACK.md` §3.5,
 `DEPLOYMENT.md`).
 
+Review follow-up, same day. The vector-store probe built its own `QdrantClient`, which is
+fine against a server and wrong against `VESTIGO_QDRANT_PATH`: local mode takes an exclusive
+lock on the storage folder, and this process already holds one whenever the similarity
+service (a process-lifetime singleton) or an embedding job is alive. Every probe after the
+first semantic search would have raised, been swallowed as `False`, and flipped the
+capability off on a healthy instance until restart — and in the window the probe *did* hold
+the lock, a starting embed job would have failed. The local arm is now a storage-directory
+check, weaker than "it answered" and documented as such. Three smaller repairs alongside it:
+`_probe()` swallows everything, since an escaping exception would have taken `/api/health`
+to a 500 and cost the frontend its gating for agent, OIDC, transfer and MCP over one optional
+subsystem (`httpx.InvalidURL` is not an `httpx.HTTPError`, so the endpoint arm could raise);
+`_schedule_refresh` compares the in-flight task's loop to the running one, because a task
+stranded on a torn-down loop stays `done() == False` forever and would have disabled
+stale-while-revalidate for the life of the process (`agent/availability.py` had the same
+latent shape and got the same fix); and `unavailable_detail()` reads the fingerprint-checked
+`cached_result()` rather than `_cache` directly, so a record from the settings in force
+before an admin's PUT cannot name the wrong host, with a cold cache no longer asserting a
+probe result it does not have.
+
 `tests/test_embeddings_availability.py` pins the reported case end to end through
 `/api/health`, plus the dead endpoint, the off switch, fingerprint invalidation, the
-cold-cache fallback and both probes swallowing their failures. An autouse conftest fixture
+cold-cache fallback and both probes swallowing their failures — plus, from the review pass,
+a local-mode probe running while a `QdrantClient` holds the folder lock, a probe that raises,
+an invalid endpoint URL, a refresh task stranded on a dead loop, and the two refusal texts
+that must not claim a probe result they do not have. An autouse conftest fixture
 keeps the probe off the network for the rest of the suite — Qdrant is faked rather than run,
 and availability must not become a fourth service the suite requires.
 
