@@ -559,7 +559,7 @@ def _settings_payload() -> dict[str, Any]:
         else:
             entry["value"] = value
         fields.append(entry)
-    config = resolve_agent_config(settings)
+    config = resolve_agent_config()
     return {
         "groups": [{"key": g.key, "label": g.label, "description": g.description} for g in GROUPS],
         "settings": fields,
@@ -615,6 +615,13 @@ def _normalize_agent_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized[field_name] = value.strip() or None
     tools = normalized.get("agent_disabled_tools")
     if isinstance(tools, list):
+        # Typed before comparing: a non-string entry is neither a known tool
+        # nor sortable alongside one, so reaching the deny-list check with it
+        # would answer a malformed payload with a 500.
+        if any(not isinstance(t, str) for t in tools):
+            raise HTTPException(
+                status_code=422, detail="agent_disabled_tools must be a list of tool names"
+            )
         unknown = sorted({t for t in tools if t not in TOOL_NAMES})
         if unknown:
             raise HTTPException(
@@ -732,6 +739,12 @@ async def probe_agent_endpoint(admin: User = Depends(require_admin)) -> dict[str
     a URL is asking precisely for a fresh answer — and a stale one up to
     ``agent_probe_ttl_seconds`` old would read as their edit having failed.
     Persists nothing.
+
+    ``force`` alone, deliberately: it bypasses the cache for *this* call while
+    leaving the entry in place, so concurrent ``/api/health`` polls keep
+    answering from it. Clearing the cache instead would drop every one of them
+    into the probe lock and hang the whole instance's health check for as long
+    as an unreachable endpoint takes to time out — which is precisely the
+    endpoint an admin presses this button against.
     """
-    reset_probe_cache()
     return {"available": await agent_available(force=True)}

@@ -17,11 +17,13 @@ Which fields may be overridden, and how they are presented, is declared in
 ``core/settings_registry.py`` — not here.
 """
 
+import os
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
+from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -549,6 +551,32 @@ _effective: Settings | None = None
 def env_pinned(field: str) -> bool:
     """Whether the environment explicitly supplied this field."""
     return field in get_base_settings().model_fields_set
+
+
+def env_layer_value(variable: str) -> str | None:
+    """The raw value the environment layer supplies for one ``VESTIGO_*`` variable.
+
+    Reads the same two sources pydantic-settings does, in the same order: the
+    process environment first, then the ``.env`` file named by
+    ``Settings.model_config``. For a field :class:`Settings` still declares,
+    read the attribute instead — this exists for *retired* variables, which no
+    longer have a field to read but whose old value may still decide something
+    (a migration reasoning about the instance it is upgrading, a startup
+    warning). Checking ``os.environ`` alone would miss every deployment that
+    configures Vestigo the way ``.env.example`` documents.
+    """
+    value = os.environ.get(variable)
+    if value is not None:
+        return value
+    env_file = Settings.model_config.get("env_file")
+    if not env_file:
+        return None
+    try:
+        return dotenv_values(env_file, encoding=Settings.model_config.get("env_file_encoding")).get(
+            variable
+        )
+    except OSError:
+        return None
 
 
 def get_settings() -> Settings:

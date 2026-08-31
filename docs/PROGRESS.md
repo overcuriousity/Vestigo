@@ -53,7 +53,9 @@ listed them only to keep the coverage test honest, marked `managed_by="agent"`, 
 settings page rendered them read-only behind a badge pointing at the other tab.
 
 Migration `0033` copies the row into `app_settings` (the API key with it — same plaintext-
-at-rest contract on both sides, and dropping it would break a working instance on upgrade)
+at-rest contract on both sides, and dropping it would break a working instance on upgrade;
+the exception is an instance that ran `VESTIGO_AGENT_SECRET_MODE=env-only`, where the key
+was being ignored and copying it would revive a credential the operator switched off)
 and drops the table. `resolve_agent_config()` is now a projection of the already-merged
 settings object onto `AgentConfig`: no DB read, no best-effort fallback, no second
 precedence rule to keep in step, and synchronous, since it does no I/O. `SettingSpec`
@@ -62,7 +64,9 @@ lost `managed_by` entirely — it had one user.
 `VESTIGO_AGENT_SECRET_MODE` is retired rather than carried: the LLM key now follows the
 instance-wide `VESTIGO_SECRETS_MODE` like every other secret. Because `Settings` ignores
 unknown `VESTIGO_*` variables, a deployment that still pins the old one would silently
-start allowing DB storage again, so startup logs a warning naming the replacement.
+start allowing DB storage again, so startup logs a warning naming the replacement — asked
+of the whole environment layer, `.env` included, since that is how `.env.example` documents
+setting it.
 
 The `Admin → Agent` tab is gone and `/admin/agent` redirects to `/admin/settings`. Its
 widgets were worth keeping and moved into the settings page's **AI agent** group as custom

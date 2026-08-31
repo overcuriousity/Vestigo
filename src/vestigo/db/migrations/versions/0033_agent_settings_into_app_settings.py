@@ -18,6 +18,14 @@ the same "acceptable only when Postgres itself is trusted" contract, so the
 copy changes nothing about its exposure, while dropping it would break a
 working instance on upgrade.
 
+That argument holds only where the key was actually in use. Under the retired
+``VESTIGO_AGENT_SECRET_MODE=env-only`` the resolver ignored a stored key
+outright, so the row on such an instance may hold a rotated or abandoned
+credential that nothing has sent anywhere in months. Copying it would hand the
+new ``secrets_mode`` (defaulting to ``db``) a live key the operator had
+switched off, so the key alone is dropped there — every other column still
+moves, and the log says what was discarded.
+
 ``compact_threshold`` is gone since 0015 and ``id``/``updated_by``/
 ``updated_at`` describe the row rather than the configuration, so neither is
 carried over. An existing ``app_settings`` key wins over the copied value:
@@ -31,9 +39,14 @@ deleting the ``app_settings`` rows it consumed so the two never disagree.
 from __future__ import annotations
 
 import json
+import logging
 
 import sqlalchemy as sa
 from alembic import op
+
+from vestigo.core.config import env_layer_value
+
+logger = logging.getLogger("alembic.runtime.migration")
 
 revision = "0033"
 down_revision = "0032"
@@ -57,6 +70,25 @@ _COLUMNS: tuple[str, ...] = (
 )
 
 
+def _retired_secret_mode(bind: sa.Connection) -> str:
+    """What ``VESTIGO_AGENT_SECRET_MODE`` resolved to on the instance being upgraded.
+
+    The switch is gone from ``Settings``, so its old value has to be read the
+    way the old resolver would have seen it: the environment layer first
+    (``.env`` included — the operator may never have exported it), then the
+    ``app_settings`` override, then its default of ``"db"``.
+    """
+    pinned = env_layer_value("VESTIGO_AGENT_SECRET_MODE")
+    if pinned is not None:
+        return pinned.strip().lower()
+    stored = bind.execute(
+        # ``#>> '{}'`` unwraps the JSON scalar to text, so this does not depend
+        # on whether the driver in use decodes the column.
+        sa.text("SELECT value #>> '{}' FROM app_settings WHERE key = 'agent_secret_mode'")
+    ).scalar()
+    return stored.strip().lower() if isinstance(stored, str) else "db"
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -74,9 +106,17 @@ def upgrade() -> None:
                 .first()
             )
             if row is not None:
+                env_only = _retired_secret_mode(bind) == "env-only"
                 for column in present:
                     value = row[column]
                     if value is None:
+                        continue
+                    if column == "api_key" and env_only:
+                        logger.warning(
+                            "0033: dropping the stored LLM API key — this instance ran with "
+                            "VESTIGO_AGENT_SECRET_MODE=env-only, which ignored it. Set "
+                            "VESTIGO_AGENT_API_KEY, or store a key from Admin -> Settings."
+                        )
                         continue
                     bind.execute(
                         sa.text(

@@ -117,14 +117,20 @@ def _source_of(settings_field: str) -> str:
     return "db" if settings_field in runtime_overrides() else "default"
 
 
-def resolve_agent_config(settings: Settings | None = None) -> AgentConfig:
+def resolve_agent_config() -> AgentConfig:
     """Project the effective instance settings onto :class:`AgentConfig`.
 
     Performs no I/O: the env/DB/default merge already happened in
     ``core/config.py``, so this cannot fail on an unreachable metadata store
     and needs no best-effort fallback of its own.
+
+    Takes no settings object on purpose. ``sources`` describes the process-wide
+    layers — which of them supplied each field — and :func:`_source_of` can
+    only ask those; a caller-supplied ``Settings`` would get values from one
+    object and provenance from another, and ``sources`` is what the model
+    endpoint's env-pin guard trusts.
     """
-    settings = settings or get_settings()
+    settings = get_settings()
     resolved: dict[str, Any] = {}
     sources: dict[str, str] = {}
     for config_field, settings_field in _FIELD_MAP:

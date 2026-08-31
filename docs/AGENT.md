@@ -600,8 +600,14 @@ its own `Admin → Agent` tab and its own secret switch
 (`VESTIGO_AGENT_SECRET_MODE`) — all of it predating the generic layer and
 duplicating it. The migration copies the row into `app_settings` and drops it;
 the secret switch is retired in favour of the instance-wide
-`VESTIGO_SECRETS_MODE`, and a deployment that still sets the old variable gets
-a startup warning saying so. `/admin/agent` redirects to `/admin/settings`.
+`VESTIGO_SECRETS_MODE`, and a deployment that still sets the old variable —
+in the environment or in `.env` — gets a startup warning saying so.
+`/admin/agent` redirects to `/admin/settings`. The one column the migration
+does **not** carry is a stored `api_key` on an instance that ran with
+`VESTIGO_AGENT_SECRET_MODE=env-only`: that mode meant the resolver ignored the
+stored key, so copying it under the new default (`secrets_mode=db`) would put a
+switched-off — possibly rotated — credential back in use. It is dropped with a
+log line naming the replacement.
 
 The API key is never round-tripped in plaintext (the payload carries
 `value_set` instead); the stored key is plaintext at rest, which

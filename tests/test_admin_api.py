@@ -503,6 +503,16 @@ def test_agent_settings_reject_unknown_tool_names(client, admin_bootstrap, store
     assert "not_a_tool" in resp.json()["detail"]
 
 
+def test_agent_settings_reject_a_non_string_tool_entry(client, admin_bootstrap, store):
+    """A malformed payload is the admin's mistake, not a crash: an int in the
+    list is neither a known tool name nor sortable next to one, so it has to be
+    rejected before the deny-list check rather than inside it."""
+    as_admin(client, admin_bootstrap)
+    resp = _put_settings(client, {"agent_disabled_tools": ["search_events", 1]})
+    assert resp.status_code == 422
+    assert "tool names" in resp.json()["detail"]
+
+
 def test_env_only_mode_rejects_db_key_storage(client, admin_bootstrap, store, monkeypatch):
     """VESTIGO_SECRETS_MODE=env-only: the LLM key follows the instance-wide
     switch like every other secret (its agent-scoped predecessor was retired

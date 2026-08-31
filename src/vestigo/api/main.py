@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -40,7 +39,7 @@ from vestigo.api.routers import (
     viz,
 )
 from vestigo.core.capabilities import get_capabilities
-from vestigo.core.config import get_settings
+from vestigo.core.config import env_layer_value, get_settings
 from vestigo.core.demo_case import cancel_pending_seeds
 from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.core.security import hash_password
@@ -379,8 +378,11 @@ def _log_config_report() -> None:
     # Retired in 0033 along with the separate agent settings row. Settings
     # ignores unknown VESTIGO_* variables, so an operator who pinned this to
     # env-only would otherwise see the LLM key silently become DB-storable
-    # again with nothing in the log to say why.
-    if "VESTIGO_AGENT_SECRET_MODE" in os.environ:
+    # again with nothing in the log to say why. Asked of the whole environment
+    # layer, .env included: that file is how .env.example tells operators to
+    # set it, so an os.environ check alone would stay quiet for exactly the
+    # deployments the warning is for.
+    if env_layer_value("VESTIGO_AGENT_SECRET_MODE") is not None:
         logger.warning(
             "VESTIGO_AGENT_SECRET_MODE is set but no longer read — the LLM API key now "
             "follows the instance-wide VESTIGO_SECRETS_MODE. Set that instead and unset this."

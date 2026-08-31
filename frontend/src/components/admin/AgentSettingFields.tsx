@@ -62,7 +62,11 @@ export function AgentModelField({
   draft,
 }: FieldControlProps) {
   /** Free-text entry: forced when the endpoint offers no listing, opt-in
-   * otherwise (a model the listing omits is still a legitimate value). */
+   * otherwise (a model the listing omits is still a legitimate value). Typing
+   * into the input latches it on, because the listing arrives 600ms after the
+   * key that triggered it — swapping the input for a dropdown underneath a
+   * half-typed model name would take the focus and the rest of the keystrokes
+   * with it. "Choose from the list" is how the admin asks for the dropdown. */
   const [manual, setManual] = useState(false);
 
   const baseUrl = effective("agent_api_base_url", siblings, draft);
@@ -108,7 +112,10 @@ export function AgentModelField({
         <Input
           value={current}
           disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={(e) => {
+            setManual(true);
+            onChange(e.target.value);
+          }}
           placeholder="gpt-4o-mini"
         />
       ) : (

@@ -30,10 +30,7 @@ export const adminApi = {
       is_admin?: boolean;
       is_active?: boolean;
     },
-  ) =>
-    patch<{ user: User }>(`/admin/users/${userId}`, payload).then(
-      (r) => r.user,
-    ),
+  ) => patch<{ user: User }>(`/admin/users/${userId}`, payload).then((r) => r.user),
 
   rotatePassword: (userId: string, newPassword: string, forceChange = true) =>
     post<{ rotated: boolean }>(`/admin/users/${userId}/password`, {
@@ -42,26 +39,19 @@ export const adminApi = {
     }),
 
   deleteUser: (userId: string, reassignTo?: string) =>
-    del<{ deleted: boolean }>(`/admin/users/${userId}`, {
-      reassign_to: reassignTo,
-    }),
+    del<{ deleted: boolean }>(`/admin/users/${userId}`, { reassign_to: reassignTo }),
 
   // --- Teams -------------------------------------------------------------
   listTeams: () => get<{ teams: Team[] }>("/admin/teams").then((r) => r.teams),
 
   createTeam: (name: string, description?: string) =>
-    post<{ team: Team }>("/admin/teams", { name, description }).then(
-      (r) => r.team,
-    ),
+    post<{ team: Team }>("/admin/teams", { name, description }).then((r) => r.team),
 
-  deleteTeam: (teamId: string) =>
-    del<{ deleted: boolean }>(`/admin/teams/${teamId}`),
+  deleteTeam: (teamId: string) => del<{ deleted: boolean }>(`/admin/teams/${teamId}`),
 
   // --- Memberships ---------------------------------------------------------
   listMembers: (teamId: string) =>
-    get<{ members: TeamMember[] }>(`/admin/teams/${teamId}/members`).then(
-      (r) => r.members,
-    ),
+    get<{ members: TeamMember[] }>(`/admin/teams/${teamId}/members`).then((r) => r.members),
 
   addMember: (teamId: string, userId: string, role: TeamRole = "member") =>
     post<{ membership: unknown }>(`/admin/teams/${teamId}/members`, {
@@ -70,20 +60,13 @@ export const adminApi = {
     }),
 
   setMemberRole: (teamId: string, userId: string, role: TeamRole) =>
-    patch<{ updated: boolean }>(`/admin/teams/${teamId}/members/${userId}`, {
-      role,
-    }),
+    patch<{ updated: boolean }>(`/admin/teams/${teamId}/members/${userId}`, { role }),
 
   removeMember: (teamId: string, userId: string) =>
     del<{ removed: boolean }>(`/admin/teams/${teamId}/members/${userId}`),
 
   // --- Audit ---------------------------------------------------------------
-  queryAudit: (filters?: {
-    user_id?: string;
-    case_id?: string;
-    action?: string;
-    limit?: number;
-  }) =>
+  queryAudit: (filters?: { user_id?: string; case_id?: string; action?: string; limit?: number }) =>
     get<{ audit: AuditEntry[] }>("/admin/audit", filters).then((r) => r.audit),
 
   // --- AI agent ------------------------------------------------------------
@@ -93,11 +76,8 @@ export const adminApi = {
    * configured (the key is never sent back to the browser, so it usually is).
    * Never errors on an unreachable endpoint — an empty list means "fall back
    * to free-text entry". */
-  listAgentModels: (creds: {
-    api_base_url?: string;
-    api_key?: string;
-    provider?: string;
-  }) => post<{ models: string[] }>("/admin/agent/models", creds),
+  listAgentModels: (creds: { api_base_url?: string; api_key?: string; provider?: string }) =>
+    post<{ models: string[] }>("/admin/agent/models", creds),
 
   /** Re-probe the configured endpoint now, ignoring the cached availability
    * result — "Test connection". Persists nothing. */

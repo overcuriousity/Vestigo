@@ -35,7 +35,10 @@ Special cases:
 - **Secrets** are stored in plaintext and never returned by the API — the console shows only
   whether one is set. `VESTIGO_SECRETS_MODE=env-only` refuses database storage of secrets
   entirely — the LLM API key included, since migration 0033 retired its separate switch
-  (`VESTIGO_AGENT_SECRET_MODE`) along with the agent's own settings row and tab.
+  (`VESTIGO_AGENT_SECRET_MODE`) along with the agent's own settings row and tab. If you ran
+  that switch on `env-only`, the migration discards the key stored in the retired row rather
+  than adopting one the old resolver had been ignoring: supply it through
+  `VESTIGO_AGENT_API_KEY`, or store it from the console once `VESTIGO_SECRETS_MODE` allows it.
 - **Optional (nullable) fields** distinguish "unset" from empty. Emptying an optional field
   clears it; emptying a plain string field stores the empty string, which for
   `VESTIGO_SIGMA_RULES_PATH` is meaningful (it disables the global ruleset). One asymmetry:

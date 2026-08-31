@@ -3,8 +3,7 @@ import type { AdminAgentTool } from "./admin";
 
 /** How the admin console renders one setting's editor. Derived server-side from
  * the pydantic annotation, so it never drifts from what validation accepts. */
-export type SettingKind =
-  "bool" | "int" | "float" | "str" | "secret" | "choice" | "json";
+export type SettingKind = "bool" | "int" | "float" | "str" | "secret" | "choice" | "json";
 
 /** One configurable setting: metadata, effective value, and where it came from.
  * Mirrors `_settings_payload()` in `src/vestigo/api/routers/admin.py`. */
@@ -18,13 +17,7 @@ export interface InstanceSetting {
    * "unset" for a nullable field, a literal empty value otherwise (an empty
    * `sigma_rules_path` disables the global ruleset). */
   nullable: boolean;
-  constraints: {
-    ge?: number;
-    gt?: number;
-    le?: number;
-    lt?: number;
-    pattern?: string;
-  };
+  constraints: { ge?: number; gt?: number; le?: number; lt?: number; pattern?: string };
   choices: string[] | null;
   default: unknown;
   /** "env" = pinned by the deployment (read-only), "db" = an admin override is
