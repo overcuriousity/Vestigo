@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] — 2026-08-31
+
+### Added
+
+- **Four new converters for a Windows-plus-gateway estate.** The vendored
+  [2timesketch](https://github.com/overcuriousity/2timesketch) suite moves to upstream
+  1.3.0, taking the vendored set to 18 scripts beside the 9 native ones:
+  - **`w3c2timesketch` / `w3c2vestigo`** — the whole `#Fields:`-described W3C Extended
+    family: IIS site logs (`u_ex*.log`), http.sys `HTTPERR`, and any other dialect, which
+    still converts with its own column names. A log root is searched recursively, because
+    IIS keeps one directory per site (`W3SVC1/`, `W3SVC2/`) with `HTTPERR/` beside them.
+  - **`exchange2timesketch`** — Exchange HttpProxy (Autodiscover, Owa, Ews, Mapi,
+    ActiveSync, Rpc), ECP, RPC Client Access and IMAP4/POP3 CSV logs.
+  - **`squid2timesketch`** — `access.log` in the native `logformat squid` or the httpd-style
+    `common`/`combined` formats, detected from the data rather than assumed, plus `cache.log`
+    (including helper output and wrapped continuation lines) and `icap.log`.
+  - **`conntrackd2timesketch`** — `conntrackd-stats.log` flow records, with both connection
+    tuples as discrete columns and the address translation between them derived into
+    `nat_type`, `translated_src_ip` and `translated_dst_ip`. That derivation is what lets an
+    analyst pivot from an external observation back to the internal host.
+- **`w3c2vestigo.py` (1.0.0)**, the native Parquet path for the IIS family, with per-row
+  provenance (`file_hash`, `byte_offset`, `content_hash`) like every other `*2vestigo`
+  converter.
+- **`--assume-tz` on `syslog2timesketch`, `squid2timesketch` and `conntrackd2timesketch`**
+  (`UTC`, `local`, or an explicit `+02:00`), naming the timezone for timestamps that record
+  no offset. The default stays UTC — what those converters assumed unconditionally before —
+  so existing output is unchanged, and the choice is recorded in the audit report or the
+  Parquet footer either way.
+
+### Fixed
+
+- **`syslog2timesketch` accepts two header forms it was silently dropping.** The year-first
+  BSD variant several appliance firmwares emit (`2026 Aug 23 00:17:04 host prog[pid]: msg`)
+  is neither RFC 3164 nor RFC 5424, and rejected *every* line of such a file. The kernel
+  monotonic timestamp that sits ahead of the program token on forwarded kernel messages
+  (`host [    1.540377] systemd[1]: …`) was discarding the whole early-boot sequence; it now
+  lands in a `kernel_time` column.
+
+### Notes
+
+The W3C `#Fields:` directive is honoured **per occurrence**, not latched. IIS rewrites its
+header block on every service restart and configuration change, so one file legitimately
+changes its column set mid-stream, and reading only the first directive shifts every later
+column while reporting nothing. This is why `w3c2vestigo` carries a step the other native
+converters do not need: before chunking, `scan_directives()` walks the file with `bytes.find`
+over 1 MiB blocks and hands each parallel worker the directive state in force at its own byte
+offset. A worker starting empty would drop every row up to the next directive; one starting
+stale would misattribute the rest. `tests/test_w3c_converter.py::TestParallelParity` asserts
+parallel output is byte-identical to serial across a mid-file field-set change.
+
+Two W3C quirks are handled explicitly rather than tolerated: Windows logs link-local
+addresses with an interface index (`fe80::1c2d:3e4f:5a6b:7c8d%12`), which is not a valid
+address, so the zone is split into `src_ip_zone`/`dst_ip_zone` instead of the row being
+dropped; and IIS substitutes `+` for a space in the User-Agent, which is reversed for
+`user_agent` alone, because a URI, query or Referer may legitimately contain a `+` and
+"fixing" those would corrupt the evidence.
+
 ## [1.17.1] — 2026-08-31
 
 ### Fixed
