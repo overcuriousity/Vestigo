@@ -4,7 +4,34 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 213 — the /mcp surface stops offering in-app-only tools and hands back the figure).
+Last updated: 2026-08-31 (session 214 — scenario presets return to Visualize, bound to roles rather than fields).
+
+## Session 214 — 2026-08-31: scenario presets, bound to roles rather than fields
+
+The 2026-08-29 Visualize round folded the task presets into `ChartMeta.question`, which kept
+their prose and dropped what they did — the metric, the compare mode, the options a preset set
+in one click. This brings them back one level up, as **scenarios**: six investigations named
+the way an analyst names them (DDoS / flood, data exfiltration, SQL injection, RDP
+interaction, lateral movement, off-hours activity), each resolving to exactly one legal
+`ChartConfig`.
+
+The design problem was that "SQL injection" is domain knowledge and the page's first standing
+rule is that the core knows nothing about what a field is. The answer is that **a scenario
+names roles, not fields**: "the field holding the request text", bound by the analyst in a
+modal that pre-fills what it can from their own timeline's tokens and reports what it could
+not. Two scenarios also suggest a filter — injection syntax, the RDP event IDs — keyed on the
+field the analyst bound, shown as a pre-checked droppable row, and merged per field into the
+page's URL filters, so it arrives as removable chips and as caption prose rather than as a
+silent narrowing.
+
+Applying a scenario adds no render path: it is the same `takeOver(config, filters)` the rail's
+own controls make. A scenario is never withheld from the gallery over a role its timeline
+cannot fill — it opens and says which role that is. `vizScenarios.test.ts` holds every
+scenario against the figure registry (scale legal, options read, required inputs covered by
+required roles), so a registry change cannot leave one emitting a config the rail refuses.
+
+New: `frontend/src/components/viz/lib/scenarios.ts`, `ScenarioModal.tsx`. `docs/VISUALIZE.md`
+§4a records it; §5 records why there is no scenario tool for the agent.
 
 ## Session 213 — 2026-08-31: `/mcp` gets the chart, not a description of one (1.17.1)
 

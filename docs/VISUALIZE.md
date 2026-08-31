@@ -137,6 +137,8 @@ and export captions all derive from it.
 
 Read top-down, in dependency order:
 
+0. **Scenarios** — §4a, above the field picker because a scenario answers *which field?* as
+   well as *which figure?*. Collapsed once the URL already describes a chart.
 1. **Field** — `FieldCombo`, with *No field — count every event* as the first entry, so the
    field-free figures (events over time, punch card) are reached from the picker itself and
    the topmost control is never inert (#298). Picking a field while on a field-free figure
@@ -731,6 +733,47 @@ lane is counted here and nowhere on screen); then, when the row cap bit, the
 `first N start/end events (by time) paired` line; and `U undated events not drawn` whenever
 any were.
 
+## 4a. Scenarios (`components/viz/lib/scenarios.ts`, `ScenarioModal.tsx`)
+
+Six investigations named in the analyst's language — DDoS / flood, data exfiltration, SQL
+injection, RDP interaction, lateral movement, off-hours activity — each of which resolves to
+exactly one legal `ChartConfig`. They are the second descendant of the retired task presets:
+`ChartMeta.question` kept the prose (§2), and this table keeps what the presets actually did,
+which was to set the *rest* of the config in one click.
+
+The standing rule that the core knows nothing about what a field is (§1) survives intact,
+because **a scenario names roles, never fields.** A `ScenarioRole` is a label, a hint, which
+chart input it fills (`field` / `fieldY` / `filter`), and an optional `suggest` pattern over
+field *tokens*. `suggestBindings` pre-fills what it can from the timeline's own
+`VizFieldInfo` list (which arrives sorted by coverage, so the first match is also the
+best-covered one) and leaves the rest empty — a role it cannot fill is reported to the
+analyst, never guessed at. The analyst binds each role in `ScenarioModal`, and the modal is
+where every piece of the scenario's domain knowledge is on screen before anything renders.
+
+Two scenarios also carry a **suggested filter**, which is what makes them more than a figure
+choice: SQL injection wildcard-matches injection syntax in the bound request field, and RDP
+interaction narrows to the remote-desktop event IDs (4624, 4625, 4778, 4779, 1149, 21, 25) in
+the bound event-ID field. The filter is built *from the bindings*, so it is keyed on the
+analyst's own field token; it is a pre-checked, described, droppable row in the modal; and
+`VisualizePage::applyScenario` merges it per field into the page's URL filters rather than
+replacing them. It therefore reaches `InheritedFiltersBar` as removable chips and
+`lib/caption.ts` as caption prose by the existing paths — nothing about a scenario is hidden
+from the figure it produced, and a shared link reproduces it.
+
+Applying a scenario adds no render path. It is one `takeOver(config, filters)` — the same
+call the rail's own controls make — with `buildScenarioConfig` writing *every* member of the
+patch, including the ones the scenario does not use: a scenario laid over a chart the analyst
+had already built must not leave that chart's derivation, marks or figure-specific inputs
+behind for a figure that never declared them.
+
+A scenario is never withheld. One whose roles find no candidate field still appears in the
+rail, still opens, and names the role it could not fill (the analysis gate's rule — advice
+plus a record, never a lock). `tests/vizScenarios.test.ts` checks every scenario against the
+registry — its scale is in the figure's `scales`, its options are all in `readsOptions`, a
+required input is covered by a required role, and no role binds an input the figure never
+asks for — so a registry change cannot leave a scenario emitting a config the rail would
+refuse.
+
 ## 5. Parity
 
 - **Agent.** `propose_chart` validates against the same registry (`docs/AGENT.md`
@@ -797,6 +840,11 @@ any were.
   boundary crosses `inputs.pairing` (`nextEnd` ↔ `next_end`) and `inputs.startFilter` /
   `endFilter` (view payloads ↔ `FilterSpec`s) through the same two helpers the compare
   filters use, tested as a round trip.
+- **Scenarios are analyst-side only** (§4a). There is no scenario tool and no backend
+  registry: a scenario resolves to a `ChartConfig` the agent could already have proposed
+  through `propose_chart`, so exposing it would add a second vocabulary for the same
+  figures — and the field binding it exists for is a question to ask a person looking at
+  their own timeline, not one to answer by pattern-matching on the model's behalf.
 
 ## 6. Out of scope, by decision
 
@@ -816,6 +864,8 @@ Every figure the 2026-08-29 round designed has shipped; what it deliberately lef
   every figure over the demo case is the natural follow-up and is listed in `ROADMAP.md`.
 
 ## History
+
+Scenarios (§4a) landed after that round, on 2026-08-31.
 
 This document is the durable form of the 2026-08-29 Visualize round, which landed as nine
 steps in a stacked series of PRs: the figure registry and the field-first rail (#324),

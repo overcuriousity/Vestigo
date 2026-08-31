@@ -326,6 +326,25 @@ export function VisualizePage() {
     [takeOver, config],
   );
 
+  /** A confirmed scenario: the figure and its suggested filter in one
+   * take-over, so the chart never renders for a moment under the old filters.
+   * The filter is merged per field rather than replacing the set — a scenario
+   * narrows what the analyst already had; it does not discard it. */
+  const applyScenario = useCallback(
+    (patch: Partial<ChartConfig>, scenarioFilters: EventFilters | null) => {
+      const next: EventFilters = scenarioFilters
+        ? {
+            ...urlFilters,
+            ...scenarioFilters,
+            filters: { ...urlFilters.filters, ...scenarioFilters.filters },
+            filterModes: { ...urlFilters.filterModes, ...scenarioFilters.filterModes },
+          }
+        : urlFilters;
+      takeOver(normalizeChartConfig({ ...config, ...patch }), next);
+    },
+    [takeOver, config, urlFilters],
+  );
+
   // Loading a saved chart addresses it by id and lets the resolution above
   // read both halves out of storage. Writing its `c_*` params instead would
   // lose exactly the members storage exists to carry.
@@ -420,8 +439,6 @@ export function VisualizePage() {
   } = resolved;
 
   const svgRef = useRef<SVGSVGElement | null>(null);
-  // Preset strip: open by default on a fresh page (no chart state in the
-  // URL yet); a URL that already describes a chart skips the guidance.
   // Which coefficient fills the matrix cells. Purely a client-side read of
   // the same response — both coefficients always ship, so switching never
   // refetches (same reasoning as pivot↔sankey).
@@ -1356,6 +1373,7 @@ export function VisualizePage() {
           // leaving it out here is what would make those two show the
           // uncollapsed superset of what was saved.
           currentFilters={filters}
+          onApplyScenario={applyScenario}
           onLoadSavedChart={loadSavedChart}
           svgRef={svgRef}
           exportFilename={exportFilename}
