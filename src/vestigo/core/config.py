@@ -463,6 +463,19 @@ class Settings(BaseSettings):
     # MCP needs no LLM endpoint).
     mcp_enabled: bool = False
 
+    # Outside-facing base URL of this deployment, e.g.
+    # "https://vestigo.example.org". Links Vestigo hands to a consumer that is
+    # not the browser are relative paths, which an external /mcp client has no
+    # origin to resolve — `propose_chart`'s Visualize deep link is the one that
+    # matters today, and over MCP it *is* the figure. Set this and such links
+    # become absolute; unset (the default) keeps the relative form, so nothing
+    # changes for a deployment that only ever serves its own SPA.
+    #
+    # Deliberately not derived from the request's Host header: behind a reverse
+    # proxy that is whatever the proxy forwarded, and a confidently wrong link
+    # is worse than a relative one the reader knows to complete.
+    public_base_url: str | None = None
+
     # ── Generated converters (docs/INPUT_FORMATS.md §"Generated converters") ──
     # Off by default: enabling it lets LLM-authored Python run in a guarded
     # subprocess on this host. Needs a configured, reachable agent endpoint too.

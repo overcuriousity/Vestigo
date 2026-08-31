@@ -184,6 +184,8 @@ def test_mcp_end_to_end_tool_call(mcp_client, admin_bootstrap):
     assert "read_story" in listed.text
     assert "propose_annotation" not in listed.text
     assert "propose_story_block" not in listed.text
+    # Same reason: its whole product is a card in the agent panel.
+    assert "propose_finding" not in listed.text
 
     called = mcp_client.post(
         "/mcp",
@@ -328,3 +330,60 @@ def test_mcp_propose_chart_hands_an_external_client_the_visualize_url(
     assert called.status_code == 200, called.text
     assert f"/cases/{case_id}/timelines/{tl_id}/visualize?" in called.text
     assert "c_marks=" in called.text
+
+
+def test_mcp_propose_chart_returns_the_figures_data_and_an_absolute_link(
+    mcp_client, admin_bootstrap, monkeypatch
+):
+    """What an external client actually needs back: the numbers, and a link
+    its human can open. The relative path the in-app card uses is not one —
+    an MCP client has no origin to resolve it against."""
+    import vestigo.api.routers.events as events_router
+    from tests.test_agent_tools import _FakeChartService
+    from vestigo.core.config import get_settings
+
+    monkeypatch.setattr(events_router, "_get_query_service", lambda: _FakeChartService())
+    settings = get_settings()
+    monkeypatch.setattr(settings, "public_base_url", "https://vestigo.example.org/")
+    as_admin(mcp_client, admin_bootstrap)
+    case_id, tl_id, token = _setup_token(mcp_client)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": f"Bearer {token}",
+    }
+    init = _rpc_initialize(mcp_client, token)
+    assert init.status_code == 200, init.text
+    session_id = init.headers.get("mcp-session-id")
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    called = mcp_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "propose_chart",
+                "arguments": {
+                    "title": "t",
+                    "description": "",
+                    "spec": {"chart_type": "bar", "field": "status"},
+                },
+            },
+        },
+        headers=headers,
+    )
+    assert called.status_code == 200, called.text
+    import json as _json
+
+    data_line = next(line for line in called.text.splitlines() if line.startswith("data: "))
+    payload = _json.loads(_json.loads(data_line[len("data: ") :])["result"]["content"][0]["text"])
+    assert payload["open_url"].startswith(
+        f"https://vestigo.example.org/cases/{case_id}/timelines/{tl_id}/visualize?"
+    )
+    # The figure itself — not just a count of how many bars it would have had.
+    assert payload["result"]["values"] == {
+        "columns": ["value", "count"],
+        "rows": [["a", 60], ["b", 40]],
+    }

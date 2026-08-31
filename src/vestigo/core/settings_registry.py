@@ -796,6 +796,16 @@ _SPECS: tuple[SettingSpec, ...] = (
         subsystem="mcp",
     ),
     SettingSpec(
+        "public_base_url",
+        "general",
+        "Public base URL",
+        "Outside-facing URL of this deployment, e.g. https://vestigo.example.org. Links "
+        "handed to a client that is not the browser — the Visualize deep link an external "
+        "MCP client gets back from a chart — are absolute when this is set and relative "
+        "paths when it is not. Leave empty unless something outside the browser consumes "
+        "Vestigo's links.",
+    ),
+    SettingSpec(
         "secrets_mode",
         "general",
         "Secret storage mode",

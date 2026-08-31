@@ -3178,7 +3178,12 @@ async def test_marks_resolve_into_the_envelope_and_the_tool_result_keeps_only_th
     store, monkeypatch
 ):
     fake = _patch_chart_service(monkeypatch)
-    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    # In-app scope: the card fetches its own data and resolves its own marks,
+    # so the model is handed the compressed summary and nothing else. The
+    # external /mcp surface keeps both — see the propose_chart surface tests.
+    in_app = _scope("c1", "t1", source_ids=["s1"])
+    in_app.conversation_id = "conv1"
+    server = build_tool_server(in_app)
     result = await _call(
         server,
         "propose_chart",
@@ -3615,3 +3620,120 @@ async def test_lanes_draw_marks(store, monkeypatch):
         ),
     )
     assert result["ok"] is True and result["summary"]["marks"]["shown"] == 1
+
+
+# ── the external /mcp surface: no card, so the figure is the payload ────────
+
+
+async def test_propose_chart_keeps_the_figures_data_for_an_external_client(store, monkeypatch):
+    """Over /mcp there is no card to draw the chart and no analyst to read it.
+
+    The in-app path drops `result` because the card fetches its own copy; an
+    external client has neither, and a summary of `{"buckets": 48}` describes
+    a figure the caller cannot see, plot, or quote a number from.
+    """
+    _patch_chart_service(monkeypatch)
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "bar", "field": "attr:status"})
+    )
+    assert result["ok"] is True
+    # Columnar, like every other tabular tool result on this transport (A13).
+    assert result["result"]["values"] == {
+        "columns": ["value", "count"],
+        "rows": [["a", 60], ["b", 40]],
+    }
+    # The summary the in-app model gets is still there — it is the reading, and
+    # the data is the evidence for it.
+    assert result["summary"]["total"] == 100
+
+
+async def test_propose_chart_data_does_not_reach_the_in_app_model(store, monkeypatch):
+    """The other half of the contract: nothing changes for the agent panel."""
+    _patch_chart_service(monkeypatch)
+    in_app = _scope("c1", "t1", source_ids=["s1"])
+    in_app.conversation_id = "conv1"
+    result = await _call(
+        build_tool_server(in_app),
+        "propose_chart",
+        _chart({"chart_type": "bar", "field": "attr:status"}),
+    )
+    assert "result" not in result and "marks" not in result
+    assert result["summary"]["total"] == 100
+
+
+async def test_propose_chart_compacts_a_timeseries_the_way_field_timeseries_does(
+    store, monkeypatch
+):
+    """The shared time axis is stated once, not repeated per series."""
+    fake = _patch_chart_service(monkeypatch)
+    starts = ["2026-03-13T09:00:00Z", "2026-03-13T10:00:00Z"]
+    fake.field_value_timeseries = lambda query, field, buckets, series_limit: {
+        "field": field,
+        "series": [
+            {
+                "value": v,
+                "buckets": [{"start": t, "count": n} for t, n in zip(starts, counts, strict=True)],
+            }
+            for v, counts in (("ok", [5, 7]), ("fail", [1, 9]))
+        ],
+        "interval_seconds": 3600,
+        "min": starts[0],
+        "max": starts[-1],
+        "distinct": 2,
+        "other_count": 0,
+        "series_truncated": False,
+    }
+    server = build_tool_server(_scope("c1", "t1", source_ids=["s1"]))
+    result = await _call(
+        server, "propose_chart", _chart({"chart_type": "heatmap", "field": "attr:status"})
+    )
+    # The axis once, not once per series — the dominant term in a wide figure.
+    assert result["result"]["bucket_starts"] == starts
+    assert result["result"]["series"] == {
+        "columns": ["value", "counts"],
+        "rows": [["ok", [5, 7]], ["fail", [1, 9]]],
+    }
+
+
+async def test_propose_finding_is_in_app_only(store, monkeypatch):
+    """It writes nothing and shows nothing without a card to show.
+
+    Over /mcp the model reports its conclusion to its own caller; a tool whose
+    entire product is an analyst-facing card would spend schema budget to
+    return a hit count `search_events` already gives, under a docstring that
+    tells the model an analyst is looking at something.
+    """
+    import vestigo.agent.tools as tools_module
+
+    monkeypatch.setattr(tools_module, "embeddings_available", lambda: True)
+    await store.init_schema()
+    async with FastMCPClient(build_tool_server(_scope("c1", "t1"))) as client:
+        external = {t.name for t in await client.list_tools()}
+    async with FastMCPClient(
+        build_tool_server(_scope_with_conversation("c1", "t1", "conv1"))
+    ) as client:
+        in_app = {t.name for t in await client.list_tools()}
+    assert "propose_finding" not in external
+    assert "propose_finding" in in_app
+    # It leaves with the other card-shaped tools, not with the read tools.
+    assert "propose_chart" in external and "search_events" in external
+
+
+async def test_propose_chart_is_described_for_the_surface_it_is_on(store, monkeypatch):
+    """The docstring promises a card, a Save button and an analyst. Over /mcp
+    none of the three exist, and a tool description is what the model plans
+    against — so that surface reads its own."""
+    await store.init_schema()
+
+    async def described(scope) -> str:
+        async with FastMCPClient(build_tool_server(scope)) as client:
+            return next(
+                t for t in await client.list_tools() if t.name == "propose_chart"
+            ).description
+
+    external = await described(_scope("c1", "t1"))
+    in_app = await described(_scope_with_conversation("c1", "t1", "conv1"))
+    assert "card" in in_app and "Save" in in_app
+    assert "card" not in external and "Save" not in external
+    assert "open_url" in external and "open_url" in in_app

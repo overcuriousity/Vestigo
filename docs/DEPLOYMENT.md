@@ -622,6 +622,12 @@ Once TLS terminates at nginx the app still thinks it is plain HTTP:
 - `VESTIGO_ENVIRONMENT=production` — disables uvicorn's auto-reload watcher.
 - With OIDC enabled, update `VESTIGO_OIDC_REDIRECT_URL` to the `https://` form — the IdP
   redirect target must match what nginx exposes, not `http://localhost:8080`.
+- With the external `/mcp` endpoint enabled, set `VESTIGO_PUBLIC_BASE_URL` to the same
+  outside-facing origin (`https://vestigo.example.org`). Links Vestigo hands an MCP client —
+  the Visualize deep link a chart comes back with — are relative paths otherwise, and a
+  client that is not the browser has no origin to complete one against. Vestigo does not
+  infer it from `Host`/`X-Forwarded-*`: those are whatever the proxy sent, and a confidently
+  wrong link is worse than a relative one.
 
 ### Notes on the proxy config
 
