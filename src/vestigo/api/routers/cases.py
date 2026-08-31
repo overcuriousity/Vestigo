@@ -60,6 +60,7 @@ from vestigo.db.postgres import (
 from vestigo.db.qdrant import QdrantStore
 from vestigo.ingestion.parser import detect_format
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from vestigo.models.availability import unavailable_detail
 from vestigo.models.embeddings import embeddings_available
 from vestigo.models.event import ParserConfig
 
@@ -1855,11 +1856,7 @@ async def start_timeline_embedding(
         # with an ImportError in the background worker.
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Embedding support is not installed. Install the 'embeddings' extra "
-                "(uv sync --extra embeddings) or configure VESTIGO_EMBEDDING_API_BASE_URL "
-                "to use a remote embedding endpoint."
-            ),
+            detail=unavailable_detail(),
         )
     store = get_store()
     case_id = case.id

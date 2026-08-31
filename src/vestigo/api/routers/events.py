@@ -67,13 +67,8 @@ from vestigo.db.postgres import (
 )
 from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
+from vestigo.models.availability import unavailable_detail
 from vestigo.models.embeddings import embeddings_available
-
-_EMBEDDINGS_UNAVAILABLE_DETAIL = (
-    "Embedding support is not installed. Install the 'embeddings' extra "
-    "(uv sync --extra embeddings) or configure VESTIGO_EMBEDDING_API_BASE_URL "
-    "to use a remote embedding endpoint."
-)
 
 _query_service: EventQueryService | None = None
 
@@ -2515,7 +2510,7 @@ async def semantic_search_events(
         # find_similar_by_text encodes the query text at request time, which
         # needs the local model (or a remote endpoint) — fail clearly instead
         # of surfacing an ImportError from the worker thread.
-        raise HTTPException(status_code=503, detail=_EMBEDDINGS_UNAVAILABLE_DETAIL)
+        raise HTTPException(status_code=503, detail=unavailable_detail())
     source_ids = await _resolve_similarity_source_ids(case_id, timeline_id)
     svc = _get_similarity_service()
     try:

@@ -4,7 +4,70 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 217 — HAProxy gets a stdlib-only converter).
+Last updated: 2026-08-31 (session 218 — embeddings availability is probed, both arms).
+
+## Session 218 — 2026-08-31: embeddings availability is probed, not inferred
+
+`embeddings_available()` answered "can this instance *compute* a vector" — the extra
+importable, or a remote endpoint configured — and never asked whether anything could *store*
+one. An operator who removed Qdrant from their stack therefore kept the entire embedding UI:
+"Improve search quality" on every timeline, a wizard that opens, a job that fails at the
+vector store, and embedding tools advertised to the agent. That is the exact condition
+`core/capabilities.py` exists to prevent, in its own words — an unconfigured subsystem
+renders no entry point rather than a disabled one. Configuration alone could not have fixed
+it either: `qdrant_url` has a non-null default, so every instance looks like it has a vector
+store whether or not one is listening.
+
+New `models/availability.py`, built like `agent/availability.py` and for the same reasons.
+Both arms are probed: Qdrant answering `get_collections()`, and — when a remote endpoint is
+configured — that endpoint answering a one-token `/embeddings` call, which is what proves the
+model exists and the key works for inference where a model listing would not. The local model
+arm stays a configuration check, and the module says why: proving it means loading ~90 MB of
+weights, which no 15-second health poll can afford and which an airgapped box that never
+fetched them would fail anyway. Results sit behind a TTL cache keyed on a fingerprint of the
+settings the answer depends on, so an admin's settings edit re-probes on the next poll rather
+than waiting out the TTL, and stale-while-revalidate keeps a hung Qdrant from slowing health.
+A store that comes back restores its UI within a TTL — no restart.
+
+`embeddings_available()` stays synchronous and does no I/O, because request handlers and the
+agent's tool registration call it; it reads the cached record, and a *cold* cache reports
+"nobody has looked yet" rather than "unavailable", so nothing vanishes during a process's
+first seconds. The startup probe runs in `_startup_recovery`, not the lifespan: booting the
+HTTP server must not depend on Qdrant answering.
+
+Two follow-throughs. The 503 now names the arm that is actually missing — telling someone
+whose Qdrant is gone to install a 2 GB ML extra sends them a long way in the wrong direction.
+And clearing `VESTIGO_QDRANT_URL` and `VESTIGO_QDRANT_PATH` is now the documented, probe-free
+way to declare a deployment embedding-free (`.env.example`, `TECH_STACK.md` §3.5,
+`DEPLOYMENT.md`).
+
+Review follow-up, same day. The vector-store probe built its own `QdrantClient`, which is
+fine against a server and wrong against `VESTIGO_QDRANT_PATH`: local mode takes an exclusive
+lock on the storage folder, and this process already holds one whenever the similarity
+service (a process-lifetime singleton) or an embedding job is alive. Every probe after the
+first semantic search would have raised, been swallowed as `False`, and flipped the
+capability off on a healthy instance until restart — and in the window the probe *did* hold
+the lock, a starting embed job would have failed. The local arm is now a storage-directory
+check, weaker than "it answered" and documented as such. Three smaller repairs alongside it:
+`_probe()` swallows everything, since an escaping exception would have taken `/api/health`
+to a 500 and cost the frontend its gating for agent, OIDC, transfer and MCP over one optional
+subsystem (`httpx.InvalidURL` is not an `httpx.HTTPError`, so the endpoint arm could raise);
+`_schedule_refresh` compares the in-flight task's loop to the running one, because a task
+stranded on a torn-down loop stays `done() == False` forever and would have disabled
+stale-while-revalidate for the life of the process (`agent/availability.py` had the same
+latent shape and got the same fix); and `unavailable_detail()` reads the fingerprint-checked
+`cached_result()` rather than `_cache` directly, so a record from the settings in force
+before an admin's PUT cannot name the wrong host, with a cold cache no longer asserting a
+probe result it does not have.
+
+`tests/test_embeddings_availability.py` pins the reported case end to end through
+`/api/health`, plus the dead endpoint, the off switch, fingerprint invalidation, the
+cold-cache fallback and both probes swallowing their failures — plus, from the review pass,
+a local-mode probe running while a `QdrantClient` holds the folder lock, a probe that raises,
+an invalid endpoint URL, a refresh task stranded on a dead loop, and the two refusal texts
+that must not claim a probe result they do not have. An autouse conftest fixture
+keeps the probe off the network for the rest of the suite — Qdrant is faked rather than run,
+and availability must not become a fourth service the suite requires.
 
 ## Session 217 — 2026-08-31: HAProxy gets a stdlib-only converter
 

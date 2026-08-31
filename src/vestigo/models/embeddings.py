@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -18,15 +17,29 @@ if TYPE_CHECKING:
 def embeddings_available() -> bool:
     """Whether embedding features can run in this installation.
 
-    True when the local sentence-transformers stack is importable (the
-    ``embeddings`` extra is installed) OR a remote OpenAI-compatible endpoint
-    is configured via ``VESTIGO_EMBEDDING_API_BASE_URL`` — the remote path needs
-    no local ML dependencies. Cheap: checks importability, never loads the
-    model.
+    Needs a model *and* somewhere to put the vectors: the local
+    sentence-transformers stack importable (the ``embeddings`` extra) or a
+    remote OpenAI-compatible endpoint configured, plus a declared vector store.
+    A configured-looking instance is not enough on its own — see
+    :mod:`vestigo.models.availability`, which probes both arms — so when that
+    probe has an answer for the current settings, it wins.
+
+    Stays synchronous and does no I/O: request handlers and the agent's tool
+    registration call it. A *cold* probe cache reports ``None``, which means
+    "nobody has looked yet", not "unavailable" — falling back to the
+    configuration check there is what keeps a working subsystem from vanishing
+    in the first seconds of a process, before startup's probe has landed.
     """
-    if get_settings().embedding_api_base_url:
-        return True
-    return importlib.util.find_spec("sentence_transformers") is not None
+    from vestigo.models.availability import (
+        cached_result,
+        model_configured,
+        vector_store_configured,
+    )
+
+    if not model_configured() or not vector_store_configured():
+        return False
+    probed = cached_result()
+    return True if probed is None else probed
 
 
 class EmbeddingModel:

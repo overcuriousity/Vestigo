@@ -348,6 +348,16 @@ _SPECS: tuple[SettingSpec, ...] = (
         secret=True,
         subsystem="embeddings",
     ),
+    SettingSpec(
+        "embedding_probe_ttl_seconds",
+        "embeddings",
+        "Availability probe TTL (seconds)",
+        "How long the embeddings availability result is cached before re-probing. The "
+        "probe asks the vector store to list its collections and, when a remote endpoint "
+        "is configured, embeds one token against it — embedding features are hidden "
+        "entirely unless both answer.",
+        subsystem="embeddings",
+    ),
     # ── Ingestion ────────────────────────────────────────────────────────
     SettingSpec(
         "ingest_batch_size",

@@ -44,7 +44,9 @@ Special cases:
   `VESTIGO_SIGMA_RULES_PATH` is meaningful (it disables the global ruleset). One asymmetry:
   `VESTIGO_QDRANT_URL` cannot be unset from the console — clearing it restores the default
   endpoint. Select an embedded on-disk Qdrant with `VESTIGO_QDRANT_PATH` (environment-only),
-  which takes precedence over the URL.
+  which takes precedence over the URL. In that mode the health probe checks the storage
+  directory rather than opening a client, because qdrant-client locks the folder exclusively
+  and the app holds that lock while embedding work runs.
 
 **Back up accordingly.** Any secret an admin stores through the console lives in
 `app_settings` in plaintext, so every Postgres dump, replica and snapshot of the metadata
@@ -65,6 +67,19 @@ map (embeddings, agent, MCP, OIDC, enrichers, Sigma, case transfer, demo case, c
 generation); a subsystem that is off renders no UI entry point and — for the AI agent — its
 tools are not advertised to the model at all. The endpoints refuse independently, so hiding
 is never the only enforcement.
+
+Two of those capabilities are *probed* rather than read off configuration, because a
+configured-looking subsystem that does not answer is the same thing to an analyst as an
+unconfigured one. The agent's LLM endpoint must serve its model listing, and embeddings need
+both arms live: the vector store answering `get_collections()`, and — when
+`VESTIGO_EMBEDDING_API_BASE_URL` is set — that endpoint answering a one-token embed. So
+removing Qdrant from the stack removes "Improve search quality", semantic search and the
+agent's embedding tools, rather than leaving buttons whose jobs fail at the store. Results
+are cached (`VESTIGO_AGENT_PROBE_TTL_SECONDS`, `VESTIGO_EMBEDDING_PROBE_TTL_SECONDS`, both
+60s by default) and revalidated in the background, so a poll never waits on a hung service
+and a service coming back restores its UI within a TTL — no restart. To declare a deployment
+embedding-free outright, clear `VESTIGO_QDRANT_URL` and `VESTIGO_QDRANT_PATH`; nothing is
+probed then.
 
 The map requires a session: an anonymous `GET /api/health` answers with liveness, version and
 `oidc_enabled` only. One exception to "refuses independently": with
