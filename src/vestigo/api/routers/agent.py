@@ -188,7 +188,7 @@ async def create_conversation(
     timeline = await store.get_timeline(case_id, payload.timeline_id)
     if timeline is None:
         raise HTTPException(status_code=404, detail="Timeline not found")
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     conversation = await store.create_agent_conversation(
         case_id,
         payload.timeline_id,
@@ -568,7 +568,7 @@ async def _message_stream_inner(
     if not conversation.title:
         await store.update_agent_conversation(conversation_id, title=payload.content[:_TITLE_MAX])
 
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     # Admin hard-deny ∪ the restriction frozen on this conversation.
     disabled_tools = frozenset(config.disabled_tools or ()) | frozenset(
         conversation.disabled_tools or ()
@@ -1350,7 +1350,7 @@ async def agent_info(user: User = Depends(get_current_user)) -> dict[str, Any]:
     ("evidence is sent to X, processed by Y"). The API key is never included.
     """
     await _require_agent()
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     admin_disabled = set(config.disabled_tools or ())
     prefs = user.preferences or {}
     user_disabled = [

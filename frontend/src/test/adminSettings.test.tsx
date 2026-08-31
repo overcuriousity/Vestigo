@@ -22,7 +22,9 @@ vi.mock("@/api/settings", async (importOriginal) => ({
   },
 }));
 
-function setting(over: Partial<InstanceSetting> & { field: string }): InstanceSetting {
+function setting(
+  over: Partial<InstanceSetting> & { field: string },
+): InstanceSetting {
   return {
     group: "detectors",
     label: over.field,
@@ -37,7 +39,6 @@ function setting(over: Partial<InstanceSetting> & { field: string }): InstanceSe
     env_only: false,
     restart_required: false,
     subsystem: null,
-    managed_by: null,
     editable: true,
     value: 3,
     ...over,
@@ -45,7 +46,13 @@ function setting(over: Partial<InstanceSetting> & { field: string }): InstanceSe
 }
 
 const PAYLOAD = {
-  groups: [{ key: "detectors", label: "Anomaly detectors", description: "Thresholds." }],
+  groups: [
+    {
+      key: "detectors",
+      label: "Anomaly detectors",
+      description: "Thresholds.",
+    },
+  ],
   settings: [
     setting({ field: "stat_rarity_floor", label: "Rarity floor" }),
     setting({
@@ -67,6 +74,7 @@ const PAYLOAD = {
     }),
   ],
   secrets_mode: "db" as const,
+  agent: { tools: [], warnings: [] },
 };
 
 function renderPage() {
@@ -82,7 +90,9 @@ function renderPage() {
 
 beforeEach(() => {
   getMock.mockReset().mockResolvedValue(PAYLOAD);
-  updateMock.mockReset().mockResolvedValue({ ...PAYLOAD, applied: ["stat_rarity_floor"] });
+  updateMock
+    .mockReset()
+    .mockResolvedValue({ ...PAYLOAD, applied: ["stat_rarity_floor"] });
 });
 
 describe("AdminSettingsPage", () => {
@@ -103,19 +113,25 @@ describe("AdminSettingsPage", () => {
     expect(updateMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith({ stat_rarity_floor: 12 }));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith({ stat_rarity_floor: 12 }),
+    );
   });
 
   it("clears an override with null when the field is emptied", async () => {
     getMock.mockResolvedValue({
       ...PAYLOAD,
-      settings: [setting({ field: "stat_rarity_floor", value: 9, source: "db" })],
+      settings: [
+        setting({ field: "stat_rarity_floor", value: 9, source: "db" }),
+      ],
     });
     renderPage();
     const input = (await screen.findByDisplayValue("9")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith({ stat_rarity_floor: null }));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith({ stat_rarity_floor: null }),
+    );
   });
 
   it("empties a nullable string to null and a plain string to ''", async () => {
@@ -144,12 +160,17 @@ describe("AdminSettingsPage", () => {
     fireEvent.change(await screen.findByDisplayValue("https://idp.local"), {
       target: { value: "" },
     });
-    fireEvent.change(screen.getByDisplayValue("/rules"), { target: { value: "" } });
+    fireEvent.change(screen.getByDisplayValue("/rules"), {
+      target: { value: "" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
     // Unset vs. the empty value itself — storing "" for the optional field would
     // leave it reading as customized forever.
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith({ oidc_issuer: null, sigma_rules_path: "" }),
+      expect(updateMock).toHaveBeenCalledWith({
+        oidc_issuer: null,
+        sigma_rules_path: "",
+      }),
     );
   });
 
@@ -158,7 +179,9 @@ describe("AdminSettingsPage", () => {
     const input = (await screen.findByDisplayValue("3")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "4.5" } });
     fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
-    expect(await screen.findByText(/expected a whole number/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/expected a whole number/),
+    ).toBeInTheDocument();
     expect(updateMock).not.toHaveBeenCalled();
   });
 });

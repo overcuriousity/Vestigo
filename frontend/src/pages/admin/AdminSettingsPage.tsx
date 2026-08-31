@@ -3,7 +3,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Lock, RotateCcw } from "lucide-react";
 import { ApiError } from "@/api/client";
 import { useHealth } from "@/api/health";
-import { settingsApi, type InstanceSetting, type InstanceSettingsResponse } from "@/api/settings";
+import { adminApi } from "@/api/admin";
+import {
+  settingsApi,
+  type InstanceAgentMeta,
+  type InstanceSetting,
+  type InstanceSettingsResponse,
+} from "@/api/settings";
+import {
+  AGENT_FIELD_CONTROLS,
+  AgentSectionHeader,
+} from "@/components/admin/AgentSettingFields";
 import { ScanBudgetCard } from "@/components/admin/ScanBudgetCard";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -41,10 +51,12 @@ function parseValue(setting: InstanceSetting, text: string): unknown {
   // "unset" (storing "" there would leave it reading as customized forever),
   // a plain string means the empty value itself — an empty sigma_rules_path
   // disables the global ruleset. Anything else has no empty form at all.
-  if (trimmed === "") return setting.kind === "str" && !setting.nullable ? "" : null;
+  if (trimmed === "")
+    return setting.kind === "str" && !setting.nullable ? "" : null;
   if (setting.kind === "int") {
     const n = Number(trimmed);
-    if (!Number.isInteger(n)) throw new Error(`${setting.label}: expected a whole number`);
+    if (!Number.isInteger(n))
+      throw new Error(`${setting.label}: expected a whole number`);
     return n;
   }
   if (setting.kind === "float") {
@@ -65,7 +77,9 @@ function parseValue(setting: InstanceSetting, text: string): unknown {
 function SourceBadge({ setting }: { setting: InstanceSetting }) {
   if (setting.source === "env") {
     return (
-      <Tooltip content={`Pinned by ${setting.env_var} — edit the deployment to change it.`}>
+      <Tooltip
+        content={`Pinned by ${setting.env_var} — edit the deployment to change it.`}
+      >
         <span>
           <Badge variant="muted">
             <Lock size={10} className="mr-1" />
@@ -75,7 +89,8 @@ function SourceBadge({ setting }: { setting: InstanceSetting }) {
       </Tooltip>
     );
   }
-  if (setting.source === "db") return <Badge variant="accent">customized</Badge>;
+  if (setting.source === "db")
+    return <Badge variant="accent">customized</Badge>;
   return null;
 }
 
@@ -84,18 +99,39 @@ function SettingRow({
   draft,
   onChange,
   secretsDisabled,
+  siblings,
+  agent,
 }: {
   setting: InstanceSetting;
   draft: Draft;
   onChange: (field: string, value: unknown) => void;
   secretsDisabled: boolean;
+  siblings: Map<string, InstanceSetting>;
+  agent: InstanceAgentMeta;
 }) {
   const disabled =
-    !setting.editable || (setting.kind === "secret" && secretsDisabled) || !!setting.managed_by;
+    !setting.editable || (setting.kind === "secret" && secretsDisabled);
   const edited = setting.field in draft;
   const draftValue = draft[setting.field];
 
   const control = () => {
+    // A few fields have an editor no annotation can imply — a model list the
+    // endpoint itself serves, a deny-list over the tool catalogue. They still
+    // write into the same draft, so the page keeps one Save.
+    const Custom = AGENT_FIELD_CONTROLS[setting.field];
+    if (Custom) {
+      return (
+        <Custom
+          setting={setting}
+          value={edited ? draftValue : setting.value}
+          disabled={disabled}
+          onChange={(v) => onChange(setting.field, v)}
+          siblings={siblings}
+          draft={draft}
+          agent={agent}
+        />
+      );
+    }
     if (setting.kind === "bool") {
       const checked = edited ? !!draftValue : !!setting.value;
       return (
@@ -107,9 +143,15 @@ function SettingRow({
       );
     }
     if (setting.kind === "choice" && setting.choices) {
-      const value = edited ? String(draftValue ?? "") : String(setting.value ?? "");
+      const value = edited
+        ? String(draftValue ?? "")
+        : String(setting.value ?? "");
       return (
-        <Select value={value} disabled={disabled} onValueChange={(v) => onChange(setting.field, v)}>
+        <Select
+          value={value}
+          disabled={disabled}
+          onValueChange={(v) => onChange(setting.field, v)}
+        >
           <SelectTrigger className="w-56">
             <SelectValue />
           </SelectTrigger>
@@ -128,7 +170,11 @@ function SettingRow({
       <Input
         className="w-72"
         type={setting.kind === "secret" ? "password" : "text"}
-        inputMode={setting.kind === "int" || setting.kind === "float" ? "numeric" : undefined}
+        inputMode={
+          setting.kind === "int" || setting.kind === "float"
+            ? "numeric"
+            : undefined
+        }
         value={text}
         disabled={disabled}
         placeholder={
@@ -151,11 +197,16 @@ function SettingRow({
             {setting.label}
           </span>
           <SourceBadge setting={setting} />
-          {setting.restart_required && <Badge variant="muted">restart required</Badge>}
-          {setting.managed_by === "agent" && <Badge variant="muted">set on the Agent tab</Badge>}
+          {setting.restart_required && (
+            <Badge variant="muted">restart required</Badge>
+          )}
         </div>
-        <p className="mt-1 text-xs text-[var(--color-fg-muted)]">{setting.help}</p>
-        <p className="mt-1 font-mono text-[11px] text-[var(--color-fg-muted)]">{setting.env_var}</p>
+        <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+          {setting.help}
+        </p>
+        <p className="mt-1 font-mono text-[11px] text-[var(--color-fg-muted)]">
+          {setting.env_var}
+        </p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {control()}
@@ -217,27 +268,38 @@ export function AdminSettingsPage() {
 
   if (isLoading || !data) return <Spinner />;
 
+  const settingsByField = new Map(data.settings.map((s) => [s.field, s]));
+
   const setField = (field: string, value: unknown) => {
     setSaved(null);
     setDraft((prev) => ({ ...prev, [field]: value }));
   };
 
-  const save = () => {
-    const settings = new Map(data.settings.map((s) => [s.field, s]));
+  const buildValues = (): Record<string, unknown> => {
     const values: Record<string, unknown> = {};
-    try {
-      for (const [field, raw] of Object.entries(draft)) {
-        const setting = settings.get(field)!;
-        if (raw === null) {
-          values[field] = null;
-        } else if (setting.kind === "bool") {
-          values[field] = !!raw;
-        } else if (setting.kind === "choice") {
-          values[field] = raw;
-        } else {
-          values[field] = parseValue(setting, String(raw));
-        }
+    for (const [field, raw] of Object.entries(draft)) {
+      const setting = settingsByField.get(field)!;
+      if (raw === null) {
+        values[field] = null;
+      } else if (setting.kind === "bool") {
+        values[field] = !!raw;
+      } else if (setting.kind === "choice") {
+        values[field] = raw;
+      } else if (typeof raw !== "string") {
+        // A custom control (the tool deny-list) writes the value itself
+        // rather than editor text; there is nothing to parse.
+        values[field] = raw;
+      } else {
+        values[field] = parseValue(setting, raw);
       }
+    }
+    return values;
+  };
+
+  const save = () => {
+    let values: Record<string, unknown>;
+    try {
+      values = buildValues();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return;
@@ -245,18 +307,36 @@ export function AdminSettingsPage() {
     mutation.mutate(values);
   };
 
+  /** "Test connection": commit what the admin typed, then force a fresh probe.
+   * Probing the stored config while the form holds unsaved edits would answer
+   * a question nobody asked. */
+  const testAgentEndpoint = async () => {
+    const values = buildValues();
+    if (Object.keys(values).length > 0) {
+      const resp = await settingsApi.update(values);
+      qc.setQueryData(["admin", "settings"], resp);
+      setDraft({});
+      setError(null);
+      setSaved(resp.applied?.length ?? 0);
+    }
+    const { available } = await adminApi.probeAgent();
+    qc.invalidateQueries({ queryKey: ["health"] });
+    return available;
+  };
+
   const dirty = Object.keys(draft).length;
 
   return (
     <div className="space-y-6">
       <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4 text-xs text-[var(--color-fg-muted)]">
-        Every setting is stored in the database and applied without a restart, except where a
-        badge says otherwise. A value pinned in the deployment environment always wins and is
-        shown read-only here — clear the variable to make it editable again.
+        Every setting is stored in the database and applied without a restart,
+        except where a badge says otherwise. A value pinned in the deployment
+        environment always wins and is shown read-only here — clear the variable
+        to make it editable again.
         {data.secrets_mode === "env-only" && (
           <p className="mt-2 text-[var(--color-warning)]">
-            VESTIGO_SECRETS_MODE=env-only: secrets cannot be stored in the database on this
-            instance. Set them as environment variables.
+            VESTIGO_SECRETS_MODE=env-only: secrets cannot be stored in the
+            database on this instance. Set them as environment variables.
           </p>
         )}
       </div>
@@ -278,12 +358,28 @@ export function AdminSettingsPage() {
         if (settings.length === 0) return null;
         return (
           <section key={group.key}>
-            <h2 className="text-sm font-semibold text-[var(--color-fg-primary)]">{group.label}</h2>
-            <p className="mb-2 text-xs text-[var(--color-fg-muted)]">{group.description}</p>
+            <h2 className="text-sm font-semibold text-[var(--color-fg-primary)]">
+              {group.label}
+            </h2>
+            <p className="mb-2 text-xs text-[var(--color-fg-muted)]">
+              {group.description}
+            </p>
             {/* The verdict belongs next to the knobs that move it: an operator
                 editing the scan budget is the person who needs to know it does
                 not currently fit. */}
-            {group.key === "scans" && <ScanBudgetCard budget={health.data?.scan_budget} />}
+            {group.key === "scans" && (
+              <ScanBudgetCard budget={health.data?.scan_budget} />
+            )}
+            {/* Same reasoning for the agent: "is this endpoint reachable" is
+                the question its knobs exist to answer, so the test sits with
+                them rather than on a page of its own. */}
+            {group.key === "agent" && (
+              <AgentSectionHeader
+                agent={data.agent}
+                onTest={testAgentEndpoint}
+                dirty={dirty > 0}
+              />
+            )}
             <div className="rounded-lg border border-[var(--color-border)] px-4">
               {settings.map((s) => (
                 <SettingRow
@@ -292,6 +388,8 @@ export function AdminSettingsPage() {
                   draft={draft}
                   onChange={setField}
                   secretsDisabled={data.secrets_mode === "env-only"}
+                  siblings={settingsByField}
+                  agent={data.agent}
                 />
               ))}
             </div>
@@ -308,7 +406,11 @@ export function AdminSettingsPage() {
         <Button variant="ghost" disabled={!dirty} onClick={() => setDraft({})}>
           Discard
         </Button>
-        <Button variant="accent" disabled={!dirty || mutation.isPending} onClick={save}>
+        <Button
+          variant="accent"
+          disabled={!dirty || mutation.isPending}
+          onClick={save}
+        >
           {mutation.isPending ? "Saving…" : "Save changes"}
         </Button>
       </div>

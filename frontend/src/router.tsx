@@ -1,6 +1,7 @@
 import {
   createBrowserRouter,
   createRoutesFromElements,
+  Navigate,
   Route,
 } from "react-router-dom";
 import { AppShell } from "@/components/layout/AppShell";
@@ -22,13 +23,16 @@ import { AdminTeamsPage } from "@/pages/admin/AdminTeamsPage";
 import { AdminTeamDetailPage } from "@/pages/admin/AdminTeamDetailPage";
 import { AdminAuditPage } from "@/pages/admin/AdminAuditPage";
 import { AdminEnrichersPage } from "@/pages/admin/AdminEnrichersPage";
-import { AdminAgentPage } from "@/pages/admin/AdminAgentPage";
 import { AdminSettingsPage } from "@/pages/admin/AdminSettingsPage";
 
 export const router = createBrowserRouter(
   createRoutesFromElements(
     <>
-      <Route path="login" element={<LoginPage />} errorElement={<RouteErrorPage />} />
+      <Route
+        path="login"
+        element={<LoginPage />}
+        errorElement={<RouteErrorPage />}
+      />
       {/* One net per branch that can actually reach the router: AppShell wraps
           its own Outlet in an ErrorBoundary, so a page throw never gets this
           far, and AppShell's own throw is caught by the RequireAuth route. */}
@@ -37,7 +41,10 @@ export const router = createBrowserRouter(
           <Route index element={<CasesPage />} />
           <Route path="cases/:caseId" element={<CaseOverviewPage />} />
           <Route path="cases/:caseId/stories" element={<StoriesPage />} />
-          <Route path="cases/:caseId/stories/:storyId" element={<StoryEditorPage />} />
+          <Route
+            path="cases/:caseId/stories/:storyId"
+            element={<StoryEditorPage />}
+          />
           <Route
             path="cases/:caseId/timelines/:timelineId"
             element={<ExplorerPage />}
@@ -55,7 +62,12 @@ export const router = createBrowserRouter(
               <Route path="teams/:teamId" element={<AdminTeamDetailPage />} />
               <Route path="audit" element={<AdminAuditPage />} />
               <Route path="enrichers" element={<AdminEnrichersPage />} />
-              <Route path="agent" element={<AdminAgentPage />} />
+              {/* The agent is configured on Settings like everything else
+                  (migration 0033); keep old links and bookmarks working. */}
+              <Route
+                path="agent"
+                element={<Navigate to="/admin/settings" replace />}
+              />
               <Route path="settings" element={<AdminSettingsPage />} />
             </Route>
           </Route>

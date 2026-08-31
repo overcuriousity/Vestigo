@@ -414,9 +414,9 @@ list used only by the correlation matrix.
 Every tool is toggleable — none are hard-wired on. A tool is available only
 if *no* layer denies it:
 
-1. **Admin hard-deny** — `agent_settings.disabled_tools` /
+1. **Admin hard-deny** — `agent_disabled_tools` /
    `VESTIGO_AGENT_DISABLED_TOOLS`. Applies to the in-app agent **and**
-   `/mcp`; users cannot re-enable. Edited on `Admin → Agent`.
+   `/mcp`; users cannot re-enable. Edited on `Admin → Settings`.
 2. **Per-user defaults** — `users.preferences["agent_disabled_tools"]`
    ("Save as my defaults" in the tool-selector popover).
 3. **Per-chat choice** — `agent_conversations.disabled_tools`, frozen at
@@ -571,8 +571,7 @@ analyst sees, not a heuristic fallback.
 | `VESTIGO_AGENT_CONTEXT_WINDOW` | Model context window in tokens (≥1024). Unset = the sliding window engages only reactively after an overflow. |
 | `VESTIGO_AGENT_TOOL_FIDELITY` | How much of an example record tool results carry: `full` (default) / `message` / `minimal` / `auto`. |
 | `VESTIGO_AGENT_DISABLED_TOOLS` | JSON array of tool names to hard-deny everywhere (in-app + `/mcp`). |
-| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). Edited on `Admin → Settings`, not the Agent tab. |
-| `VESTIGO_AGENT_SECRET_MODE` | `db` (default) or `env-only`: refuse DB storage of the API key; `VESTIGO_AGENT_API_KEY` becomes the only source. Edited on `Admin → Settings`. |
+| `VESTIGO_AGENT_PROBE_TTL_SECONDS` | Availability probe cache (default 60). |
 | `VESTIGO_MCP_ENABLED` | Serve the external `/mcp` endpoint (default `false`). Independent of `VESTIGO_AGENT_*`. |
 | `VESTIGO_PUBLIC_BASE_URL` | Outside-facing URL of this deployment (e.g. `https://vestigo.example.org`), scheme required. Makes `propose_chart`'s `open_url` absolute; unset leaves it a relative path. |
 
@@ -584,32 +583,44 @@ operator decision.
 
 ### DB-backed settings, env-wins precedence
 
-Every field above except `VESTIGO_AGENT_PROBE_TTL_SECONDS`,
-`VESTIGO_AGENT_SECRET_MODE`, and `VESTIGO_MCP_ENABLED` is editable from
-`Admin → Agent`, backed by a singleton `agent_settings` row. Those three live
-on `Admin → Settings` instead, in the generic `app_settings` layer
-(`core/settings_registry.py`); the agent's own row predates it and keeps its
-purpose-built resolver, so the two coexist deliberately — same precedence
-rules, same "pinned by environment" semantics, different storage.
-`resolve_agent_config()` (`agent/config.py`) resolves **per field**: env var
-if set, else DB value, else hardcoded default — so an operator can pin
-`VESTIGO_AGENT_API_KEY` while leaving `model` admin-editable. The resolved
-`AgentConfig.sources` dict records which layer won each field; the admin UI
-renders env-pinned fields disabled with a `pinned by VESTIGO_AGENT_<FIELD>`
-badge. The API key is never round-tripped in plaintext (only `api_key_set`);
-the DB-stored key is plaintext at rest, which `VESTIGO_AGENT_SECRET_MODE=
-env-only` avoids entirely. Resolved configs are cached per-fingerprint, so
-admin edits take effect on the next call without a restart, and a `PUT`
-resets the availability-probe cache.
+Every field above is an ordinary instance setting, editable under
+`Admin → Settings` in the **AI agent** group and stored in the generic
+`app_settings` layer (`core/settings_registry.py`). Precedence is the
+instance-wide one, resolved **per field**: the environment wins where the
+operator pinned a variable, then the admin-edited override, then the field's
+own default — so an operator can pin `VESTIGO_AGENT_API_KEY` while leaving
+the model admin-editable. `resolve_agent_config()` (`agent/config.py`) is a
+projection of the merged settings object onto `AgentConfig`; it performs no
+I/O of its own. `AgentConfig.sources` records which layer won each field, and
+the console renders an env-pinned field read-only with its variable name.
 
-`POST /api/admin/agent-settings/models` (admin-only) lists the model ids the
-configured endpoint advertises, so the model field can be a dropdown. It
-accepts the **unsaved** form credentials (omitted fields fall back to the
-resolved config), but env-pinned fields are not overridable per request —
-otherwise overriding `api_base_url` while the key stays pinned would ship
-the operator's key to a host the caller chose. It always returns 200
-(failures yield `[]` and the UI falls back to free-text entry), persists
-nothing, and reaches only the operator's own configured endpoint.
+Until migration `0033` the agent owned a purpose-built `agent_settings`
+singleton row, a second resolver, its own `GET`/`PUT /admin/agent-settings`,
+its own `Admin → Agent` tab and its own secret switch
+(`VESTIGO_AGENT_SECRET_MODE`) — all of it predating the generic layer and
+duplicating it. The migration copies the row into `app_settings` and drops it;
+the secret switch is retired in favour of the instance-wide
+`VESTIGO_SECRETS_MODE`, and a deployment that still sets the old variable gets
+a startup warning saying so. `/admin/agent` redirects to `/admin/settings`.
+
+The API key is never round-tripped in plaintext (the payload carries
+`value_set` instead); the stored key is plaintext at rest, which
+`VESTIGO_SECRETS_MODE=env-only` avoids entirely. Resolved configs are cached
+per-fingerprint, so an admin edit takes effect on the next call without a
+restart, and a settings `PUT` resets the availability-probe cache.
+
+Two admin-only routes remain agent-specific because neither persists anything.
+`POST /api/admin/agent/models` lists the model ids the configured endpoint
+advertises, so the model field can be a dropdown. It accepts the **unsaved**
+form credentials (omitted fields fall back to the resolved config), but
+env-pinned fields are not overridable per request — otherwise overriding
+`api_base_url` while the key stays pinned would ship the operator's key to a
+host the caller chose. It always returns 200 (failures yield `[]` and the UI
+falls back to free-text entry) and reaches only the operator's own configured
+endpoint. `POST /api/admin/agent/probe` is "Test connection": it drops the
+cached availability result and re-probes, because an admin who just saved a
+URL is asking for a fresh answer rather than one up to
+`agent_probe_ttl_seconds` old.
 
 ## Context management
 
@@ -773,8 +784,8 @@ ran on the same possibly-small model and was nondeterministic).
   must never depend on call order.
 - **Config guard-rail.** `fidelity_config_warning` flags an explicit
   `tool_fidelity=full` against a `context_window` below `AUTO_FULL_MIN_WINDOW`
-  (100k). Advisory only — logged at turn start, surfaced in the admin
-  agent-settings `warnings` array, and rendered on the admin agent page.
+  (100k). Advisory only — logged at turn start, surfaced in the settings
+  payload's `agent.warnings` array, and rendered above the AI agent group.
 - **Forensic trail.** A reduced turn persists one append-only `role="window"`
   message row (reason, attempt, budget, counts, before/after estimates) plus an
   `agent.window` audit row, written on *every* exit including stop and error. The

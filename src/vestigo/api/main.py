@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -374,6 +375,15 @@ def _log_config_report() -> None:
         logger.warning(
             "environment=production but VESTIGO_AUTH_COOKIE_SECURE=false — session cookies "
             "will be sent over plain HTTP. Set VESTIGO_AUTH_COOKIE_SECURE=1 behind TLS."
+        )
+    # Retired in 0033 along with the separate agent settings row. Settings
+    # ignores unknown VESTIGO_* variables, so an operator who pinned this to
+    # env-only would otherwise see the LLM key silently become DB-storable
+    # again with nothing in the log to say why.
+    if "VESTIGO_AGENT_SECRET_MODE" in os.environ:
+        logger.warning(
+            "VESTIGO_AGENT_SECRET_MODE is set but no longer read — the LLM API key now "
+            "follows the instance-wide VESTIGO_SECRETS_MODE. Set that instead and unset this."
         )
 
 

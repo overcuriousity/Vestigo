@@ -7,7 +7,6 @@ const TABS = [
   { to: "/admin/teams", label: "Teams" },
   { to: "/admin/audit", label: "Audit log" },
   { to: "/admin/enrichers", label: "Enrichers" },
-  { to: "/admin/agent", label: "Agent" },
   { to: "/admin/settings", label: "Settings" },
 ];
 

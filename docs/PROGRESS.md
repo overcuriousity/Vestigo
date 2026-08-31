@@ -4,7 +4,50 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 215 — review pass over the `/mcp` chart surface and the scenario modal).
+Last updated: 2026-08-31 (session 216 — the agent's settings become ordinary settings).
+
+## Session 216 — 2026-08-31: the agent's configuration becomes ordinary configuration
+
+The AI agent kept its own everything: a wide `agent_settings` singleton row (migrations
+0011/0012/0013/0015), a second resolver merging it against the env layer by hand, its own
+`GET`/`PUT /admin/agent-settings`, its own `Admin → Agent` tab, and its own secret switch
+`VESTIGO_AGENT_SECRET_MODE`. All of it predates the generic `app_settings` layer, and all
+eleven knobs it stored are already `VESTIGO_AGENT_*` fields on `Settings` — the registry
+listed them only to keep the coverage test honest, marked `managed_by="agent"`, and the
+settings page rendered them read-only behind a badge pointing at the other tab.
+
+Migration `0033` copies the row into `app_settings` (the API key with it — same plaintext-
+at-rest contract on both sides, and dropping it would break a working instance on upgrade)
+and drops the table. `resolve_agent_config()` is now a projection of the already-merged
+settings object onto `AgentConfig`: no DB read, no best-effort fallback, no second
+precedence rule to keep in step, and synchronous, since it does no I/O. `SettingSpec`
+lost `managed_by` entirely — it had one user.
+
+`VESTIGO_AGENT_SECRET_MODE` is retired rather than carried: the LLM key now follows the
+instance-wide `VESTIGO_SECRETS_MODE` like every other secret. Because `Settings` ignores
+unknown `VESTIGO_*` variables, a deployment that still pins the old one would silently
+start allowing DB storage again, so startup logs a warning naming the replacement.
+
+The `Admin → Agent` tab is gone and `/admin/agent` redirects to `/admin/settings`. Its
+widgets were worth keeping and moved into the settings page's **AI agent** group as custom
+controls over the same draft — the endpoint-fed model dropdown, the tool deny-list
+checkboxes, the headers textarea — so the page keeps exactly one Save covering agent and
+non-agent fields alike. The two agent routes that persist nothing survive on their own:
+`POST /admin/agent/models` (the listing behind the dropdown) and a new
+`POST /admin/agent/probe` for "Test connection", which drops the cached availability
+result rather than overloading an empty PUT to do it.
+
+Two checks the retired PUT carried had to land somewhere, and neither belongs on
+`Settings`: whitespace trimming on pasted credentials, and rejecting a tool name the
+catalogue does not know (`core/config.py` must not import `agent/tools.py`). Both now run
+in the admin router, on the only surface that writes those fields.
+
+Audit of the second half of the ask — whether everything settable is actually exposed —
+found nothing else missing: `test_registry_covers_every_settings_field` already enforces
+registry/`Settings` parity both ways, `_settings_payload()` emits every spec unfiltered,
+and the only other non-editable fields are the `env_only` bootstrap ones, read-only by
+design. The `os.environ` reads outside `config.py` are all in `assets/converters/*.py`,
+standalone subprocess scripts rather than app config.
 
 ## Session 215 — 2026-08-31: review pass over `/mcp` charts and the scenario modal
 

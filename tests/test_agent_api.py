@@ -19,6 +19,7 @@ from vestigo.agent import availability
 from vestigo.agent.config import config_fingerprint, resolve_agent_config
 from vestigo.agent.tools import AgentScope
 from vestigo.core.config import get_settings
+from vestigo.core.runtime_settings import load_runtime_settings
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,7 @@ def _configure_agent(monkeypatch, provider: str = "openai"):
 @pytest.mark.asyncio
 async def test_agent_unconfigured_is_not_configured(store):
     get_settings.cache_clear()
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     assert availability.agent_configured(config) is False
 
 
@@ -56,7 +57,7 @@ async def test_agent_available_false_without_config(store):
 @pytest.mark.asyncio
 async def test_agent_available_requires_probe_success(store, monkeypatch):
     _configure_agent(monkeypatch)
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     assert availability.agent_configured(config) is True
 
     async def probe_ok(config):
@@ -150,13 +151,13 @@ async def test_probe_bearer_header_only_for_kimi(store, monkeypatch):
     monkeypatch.setenv("VESTIGO_AGENT_API_KEY", "sk-secret")
     monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "https://api.anthropic.com")
     get_settings.cache_clear()
-    assert await availability._probe(await resolve_agent_config()) is True
+    assert await availability._probe(resolve_agent_config()) is True
     assert captured["headers"]["x-api-key"] == "sk-secret"
     assert "Authorization" not in captured["headers"]
 
     monkeypatch.setenv("VESTIGO_AGENT_API_BASE_URL", "https://api.kimi.com/coding")
     get_settings.cache_clear()
-    assert await availability._probe(await resolve_agent_config()) is True
+    assert await availability._probe(resolve_agent_config()) is True
     assert captured["headers"]["Authorization"] == "Bearer sk-secret"
 
 
@@ -175,7 +176,7 @@ async def test_kimi_probe_url_and_headers(store, monkeypatch):
     monkeypatch.setenv("VESTIGO_AGENT_USER_AGENT", "claude-code/0.1.0")
     get_settings.cache_clear()
     try:
-        config = await resolve_agent_config()
+        config = resolve_agent_config()
         assert availability._models_probe_url(config) == "https://api.kimi.com/coding/v1/models"
         assert availability.probe_headers(config)["User-Agent"] == "claude-code/0.1.0"
     finally:
@@ -191,11 +192,14 @@ async def test_kimi_probe_url_and_headers(store, monkeypatch):
 async def test_resolver_env_wins_per_field(store, monkeypatch):
     """Env overrides only the fields it sets; DB fills the rest; unset fields default."""
     await store.init_schema()
-    await store.update_agent_settings({"model": "db-model", "api_base_url": "http://db"}, "root")
+    await store.set_app_settings(
+        {"agent_model": "db-model", "agent_api_base_url": "http://db"}, "root"
+    )
     monkeypatch.setenv("VESTIGO_AGENT_MODEL", "env-model")
     get_settings.cache_clear()
+    await load_runtime_settings(store)
     try:
-        config = await resolve_agent_config()
+        config = resolve_agent_config()
         assert config.model == "env-model"
         assert config.sources["model"] == "env"
         assert config.api_base_url == "http://db"
@@ -212,14 +216,14 @@ async def test_resolver_picks_up_reasoning_effort_env(store, monkeypatch):
     monkeypatch.setenv("VESTIGO_AGENT_REASONING_EFFORT", "high")
     get_settings.cache_clear()
     try:
-        config = await resolve_agent_config()
+        config = resolve_agent_config()
         assert config.reasoning_effort == "high"
         assert config.sources["reasoning_effort"] == "env"
     finally:
         get_settings.cache_clear()
 
 
-def test_admin_agent_settings_shows_reasoning_effort_env_pinned(
+def test_admin_settings_show_reasoning_effort_env_pinned(
     client, admin_bootstrap, store, monkeypatch
 ):
     from tests.conftest import as_admin
@@ -228,12 +232,14 @@ def test_admin_agent_settings_shows_reasoning_effort_env_pinned(
     monkeypatch.setenv("VESTIGO_AGENT_REASONING_EFFORT", "high")
     get_settings.cache_clear()
     try:
-        resp = client.get("/api/admin/agent-settings")
+        resp = client.get("/api/admin/settings")
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["effective"]["reasoning_effort"] == "high"
-        assert body["sources"]["reasoning_effort"] == "env"
-        assert body["env_vars"]["reasoning_effort"] == "VESTIGO_AGENT_REASONING_EFFORT"
+        field = next(s for s in resp.json()["settings"] if s["field"] == "agent_reasoning_effort")
+        assert field["value"] == "high"
+        assert field["source"] == "env"
+        assert field["env_var"] == "VESTIGO_AGENT_REASONING_EFFORT"
+        assert field["editable"] is False
+        assert resolve_agent_config().reasoning_effort == "high"
     finally:
         get_settings.cache_clear()
 
@@ -255,7 +261,8 @@ async def test_probe_cache_invalidates_on_config_change(store, monkeypatch):
     assert await availability.agent_available() is True
     assert calls["n"] == 1
 
-    await store.update_agent_settings({"max_turns": 42}, "root")
+    await store.set_app_settings({"agent_max_turns": 42}, "root")
+    await load_runtime_settings(store)
     assert await availability.agent_available() is True
     assert calls["n"] == 2
 
@@ -1388,7 +1395,7 @@ async def test_resolver_agent_v2_fields(store, monkeypatch):
     monkeypatch.setenv("VESTIGO_AGENT_DISABLED_TOOLS", '["histogram"]')
     get_settings.cache_clear()
     try:
-        config = await resolve_agent_config()
+        config = resolve_agent_config()
         assert config.context_window == 200000
         assert config.sources["context_window"] == "env"
         assert config.disabled_tools == ["histogram"]
@@ -1397,28 +1404,32 @@ async def test_resolver_agent_v2_fields(store, monkeypatch):
         get_settings.cache_clear()
 
 
-def test_admin_agent_settings_toggles_roundtrip(client, admin_bootstrap, store):
+def test_admin_settings_tool_toggles_roundtrip(client, admin_bootstrap, store):
     from vestigo.agent.tools import TOOL_REGISTRY
 
     as_admin(client, admin_bootstrap)
-    body = client.get("/api/admin/agent-settings").json()
-    assert len(body["tools"]) == len(TOOL_REGISTRY)
-    names = {t["name"] for t in body["tools"]}
+    body = client.get("/api/admin/settings").json()
+    assert len(body["agent"]["tools"]) == len(TOOL_REGISTRY)
+    names = {t["name"] for t in body["agent"]["tools"]}
     assert {"search_events", "propose_annotation", "semantic_search"} <= names
 
     put = client.put(
-        "/api/admin/agent-settings",
+        "/api/admin/settings",
         json={
-            "disabled_tools": ["semantic_search", "similar_events"],
-            "context_window": 128000,
+            "values": {
+                "agent_disabled_tools": ["semantic_search", "similar_events"],
+                "agent_context_window": 128000,
+            }
         },
     )
     assert put.status_code == 200, put.text
-    effective = put.json()["effective"]
-    assert effective["disabled_tools"] == ["semantic_search", "similar_events"]
-    assert effective["context_window"] == 128000
+    config = resolve_agent_config()
+    assert config.disabled_tools == ["semantic_search", "similar_events"]
+    assert config.context_window == 128000
 
-    bad = client.put("/api/admin/agent-settings", json={"disabled_tools": ["not_a_tool"]})
+    bad = client.put(
+        "/api/admin/settings", json={"values": {"agent_disabled_tools": ["not_a_tool"]}}
+    )
     assert bad.status_code == 422
 
 

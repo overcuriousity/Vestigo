@@ -564,73 +564,6 @@ class AppSettingRow(Base):
         }
 
 
-class AgentSettingsRow(Base):
-    """Instance-wide AI agent configuration, set by admins (A7, docs/AGENT.md).
-
-    A single row pinned at ``id="global"`` — there is exactly one agent
-    configuration per instance. Any field left ``None`` here falls back to
-    the corresponding ``VESTIGO_AGENT_*`` environment variable at resolution
-    time (see the env-always-wins resolver that consumes this row); this
-    model only owns storage, not precedence. ``api_key`` is masked to a
-    boolean by default in ``to_dict`` so the plaintext key never leaves this
-    module unless explicitly requested.
-    """
-
-    __tablename__ = "agent_settings"
-
-    id: Mapped[str] = mapped_column(String(16), primary_key=True, default="global")
-    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    api_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    api_key: Mapped[str | None] = mapped_column(Text, nullable=True)
-    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    extra_headers: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    max_turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # Model context window in tokens, driving the sliding window
-    # (agent/window.py; None = reactive-only).
-    context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # How much of an example record tool results carry (agent/fidelity.py).
-    tool_fidelity: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # Admin hard-deny tool list — removed from the tool server for the in-app
-    # agent AND the external /mcp transport; users cannot re-enable these.
-    disabled_tools: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(UTC),
-        onupdate=lambda: datetime.now(UTC),
-        server_default=func.now(),
-    )
-
-    def to_dict(self, *, mask_key: bool = True) -> dict[str, Any]:
-        """Return a serializable dictionary.
-
-        When ``mask_key`` is True (the default), ``api_key`` is replaced by
-        ``api_key_set`` (a bool) so the plaintext key is never included.
-        """
-        d: dict[str, Any] = {
-            "id": self.id,
-            "model": self.model,
-            "provider": self.provider,
-            "api_base_url": self.api_base_url,
-            "user_agent": self.user_agent,
-            "extra_headers": self.extra_headers,
-            "max_turns": self.max_turns,
-            "reasoning_effort": self.reasoning_effort,
-            "context_window": self.context_window,
-            "tool_fidelity": self.tool_fidelity,
-            "disabled_tools": self.disabled_tools,
-            "updated_by": self.updated_by,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-        if mask_key:
-            d["api_key_set"] = bool(self.api_key)
-        else:
-            d["api_key"] = self.api_key
-        return d
-
-
 class EnrichmentResultStaging(Base):
     """Crash-safe staging area for in-flight enrichment jobs.
 
@@ -2773,33 +2706,6 @@ class PostgresStore:
             await session.commit()
             result = await session.execute(select(AppSettingRow))
             return list(result.scalars().all())
-
-    async def get_agent_settings(self) -> AgentSettingsRow | None:
-        """Return the single instance-wide agent settings row, if it exists."""
-        async with self.session_factory() as session:
-            return await session.get(AgentSettingsRow, "global")
-
-    async def update_agent_settings(
-        self, values: dict[str, Any], updated_by: str | None
-    ) -> AgentSettingsRow:
-        """Create or update the single "global" agent settings row.
-
-        Only keys present in ``values`` are changed; a key present with
-        value ``None`` clears that column (distinct from a key simply being
-        absent from ``values``, which leaves the existing value untouched).
-        """
-        async with self.session_factory() as session:
-            row = await session.get(AgentSettingsRow, "global")
-            if row is None:
-                row = AgentSettingsRow(id="global")
-                session.add(row)
-            for key, value in values.items():
-                setattr(row, key, value)
-            row.updated_by = updated_by
-            row.updated_at = datetime.now(UTC)
-            await session.commit()
-            await session.refresh(row)
-            return row
 
     async def stage_enrichment_results(self, rows: list[dict[str, Any]]) -> None:
         """Bulk-insert enrichment result rows into the crash-safe staging table."""
