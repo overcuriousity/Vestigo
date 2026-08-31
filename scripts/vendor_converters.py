@@ -98,7 +98,8 @@ CONVERTERS = {
     "syslog2timesketch": (
         "syslog",
         "syslog2timesketch.py",
-        "Linux syslog/auth.log (RFC 3164 plain text, rotated or gzip) to Timesketch timeline.",
+        "Linux syslog/auth.log (RFC 3164 BSD, year-first BSD, or rsyslog ISO "
+        "headers; plain text, rotated or gzip) to Timesketch timeline.",
         ["auth.log*", "secure*", "syslog*", "messages*", "cron.log*"],
     ),
     "suricata2timesketch": (
@@ -113,6 +114,41 @@ CONVERTERS = {
         "DShield webhoneypot (isc-agent) HTTP request logs to Timesketch timeline, incl. "
         "reverse-proxy X-Forwarded-For/X-Real-Ip client resolution and matched signature metadata.",
         ["webhoneypot_YYYY-MM-DD.json"],
+    ),
+    "w3c2timesketch": (
+        "w3c",
+        "w3c2timesketch.py",
+        "W3C Extended Log File Format logs — IIS site logs (u_ex*.log), http.sys "
+        "HTTPERR logs, and any other '#Fields:'-described W3C log — to Timesketch "
+        "timeline. The field directive is honored per occurrence, so a column set "
+        "that changes mid-file (an IIS restart) is parsed against the block it "
+        "describes.",
+        ["u_ex*.log", "httperr*.log", "*.log (any '#Fields:' W3C log)"],
+    ),
+    "exchange2timesketch": (
+        "exchange",
+        "exchange2timesketch.py",
+        "Microsoft Exchange Server protocol logs (HttpProxy per front-end protocol, "
+        "ECP, RPC Client Access, IMAP4/POP3) to Timesketch timeline, generic over "
+        "the '#Fields:' CSV preamble.",
+        ["HttpProxy_*.LOG", "*.LOG (Exchange '#Log-type:' CSV)"],
+    ),
+    "squid2timesketch": (
+        "squid",
+        "squid2timesketch.py",
+        "Squid proxy access.log (native 'logformat squid' or httpd-style "
+        "common/combined, detected from the data), cache.log incl. helper output "
+        "and wrapped continuation lines, and icap.log to Timesketch timeline.",
+        ["access.log*", "cache.log*", "icap.log*"],
+    ),
+    "conntrackd2timesketch": (
+        "conntrackd",
+        "conntrackd2timesketch.py",
+        "conntrackd flow logs (conntrackd-stats.log, plain or .gz) to Timesketch "
+        "timeline, with both connection tuples as discrete columns and the address "
+        "translation between them derived into nat_type/translated_src_ip/"
+        "translated_dst_ip.",
+        ["conntrackd-stats.log*", "conntrackd*.log*"],
     ),
     "zeek2timesketch": (
         "zeek",

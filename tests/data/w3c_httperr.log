@@ -1,0 +1,6 @@
+#Software: Microsoft HTTP API 2.0
+#Version: 1.0
+#Date: 2026-01-01 11:11:32
+#Fields: date time c-ip c-port s-ip s-port cs-version cs-method cs-uri streamid sc-status s-siteid s-reason s-queuename
+2026-01-01 11:11:32 198.51.100.7 32650 192.0.2.10 444 HTTP/1.1 RPC_IN_DATA /rpc/rpcproxy.dll?srv01.example.test:6001 - 400 2 BadRequest MSExchangeRpcProxyAppPool
+2026-01-01 11:11:41 203.0.113.44 2993 192.0.2.10 443 - - - - - - Timer_ConnectionIdle -

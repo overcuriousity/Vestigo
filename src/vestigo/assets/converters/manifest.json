@@ -1,7 +1,7 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "c19905d82d17aeab98db1da75533d120cf370857",
-  "version": "1.2.0",
+  "commit": "bb4d69f78c15fafc2ae069075e2308647a09091b",
+  "version": "1.3.0",
   "license": "MIT License",
   "converters": [
     {
@@ -14,7 +14,7 @@
         "error.log*"
       ],
       "size_bytes": 70860,
-      "sha256": "4577e817e8225b0134310d28627dc724536f7fc9f1b64c82392aeba813a733e8"
+      "sha256": "4d1ae5580f27a4ca08afc647ac932978aec95f9c58c14b97de0e91c648d501e7"
     },
     {
       "name": "browser2timesketch",
@@ -25,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 108833,
-      "sha256": "033dc7950906318a441ee074e73035aa2b12d37a01fa1626b42ffd3860bf5f81"
+      "sha256": "505bfb4ddd1905cfeb2edc903912b2982db6fe32340f4c83fcdb3fc15208a4ca"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -35,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 50166,
-      "sha256": "508babee7c9dfcbff7deb1dbb069704bdafa1e9112b591f5ff34d7448450c972"
+      "sha256": "8b587547dd20eeaea1c11eb8660b9045da4650d0596f188c47ecb60709883dde"
     },
     {
       "name": "cloudtrail2vestigo",
@@ -52,6 +52,17 @@
       "sha256": "7c7696831039be4b75508b02f1f5400b199e612f1eadaa7b23af1db51099cd6d"
     },
     {
+      "name": "conntrackd2timesketch",
+      "filename": "conntrackd2timesketch.py",
+      "description": "conntrackd flow logs (conntrackd-stats.log, plain or .gz) to Timesketch timeline, with both connection tuples as discrete columns and the address translation between them derived into nat_type/translated_src_ip/translated_dst_ip.",
+      "inputs": [
+        "conntrackd-stats.log*",
+        "conntrackd*.log*"
+      ],
+      "size_bytes": 55392,
+      "sha256": "fbb498b7f11523d68b25c033fbfabdd01fd7d0712015bfff39efe4c402da7ca3"
+    },
+    {
       "name": "cowrie2timesketch",
       "filename": "cowrie2timesketch.py",
       "description": "Cowrie SSH/Telnet honeypot JSON logs (plain, rotated, or gzip) to Timesketch timeline.",
@@ -61,7 +72,7 @@
         "cowrie.json*.gz"
       ],
       "size_bytes": 51285,
-      "sha256": "f04904118dcd9218a4604b5baca9b1b950d2d1b81772b9f505b0104f0de8be15"
+      "sha256": "c359794d71d9fd7855fdc5d70e71794f050bc655b07049fde1fabb384e38e493"
     },
     {
       "name": "evtx2timesketch",
@@ -73,7 +84,7 @@
         "evtx_dump -o jsonl"
       ],
       "size_bytes": 65293,
-      "sha256": "254747aa0fb02348b6ea97169446653232465351cc4657c2b948480ffb9dc326"
+      "sha256": "71c6656ce944104f26812069266b2fce630046156a8e974e2de919615168d5ac"
     },
     {
       "name": "evtx2vestigo",
@@ -91,6 +102,17 @@
       "sha256": "f75a2c764d6b91271f665dfd25e0d54e5725fba6bd11b22c592d065de8c3f9b0"
     },
     {
+      "name": "exchange2timesketch",
+      "filename": "exchange2timesketch.py",
+      "description": "Microsoft Exchange Server protocol logs (HttpProxy per front-end protocol, ECP, RPC Client Access, IMAP4/POP3) to Timesketch timeline, generic over the '#Fields:' CSV preamble.",
+      "inputs": [
+        "HttpProxy_*.LOG",
+        "*.LOG (Exchange '#Log-type:' CSV)"
+      ],
+      "size_bytes": 59404,
+      "sha256": "15974e0126ccb2354855c55c97e70fe6dd3451501624ef2f96e148c89f032cbd"
+    },
+    {
       "name": "filterlog2timesketch",
       "filename": "filterlog2timesketch.py",
       "description": "pfSense/OPNsense filterlog firewall logs to Timesketch timeline.",
@@ -98,7 +120,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 58683,
-      "sha256": "ba56afb539aa84d546848c0187bae0d8e1a71b81428bbce43ce7c69b49ee5e3a"
+      "sha256": "99b83697823f8beb8ce8b3a734751fd53e3b7b2f817ae3cb798897a61f2e6575"
     },
     {
       "name": "filterlog2vestigo",
@@ -123,7 +145,7 @@
         "*-json.log (Docker json-file)"
       ],
       "size_bytes": 74181,
-      "sha256": "b748739e595af13d8d6b9669c0ec64f5713733921da27c464bdd13d954b13963"
+      "sha256": "298e594076f9df4d152635716ce918e0239d9d7e9b2cd098d672c2385dfe4072"
     },
     {
       "name": "haproxy2vestigo",
@@ -148,7 +170,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 46467,
-      "sha256": "9a12b1c10911221d7c2756ec687d9ec19938bd3f8df5fcce4b1b88f2ef359dac"
+      "sha256": "b5d34685f0b73828a6d4c1e8301a63a6acfa6a1423e9e1b53b4673f8cbc0a5de"
     },
     {
       "name": "nginx2timesketch",
@@ -159,7 +181,7 @@
         "error.log*"
       ],
       "size_bytes": 54137,
-      "sha256": "50df8568620513867910f38f85c41ceb5573fb20d1a0f0d7be8bb1e11780f3d7"
+      "sha256": "12be34b2725a4eac4d4130291fbe23b119e15a30ee5c158165c3bdb30e06d576"
     },
     {
       "name": "nginx2vestigo",
@@ -185,7 +207,7 @@
         "*.pcapng"
       ],
       "size_bytes": 112133,
-      "sha256": "cc839e3618ed14327582684938af464ec49a74f5bc0a4c12cd8bd91cd9a0731f"
+      "sha256": "acfc8efbec9c3d76f0a4b6e86090a57232e01d015f08d0d18ec506ced4152b02"
     },
     {
       "name": "pcap2vestigo",
@@ -203,6 +225,18 @@
       "sha256": "96d4d26da3149b397638d78564d2c2792f10c2cd10ae3b86a3fe20a427e5fd5f"
     },
     {
+      "name": "squid2timesketch",
+      "filename": "squid2timesketch.py",
+      "description": "Squid proxy access.log (native 'logformat squid' or httpd-style common/combined, detected from the data), cache.log incl. helper output and wrapped continuation lines, and icap.log to Timesketch timeline.",
+      "inputs": [
+        "access.log*",
+        "cache.log*",
+        "icap.log*"
+      ],
+      "size_bytes": 62284,
+      "sha256": "31051e6878bc2065e1f5db70e5a4962821c5db53609c6adf338166fd2b977851"
+    },
+    {
       "name": "suricata2timesketch",
       "filename": "suricata2timesketch.py",
       "description": "Suricata IDS/IPS logs (EVE JSON, fast.log, OPNsense syslog export) to Timesketch timeline.",
@@ -212,7 +246,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 61072,
-      "sha256": "2f7d7a8fdc268e7f02e6b223394f2241e1091d3f9da2abcbc05d32f8684bdfb9"
+      "sha256": "8c76cd08248bfe8aabac6a641536f172908a1283d6907cc80d4f847755543cb1"
     },
     {
       "name": "suricata2vestigo",
@@ -233,7 +267,7 @@
     {
       "name": "syslog2timesketch",
       "filename": "syslog2timesketch.py",
-      "description": "Linux syslog/auth.log (RFC 3164 plain text, rotated or gzip) to Timesketch timeline.",
+      "description": "Linux syslog/auth.log (RFC 3164 BSD, year-first BSD, or rsyslog ISO headers; plain text, rotated or gzip) to Timesketch timeline.",
       "inputs": [
         "auth.log*",
         "secure*",
@@ -241,8 +275,8 @@
         "messages*",
         "cron.log*"
       ],
-      "size_bytes": 60394,
-      "sha256": "8a855c0e2d26e1aaf8f456a861d713310c79c0832ae53962eedd5779269ef188"
+      "size_bytes": 64337,
+      "sha256": "f76951694242bb9a8a56c6b5c9672264e18683b79179a7a3cc13599ab29e2daf"
     },
     {
       "name": "timesketch2parquet",
@@ -260,6 +294,34 @@
       "sha256": "1418f057d14be61e79e39afdeb6b2862c5371260b5e335730862b145dde87e27"
     },
     {
+      "name": "w3c2timesketch",
+      "filename": "w3c2timesketch.py",
+      "description": "W3C Extended Log File Format logs \u2014 IIS site logs (u_ex*.log), http.sys HTTPERR logs, and any other '#Fields:'-described W3C log \u2014 to Timesketch timeline. The field directive is honored per occurrence, so a column set that changes mid-file (an IIS restart) is parsed against the block it describes.",
+      "inputs": [
+        "u_ex*.log",
+        "httperr*.log",
+        "*.log (any '#Fields:' W3C log)"
+      ],
+      "size_bytes": 61518,
+      "sha256": "67115c413957c713344c0e01399d10bfc018c97cb4b7a4e3c7f5e5eece268458"
+    },
+    {
+      "name": "w3c2vestigo",
+      "filename": "w3c2vestigo.py",
+      "description": "W3C Extended Log File Format logs \u2014 IIS site logs (u_ex*.log), http.sys HTTPERR logs, and any other '#Fields:'-described W3C log (plain or .gz, file or directory searched recursively) \u2014 to a Vestigo Parquet file for direct upload. The field directive is honored per occurrence, so a column set that changes mid-file (an IIS restart) is parsed against the block it describes, in parallel runs too. Requires pyarrow.",
+      "inputs": [
+        "u_ex*.log",
+        "httperr*.log",
+        "*.log (any '#Fields:' W3C log)"
+      ],
+      "native": true,
+      "requires": [
+        "pyarrow"
+      ],
+      "size_bytes": 45710,
+      "sha256": "d36ccc0ded213d2579848dcf05b948fd99529e3166dcb075cd78ce58fc286438"
+    },
+    {
       "name": "webhoneypot2timesketch",
       "filename": "webhoneypot2timesketch.py",
       "description": "DShield webhoneypot (isc-agent) HTTP request logs to Timesketch timeline, incl. reverse-proxy X-Forwarded-For/X-Real-Ip client resolution and matched signature metadata.",
@@ -267,7 +329,7 @@
         "webhoneypot_YYYY-MM-DD.json"
       ],
       "size_bytes": 55705,
-      "sha256": "3ec11c6fcaa23ba7f72eb04813a86d7154ac1cc3991f76236ee5492cd2170942"
+      "sha256": "937532f3e1fa6cdb85faf2dfc6ce103a011322da73f5239426e74c4bf5b03565"
     },
     {
       "name": "zeek2timesketch",
@@ -281,7 +343,7 @@
         "*.log.gz"
       ],
       "size_bytes": 59870,
-      "sha256": "f254a79a6840c0f3b29c5736ca6c781932d4d266f26967b290f526fec113f774"
+      "sha256": "1e7c81420f44c634e9b96f2c5b2279062c02f4b7f300aa97b01034d3dd03d8a5"
     }
   ]
 }

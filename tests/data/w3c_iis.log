@@ -1,0 +1,12 @@
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-01-01 00:00:07
+#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken
+2026-01-01 00:00:07 192.0.2.10 GET /owa/auth/logon.aspx url=https://mail.example.test/owa/ 443 - 198.51.100.7 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) https://mail.example.test/ 200 0 0 42
+2026-01-01 00:00:09 fe80::1c2d:3e4f:5a6b:7c8d%12 RPC_IN_DATA /rpc/rpcproxy.dll SRV01.example.test:6001 444 EXAMPLE\SRV01$ fe80::1c2d:3e4f:5a6b:7c8d%12 MSRPC - 401 1 2148074254 3
+this line is not a w3c record
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-01-01 02:00:00
+#Fields: date time c-ip cs-method cs-uri-stem sc-status sc-bytes
+2026-01-01 02:00:00 203.0.113.44 POST /ecp/DDI/DDIService.svc/SetObject 500 8192
