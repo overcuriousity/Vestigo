@@ -4,7 +4,69 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 218 — embeddings availability is probed, both arms).
+Last updated: 2026-08-31 (session 219 — IIS/HTTPERR, Exchange, Squid and conntrackd converters).
+
+## Session 219 — 2026-08-31: four converters for a Windows-plus-gateway estate
+
+A real case arrived with five log families the suite had no answer for: IIS site logs and
+http.sys HTTPERR from an Exchange front end, Exchange HttpProxy CSV logs, Squid
+access/cache/icap logs, and a firewall's conntrackd flow log. Upstream 2timesketch goes to
+1.3.0 with four new stdlib converters (`w3c`, `exchange`, `squid`, `conntrackd`), the
+vendored set to 18 scripts beside the 9 native ones, and `w3c2vestigo.py` is the new native
+Parquet path for the IIS family.
+
+`w3c` covers the whole `#Fields:`-described family rather than IIS alone — HTTPERR is the
+same format, and the generic path means an unmodelled dialect still converts with its own
+column names. The directive is honoured **per occurrence**: IIS rewrites its header block on
+every service restart and config change, so one file legitimately changes its column set
+mid-stream, and latching the first directive shifts every later column while reporting
+nothing. That constraint is what shapes `w3c2vestigo`'s parallel path, which the other native
+converters do not need: `scan_directives()` pre-walks the file with `bytes.find` over 1 MiB
+blocks and hands each chunk worker the state in force at its own start offset. A worker
+starting empty drops every row to the next directive; one starting stale misattributes the
+rest. `TestParallelParity` pins byte-identical parallel-vs-serial output across a mid-file
+change, with a chunk-count assertion so it cannot pass vacuously.
+
+Two W3C quirks are handled rather than tolerated. Windows logs link-local addresses with an
+interface index (`fe80::1%12`), which is not a valid address — the zone goes to
+`src_ip_zone`/`dst_ip_zone` instead of the row being dropped. And IIS writes `+` for a space
+in the User-Agent; that is reversed for `user_agent` alone, because a URI, query or Referer
+may legitimately contain a `+` and "fixing" those would corrupt the evidence.
+
+`exchange` is generic over the Exchange CSV preamble. Two shapes are deliberate: the bare
+header line Exchange writes *ahead of* its own `#Fields:` directive is recognized as a
+duplicate rather than parsed into one garbage event per file, and the periodic
+`GlobalActivity` rows — real records that carry no DateTime — are anchored to the preceding
+dated row and flagged `timestamp_inferred`, following the haproxy precedent, rather than
+dropped along with the latency and error counters that explain their neighbours.
+
+`squid` detects native `logformat squid` versus the httpd-style common/combined formats from
+the data, since which is in use is a one-line config choice the file never announces.
+`cache.log` covers both the `kidN|` SMP prefix and the `(helper)[pid] LEVEL` lines helpers
+write into the same file, and wrapped continuation lines stay attached to their entry.
+
+`conntrackd` emits both connection tuples as discrete columns and derives the translation
+between them — a reply destination that differs from the original source is SNAT, a reply
+source that differs from the original destination is DNAT. That derivation is the reason the
+log is worth converting: it is what lets an analyst pivot from an external observation back
+to the internal host. On the case's data it found 1,901 SNAT and 374 DNAT flows in 50,000.
+
+`syslog2timesketch` gained two header forms it had been silently dropping. The year-first BSD
+variant several appliance firmwares emit (`2026 Aug 23 00:17:04 host prog[pid]: msg`) is
+neither RFC 3164 nor RFC 5424, and rejected every line of the case's `auth`, `messages`,
+`firewall.log`, `kernel.log` and `openvpn.log`. The kernel monotonic timestamp that sits
+ahead of the program token on forwarded kernel messages (`host [    1.540377] systemd[1]:`)
+was discarding the whole early-boot sequence; it now lands in `kernel_time`. Neither BSD form
+records a timezone, so `--assume-tz` names the one they were written in — default UTC, which
+is what the converter assumed unconditionally before, so existing output is unchanged. squid
+and conntrackd take the same flag for the same reason.
+
+Verified against the real estate rather than fixtures alone: 7,064 HTTPERR rows, 19,996 IIS
+rows, 72 Exchange HttpProxy rows, 11,512 Squid rows, 50,000 conntrackd flows and the syslog
+set, all with zero unparseable lines. One known gap left as-is: multi-line application
+tracebacks logged through syslog (838 of 3,000 lines in the case's `firewall.log`) still have
+no header and are still skipped — anchoring them the way squid anchors continuations would
+change row counts for every existing user, so it is a separate decision.
 
 ## Session 218 — 2026-08-31: embeddings availability is probed, not inferred
 

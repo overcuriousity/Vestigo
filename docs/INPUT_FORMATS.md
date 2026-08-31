@@ -490,6 +490,53 @@ dated neighbour and marked `timestamp_inferred`, rather than written with `times
 and `--year` supplies the year the BSD syslog prefix omits, for those same lines when they
 arrive over syslog. Like every `*2timesketch` script it has no per-row provenance.
 
+### `w3c2vestigo.py`: IIS, HTTPERR, and the rest of the W3C Extended family
+
+`src/vestigo/assets/converters/w3c2vestigo.py` covers every log that describes its own
+columns with a `#Fields:` directive: IIS site logs (`u_ex*.log`), the http.sys `HTTPERR`
+log, and any other W3C Extended dialect. A directory is searched **recursively**, because
+IIS keeps one directory per site (`W3SVC1/`, `W3SVC2/`) under a single log root with
+`HTTPERR/` beside them — the root is what an analyst has.
+
+The directive is honoured **per occurrence**, not latched. IIS rewrites its whole header
+block on every service restart and configuration change, so one file legitimately changes
+its column set mid-stream; a converter that reads only the first `#Fields:` line shifts
+every later column and reports nothing. This is also why the parallel path carries an extra
+step the other native converters do not need: before chunking, `scan_directives()` walks the
+file with `bytes.find` over 1 MiB blocks (a sequential read, no per-line decoding) and
+records every `#`-prefixed line with its byte offset, and each chunk worker is handed the
+directive state in force at its own start offset. A worker beginning with an empty state
+would drop every row up to the next directive; one beginning with a stale state would
+misattribute the rest. `tests/test_w3c_converter.py::TestParallelParity` asserts parallel
+output is byte-identical to serial across a mid-file field-set change.
+
+Field naming: the well-known W3C names map to the suite's canonical spellings (`c-ip` →
+`src_ip`, `s-ip` → `dst_ip`, `cs(User-Agent)` → `user_agent`, `sc-status` → `status_code`,
+`time-taken` → `time_taken_ms`, and so on); anything unrecognized keeps a sanitized form of
+its own name, so an unmodelled dialect loses nothing. Two format quirks are handled
+explicitly:
+
+- **IPv6 scope zones.** Windows logs link-local addresses with an interface index
+  (`fe80::1c2d:3e4f:5a6b:7c8d%12`), which is not a valid address. The zone is split into
+  `src_ip_zone`/`dst_ip_zone` rather than the row being dropped.
+- **`+` for space.** IIS substitutes `+` for a space in the User-Agent. That is reversed for
+  `user_agent` alone — a URI, query, or Referer may legitimately contain a `+`, and
+  "fixing" those would corrupt the evidence.
+
+`-` is the format's "not recorded" placeholder and yields an omitted attribute, never a
+literal dash.
+
+**Timezone.** Per the W3C spec, and by IIS/http.sys default, `date`/`time` are UTC and are
+taken as such. A site configured to log local time is off by its offset, so `--assume-tz`
+(`UTC`, `local`, or `+02:00`) overrides the assumption for the whole run. Either way the
+choice is written to `vestigo.timezone_assumption` in the Parquet footer, so the shift is a
+visible decision rather than an invisible one.
+
+The vendored `w3c2timesketch.py` parses the same three flavors into CSV/JSONL with the same
+field mapping and the same per-occurrence directive handling. It is single-pass and
+single-process (no chunking, so no directive pre-scan), writes flat columns rather than an
+attribute map, and like every `*2timesketch` script has no per-row provenance.
+
 ### `timesketch2parquet.py`: converting existing CSV/JSONL
 
 If you already have a Timesketch-compatible CSV or JSONL file, don't hand-write a converter —
