@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.1] — 2026-08-31
+
+### Fixed
+
+- **The pre-Alembic test fixtures dropped a table the model no longer has**, which had left
+  CI red on `main` since the `agent_settings` fold. Both tests that simulate a pre-Alembic
+  database build one with `Base.metadata.create_all()` — the *current* model's tables — then
+  drop everything revisions after `0001` added, so the result looks like revision `0001` and
+  the upgrade to head has nothing to collide with. Folding `agent_settings` into
+  `app_settings` (migration `0033`) removed the `AgentSettings` model, so `create_all`
+  stopped creating that table while the fixtures kept dropping it unconditionally:
+  `UndefinedTableError: table "agent_settings" does not exist`. Migration `0033` itself is
+  correctly guarded by an inspector check, so nothing was ever wrong in production — this was
+  only ever the fixtures, and the upgrade still creates the table in `0011` and drops it in
+  `0033`, in order.
+
+### Notes
+
+The backend job gates `Publish image + GitHub release`, so the red suite meant **v1.18.0 was
+tagged and released with no `ghcr.io` image built**. This release restores the image
+pipeline; `ghcr.io/overcuriousity/vestigo:1.18.1`, `:1.18` and `:latest` are published from
+it. There is no `1.18.0` image and there will not be one — its tag commit predates this fix,
+and moving a published tag to manufacture one is worse than leaving the gap. Anyone pinning
+`1.18.0` should pin `1.18.1`; the converter changes released in 1.18.0 are unchanged here.
+
 ## [1.18.0] — 2026-08-31
 
 ### Added
