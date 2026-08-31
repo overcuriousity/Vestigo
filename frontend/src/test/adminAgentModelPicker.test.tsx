@@ -1,49 +1,102 @@
 /**
- * Admin agent settings: the model field.
+ * The agent's model field, now a control on the settings page rather than a
+ * page of its own (migration 0033 retired the separate agent settings row and
+ * its endpoint).
  *
  * Free text was the only option, which meant typing a model id exactly right
- * from memory. It is now a dropdown fed by the endpoint's own /models listing
- * — but only when that listing actually returns something. No credentials, an
+ * from memory. It is a dropdown fed by the endpoint's own /models listing —
+ * but only when that listing actually returns something. No credentials, an
  * unreachable endpoint, or an endpoint that serves no listing all fall back to
  * free text, which is also reachable on demand for models a listing omits.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { AdminAgentPage } from "@/pages/admin/AdminAgentPage";
+import { AdminSettingsPage } from "@/pages/admin/AdminSettingsPage";
+import { TooltipProvider } from "@/components/ui/Tooltip";
+import type { InstanceSetting } from "@/api/settings";
 
-const getAgentSettingsMock = vi.fn();
+const getMock = vi.fn();
+const updateMock = vi.fn();
 const listAgentModelsMock = vi.fn();
 
-vi.mock("@/api/admin", () => ({
-  adminApi: {
-    getAgentSettings: (...a: unknown[]) => getAgentSettingsMock(...a),
-    listAgentModels: (...a: unknown[]) => listAgentModelsMock(...a),
-    putAgentSettings: vi.fn(),
+vi.mock("@/api/settings", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  settingsApi: {
+    get: () => getMock(),
+    update: (values: Record<string, unknown>) => updateMock(values),
   },
 }));
 
-vi.mock("@/api/health", () => ({ healthApi: { check: vi.fn() } }));
+vi.mock("@/api/admin", () => ({
+  adminApi: {
+    listAgentModels: (...a: unknown[]) => listAgentModelsMock(...a),
+    probeAgent: vi.fn().mockResolvedValue({ available: true }),
+  },
+}));
 
-function settings(over: Record<string, unknown> = {}) {
+function setting(
+  over: Partial<InstanceSetting> & { field: string },
+): InstanceSetting {
   return {
-    effective: {
-      model: "",
-      provider: "openai",
-      api_base_url: "http://llm.example/v1",
-      api_key_set: true,
-      user_agent: null,
-      extra_headers: null,
-      max_turns: 15,
-      reasoning_effort: "off",
-      context_window: null,
-      disabled_tools: [],
-      ...over,
-    },
-    sources: {},
-    env_vars: {},
-    secret_mode: "db",
-    tools: [],
+    group: "agent",
+    label: over.field,
+    help: "",
+    kind: "str",
+    nullable: true,
+    constraints: {},
+    choices: null,
+    default: null,
+    source: "default",
+    env_var: `VESTIGO_${over.field.toUpperCase()}`,
+    env_only: false,
+    restart_required: false,
+    subsystem: "agent",
+    editable: true,
+    value: null,
+    ...over,
+  } as InstanceSetting;
+}
+
+function payload(over: Partial<InstanceSetting>[] = []) {
+  const base = [
+    setting({ field: "agent_model", label: "Model" }),
+    setting({
+      field: "agent_api_base_url",
+      label: "Endpoint URL",
+      value: "http://llm.example/v1",
+    }),
+    setting({
+      field: "agent_api_key",
+      label: "API key",
+      kind: "secret",
+      value: null,
+      value_set: true,
+    }),
+    setting({
+      field: "agent_provider",
+      label: "Wire protocol",
+      kind: "choice",
+      choices: ["openai", "anthropic"],
+      value: "openai",
+      nullable: false,
+    }),
+  ];
+  const settings = base.map((s) => {
+    const patch = over.find((o) => o.field === s.field);
+    return patch ? { ...s, ...patch } : s;
+  });
+  return {
+    groups: [
+      {
+        key: "agent",
+        label: "AI agent",
+        description: "LLM endpoint and tool policy.",
+      },
+    ],
+    settings,
+    secrets_mode: "db" as const,
+    agent: { tools: [], warnings: [] },
   };
 }
 
@@ -51,7 +104,9 @@ function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <AdminAgentPage />
+      <TooltipProvider>
+        <AdminSettingsPage />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
 }
@@ -59,7 +114,8 @@ function renderPage() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers({ shouldAdvanceTime: true });
-  getAgentSettingsMock.mockResolvedValue(settings());
+  getMock.mockResolvedValue(payload());
+  updateMock.mockResolvedValue(payload());
   listAgentModelsMock.mockResolvedValue({ models: [] });
 });
 
@@ -69,7 +125,9 @@ afterEach(() => {
 
 describe("admin agent model picker", () => {
   it("lists models from the endpoint once credentials are present", async () => {
-    listAgentModelsMock.mockResolvedValue({ models: ["gpt-4o", "gpt-4o-mini"] });
+    listAgentModelsMock.mockResolvedValue({
+      models: ["gpt-4o", "gpt-4o-mini"],
+    });
     renderPage();
 
     await screen.findByText("AI agent");
@@ -101,30 +159,40 @@ describe("admin agent model picker", () => {
   });
 
   it("does not call the endpoint without a base URL", async () => {
-    getAgentSettingsMock.mockResolvedValue(
-      settings({ api_base_url: "", api_key_set: false }),
+    getMock.mockResolvedValue(
+      payload([
+        { field: "agent_api_base_url", value: null },
+        { field: "agent_api_key", value_set: false },
+      ]),
     );
     renderPage();
 
     await screen.findByText("AI agent");
     vi.advanceTimersByTime(700);
 
-    await screen.findByText(/Set the API base URL and key/);
+    await screen.findByText(/Set the endpoint URL and key/);
     expect(listAgentModelsMock).not.toHaveBeenCalled();
     expect(screen.getByPlaceholderText("gpt-4o-mini")).toBeTruthy();
   });
 
   it("keeps an env-pinned model read-only and never lists", async () => {
     listAgentModelsMock.mockResolvedValue({ models: ["gpt-4o"] });
-    getAgentSettingsMock.mockResolvedValue({
-      ...settings({ model: "pinned-model" }),
-      sources: { model: "env" },
-      env_vars: { model: "VESTIGO_AGENT_MODEL" },
-    });
+    getMock.mockResolvedValue(
+      payload([
+        {
+          field: "agent_model",
+          value: "pinned-model",
+          source: "env",
+          editable: false,
+        },
+      ]),
+    );
     renderPage();
 
-    await screen.findByText(/pinned by VESTIGO_AGENT_MODEL/);
-    const input = screen.getByPlaceholderText("gpt-4o-mini") as HTMLInputElement;
+    await screen.findByText("VESTIGO_AGENT_MODEL");
+    const input = screen.getByPlaceholderText(
+      "gpt-4o-mini",
+    ) as HTMLInputElement;
     expect(input.disabled).toBe(true);
     expect(input.value).toBe("pinned-model");
 
@@ -135,21 +203,23 @@ describe("admin agent model picker", () => {
 });
 
 describe("admin agent settings warnings", () => {
-  it("renders the backend's guard-rail warnings", async () => {
-    getAgentSettingsMock.mockResolvedValue({
-      ...settings({ tool_fidelity: "full", context_window: 65536 }),
-      warnings: [
-        "tool_fidelity is 'full' but context_window is 65536 tokens (< 100000); " +
-          "a single tool sweep can fill the window before history and an answer fit.",
-      ],
+  it("renders the backend's guard-rail warnings above the agent group", async () => {
+    getMock.mockResolvedValue({
+      ...payload(),
+      agent: {
+        tools: [],
+        warnings: [
+          "tool_fidelity is 'full' but context_window is 65536 tokens (< 100000); " +
+            "a single tool sweep can fill the window before history and an answer fit.",
+        ],
+      },
     });
     renderPage();
 
     expect(await screen.findByText(/tool_fidelity is 'full'/)).toBeTruthy();
   });
 
-  it("renders nothing extra when there are no warnings — or an older server omits the field", async () => {
-    getAgentSettingsMock.mockResolvedValue(settings());
+  it("renders nothing extra when there are no warnings", async () => {
     renderPage();
 
     await screen.findByText("AI agent");

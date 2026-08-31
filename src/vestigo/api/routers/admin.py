@@ -12,11 +12,11 @@ from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from vestigo.agent.availability import list_models, reset_probe_cache
-from vestigo.agent.config import EFFORT_VALUES, resolve_agent_config
-from vestigo.agent.fidelity import FIDELITY_VALUES, fidelity_config_warning
+from vestigo.agent.availability import agent_available, list_models, reset_probe_cache
+from vestigo.agent.config import resolve_agent_config
+from vestigo.agent.fidelity import fidelity_config_warning
 from vestigo.agent.tools import TOOL_NAMES, TOOL_REGISTRY
 from vestigo.api.deps import get_store, require_admin
 from vestigo.api.uploads import receive_upload_to_tmp
@@ -34,22 +34,6 @@ from vestigo.core.settings_registry import (
     secret_fields,
 )
 from vestigo.db.postgres import User, generate_id
-
-# Fields resolved by resolve_agent_config / persisted by update_agent_settings,
-# in the order the AgentConfig dataclass declares them (excluding `sources`).
-_AGENT_SETTINGS_FIELDS: tuple[str, ...] = (
-    "model",
-    "provider",
-    "api_base_url",
-    "api_key",
-    "user_agent",
-    "extra_headers",
-    "max_turns",
-    "reasoning_effort",
-    "context_window",
-    "tool_fidelity",
-    "disabled_tools",
-)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -567,8 +551,7 @@ def _settings_payload() -> dict[str, Any]:
             "env_only": spec.env_only,
             "restart_required": spec.restart_required,
             "subsystem": spec.subsystem,
-            "managed_by": spec.managed_by,
-            "editable": not spec.env_only and spec.managed_by is None and not pinned,
+            "editable": not spec.env_only and not pinned,
         }
         if spec.field in secrets:
             entry["value"] = None
@@ -576,13 +559,76 @@ def _settings_payload() -> dict[str, Any]:
         else:
             entry["value"] = value
         fields.append(entry)
+    config = resolve_agent_config()
     return {
         "groups": [{"key": g.key, "label": g.label, "description": g.description} for g in GROUPS],
         "settings": fields,
         # env-only refuses secret storage instance-wide; the console disables
         # those inputs instead of letting the PUT fail.
         "secrets_mode": settings.secrets_mode,
+        # The two things the agent group needs that no single field carries:
+        # the tool catalog `agent_disabled_tools` toggles against, and advisory
+        # guard-rails on the *combination* of resolved values (full fidelity
+        # against an underpowered window). The warnings change no behaviour —
+        # every override stands — but the operator should see them before an
+        # investigation dies of the combination.
+        "agent": {
+            "tools": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "embeddings_gated": t.embeddings_gated,
+                    "requires_conversation": t.requires_conversation,
+                }
+                for t in TOOL_REGISTRY
+            ],
+            "warnings": [
+                w
+                for w in (fidelity_config_warning(config.tool_fidelity, config.context_window),)
+                if w is not None
+            ],
+        },
     }
+
+
+#: Agent string fields where a pasted value routinely carries stray whitespace
+#: (a trailing space on a URL, a newline after an API key) that silently breaks
+#: the endpoint probe. Whitespace-only degrades to an explicit clear.
+_AGENT_TRIMMED_FIELDS: frozenset[str] = frozenset(
+    {"agent_model", "agent_api_base_url", "agent_api_key", "agent_user_agent"}
+)
+
+
+def _normalize_agent_values(values: dict[str, Any]) -> dict[str, Any]:
+    """Trim agent strings and reject unknown tool names before validation.
+
+    Two checks the generic ``Settings`` model cannot make: whitespace around a
+    pasted credential is a formatting concern rather than a validation one, and
+    the tool catalogue lives in ``agent/tools.py``, which ``core/config.py``
+    must not import. They ran on the retired agent-settings PUT; they run here
+    now, on the only surface that writes these fields.
+    """
+    normalized = dict(values)
+    for field_name in _AGENT_TRIMMED_FIELDS & set(normalized):
+        value = normalized[field_name]
+        if isinstance(value, str):
+            normalized[field_name] = value.strip() or None
+    tools = normalized.get("agent_disabled_tools")
+    if isinstance(tools, list):
+        # Typed before comparing: a non-string entry is neither a known tool
+        # nor sortable alongside one, so reaching the deny-list check with it
+        # would answer a malformed payload with a 500.
+        if any(not isinstance(t, str) for t in tools):
+            raise HTTPException(
+                status_code=422, detail="agent_disabled_tools must be a list of tool names"
+            )
+        unknown = sorted({t for t in tools if t not in TOOL_NAMES})
+        if unknown:
+            raise HTTPException(
+                status_code=422, detail=f"unknown tool name(s): {', '.join(unknown)}"
+            )
+        normalized["agent_disabled_tools"] = sorted(set(tools)) or None
+    return normalized
 
 
 @router.get("/settings")
@@ -604,8 +650,9 @@ async def set_instance_settings(
     """
     if not payload.values:
         return _settings_payload()
+    values = _normalize_agent_values(payload.values)
     try:
-        applied = await save_runtime_settings(payload.values, admin.id)
+        applied = await save_runtime_settings(values, admin.id)
     except SettingsValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -624,124 +671,14 @@ async def set_instance_settings(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AI agent configuration (A7)
+# AI agent: the endpoint's model listing
 # ═════════════════════════════════════════════════════════════════════════════
-
-
-class AgentSettingsUpdate(BaseModel):
-    """Payload to edit the DB-backed layer of the agent config (see agent/config.py).
-
-    Every field is optional so a PUT can touch only what changed. An
-    explicit ``null`` clears that field's DB override (falling back to env,
-    then the hardcoded default); a field simply absent from the request body
-    leaves its stored value untouched — the two are distinguished via
-    ``model_fields_set``, not by inspecting the resolved values.
-    """
-
-    model: str | None = None
-    provider: str | None = Field(default=None, pattern="^(openai|anthropic)$")
-    api_base_url: str | None = None
-    api_key: str | None = None
-    user_agent: str | None = None
-    extra_headers: dict[str, str] | None = None
-    max_turns: int | None = Field(default=None, ge=1, le=100)
-    reasoning_effort: str | None = None
-    context_window: int | None = Field(default=None, ge=1024, le=10_000_000)
-    tool_fidelity: str | None = None
-    disabled_tools: list[str] | None = None
-
-    @field_validator(
-        "model",
-        "provider",
-        "api_base_url",
-        "api_key",
-        "user_agent",
-        "reasoning_effort",
-        "tool_fidelity",
-        mode="before",
-    )
-    @classmethod
-    def _strip_strings(cls, value: Any) -> Any:
-        # Pasted values routinely carry stray whitespace (trailing spaces on a
-        # URL, a newline after an API key) that silently breaks the endpoint
-        # probe. Whitespace-only degrades to an explicit clear.
-        if isinstance(value, str):
-            return value.strip() or None
-        return value
-
-    @field_validator("reasoning_effort")
-    @classmethod
-    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
-        if value is not None and value not in EFFORT_VALUES:
-            raise ValueError(f"reasoning_effort must be one of {EFFORT_VALUES}")
-        return value
-
-    @field_validator("tool_fidelity")
-    @classmethod
-    def _validate_tool_fidelity(cls, value: str | None) -> str | None:
-        if value is not None and value not in FIDELITY_VALUES:
-            raise ValueError(f"tool_fidelity must be one of {FIDELITY_VALUES}")
-        return value
-
-    @field_validator("disabled_tools")
-    @classmethod
-    def _validate_disabled_tools(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return None
-        unknown = sorted(set(value) - TOOL_NAMES)
-        if unknown:
-            raise ValueError(f"unknown tool name(s): {', '.join(unknown)}")
-        return sorted(set(value))
-
-
-async def _agent_settings_response() -> dict[str, Any]:
-    """Build the GET/PUT response shape: effective config, sources, env pins.
-
-    ``api_key`` is never included in ``effective`` — only ``api_key_set``, a
-    boolean — so the plaintext key never leaves this module via this route.
-    """
-    config = await resolve_agent_config()
-    effective: dict[str, Any] = {
-        f: getattr(config, f) for f in _AGENT_SETTINGS_FIELDS if f != "api_key"
-    }
-    effective["api_key_set"] = bool(config.api_key)
-    # Advisory guard-rails on the resolved config — no behaviour change, the
-    # operator keeps every override; they just find out before an investigation
-    # dies. Currently: full fidelity against an underpowered window.
-    warnings = [
-        w
-        for w in (fidelity_config_warning(config.tool_fidelity, config.context_window),)
-        if w is not None
-    ]
-    env_vars = {
-        field_name: f"VESTIGO_AGENT_{field_name.upper()}"
-        for field_name, source in config.sources.items()
-        if source == "env"
-    }
-    return {
-        "effective": effective,
-        "sources": dict(config.sources),
-        "env_vars": env_vars,
-        "warnings": warnings,
-        "secret_mode": get_settings().agent_secret_mode,
-        # Full tool catalog so the admin UI renders toggles without
-        # hardcoding tool names.
-        "tools": [
-            {
-                "name": t.name,
-                "description": t.description,
-                "embeddings_gated": t.embeddings_gated,
-                "requires_conversation": t.requires_conversation,
-            }
-            for t in TOOL_REGISTRY
-        ],
-    }
-
-
-@router.get("/agent-settings")
-async def get_agent_settings(admin: User = Depends(require_admin)) -> dict[str, Any]:
-    """Return the effective AI agent configuration, its per-field source, and env pins."""
-    return await _agent_settings_response()
+#
+# The agent's *configuration* is not here: every knob is a ``VESTIGO_AGENT_*``
+# field persisted through the settings endpoints above (migration 0033 retired
+# the separate ``agent_settings`` row and its PUT). What remains is a probe —
+# asking the operator's endpoint which models it serves — which persists
+# nothing and therefore is not a settings route.
 
 
 class AgentModelsRequest(BaseModel):
@@ -758,13 +695,13 @@ class AgentModelsRequest(BaseModel):
     provider: str | None = None
 
 
-@router.post("/agent-settings/models")
+@router.post("/agent/models")
 async def list_agent_models(
     payload: AgentModelsRequest, admin: User = Depends(require_admin)
 ) -> dict[str, Any]:
     """List the model ids the configured LLM endpoint advertises.
 
-    Populates the model picker in the admin UI, which is why it takes the
+    Populates the model picker on the settings page, which is why it takes the
     *unsaved* form values: an admin typing a new endpoint and key should see
     its models before committing them. Nothing is persisted and the probe
     cache is untouched — this is a read against the operator's own endpoint.
@@ -777,8 +714,8 @@ async def list_agent_models(
     no listing all return an empty list — the UI falls back to free-text
     model entry, so a failure here is not an error condition.
     """
-    config = await resolve_agent_config()
-    # An env-pinned field is not overridable here, matching the PUT endpoint
+    config = resolve_agent_config()
+    # An env-pinned field is not overridable here, matching the settings PUT
     # and the disabled inputs in the UI. It also closes an exfiltration path
     # the pin would otherwise not cover: overriding `api_base_url` while the
     # key stays env-pinned would send the operator's key — which this API
@@ -793,44 +730,21 @@ async def list_agent_models(
     return {"models": await list_models(config)}
 
 
-@router.put("/agent-settings")
-async def set_agent_settings(
-    payload: AgentSettingsUpdate, admin: User = Depends(require_admin)
-) -> dict[str, Any]:
-    """Update the DB-backed layer of the AI agent configuration.
+@router.post("/agent/probe")
+async def probe_agent_endpoint(admin: User = Depends(require_admin)) -> dict[str, Any]:
+    """Re-probe the configured LLM endpoint now, ignoring the cached result.
 
-    Only fields present in the request body change (``model_fields_set``);
-    a field set to ``null`` explicitly clears it. Resets the availability
-    probe cache so the next health check re-probes immediately instead of
-    waiting out the TTL. Audited with field *names* only — values (which may
-    include the API key) never enter the audit trail.
+    "Test connection" on the settings page. The availability cache exists so
+    ``/api/health`` never waits on a hung endpoint, but an admin who just saved
+    a URL is asking precisely for a fresh answer — and a stale one up to
+    ``agent_probe_ttl_seconds`` old would read as their edit having failed.
+    Persists nothing.
+
+    ``force`` alone, deliberately: it bypasses the cache for *this* call while
+    leaving the entry in place, so concurrent ``/api/health`` polls keep
+    answering from it. Clearing the cache instead would drop every one of them
+    into the probe lock and hang the whole instance's health check for as long
+    as an unreachable endpoint takes to time out — which is precisely the
+    endpoint an admin presses this button against.
     """
-    if (
-        "api_key" in payload.model_fields_set
-        and payload.api_key is not None
-        and get_settings().agent_secret_mode == "env-only"
-    ):
-        # A10: env-only mode keeps the LLM key out of Postgres entirely.
-        # Clearing (null) stays allowed so a key stored before the mode was
-        # enabled can be cleaned up.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "API key storage in the database is disabled "
-                "(VESTIGO_AGENT_SECRET_MODE=env-only); set VESTIGO_AGENT_API_KEY instead"
-            ),
-        )
-    store = get_store()
-    changed_fields = sorted(payload.model_fields_set)
-    if changed_fields:
-        values = {f: getattr(payload, f) for f in payload.model_fields_set}
-        await store.update_agent_settings(values, admin.id)
-    reset_probe_cache()
-    await store.record_audit(
-        action="admin.agent_settings_update",
-        actor=admin,
-        target_type="agent_settings",
-        target_id="global",
-        detail={"fields": changed_fields},
-    )
-    return await _agent_settings_response()
+    return {"available": await agent_available(force=True)}

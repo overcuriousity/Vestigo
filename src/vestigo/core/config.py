@@ -17,11 +17,13 @@ Which fields may be overridden, and how they are presented, is declared in
 ``core/settings_registry.py`` — not here.
 """
 
+import os
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
+from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -46,8 +48,9 @@ class Settings(BaseSettings):
     # the settings API refuses to store any secret and the resolver ignores
     # previously stored ones, leaving the environment as the only source.
     # Deliberately env-only itself: a mode meant to constrain the console must
-    # not be editable from it. Its agent-scoped predecessor
-    # (`agent_secret_mode`) still applies to the LLM key on its own page.
+    # not be editable from it. Covers every secret, the LLM API key included —
+    # its agent-scoped predecessor `agent_secret_mode` was retired with the
+    # separate agent settings row (migration 0033).
     secrets_mode: str = Field(default="db", pattern="^(db|env-only)$")
 
     # Login backoff: after `threshold` consecutive failures per
@@ -422,12 +425,6 @@ class Settings(BaseSettings):
     agent_provider: str = Field(default="openai", pattern="^(openai|anthropic)$")
     agent_api_base_url: str | None = None
     agent_api_key: str | None = None
-    # Where the LLM API key may live (A10). "db" (default): admins may store it
-    # in the agent_settings row (plaintext at rest — acceptable only if Postgres
-    # itself is trusted). "env-only": the admin API refuses to store a key and
-    # the resolver ignores any previously stored one — VESTIGO_AGENT_API_KEY is
-    # then the only way to supply it.
-    agent_secret_mode: str = Field(default="db", pattern="^(db|env-only)$")
     # Some subscription endpoints gate on the client's User-Agent (e.g. Kimi's
     # /coding endpoint 403s unless the UA identifies a coding agent). Set the
     # value the endpoint expects; unset sends the SDK default.
@@ -452,7 +449,7 @@ class Settings(BaseSettings):
     # Model context window in tokens. Unset = no proactive sliding window
     # (the right number is model-specific, so it's an explicit opt-in; an
     # overflow still enables the window reactively for one retry).
-    agent_context_window: int | None = Field(default=None, ge=1024)
+    agent_context_window: int | None = Field(default=None, ge=1024, le=10_000_000)
     # How much of an example record tool results carry: full | message |
     # minimal | auto (derive from agent_context_window). Unset = full, i.e. a
     # deployment that has declared no constraint is assumed to have room.
@@ -560,6 +557,32 @@ _effective: Settings | None = None
 def env_pinned(field: str) -> bool:
     """Whether the environment explicitly supplied this field."""
     return field in get_base_settings().model_fields_set
+
+
+def env_layer_value(variable: str) -> str | None:
+    """The raw value the environment layer supplies for one ``VESTIGO_*`` variable.
+
+    Reads the same two sources pydantic-settings does, in the same order: the
+    process environment first, then the ``.env`` file named by
+    ``Settings.model_config``. For a field :class:`Settings` still declares,
+    read the attribute instead — this exists for *retired* variables, which no
+    longer have a field to read but whose old value may still decide something
+    (a migration reasoning about the instance it is upgrading, a startup
+    warning). Checking ``os.environ`` alone would miss every deployment that
+    configures Vestigo the way ``.env.example`` documents.
+    """
+    value = os.environ.get(variable)
+    if value is not None:
+        return value
+    env_file = Settings.model_config.get("env_file")
+    if not env_file:
+        return None
+    try:
+        return dotenv_values(env_file, encoding=Settings.model_config.get("env_file_encoding")).get(
+            variable
+        )
+    except OSError:
+        return None
 
 
 def get_settings() -> Settings:

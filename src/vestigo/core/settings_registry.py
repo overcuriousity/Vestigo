@@ -30,11 +30,6 @@ Three policy flags decide how a field behaves in the console:
     instead. Storage follows the same contract ``agent_api_key`` already has:
     plaintext at rest, acceptable only when Postgres itself is trusted, and
     refused entirely under ``VESTIGO_SECRETS_MODE=env-only``.
-
-Fields marked ``managed_by="agent"`` are persisted through the older, purpose-
-built ``agent_settings`` row (``agent/config.py``) instead of ``app_settings``;
-they are listed here for coverage and for the console's cross-link, but the
-generic PUT refuses them.
 """
 
 from __future__ import annotations
@@ -66,8 +61,6 @@ class SettingSpec:
     #: configuration is hidden from the analyst UI and the agent's tool list
     #: (see ``core/capabilities.py``).
     subsystem: str | None = None
-    #: Non-None when another admin surface owns persistence for this field.
-    managed_by: str | None = None
     #: Choice values for enum-ish string fields the pydantic pattern can't
     #: express as a machine-readable list.
     choices: tuple[str, ...] | None = None
@@ -766,12 +759,98 @@ _SPECS: tuple[SettingSpec, ...] = (
     ),
     # ── AI agent ─────────────────────────────────────────────────────────
     SettingSpec(
-        "agent_secret_mode",
+        "agent_model",
         "agent",
-        "Agent key storage mode",
-        "'db' lets admins store the LLM API key in Postgres; 'env-only' refuses storage and "
-        "ignores any previously stored key.",
-        choices=("db", "env-only"),
+        "Model",
+        "Model id as the endpoint names it, e.g. gpt-4o-mini. The console lists what the "
+        "endpoint offers once the URL and key are set; a model it omits is still a valid "
+        "value.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_provider",
+        "agent",
+        "Wire protocol",
+        "'openai' for the chat-completions API (ollama, vLLM, LocalAI, OpenRouter), "
+        "'anthropic' for the Messages API (Anthropic itself, the Kimi coding plan).",
+        choices=("openai", "anthropic"),
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_api_base_url",
+        "agent",
+        "Endpoint URL",
+        "Base URL of the LLM endpoint, e.g. https://api.openai.com/v1. Reached directly "
+        "regardless of the offline policy — the operator pointed Vestigo at it.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_api_key",
+        "agent",
+        "API key",
+        "Credential for the endpoint. Stored in Postgres in plaintext unless "
+        "VESTIGO_SECRETS_MODE=env-only, which refuses storage and leaves the environment "
+        "as the only source.",
+        secret=True,
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_user_agent",
+        "agent",
+        "User-Agent override",
+        "Some subscription endpoints gate on the client's User-Agent (Kimi's /coding "
+        "endpoint 403s unless it identifies a coding agent). Unset sends the SDK default.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_extra_headers",
+        "agent",
+        "Extra headers",
+        "Additional HTTP headers sent with every model request, as a JSON object of string values.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_max_turns",
+        "agent",
+        "Max turns",
+        "Hard cap on model round-trips per user message — the bound on the tool-call loop.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_reasoning_effort",
+        "agent",
+        "Reasoning effort",
+        "Passed through when the provider supports it. Unset means off, so a model that "
+        "ignores the parameter is never charged for it.",
+        choices=("off", "low", "medium", "high", "max"),
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_context_window",
+        "agent",
+        "Context window (tokens)",
+        "The model's context window. When set, older tool results are elided from what the "
+        "model sees before a request can overflow it (the full transcript is always kept). "
+        "Unset = the window only engages after an overflow, costing one failed round trip.",
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_tool_fidelity",
+        "agent",
+        "Tool result detail",
+        "How much of each event record searches, similarity lookups and findings return to "
+        "the agent. 'full' assumes a large window; 'message' or 'auto' suit a small local "
+        "model. 'auto' follows the context window above. An overflow retries one level "
+        "down automatically, so this costs a slower turn rather than a failed one.",
+        choices=("full", "message", "minimal", "auto"),
+        subsystem="agent",
+    ),
+    SettingSpec(
+        "agent_disabled_tools",
+        "agent",
+        "Disabled tools",
+        "Admin hard-deny list, applied to the in-app agent and the external /mcp endpoint "
+        "alike. Per-user and per-chat toggles can only restrict further, never re-enable.",
         subsystem="agent",
     ),
     SettingSpec(
@@ -824,92 +903,6 @@ _SPECS: tuple[SettingSpec, ...] = (
         "'env-only' refuses storage instance-wide and ignores anything already stored.",
         choices=("db", "env-only"),
         env_only=True,
-    ),
-    # Persisted by the dedicated agent settings row (docs/AGENT.md); listed
-    # here so coverage stays exhaustive and the console can cross-link.
-    SettingSpec(
-        "agent_model", "agent", "Model", "Model id.", managed_by="agent", subsystem="agent"
-    ),
-    SettingSpec(
-        "agent_provider",
-        "agent",
-        "Wire protocol",
-        "openai or anthropic.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_api_base_url",
-        "agent",
-        "Endpoint URL",
-        "LLM endpoint base URL.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_api_key",
-        "agent",
-        "API key",
-        "LLM endpoint credential.",
-        secret=True,
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_user_agent",
-        "agent",
-        "User-Agent override",
-        "Some subscription endpoints gate on it.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_extra_headers",
-        "agent",
-        "Extra headers",
-        "Additional HTTP headers as a JSON object.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_max_turns",
-        "agent",
-        "Max turns",
-        "Model round-trips per user message.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_reasoning_effort",
-        "agent",
-        "Reasoning effort",
-        "Passed through when the provider supports it.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_context_window",
-        "agent",
-        "Context window",
-        "Model context window in tokens.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_tool_fidelity",
-        "agent",
-        "Tool result fidelity",
-        "How much of an example record tool results carry.",
-        managed_by="agent",
-        subsystem="agent",
-    ),
-    SettingSpec(
-        "agent_disabled_tools",
-        "agent",
-        "Disabled tools",
-        "Admin hard-deny list applied to the in-app agent and /mcp alike.",
-        managed_by="agent",
-        subsystem="agent",
     ),
     # ── Generated converters ─────────────────────────────────────────────
     SettingSpec(
@@ -1001,7 +994,7 @@ def all_specs() -> tuple[SettingSpec, ...]:
 
 def editable_fields() -> frozenset[str]:
     """Fields the generic settings API may persist to ``app_settings``."""
-    return frozenset(s.field for s in _SPECS if not s.env_only and s.managed_by is None)
+    return frozenset(s.field for s in _SPECS if not s.env_only)
 
 
 def secret_fields() -> frozenset[str]:

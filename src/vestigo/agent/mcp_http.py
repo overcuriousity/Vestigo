@@ -166,7 +166,7 @@ class MCPEndpoint:
             # driving one just the same. There is no overflow backstop on this
             # path — the client owns its own retries — so the configured tier is
             # simply the tier.
-            config = await resolve_agent_config()
+            config = resolve_agent_config()
             agent_scope = await build_scope(
                 token_row.case_id,
                 token_row.timeline_id,

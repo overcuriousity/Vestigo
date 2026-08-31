@@ -183,7 +183,7 @@ async def rank_columns_with_llm(
             if not await agent_available():
                 return None
 
-            config = await resolve_agent_config()
+            config = resolve_agent_config()
             if not config.model:
                 return None
 

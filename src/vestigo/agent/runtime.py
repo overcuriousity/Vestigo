@@ -574,7 +574,7 @@ async def stream_turn(
     into the prompt: that text is persisted as the analyst's own
     ``UserPromptPart`` and would stack one stale note per interruption.
     """
-    config = await resolve_agent_config()
+    config = resolve_agent_config()
     # When no model is injected (tests), the turn owns an HTTP client that
     # must be closed when the stream ends — see build_model's docstring.
     http_client: httpx.AsyncClient | None = None

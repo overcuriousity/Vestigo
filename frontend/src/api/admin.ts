@@ -1,4 +1,4 @@
-import { del, get, patch, post, put } from "./client";
+import { del, get, patch, post } from "./client";
 import type { AuditEntry, Team, TeamMember, TeamRole, User } from "./types";
 
 /** One tool in the agent's catalog, for the admin toggle UI. */
@@ -7,22 +7,6 @@ export interface AdminAgentTool {
   description: string;
   embeddings_gated: boolean;
   requires_conversation: boolean;
-}
-
-/** GET/PUT `/admin/agent-settings` response shape: the effective (env/db/default-merged)
- * AI agent config, the source each field was resolved from, and the env var name for any
- * field currently pinned by the environment (see `resolve_agent_config` in the backend). */
-export interface AgentSettingsResponse {
-  effective: Record<string, unknown> & { api_key_set: boolean };
-  sources: Record<string, "env" | "db" | "default">;
-  env_vars: Record<string, string>;
-  /** A10: "env-only" means the backend refuses to store the API key in the DB. */
-  secret_mode: "db" | "env-only";
-  /** Advisory guard-rails on the resolved config (e.g. full fidelity against an
-   * underpowered context window) — surface them, they change no behaviour. */
-  warnings: string[];
-  /** Full tool catalog — checkbox source for the disabled_tools toggle list. */
-  tools: AdminAgentTool[];
 }
 
 export const adminApi = {
@@ -85,12 +69,7 @@ export const adminApi = {
   queryAudit: (filters?: { user_id?: string; case_id?: string; action?: string; limit?: number }) =>
     get<{ audit: AuditEntry[] }>("/admin/audit", filters).then((r) => r.audit),
 
-  // --- AI agent settings (A7) ----------------------------------------------
-  getAgentSettings: () => get<AgentSettingsResponse>("/admin/agent-settings"),
-
-  putAgentSettings: (patch: Record<string, unknown>) =>
-    put<AgentSettingsResponse>("/admin/agent-settings", patch),
-
+  // --- AI agent ------------------------------------------------------------
   /** Model ids the configured LLM endpoint advertises, for the model picker.
    * Takes the *unsaved* credentials so an admin sees an endpoint's models
    * before committing them; omitted fields fall back to what is already
@@ -98,5 +77,9 @@ export const adminApi = {
    * Never errors on an unreachable endpoint — an empty list means "fall back
    * to free-text entry". */
   listAgentModels: (creds: { api_base_url?: string; api_key?: string; provider?: string }) =>
-    post<{ models: string[] }>("/admin/agent-settings/models", creds),
+    post<{ models: string[] }>("/admin/agent/models", creds),
+
+  /** Re-probe the configured endpoint now, ignoring the cached availability
+   * result — "Test connection". Persists nothing. */
+  probeAgent: () => post<{ available: boolean }>("/admin/agent/probe", {}),
 };

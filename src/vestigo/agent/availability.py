@@ -198,7 +198,7 @@ async def agent_available(*, force: bool = False) -> bool:
     """
     global _cache
     settings = get_settings()
-    config = await resolve_agent_config(settings)
+    config = resolve_agent_config()
     if not agent_configured(config):
         return False
     fingerprint = config_fingerprint(config)

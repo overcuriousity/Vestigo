@@ -1,6 +1,7 @@
 import {
   createBrowserRouter,
   createRoutesFromElements,
+  Navigate,
   Route,
 } from "react-router-dom";
 import { AppShell } from "@/components/layout/AppShell";
@@ -22,7 +23,6 @@ import { AdminTeamsPage } from "@/pages/admin/AdminTeamsPage";
 import { AdminTeamDetailPage } from "@/pages/admin/AdminTeamDetailPage";
 import { AdminAuditPage } from "@/pages/admin/AdminAuditPage";
 import { AdminEnrichersPage } from "@/pages/admin/AdminEnrichersPage";
-import { AdminAgentPage } from "@/pages/admin/AdminAgentPage";
 import { AdminSettingsPage } from "@/pages/admin/AdminSettingsPage";
 
 export const router = createBrowserRouter(
@@ -55,7 +55,9 @@ export const router = createBrowserRouter(
               <Route path="teams/:teamId" element={<AdminTeamDetailPage />} />
               <Route path="audit" element={<AdminAuditPage />} />
               <Route path="enrichers" element={<AdminEnrichersPage />} />
-              <Route path="agent" element={<AdminAgentPage />} />
+              {/* The agent is configured on Settings like everything else
+                  (migration 0033); keep old links and bookmarks working. */}
+              <Route path="agent" element={<Navigate to="/admin/settings" replace />} />
               <Route path="settings" element={<AdminSettingsPage />} />
             </Route>
           </Route>
