@@ -7,11 +7,14 @@ an error. The AI agent has behaved this way since it shipped; this module
 generalizes the rule to every optional subsystem so the answer comes from one
 place (``GET /api/health``) instead of one ad-hoc flag per feature.
 
-"Configured" means *usable*, not *switched on*: embeddings need either the
-local extra installed or a remote endpoint; enrichment needs at least one
-enricher whose asset is present; case transfer needs a nonzero concurrency
-budget. Each predicate is cheap — an import check, a settings read, or a
-cached availability record — because health is polled every 15 seconds.
+"Configured" means *usable*, not *switched on*: embeddings need a model
+(the local extra or a remote endpoint) *and* a vector store, both actually
+probed; enrichment needs at least one enricher whose asset is present; case
+transfer needs a nonzero concurrency budget. Each predicate is cheap — an
+import check, a settings read, or a cached availability record — because
+health is polled every 15 seconds; the two that probe a network service
+(agent, embeddings) serve a TTL cache and revalidate in the background rather
+than making a poll wait on a hung endpoint.
 """
 
 from __future__ import annotations
@@ -73,12 +76,12 @@ def _oidc_available(settings: Any) -> bool:
 async def get_capabilities() -> dict[str, bool]:
     """Resolve every optional subsystem's availability for this instance."""
     from vestigo.agent.availability import agent_available
-    from vestigo.models.embeddings import embeddings_available
+    from vestigo.models.availability import embeddings_operational
 
     settings = get_settings()
     agent = await agent_available()
     return {
-        "embeddings": embeddings_available(),
+        "embeddings": await embeddings_operational(),
         "agent": agent,
         "mcp": settings.mcp_enabled,
         "oidc": _oidc_available(settings),

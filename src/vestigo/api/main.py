@@ -412,6 +412,33 @@ async def _settle_orphaned_column_recommendations(store: PostgresStore) -> None:
         logger.exception("Could not settle orphaned column recommendations.")
 
 
+async def _probe_embeddings_availability() -> None:
+    """Fill the embeddings availability cache before the first health poll.
+
+    Deliberately *not* awaited in the lifespan the way
+    ``_refresh_enricher_availability`` is: that one is a local filesystem
+    check, while this opens a socket to Qdrant and possibly to a remote
+    embedding endpoint. Booting the HTTP server must not depend on either
+    answering — the same rule ``_startup_recovery`` exists for.
+
+    Skipping it would not break anything: ``embeddings_operational`` probes on
+    a cold cache anyway, so the first ``/api/health`` poll would pay for it.
+    Doing it here means that poll is a dict read, and that the capability is
+    already truthful when the first browser asks.
+    """
+    try:
+        from vestigo.models.availability import embeddings_operational
+
+        available = await embeddings_operational(force=True)
+        if not available:
+            logger.info(
+                "Embedding features are unavailable on this instance — the model or the "
+                "vector store did not answer. Nothing embedding-related is offered in the UI."
+            )
+    except Exception:
+        logger.exception("Could not determine embeddings availability at startup.")
+
+
 async def _probe_scan_budget() -> None:
     """Size the heavy-scan budget from ClickHouse's ceiling, not the app's host.
 
@@ -508,6 +535,7 @@ async def _startup_recovery(store: PostgresStore) -> None:
             await _probe_scan_budget()
         except Exception:
             logger.exception("Could not size the scan budget from ClickHouse; using detection.")
+        await _probe_embeddings_availability()
         await _sweep_stale_transfer_archives()
         await _reconcile_orphaned_ingests()
         enrichment_reruns = await _reconcile_orphaned_enrichment_jobs()

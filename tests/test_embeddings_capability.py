@@ -10,7 +10,7 @@ from __future__ import annotations
 from tests.conftest import as_admin
 from vestigo.api.routers import cases as cases_router
 from vestigo.api.routers import events as events_router
-from vestigo.models import embeddings as embeddings_module
+from vestigo.models import availability as availability_module
 from vestigo.models.embeddings import embeddings_available
 
 
@@ -26,9 +26,15 @@ def test_health_reports_embeddings_available(client, admin_bootstrap):
 
 def test_health_reports_embeddings_unavailable(client, admin_bootstrap, monkeypatch):
     # /api/health resolves every optional subsystem through core.capabilities,
-    # which imports the predicate per call — so the patch lands on its origin.
+    # which now asks `models.availability` for a probed answer rather than the
+    # configuration check — so the patch lands on the probe.
     as_admin(client, admin_bootstrap)
-    monkeypatch.setattr(embeddings_module, "embeddings_available", lambda: False)
+
+    async def _unavailable() -> bool:
+        return False
+
+    monkeypatch.setattr(availability_module, "_probe", _unavailable)
+    availability_module.reset_probe_cache()
     body = client.get("/api/health").json()
     assert body["embeddings_available"] is False
     assert body["capabilities"]["embeddings"] is False

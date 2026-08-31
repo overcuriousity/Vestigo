@@ -455,6 +455,32 @@ def as_admin(client: TestClient, admin_bootstrap: dict) -> dict:
 
 
 @pytest.fixture(autouse=True)
+def stub_embeddings_probe(monkeypatch):
+    """Keep the embeddings availability probe off the network.
+
+    ``models/availability.py`` decides the ``embeddings`` capability by asking
+    the vector store to list its collections (and, with a remote endpoint
+    configured, by embedding a token against it). Qdrant is faked per test
+    rather than run — the suite deliberately requires only ClickHouse and
+    Postgres — so a real probe would make every ``/api/health`` call depend on
+    a service that is up on one developer's box and not the next.
+
+    The stub answers with the configuration half, which is what the suite's
+    existing assertions are about. Tests that are about the probe patch its
+    arms themselves.
+    """
+    from vestigo.models import availability
+
+    async def _configured_only() -> bool:
+        return availability.model_configured() and availability.vector_store_configured()
+
+    monkeypatch.setattr(availability, "_probe", _configured_only)
+    availability.reset_probe_cache()
+    yield
+    availability.reset_probe_cache()
+
+
+@pytest.fixture(autouse=True)
 def no_demo_seed(monkeypatch):
     """Don't seed a demo case for tests that aren't about demo seeding.
 

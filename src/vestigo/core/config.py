@@ -81,6 +81,12 @@ class Settings(BaseSettings):
     # embedding_model is used as the request's "model" field in that case.
     embedding_api_base_url: str | None = None
     embedding_api_key: str | None = None
+    # How long the two-arm availability probe (vector store + remote endpoint,
+    # models/availability.py) is cached. The embeddings capability, and so the
+    # whole embedding UI, is that probe's answer — short enough that removing
+    # or restoring Qdrant is visible within a poll or two, long enough that a
+    # 15-second health poll is not a 15-second probe loop.
+    embedding_probe_ttl_seconds: float = Field(default=60.0, gt=0)
 
     # Statistical anomaly detection
     # Maximum occurrence count below which a value is flagged as rare (value_novelty).
