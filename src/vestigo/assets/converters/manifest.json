@@ -1,7 +1,7 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "1bbe64fbcf04a56e56894c5f9a127bb947b10959",
-  "version": "1.1.0",
+  "commit": "c19905d82d17aeab98db1da75533d120cf370857",
+  "version": "1.2.0",
   "license": "MIT License",
   "converters": [
     {
@@ -14,7 +14,7 @@
         "error.log*"
       ],
       "size_bytes": 70860,
-      "sha256": "ccee22a749370069124ddd71fc384965d7fc49f76af82b3d0f0e98ac4908462f"
+      "sha256": "4577e817e8225b0134310d28627dc724536f7fc9f1b64c82392aeba813a733e8"
     },
     {
       "name": "browser2timesketch",
@@ -25,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 108833,
-      "sha256": "b4ac191ed64e7d60d5c8bf6af1103fe7f7418e4480e253707c0f565336c05302"
+      "sha256": "033dc7950906318a441ee074e73035aa2b12d37a01fa1626b42ffd3860bf5f81"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -35,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 50166,
-      "sha256": "401420057166bef64bae798edfc7b2079f6d544e0400e8d9f49f02999d6d61ee"
+      "sha256": "508babee7c9dfcbff7deb1dbb069704bdafa1e9112b591f5ff34d7448450c972"
     },
     {
       "name": "cloudtrail2vestigo",
@@ -61,7 +61,7 @@
         "cowrie.json*.gz"
       ],
       "size_bytes": 51285,
-      "sha256": "501274a07bc845bb4c65bcf66f25ad83ee1e347de157d04ce6ef1cb5605ac73b"
+      "sha256": "f04904118dcd9218a4604b5baca9b1b950d2d1b81772b9f505b0104f0de8be15"
     },
     {
       "name": "evtx2timesketch",
@@ -73,7 +73,7 @@
         "evtx_dump -o jsonl"
       ],
       "size_bytes": 65293,
-      "sha256": "8e2b42cd76684cffb1eba9968e6479706b3ca7d959d62a9162008361ed302f2d"
+      "sha256": "254747aa0fb02348b6ea97169446653232465351cc4657c2b948480ffb9dc326"
     },
     {
       "name": "evtx2vestigo",
@@ -98,7 +98,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 58683,
-      "sha256": "0b4869ee5538b7980c1081666f3406aff19320d07164e62f7aa22a4134740981"
+      "sha256": "ba56afb539aa84d546848c0187bae0d8e1a71b81428bbce43ce7c69b49ee5e3a"
     },
     {
       "name": "filterlog2vestigo",
@@ -113,6 +113,17 @@
       ],
       "size_bytes": 39085,
       "sha256": "41df26455f7cbdeb9dd7356bad8adebdaad2ba3291fdd50d2c4dfede84f154db"
+    },
+    {
+      "name": "haproxy2timesketch",
+      "filename": "haproxy2timesketch.py",
+      "description": "HAProxy HTTP/TCP logs, connection/SSL errors and startup/reload lines (plain or .gz, file or directory) to Timesketch timeline. Auto-detects a Docker json-file, syslog, or bare envelope and measures the accept_date timezone rather than assuming it.",
+      "inputs": [
+        "haproxy.log*",
+        "*-json.log (Docker json-file)"
+      ],
+      "size_bytes": 74181,
+      "sha256": "b748739e595af13d8d6b9669c0ec64f5713733921da27c464bdd13d954b13963"
     },
     {
       "name": "haproxy2vestigo",
@@ -137,7 +148,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 46467,
-      "sha256": "9906013228f715d6995877da611862a42d81822c297e0a4e283d419b4727af32"
+      "sha256": "9a12b1c10911221d7c2756ec687d9ec19938bd3f8df5fcce4b1b88f2ef359dac"
     },
     {
       "name": "nginx2timesketch",
@@ -147,8 +158,8 @@
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 54690,
-      "sha256": "f4c65cbc643af2b6b7f2dc9ca5e215deea4a099ac35ee29590d4612fb226fa99"
+      "size_bytes": 54137,
+      "sha256": "50df8568620513867910f38f85c41ceb5573fb20d1a0f0d7be8bb1e11780f3d7"
     },
     {
       "name": "nginx2vestigo",
@@ -174,7 +185,7 @@
         "*.pcapng"
       ],
       "size_bytes": 112133,
-      "sha256": "0351d8d59ddb0623905307bec7693854c65eb3c26df535cc40534ab4fed85607"
+      "sha256": "cc839e3618ed14327582684938af464ec49a74f5bc0a4c12cd8bd91cd9a0731f"
     },
     {
       "name": "pcap2vestigo",
@@ -201,7 +212,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 61072,
-      "sha256": "052741ca2cd4890c72e6d1137f06c5e9edb406c0db8e492b21463d7fb6983851"
+      "sha256": "2f7d7a8fdc268e7f02e6b223394f2241e1091d3f9da2abcbc05d32f8684bdfb9"
     },
     {
       "name": "suricata2vestigo",
@@ -231,7 +242,7 @@
         "cron.log*"
       ],
       "size_bytes": 60394,
-      "sha256": "6e28c2688b6bbd3fd16dd9d16056a44b48b85d7879d5eefdc12edd883d7bd073"
+      "sha256": "8a855c0e2d26e1aaf8f456a861d713310c79c0832ae53962eedd5779269ef188"
     },
     {
       "name": "timesketch2parquet",
@@ -256,7 +267,7 @@
         "webhoneypot_YYYY-MM-DD.json"
       ],
       "size_bytes": 55705,
-      "sha256": "087330cf90083ca7d48db6d7a8145cae9e580b08548c7eb628dcd147c5d1a386"
+      "sha256": "3ec11c6fcaa23ba7f72eb04813a86d7154ac1cc3991f76236ee5492cd2170942"
     },
     {
       "name": "zeek2timesketch",
@@ -270,7 +281,7 @@
         "*.log.gz"
       ],
       "size_bytes": 59870,
-      "sha256": "2bd567e4c1355704a3f3ef7c4e383f5718a5addd76d383b3cb90faff726dbe24"
+      "sha256": "f254a79a6840c0f3b29c5736ca6c781932d4d266f26967b290f526fec113f774"
     }
   ]
 }
