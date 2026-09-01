@@ -182,6 +182,9 @@ def test_the_refusal_names_the_arm_that_is_missing(monkeypatch):
 
 def test_the_refusal_still_names_the_extra_when_that_is_what_is_missing(monkeypatch):
     monkeypatch.setattr(availability, "model_configured", lambda: False)
+    # CI syncs --all-extras, so without this the local stack really is
+    # importable and the refusal would instead be about missing weights.
+    monkeypatch.setattr(availability, "_local_stack_importable", lambda: False)
     assert "embeddings' extra" in availability.unavailable_detail()
 
 
