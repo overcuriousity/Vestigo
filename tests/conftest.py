@@ -12,6 +12,7 @@ directly.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -33,6 +34,13 @@ from vestigo.core import security
 from vestigo.core.config import get_settings
 from vestigo.core.login_backoff import reset_login_backoff
 from vestigo.db.postgres import PostgresStore, User
+
+# Embeddings ship *off* (core/config.py::embeddings_enabled): a stock install
+# has no probed vector store and, where the local ML extra is present, no
+# weights it was allowed online to fetch. CI syncs --all-extras and the bulk of
+# this suite is written for an instance that can embed, so switch the subsystem
+# on for the session. Tests that are about the switch set it themselves.
+os.environ.setdefault("VESTIGO_EMBEDDINGS_ENABLED", "true")
 
 # ---------------------------------------------------------------------------
 # Backing services
@@ -475,6 +483,11 @@ def stub_embeddings_probe(monkeypatch):
         return availability.model_configured() and availability.vector_store_configured()
 
     monkeypatch.setattr(availability, "_probe", _configured_only)
+    # Same reasoning one layer down: with `allow_online` false the local arm
+    # also asks whether the model weights are in this host's Hugging Face
+    # cache, and whether a given runner has ever downloaded all-MiniLM-L6-v2
+    # says nothing about the logic under test. Tests about that arm patch it.
+    monkeypatch.setattr(availability, "_local_weights_present", lambda: True)
     availability.reset_probe_cache()
     yield
     availability.reset_probe_cache()

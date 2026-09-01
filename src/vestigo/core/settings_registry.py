@@ -311,6 +311,19 @@ _SPECS: tuple[SettingSpec, ...] = (
     ),
     # ── Embeddings ───────────────────────────────────────────────────────
     SettingSpec(
+        "embeddings_enabled",
+        "embeddings",
+        "Enable embeddings",
+        "Master switch for the whole embedding subsystem — semantic search, the "
+        "'Improve search quality' wizard, and the agent's similarity tools. Off by "
+        "default: an installation that ships the local ML extra but has never been "
+        "online to fetch the model weights, or that runs no vector store, would "
+        "otherwise offer a job that cannot finish. Turning it on hands the answer back "
+        "to the availability probe, which still hides the subsystem unless a model and "
+        "a vector store both actually respond.",
+        subsystem="embeddings",
+    ),
+    SettingSpec(
         "embedding_model",
         "embeddings",
         "Embedding model",
@@ -848,9 +861,11 @@ _SPECS: tuple[SettingSpec, ...] = (
     SettingSpec(
         "agent_disabled_tools",
         "agent",
-        "Disabled tools",
-        "Admin hard-deny list, applied to the in-app agent and the external /mcp endpoint "
-        "alike. Per-user and per-chat toggles can only restrict further, never re-enable.",
+        "Available tools",
+        "Which tools the agent may call, on the in-app agent and the external /mcp "
+        "endpoint alike. A checked tool is allowed; unchecking one adds it to the admin "
+        "hard-deny list, and per-user and per-chat toggles can only restrict further, "
+        "never re-enable. Everything is checked on a stock install.",
         subsystem="agent",
     ),
     SettingSpec(

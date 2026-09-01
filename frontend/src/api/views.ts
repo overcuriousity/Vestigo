@@ -1,4 +1,4 @@
-import { del, get, post } from "./client";
+import { del, get, patch, post } from "./client";
 import type { View } from "./types";
 
 export const viewsApi = {
@@ -14,6 +14,9 @@ export const viewsApi = {
     post<{ view: View }>(`/cases/${caseId}/views`, { name, query, filter }).then(
       (r) => r.view,
     ),
+
+  rename: (caseId: string, viewId: string, name: string) =>
+    patch<{ view: View }>(`/cases/${caseId}/views/${viewId}`, { name }).then((r) => r.view),
 
   /** `hidden` is true when a story block still embeds the view: the row is
    *  kept so that story keeps rendering, and swept once the last block

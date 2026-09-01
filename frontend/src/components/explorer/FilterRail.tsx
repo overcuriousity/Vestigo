@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex, Trash2 } from "lucide-react";
+import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex, Trash2, Pencil, Check } from "lucide-react";
 import { Input } from "@/components/ui/Input";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { Button } from "@/components/ui/Button";
@@ -82,9 +82,9 @@ const MODE_PLACEHOLDER: Record<RowMatchMode, string> = {
   empty: "(empty)",
 };
 
-/** Saved-view count above which the list gets a search box. Five rows are
- *  faster to scan than to filter. */
-const VIEW_SEARCH_MIN = 5;
+/** Saved-view count above which the list gets a search box. A single view
+ *  has nothing to filter. */
+const VIEW_SEARCH_MIN = 1;
 
 /** 3-state exact/wildcard/regex selector for one field-filter entry row. */
 function MatchModeControl({
@@ -193,6 +193,13 @@ export function FilterRail({
   const [excludeMode, setExcludeMode] = useState<RowMatchMode>("exact");
   const [viewSearch, setViewSearch] = useState("");
   const [pendingDelete, setPendingDelete] = useState<View | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  // The rename input unmounts on commit/cancel, which fires a native blur on
+  // the still-focused element; this ref suppresses the resulting onBlur so it
+  // can't re-trigger commitRename (once to cancel, once to duplicate a commit
+  // already in flight).
+  const suppressRenameBlurRef = useRef(false);
 
   const qc = useQueryClient();
   const deleteView = useMutation({
@@ -211,6 +218,28 @@ export function FilterRail({
     },
     onError: (err: Error) => toast.error("Could not delete view", err.message),
   });
+  const renameView = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) =>
+      viewsApi.rename(caseId, id, name),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["views", caseId] });
+      suppressRenameBlurRef.current = true;
+      setRenamingId(null);
+    },
+    onError: (err: Error) => toast.error("Could not rename view", err.message),
+  });
+  const commitRename = (v: View) => {
+    const name = renameValue.trim();
+    if (!name || name === v.name) {
+      setRenamingId(null);
+      return;
+    }
+    renameView.mutate({ id: v.id, name });
+  };
+  const cancelRename = () => {
+    suppressRenameBlurRef.current = true;
+    setRenamingId(null);
+  };
 
   /** Case-insensitive substring match on the view name.
    *
@@ -760,40 +789,87 @@ export function FilterRail({
                 onChange={(e) => setViewSearch(e.target.value)}
               />
             )}
-            <div className="space-y-1">
+            <div className="max-h-64 space-y-1 overflow-y-auto">
               {matchingViews.length === 0 ? (
                 <p className="px-2.5 py-1.5 text-xs text-[var(--color-fg-muted)]">
                   No views match
                 </p>
               ) : (
-                matchingViews.map((v) => (
-                  <div
-                    key={v.id}
-                    className="group flex items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] transition-base hover:border-[var(--color-accent)]"
-                  >
-                    <button
-                      className="min-w-0 flex-1 px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] group-hover:text-[var(--color-fg-primary)]"
-                      onClick={() => {
-                        const payload = v.filter as Record<string, unknown>;
-                        onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
-                      }}
+                matchingViews.map((v) =>
+                  renamingId === v.id ? (
+                    <div
+                      key={v.id}
+                      className="flex items-center gap-1 rounded border border-[var(--color-accent)] bg-[var(--color-bg-elevated)] p-1"
                     >
-                      <div className="truncate font-medium">{v.name}</div>
-                      <div className="text-[var(--color-fg-muted)]">
-                        {fmtRelative(v.created_at)}
-                      </div>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Delete view ${v.name}`}
-                      className="mr-1 shrink-0 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-danger)] focus-visible:opacity-100 group-hover:opacity-100"
-                      onClick={() => setPendingDelete(v)}
+                      <Input
+                        autoFocus
+                        className="min-w-0 flex-1"
+                        value={renameValue}
+                        onChange={(e) => setRenameValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitRename(v);
+                          else if (e.key === "Escape") cancelRename();
+                        }}
+                        onBlur={() => {
+                          if (suppressRenameBlurRef.current) {
+                            suppressRenameBlurRef.current = false;
+                            return;
+                          }
+                          commitRename(v);
+                        }}
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Save name for ${v.name}`}
+                        className="shrink-0 text-[var(--color-fg-muted)] hover:text-[var(--color-fg-primary)]"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => commitRename(v)}
+                      >
+                        <Check size={13} />
+                      </Button>
+                    </div>
+                  ) : (
+                    <div
+                      key={v.id}
+                      className="group flex items-center gap-1 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] transition-base hover:border-[var(--color-accent)]"
                     >
-                      <Trash2 size={13} />
-                    </Button>
-                  </div>
-                ))
+                      <button
+                        className="min-w-0 flex-1 px-2.5 py-1.5 text-left text-xs text-[var(--color-fg-secondary)] group-hover:text-[var(--color-fg-primary)]"
+                        onClick={() => {
+                          const payload = v.filter as Record<string, unknown>;
+                          onApplyView(viewPayloadToFilters(payload), viewPayloadColumns(payload));
+                        }}
+                      >
+                        <div className="truncate font-medium">{v.name}</div>
+                        <div className="text-[var(--color-fg-muted)]">
+                          {fmtRelative(v.created_at)}
+                        </div>
+                      </button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Rename view ${v.name}`}
+                        className="shrink-0 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-fg-primary)] focus-visible:opacity-100 group-hover:opacity-100"
+                        onClick={() => {
+                          setRenamingId(v.id);
+                          setRenameValue(v.name);
+                        }}
+                      >
+                        <Pencil size={13} />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Delete view ${v.name}`}
+                        className="mr-1 shrink-0 text-[var(--color-fg-muted)] opacity-0 hover:text-[var(--color-danger)] focus-visible:opacity-100 group-hover:opacity-100"
+                        onClick={() => setPendingDelete(v)}
+                      >
+                        <Trash2 size={13} />
+                      </Button>
+                    </div>
+                  ),
+                )
               )}
             </div>
           </div>

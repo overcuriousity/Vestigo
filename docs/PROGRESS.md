@@ -4,7 +4,50 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-08-31 (session 219 — IIS/HTTPERR, Exchange, Squid and conntrackd converters).
+Last updated: 2026-09-01 (session 220 — embeddings off by default, and the weights arm).
+
+## Session 220 — 2026-09-01: the embedding subsystem stops advertising itself
+
+A containerized airgapped install still offered "Improve search quality" on every timeline
+with nothing behind it. The gate was never missing — `EmbedWizard` has hidden itself on
+`capabilities.embeddings` since the two-arm probe landed — the capability was simply
+answering *true*. `scripts/airgap-bundle.sh` defaulted `INSTALL_EMBEDDINGS=1` while the
+`Dockerfile` defaulted to `0`, so the bundled image carried torch and sentence-transformers;
+the airgap compose runs Qdrant, so the store arm answered; and the model arm asked only
+whether the *library* imported. Its own docstring had conceded the gap in so many words —
+"an airgapped box that never fetched the weights would fail anyway". It did.
+
+Three changes, at three different distances from the symptom.
+
+`VESTIGO_EMBEDDINGS_ENABLED` is a new master switch, **off by default**, checked ahead of
+everything: a subsystem an operator has turned off must not open a socket to report that it
+is off, and no probe result can turn it back on. It is editable in Settings → Embeddings
+without a restart, and it is in the fingerprint, so the flip takes effect on the next health
+poll. Off is the honest default — the two things embeddings need are the two a fresh install
+is least likely to have. This *is* a behaviour change on upgrade: an existing install that
+was embedding happily loses the UI until someone sets it true.
+
+The local model arm now asks whether the weights are actually here, but only where they
+cannot appear on their own: `allow_online` false and no remote endpoint. A `config.json`
+lookup in the Hugging Face cache (`try_to_load_from_cache`, one or two stats — it sits on the
+synchronous request path), a bare name resolved under `sentence-transformers/` the way the
+library resolves it, and a model name that is an existing directory taken at its word. An
+online host is left alone: it downloads on first use, and hiding the feature until someone
+embeds once would be its own bug. `unavailable_detail()` grew the matching message, because
+telling an airgapped operator to install a 2 GB extra they already have is the same wrong
+turn the vector-store message was written to avoid.
+
+And the bundle script's default is inverted — `--embeddings` opts in, `--no-embeddings`
+stays as the explicit form of the default. The image can carry the library; it cannot carry
+the weights, and the host it installs on may never fetch them. `bundle.env` records the
+choice and `install.sh` prints it, so the missing menu is explained at install time rather
+than discovered later.
+
+Unrelated but adjacent: the agent's tool list was labelled **"Disabled tools"** over a
+checkbox list where checked means *allowed*, so a stock install read as "every tool
+disabled". The control was right and the label was not; it is now "Available tools", with
+help text that says unchecking one denies it.
+
 
 ## Session 219 — 2026-08-31: four converters for a Windows-plus-gateway estate
 

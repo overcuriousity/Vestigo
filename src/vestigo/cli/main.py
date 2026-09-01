@@ -15,6 +15,7 @@ from vestigo.core.runtime_settings import load_runtime_settings
 from vestigo.db.postgres import PostgresStore, User, generate_id
 from vestigo.ingestion.files import copy_and_hash, hash_file
 from vestigo.ingestion.pipeline import EmbeddingPipeline, IngestionPipeline
+from vestigo.models.embeddings import embeddings_available
 
 app = typer.Typer(
     name="vestigo",
@@ -308,6 +309,14 @@ def embed(
         if case_obj is None:
             typer.echo(
                 f"ERROR: No case with id '{case}'. Run 'vestigo cases list' to see valid IDs.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if not embeddings_available():
+            typer.echo(
+                "ERROR: Embeddings are disabled or unconfigured on this installation. "
+                "Enable 'embeddings_enabled' and configure a model and vector store first.",
                 err=True,
             )
             raise typer.Exit(code=1)

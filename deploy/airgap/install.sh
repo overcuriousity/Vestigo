@@ -58,6 +58,14 @@ fi
 # shellcheck disable=SC1091
 . ./bundle.env
 say "Vestigo $VESTIGO_VERSION ($VESTIGO_COMMIT), image tag $VESTIGO_IMAGE_TAG, ${VESTIGO_BUNDLE_SCOPE:-full} bundle"
+# Worth naming at install time rather than leaving an operator to discover it
+# from a missing menu: the embedding subsystem is off in a stock install, and a
+# bundle built without --embeddings cannot serve it locally at all.
+if [ "${VESTIGO_BUNDLE_EMBEDDINGS:-0}" = "1" ]; then
+  say "  local embeddings: included — set VESTIGO_EMBEDDINGS_ENABLED=true in .env once the model weights are on this host"
+else
+  say "  local embeddings: not included — semantic search stays hidden unless you set VESTIGO_EMBEDDING_API_BASE_URL and VESTIGO_EMBEDDINGS_ENABLED=true"
+fi
 
 # The image archive carries its own inventory. Counting it here catches a short
 # save (see the -m note in scripts/airgap-bundle.sh) on the side that can still

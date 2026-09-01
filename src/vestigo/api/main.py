@@ -439,13 +439,18 @@ async def _probe_embeddings_availability() -> None:
     already truthful when the first browser asks.
     """
     try:
-        from vestigo.models.availability import embeddings_operational
+        from vestigo.models.availability import embeddings_operational, unavailable_detail
 
         available = await embeddings_operational(force=True)
         if not available:
+            # The reason, not a guess at it: "did not answer" was the only line
+            # this ever logged, and it is the wrong one for the two commonest
+            # cases — the operator switch is off, or the local weights are not
+            # on an airgapped host. Neither involved anything failing to answer.
             logger.info(
-                "Embedding features are unavailable on this instance — the model or the "
-                "vector store did not answer. Nothing embedding-related is offered in the UI."
+                "Embedding features are unavailable on this instance, so nothing "
+                "embedding-related is offered in the UI. %s",
+                unavailable_detail(),
             )
     except Exception:
         logger.exception("Could not determine embeddings availability at startup.")
