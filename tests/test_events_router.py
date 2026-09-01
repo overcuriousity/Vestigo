@@ -685,6 +685,36 @@ async def _collect(resp, chunks: list[str]) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bulk_annotate_with_a_time_filter_is_still_audited(patched_store, monkeypatch):
+    """Bulk-tagging writes annotations to evidence, so losing its audit row is
+    worse than losing an export's. The `start`/`end` datetimes in the filter
+    body used to blow up the audit JSON column, and `record_audit` swallowed
+    it — tags applied, nothing recorded. The ISO-8601 form of the assertion is
+    deliberate: the store-level floor keeps the row, but only dumping the body
+    JSON-safe here writes a timestamp an analyst can read back as a timestamp.
+    """
+    await _seed_export_timeline(patched_store)
+
+    class _NoMatches(_FakeExportService):
+        def query_event_refs(self, query, cap: int = 100_000):
+            return []
+
+    monkeypatch.setattr(events, "_get_query_service", lambda: _NoMatches(0, []))
+
+    body = events.BulkAnnotateByFilterRequest(
+        annotation_type="tag",
+        content="sqli-sweep",
+        start=datetime(2026, 3, 1, tzinfo=UTC),
+        end=datetime(2026, 3, 2, tzinfo=UTC),
+    )
+    await events.bulk_annotate_by_filter("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+
+    rows = await patched_store.query_audit(case_id="c1", action="events.bulk_annotate")
+    assert len(rows) == 1
+    assert rows[0].detail["filter"]["start"] == "2026-03-01T00:00:00Z"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fmt", ["jsonl", "csv"])
 async def test_export_hard_fails_on_shortfall(patched_store, monkeypatch, fmt):
     """A forensic export that streams fewer rows than the filter matches must

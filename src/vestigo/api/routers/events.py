@@ -985,7 +985,10 @@ async def bulk_annotate_by_filter(
             "matched": len(refs),
             "tagged": tagged,
             "filter": body.model_dump(
-                exclude={"annotation_type", "content"}, exclude_none=True, exclude_defaults=True
+                mode="json",
+                exclude={"annotation_type", "content"},
+                exclude_none=True,
+                exclude_defaults=True,
             ),
         },
     )
@@ -1633,7 +1636,7 @@ async def export_events(
         detail={
             "format": body.format,
             "expected": expected,
-            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            "filter": body.filter.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
             **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )
@@ -1749,7 +1752,7 @@ async def _audit_inventory_export(
             "separator": body.separator,
             "order_by": body.order_by,
             "expected": expected,
-            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            "filter": body.filter.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
             **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )

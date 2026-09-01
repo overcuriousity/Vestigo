@@ -11,6 +11,7 @@ download rather than hand over a silently short inventory.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -261,6 +262,22 @@ async def test_export_is_audited(patched_store, monkeypatch):
     actions = [a.action for a in await patched_store.query_audit(case_id="c1")]
     assert "events.export.field_inventory" in actions
     assert "events.export.field_inventory.result" in actions
+
+
+@pytest.mark.asyncio
+async def test_export_with_a_time_filter_is_still_audited(patched_store, monkeypatch):
+    """A `start`/`end` filter used to fail the audit write outright: the raw
+    ``datetime`` from ``ExportFilter.model_dump()`` reached the audit log's
+    JSON column and blew up in ``record_audit``, which swallows the exception
+    (best-effort logging) — so the export succeeded but silently lost its
+    custody record. The filter must be dumped JSON-safe so a time-scoped
+    export is audited exactly like an unscoped one."""
+    body = _request(filter=events.ExportFilter(start=datetime(2026, 3, 1, tzinfo=UTC)))
+    await _export(patched_store, monkeypatch, _FakeInventoryService(2), body)
+
+    rows = await patched_store.query_audit(case_id="c1", action="events.export.field_inventory")
+    assert len(rows) == 1
+    assert rows[0].detail["filter"]["start"] == "2026-03-01T00:00:00Z"
 
 
 # ── The single streamed-export slot ─────────────────────────────────────────
