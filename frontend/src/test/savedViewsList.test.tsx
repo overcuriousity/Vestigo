@@ -142,6 +142,11 @@ describe("saved views list", () => {
     fireEvent.change(input, { target: { value: "Renamed" } });
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(viewsApi.rename).toHaveBeenCalledWith("c1", "v1", "Renamed"));
+    // Unmounting the still-focused input on success fires a native blur;
+    // that must not re-trigger a second, duplicate PATCH.
+    fireEvent.blur(input);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(viewsApi.rename).toHaveBeenCalledTimes(1);
   });
 
   it("cancels a rename on Escape without saving", () => {
@@ -152,5 +157,9 @@ describe("saved views list", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     expect(viewsApi.rename).not.toHaveBeenCalled();
     expect(screen.getByText("Failed logons")).toBeInTheDocument();
+    // Unmounting the still-focused input on cancel fires a native blur;
+    // that must not resurrect the edit as a save.
+    fireEvent.blur(input);
+    expect(viewsApi.rename).not.toHaveBeenCalled();
   });
 });

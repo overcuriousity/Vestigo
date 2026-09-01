@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search, Clock, PlusCircle, MinusCircle, BookmarkCheck, PanelLeftClose, X, Tag, ShieldAlert, FileText, Database, Regex, Trash2, Pencil, Check } from "lucide-react";
 import { Input } from "@/components/ui/Input";
@@ -195,6 +195,11 @@ export function FilterRail({
   const [pendingDelete, setPendingDelete] = useState<View | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  // The rename input unmounts on commit/cancel, which fires a native blur on
+  // the still-focused element; this ref suppresses the resulting onBlur so it
+  // can't re-trigger commitRename (once to cancel, once to duplicate a commit
+  // already in flight).
+  const suppressRenameBlurRef = useRef(false);
 
   const qc = useQueryClient();
   const deleteView = useMutation({
@@ -218,6 +223,7 @@ export function FilterRail({
       viewsApi.rename(caseId, id, name),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["views", caseId] });
+      suppressRenameBlurRef.current = true;
       setRenamingId(null);
     },
     onError: (err: Error) => toast.error("Could not rename view", err.message),
@@ -229,6 +235,10 @@ export function FilterRail({
       return;
     }
     renameView.mutate({ id: v.id, name });
+  };
+  const cancelRename = () => {
+    suppressRenameBlurRef.current = true;
+    setRenamingId(null);
   };
 
   /** Case-insensitive substring match on the view name.
@@ -798,9 +808,15 @@ export function FilterRail({
                         onChange={(e) => setRenameValue(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") commitRename(v);
-                          else if (e.key === "Escape") setRenamingId(null);
+                          else if (e.key === "Escape") cancelRename();
                         }}
-                        onBlur={() => commitRename(v)}
+                        onBlur={() => {
+                          if (suppressRenameBlurRef.current) {
+                            suppressRenameBlurRef.current = false;
+                            return;
+                          }
+                          commitRename(v);
+                        }}
                       />
                       <Button
                         variant="ghost"
