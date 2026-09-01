@@ -4,8 +4,10 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-08-29, v1.15.1):** three open issues, listed below. Phase 3 is complete
-and the queue is feature-shaped. Priority, roughly by payoff-per-effort:
+**State (verified 2026-09-01, v1.18.1):** one open issue (#307, folded into Milestone 10 as
+G1). Phase 3 is complete and the queue is feature-shaped. **Milestone 10 — AI agent log
+investigation — is the 2.0 thrust and outranks everything below**; the numbered list orders
+the remaining 1.x work by payoff-per-effort:
 
 1. **D11** entropy bigram variant — closes a capability gap the docs used to overclaim;
    truth of what we ship outranks new surface.
@@ -261,6 +263,11 @@ window replaced compaction + fidelity ladder). See `AGENT.md`.
   reproducible and offline-safe, no OPSEC gate. Care points: decompression bombs, output
   size vs. context budget, and keeping the op set append-only so old conversations replay.
   Ships independently of and before A8.
+- [ ] **A13 — Agent similarity tools gain reranking.** When V2 (Milestone 10) ships, the
+  agent's semantic-similarity tools pass through the same two-stage retrieval as the
+  Explorer, so the model and the analyst rank results identically — a divergence there
+  would make agent citations unreproducible from the UI. Blocked on V2; near-zero work
+  once it lands (`similarity.py` is the shared path).
 - [ ] **A8 — External MCP toolsets (web research / OSINT).** Do NOT build bespoke whois/web
   tools or a plugin API: the runtime is pydantic-ai with MCP toolsets, so let the agent
   consume operator-configured **external MCP servers** — zero Vestigo code per tool,
@@ -304,10 +311,113 @@ timeline filter identically.
   `--help` says what it captures. The server-side half (inline rendering, per-file download)
   needs E4's blob store and arrives with that milestone.
 
+## Milestone 10 — AI agent log investigation (the v2.0 USP)
+
+Decided 2026-09-01. The August 2026 AISI incident report — one anomaly, 122 transcripts,
+212,840 messages reviewed *by hand* — names the gap: agent harnesses log in proprietary
+formats, the interesting behaviours are cross-log, and no forensic tool owns the problem.
+Observability platforms (Langfuse, LangSmith, Arize) monitor *your own* agents in
+production; nothing does *forensics on agent logs as evidence* — provenance-hashed,
+offline, cross-run. Vestigo already has the skeleton: event-granular provenance, immutable
+sources, baselines/dispositions, Sigma, Stories. **v2.0 makes this the primary use case
+and aims to be the best tool in the world at it.**
+
+Two tracks. G is the investigation surface; V is the vector subsystem it leans on,
+redesigned. Order across tracks: **G1 → G2 ∥ V1 → G3 → V2/V3 → G4 → G5/G6**.
+
+### G — investigation surface
+
+- [ ] **G1 — Agent-telemetry converters** (= issue #307, the contract for this item).
+  Tier 1: OTel GenAI semantic conventions (OTLP/JSON spans + message log events) and
+  OpenInference exports. Tier 2 (demand-driven): Claude Code session JSONL, OpenAI Agents
+  SDK traces, Wintermute audit export. One event per span with start/end preserved,
+  prompt/completion messages as their own rows, `trace_id`/`span_id`/`parent_span_id`
+  retained so call trees survive, token counts and durations as typed numerics. Raw
+  payloads hashed, parser config hashed into identity — same provenance as every
+  converter. No embeddings involved: statistical detectors and Sigma get purchase from
+  day one. The field-naming decisions made here (span kind, tool name, role, session id)
+  are load-bearing for G2–G5 — write them into `INPUT_FORMATS.md` as the agent-telemetry
+  vocabulary, the way `status_code` was decided once for N-track.
+- [ ] **G2 — Session and trace surface in the Explorer.** Supersedes #307's "no dedicated
+  UI mode" — a generic event grid cannot be the world's best way to read a conversation.
+  Two views, reached from any agent-telemetry event row: a **conversation reader**
+  (turn-by-turn, role-distinguished, tool calls collapsible, long content expandable
+  in place) and a **call-tree pivot** (orchestrator → sub-agent → tool from parent
+  linkage, with per-node duration and token rollups). Both are projections of the event
+  grid's data — same filters, same provenance chips, no second query system. Needs G1
+  only, and it is the USP demo moment; design round decides whether it lives as a third
+  Explorer mode or a sheet, and must handle the 200k-message session without loading it.
+- [ ] **G3 — Detection pack for agent telemetry.** Mostly reuse, verified against the
+  shipped detectors: tool-call novelty and bursts are `value_novelty` + `frequency` over
+  the G1 fields; token/duration outliers are the numeric detectors; impossible tool
+  sequences fit `sequence_motif`/D15 shapes partitioned by session id. Genuinely new:
+  **cross-run joins** — the same external artifact (URL, account, repo) appearing in
+  independent traces, the AISI coordination signature, buildable as SQL over typed
+  attributes — and a **curated Sigma ruleset** for prompt-injection patterns in inbound
+  tool results and credential-shaped strings in outbound messages, routed via the
+  existing `logsource` machinery once G1 fixes the field names. Ships with detector docs
+  in `ANOMALY_DETECTION.md` per the standing rule.
+- [ ] **G4 — Semantic investigation flow** (needs V1; better with V2). Where embeddings
+  earn their keep for the first time: agent messages are natural language, and the
+  questions are paraphrase-shaped ("everywhere the agent discussed credentials",
+  injection families that mutate wording). Turn-level embedding defaults that embed
+  message *content* and never the JSON envelope — verify `field_recommend.py`'s cohesion
+  scoring picks the G1 content fields and pin it; semantic search + rerank as the primary
+  triage gesture on agent timelines; session-level clustering to group recurring
+  injection families across runs. All of it is a *search and triage* surface under the
+  standing decision below — results name their neighbors, findings stay statistical.
+- [ ] **G5 — Agent-incident demo case.** A fabricated AISI-style scenario through
+  `demo/`: a multi-session agent trace with an injection, a credential egress and a
+  cross-run coordination artifact. Every G3 detection must fire on it, enforced by the
+  existing demo-coverage test; the demo continues to require no embeddings (semantic
+  stays optional), which keeps the coverage test honest about what the stock install
+  detects.
+- [ ] **G6 — Positioning.** README and `CONCEPT.md` §8 gain the third comparison axis:
+  observability platforms do monitoring of your own agents; Vestigo does forensics on
+  evidence. Tone rule applies in full — no claims about their current feature sets
+  nobody verified, and AMiner stays uninvolved.
+
+### V — vector subsystem redesign
+
+- [ ] **V1 — Endpoint-only embeddings; EmbeddingGemma as the reference default.** Remove
+  the local inference path entirely: the `embeddings` extra (torch +
+  sentence-transformers), the local branch of `models/embeddings.py`,
+  `embedding_device`, the `INSTALL_EMBEDDINGS` build arg, the airgap `--embeddings`
+  flag, and the weights probe PR #339 added (that PR documents its own retirement here).
+  The OpenAI-compatible `/embeddings` endpoint becomes the only path; capability =
+  switch + configured endpoint + one-token probe, one arm gone. Docs name
+  **EmbeddingGemma-300M served via llama.cpp/Ollama/vLLM** as the reference deployment —
+  the airgap story becomes "run the endpoint on your own network", which is strictly
+  simpler than shipping weights, and MiniLM remains servable the same way so nobody is
+  stranded. No data migration: collections are keyed by `embedding_config_hash`, so
+  existing local-embedded collections go stale and re-embed against the endpoint like
+  any config change.
+- [ ] **V2 — Reranking.** Two-stage retrieval: Qdrant top-k (~50) → a `/rerank` endpoint
+  → top-n. There is no OpenAI-standard rerank API; adopt the de-facto
+  Cohere/TEI/Infinity-compatible shape and probe it the way the agent endpoint is
+  probed (TTL cache, fingerprint, stale-while-revalidate). New optional settings +
+  capability; wired once into `db/similarity.py` so the Explorer semantic mode and the
+  agent tools (A13) inherit it together. Degrades to vector order when unconfigured —
+  reranking is an upgrade, never a requirement.
+- [ ] **V3 — Qdrant modernization.** Matryoshka output dimension (768/512/256/128) as an
+  `EmbeddingConfig` field — hash-covered, so dimension changes keep the identity
+  semantics; scalar quantization for large cases; payload indexes on session id and
+  role so semantic search filters *within* a session or to one side of the
+  conversation. One design question flagged honestly for the round rather than assumed:
+  hybrid sparse+dense (Qdrant-native BM25/SPLADE) versus leaving keyword search to
+  ClickHouse `search_blob` — the wrong answer duplicates a query system.
+
 ## Standing decisions (with revisit triggers)
 
 Decisions, not work items — each stays as decided unless its trigger fires.
 
+- **Embeddings are a triage/relevance layer, never a scored detector** (2026-09-01, with
+  Milestone 10). The reason PCA was skipped applies with full force: a cosine distance is
+  not an explanation an analyst can defend. Semantic surfaces return neighbors and name
+  their exemplars; anything that produces a *finding* with a disposition stays SQL-
+  explainable. Trigger: an embedding-native signal proves itself with an explanation
+  story as strong as the statistical detectors' — then design it as its own round, not
+  as a quiet promotion of search results to findings.
 - **Generated-converter guard stays stdlib-only.** rlimits, `python -I`, a scrubbed
   environment, a private cwd and an AST deny-list — no bwrap/firejail/container, so the
   reference uv and image deployments keep working (2026-08-17). Trigger: a report of a
