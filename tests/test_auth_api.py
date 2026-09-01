@@ -247,6 +247,69 @@ def test_update_my_preferences_records_a_declined_answer(client, admin_bootstrap
     }
 
 
+def test_update_my_preferences_stores_a_method_focus(client, admin_bootstrap):
+    """An analyst narrowing one method to one field (#341) has to outlive the
+    Tools sheet being closed — that it did not is the whole bug."""
+    as_admin(client, admin_bootstrap)
+
+    resp = client.put(
+        "/api/auth/me/preferences",
+        json={
+            "preferences": {
+                "analysis_method_focus": {"tl-1": {"proportion_shift": ["attr:http_uri"]}}
+            }
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["user"]["preferences"]["analysis_method_focus"] == {
+        "tl-1": {"proportion_shift": ["attr:http_uri"]}
+    }
+
+
+def test_method_focus_on_a_second_timeline_keeps_the_first(client, admin_bootstrap):
+    """Same one-level-down merge the column opt-in relies on: focusing a method
+    on today's timeline must not silently drop yesterday's."""
+    as_admin(client, admin_bootstrap)
+    client.put(
+        "/api/auth/me/preferences",
+        json={
+            "preferences": {
+                "analysis_method_focus": {"tl-1": {"proportion_shift": ["attr:http_uri"]}}
+            }
+        },
+    )
+
+    resp = client.put(
+        "/api/auth/me/preferences",
+        json={"preferences": {"analysis_method_focus": {"tl-2": {"value_novelty": ["attr:ua"]}}}},
+    )
+
+    assert resp.json()["user"]["preferences"]["analysis_method_focus"] == {
+        "tl-1": {"proportion_shift": ["attr:http_uri"]},
+        "tl-2": {"value_novelty": ["attr:ua"]},
+    }
+
+
+def test_method_focus_rejects_anything_but_field_token_lists(client, admin_bootstrap):
+    """The blob stays a whitelist one level further down than before: a focus
+    is method -> list of field tokens, not free-form nesting."""
+    as_admin(client, admin_bootstrap)
+
+    for bad in (
+        {"tl-1": True},
+        {"tl-1": {"proportion_shift": "attr:http_uri"}},
+        {"tl-1": {"proportion_shift": [1, 2]}},
+        {"tl-1": {"proportion_shift": [""]}},
+    ):
+        assert (
+            client.put(
+                "/api/auth/me/preferences", json={"preferences": {"analysis_method_focus": bad}}
+            ).status_code
+            == 422
+        ), bad
+
+
 def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bootstrap):
     """The blob is feature state, not a key/value store every session can write."""
     as_admin(client, admin_bootstrap)

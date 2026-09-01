@@ -23,8 +23,8 @@
  * than in a separate Method tab: "what does this actually do" is only ever
  * asked while looking at one of a method's findings.
  */
-import { useEffect, useState } from "react";
-import { Play, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Crosshair, Play, X } from "lucide-react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { METHODS_BY_ID, type MethodId, type MethodMeta } from "./method-registry";
 import { EVIDENCE_CLASSES } from "./method-registry";
@@ -40,6 +40,7 @@ import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
 import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
 import { useFieldOverrides } from "@/hooks/useFieldOverrides";
+import { useMethodFocus } from "@/hooks/useMethodFocus";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
@@ -208,6 +209,18 @@ function MethodBody({
   const { forMethod, declare, canEdit, saveError } = useFieldOverrides(caseId, timelineId);
   const overrides = forMethod(methodId);
 
+  // This analyst's own narrowing of the same method (#341) — per user, never
+  // shared, and applied by sending these fields explicitly on every sweep.
+  const { fieldsFor, setFocus, clearFocus } = useMethodFocus(timelineId);
+  const focusedFields = fieldsFor(methodId);
+  const isFocused = focusedFields !== undefined;
+  // Only an explicit selection can be focused: "let the method choose" is the
+  // absence of a field set, so there is nothing to keep.
+  const selectedFocusFields = useMemo(() => {
+    const picked = Object.values(fields).find((v) => v !== null && v !== undefined && v.length > 0);
+    return picked ?? null;
+  }, [fields]);
+
   return (
     <>
       <Subhead>How this method works</Subhead>
@@ -284,7 +297,42 @@ function MethodBody({
             {running ? "Running…" : runLabel}
           </Button>
         )}
+        {/* The run above answers "what does this method say about these
+            fields?" once. Keeping that answer is a separate ask (#341):
+            without it, closing the sheet puts every field back and the ranked
+            feed fills with the fields the analyst just ruled out. Distinct
+            from the per-field Pin/Ban chips in the picker, which declare the
+            *case team's* shared, audited field set — this one is only ever
+            this analyst's, which is why the copy says so. */}
+        {onRun && selectedFocusFields !== null && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={running}
+            title={
+              isFocused
+                ? "Stop narrowing this method to these fields"
+                : "Keep scanning only these fields for this method — only you see this"
+            }
+            onClick={() =>
+              void (isFocused
+                ? clearFocus(methodId)
+                : setFocus(methodId, selectedFocusFields))
+            }
+          >
+            <Crosshair size={11} />
+            {isFocused ? "Clear focus" : "Focus on this selection"}
+          </Button>
+        )}
       </form>
+      {onRun && isFocused && (
+        <p data-testid="method-focus-note" className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+          Only you see this. Every sweep now scans just {focusedFields!.join(", ")} for this
+          method, so it reports nothing about the fields it no longer reads. Declared fields
+          (the pins above) stay the case team's shared answer.
+        </p>
+      )}
       {onRun && blocker && (
         <p data-testid="method-knob-blocker" className="mt-1.5 text-xs text-[var(--color-warning)]">
           {blocker}

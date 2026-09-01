@@ -11,6 +11,7 @@ download rather than hand over a silently short inventory.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -151,6 +152,31 @@ async def test_separator_is_configurable(patched_store, monkeypatch, separator, 
     assert f".{ext}" in resp.headers["content-disposition"]
 
 
+@pytest.mark.parametrize(
+    ("separator", "expected_suffix"),
+    [
+        ("comma", "-inventory-comma.csv"),
+        ("semicolon", "-inventory-semicolon.csv"),
+        ("pipe", "-inventory-pipe.csv"),
+        ("tab", "-inventory-tab.tsv"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_filename_names_the_separator(patched_store, monkeypatch, separator, expected_suffix):
+    """comma, semicolon and pipe all produced the same filename, so a second
+    export of the same field landed beside the first as `…(1).csv` and the
+    analyst kept opening the original — which is what "the separator picker
+    does nothing" actually was. The file must name the separator it used."""
+    resp, _ = await _export(
+        patched_store,
+        monkeypatch,
+        _FakeInventoryService(2),
+        _request(columns=["value"], separator=separator, order_by="value_asc"),
+    )
+
+    assert resp.headers["content-disposition"].endswith(f'{expected_suffix}"')
+
+
 @pytest.mark.asyncio
 async def test_a_value_containing_the_separator_is_quoted(patched_store, monkeypatch):
     """The inventory of a field whose values contain the chosen separator must
@@ -261,6 +287,22 @@ async def test_export_is_audited(patched_store, monkeypatch):
     actions = [a.action for a in await patched_store.query_audit(case_id="c1")]
     assert "events.export.field_inventory" in actions
     assert "events.export.field_inventory.result" in actions
+
+
+@pytest.mark.asyncio
+async def test_export_with_a_time_filter_is_still_audited(patched_store, monkeypatch):
+    """A `start`/`end` filter used to fail the audit write outright: the raw
+    ``datetime`` from ``ExportFilter.model_dump()`` reached the audit log's
+    JSON column and blew up in ``record_audit``, which swallows the exception
+    (best-effort logging) — so the export succeeded but silently lost its
+    custody record. The filter must be dumped JSON-safe so a time-scoped
+    export is audited exactly like an unscoped one."""
+    body = _request(filter=events.ExportFilter(start=datetime(2026, 3, 1, tzinfo=UTC)))
+    await _export(patched_store, monkeypatch, _FakeInventoryService(2), body)
+
+    rows = await patched_store.query_audit(case_id="c1", action="events.export.field_inventory")
+    assert len(rows) == 1
+    assert rows[0].detail["filter"]["start"] == "2026-03-01T00:00:00Z"
 
 
 # ── The single streamed-export slot ─────────────────────────────────────────

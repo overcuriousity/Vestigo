@@ -6299,6 +6299,25 @@ class PostgresStore:
     # Audit log
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        """Coerce *value* into something the ``detail`` JSON column can store.
+
+        ``record_audit`` is best-effort by contract: it logs and swallows
+        rather than failing the request it is recording. That makes an
+        unserializable detail uniquely dangerous — the request succeeds and the
+        audit row simply never exists. Both export call sites and the
+        bulk-annotate one shipped exactly that bug, handing a pydantic
+        ``model_dump()`` (native ``datetime``) straight to the column, so every
+        export or bulk-tag carrying a time filter lost its custody record.
+
+        Call sites should still dump JSON-safe themselves —
+        ``model_dump(mode="json")`` gives proper ISO-8601 rather than
+        ``str(datetime)``'s space separator. This is the floor under them, not
+        a substitute for it.
+        """
+        return json.loads(json.dumps(value, default=str))
+
     async def record_audit(
         self,
         action: str,
@@ -6344,7 +6363,7 @@ class PostgresStore:
             status_code=status_code,
             ip=ip,
             user_agent=user_agent,
-            detail=detail,
+            detail=self._json_safe(detail) if detail is not None else None,
         )
         try:
             async with self.session_factory() as session:

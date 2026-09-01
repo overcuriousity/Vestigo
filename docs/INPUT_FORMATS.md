@@ -740,3 +740,39 @@ locally, and upload the Parquet is the path for anything a hint cannot express.
 The copy-paste prompts in the downloads panel are rendered by the same module
 (`GET /api/converters/prompt`), so a hand-run converter is written to the same contract.
 
+
+## Export column layout
+
+The events export is the inverse of everything above, and worth stating here because a CSV
+it produces is close to one this document would accept back.
+
+**CSV** gives every field its own column. The core scalar columns come first, in this fixed
+order — `event_id`, `timestamp`, `timestamp_desc`, `source_id`, `artifact`, `artifact_long`,
+`display_name`, `message`, `tags`, `content_hash`, `file_hash`, `user_tags`, `comments`,
+`anomaly_findings` — followed by one `attr:<key>` column per attribute key, alphabetically.
+`tags` and `user_tags` are `;`-joined, `comments` and `anomaly_findings` are ` | `-joined.
+An event that does not carry a given key writes an empty cell.
+
+The attribute columns are the union across the *timeline's* sources, taken from the cached
+per-source field-stats inventory (the same one the field picker and `viz/fields` read), not
+from the rows the filter happened to match. A narrower filter therefore never changes the
+column set, and the export costs no extra scan to decide it.
+
+Two comment lines carry the file's own provenance. A leading
+`# applied_time_offsets={…}` appears only when a per-source clock-skew correction is
+active. A trailing `# vestigo_export complete=<bool> rows=<n> expected=<n>` proves the file
+holds every event the filter matched; a shortfall marks it `complete=false` and breaks the
+download rather than handing over a silently short file.
+
+That flag is about *rows*. An attribute key absent from the cached inventory — computed
+before the event landed, or past the per-source key cap — has no column, and its values are
+dropped, because reopening the column set mid-stream would invalidate every row already
+sent. The trailer then also carries `dropped_attribute_keys=<n> dropped_attribute_values=<n>
+dropped_keys=<a;b;c>`. It is disclosed rather than fatal: every matching event is still
+present and still counted, only extra columns are missing, and a stale cache must not become
+an outage.
+
+**JSONL** is unchanged by any of the above and remains the lossless record: one object per
+event with its `attributes` map and annotations intact, a leading `_meta` record for active
+time offsets, and a trailing `_meta` completeness record. Prefer it whenever the file is
+meant to be read back rather than read by a person.
