@@ -7,7 +7,7 @@ import csv
 import io
 import logging
 import math
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from typing import Any
 from urllib.parse import urlencode
 
@@ -58,18 +58,50 @@ class UpdateMeRequest(BaseModel):
     onboarding_completed: bool | None = Field(default=None)
 
 
+def _check_bool_value(key: str, value: Any) -> None:
+    """A dict-valued preference whose entries are a plain yes/no."""
+    if not isinstance(value, bool):
+        raise ValueError(f"Preference {key} values must be booleans")
+
+
+def _check_method_focus_value(key: str, value: Any) -> None:
+    """One timeline's focus: ``{method_id: [field_token, ...]}``.
+
+    Nested one level deeper than the other preferences, so it validates one
+    level deeper too — the blob stays a whitelist rather than becoming the
+    free-form store the top-level check exists to prevent.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"Preference {key} values must be objects of method -> fields")
+    for method, fields in value.items():
+        if not isinstance(method, str) or not method:
+            raise ValueError(f"Preference {key} method ids must be non-empty strings")
+        if not isinstance(fields, list) or not all(
+            isinstance(f, str) and f and len(f) <= _MAX_PREFERENCE_KEY_LENGTH for f in fields
+        ):
+            raise ValueError(f"Preference {key} fields must be a list of field tokens")
+
+
 #: Keys the current user may set in their own ``preferences`` blob, with the
-#: type each must have. A whitelist rather than a free-form merge: the blob is
-#: read by feature code that assumes its own shape, and it is written from the
-#: browser — an arbitrary key/value store reachable by every session is a
-#: storage sink nobody asked for. Agent tool preferences keep their own
-#: endpoint (`/api/agent/preferences`), which validates against the registry.
-_ALLOWED_PREFERENCE_KEYS: dict[str, type] = {
+#: type each must have and how its entries are checked one level down. A
+#: whitelist rather than a free-form merge: the blob is read by feature code
+#: that assumes its own shape, and it is written from the browser — an
+#: arbitrary key/value store reachable by every session is a storage sink
+#: nobody asked for. Agent tool preferences keep their own endpoint
+#: (`/api/agent/preferences`), which validates against the registry.
+_ALLOWED_PREFERENCE_KEYS: dict[str, tuple[type, Callable[[str, Any], None] | None]] = {
     # `{timeline_id: true}` — the timelines this analyst has opted in to
     # "Suggest with AI" on (issue #213), having read the disclosure naming the
     # endpoint, the model and what the request carries. The opt-in is per
     # timeline because that is the granularity at which evidence is sent.
-    "column_advisor_optin": dict,
+    "column_advisor_optin": (dict, _check_bool_value),
+    # `{timeline_id: {method_id: [field_token, ...]}}` — this analyst's own
+    # narrowing of which fields one method scans (#341). Per user and never
+    # shared: `Timeline.field_overrides` is the *team's* audited declaration,
+    # and one analyst focusing their own feed must not rewrite a colleague's.
+    # Applied by sending an explicit `fields` to /analysis/findings, which
+    # bypasses the overrides layer by contract rather than competing with it.
+    "analysis_method_focus": (dict, _check_method_focus_value),
 }
 
 #: Ceiling on entries in a dict-valued preference. High enough that no real
@@ -102,15 +134,16 @@ class UpdatePreferencesRequest(BaseModel):
     @classmethod
     def _check_keys(cls, value: dict[str, Any]) -> dict[str, Any]:
         for key, entry in value.items():
-            expected = _ALLOWED_PREFERENCE_KEYS.get(key)
-            if expected is None:
+            spec = _ALLOWED_PREFERENCE_KEYS.get(key)
+            if spec is None:
                 raise ValueError(f"Unknown preference: {key}")
+            expected, check_value = spec
             if not isinstance(entry, expected):
                 raise ValueError(f"Preference {key} must be a {expected.__name__}")
             if expected is dict:
                 # A dict-valued preference is still a whitelist, one level
-                # down: string keys, boolean values, bounded size. Without
-                # this it would be the arbitrary key/value store the
+                # down: string keys, a per-key value check, bounded size.
+                # Without this it would be the arbitrary key/value store the
                 # top-level whitelist exists to prevent.
                 if len(entry) > _MAX_PREFERENCE_ENTRIES:
                     raise ValueError(
@@ -124,8 +157,8 @@ class UpdatePreferencesRequest(BaseModel):
                             f"Preference {key} keys may be at most "
                             f"{_MAX_PREFERENCE_KEY_LENGTH} characters"
                         )
-                    if not isinstance(inner, bool):
-                        raise ValueError(f"Preference {key} values must be booleans")
+                    if check_value is not None:
+                        check_value(key, inner)
         return value
 
 
