@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from tests.conftest import _fake_user
 from vestigo.api import deps
 from vestigo.api.routers import events
+from vestigo.db import field_stats
 from vestigo.db.postgres import Case, PostgresStore
 from vestigo.db.queries import QueryRequestTooLargeError
 
@@ -637,6 +638,28 @@ async def test_count_events_matches_bulk_write_scope(patched_store, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
+class _FakeStatsClickHouse:
+    """Just enough of ``ClickHouseStore`` for ``compute_source_field_stats`` to
+    answer "zero events, no attributes" without touching a real database —
+    the CSV export's attr-column resolution needs *some* clickhouse store to
+    hand ``ensure_source_field_stats`` on a cache miss."""
+
+    database = "vestigo"
+
+    class _Result:
+        result_rows: list = []
+
+    class _Client:
+        def query(self, *_a, **_k):
+            return _FakeStatsClickHouse._Result()
+
+    def __init__(self) -> None:
+        self.client = self._Client()
+
+    def init_schema(self) -> None:
+        pass
+
+
 class _FakeExportService:
     """Decouples the pre-flight ``count()`` from what ``iter_events`` streams,
     so a shortfall (the integrity failure the hard-fail guards) can be forced."""
@@ -644,6 +667,7 @@ class _FakeExportService:
     def __init__(self, count_val: int, rows: list[dict]) -> None:
         self._count = count_val
         self._rows = rows
+        self.store = _FakeStatsClickHouse()
 
     def count(self, query):
         return self._count
@@ -755,6 +779,111 @@ async def test_export_complete_marks_trailer_and_does_not_raise(patched_store, m
     joined = "".join(chunks)
     assert ("complete=true" in joined) or ('"complete": true' in joined)
     assert ("rows=3" in joined) or ('"written": 3' in joined)
+
+
+@pytest.mark.asyncio
+async def test_export_csv_gives_each_attribute_its_own_column(patched_store, monkeypatch):
+    """A CSV export must give one column per data field, not dump every custom
+    field into a single JSON 'attributes' blob (user-reported)."""
+    await _seed_export_timeline(patched_store)
+    await patched_store.upsert_source_field_stats(
+        case_id="c1",
+        source_id="s1",
+        stats_version=field_stats.EFFECTIVE_STATS_VERSION,
+        events_total=2,
+        payload={
+            "top_level": {},
+            "attributes": {
+                "src_ip": {"distinct": 2, "coverage": 2, "samples": ["10.0.0.4"]},
+                "user": {"distinct": 1, "coverage": 1, "samples": ["admin"]},
+            },
+            "attr_keys_truncated": False,
+        },
+    )
+    rows = [
+        {
+            "event_id": "e1",
+            "source_id": "s1",
+            "message": "m1",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "tags": [],
+            "attributes": {"src_ip": "10.0.0.4", "user": "admin"},
+        },
+        {
+            "event_id": "e2",
+            "source_id": "s1",
+            "message": "m2",
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "tags": [],
+            "attributes": {"src_ip": "10.0.0.9"},
+        },
+    ]
+    fake = _FakeExportService(count_val=2, rows=rows)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format="csv", filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    chunks: list[str] = []
+    await _collect(resp, chunks)
+    lines = "".join(chunks).splitlines()
+
+    header = lines[0].split(",")
+    assert "attributes" not in header
+    assert "attr:src_ip" in header
+    assert "attr:user" in header
+
+    idx_src_ip = header.index("attr:src_ip")
+    idx_user = header.index("attr:user")
+    row2 = lines[2].split(",")
+    assert row2[idx_src_ip] == "10.0.0.9"
+    assert row2[idx_user] == ""  # e2 carries no 'user' attribute
+
+
+@pytest.mark.asyncio
+async def test_export_csv_discloses_attribute_keys_with_no_column(patched_store, monkeypatch):
+    """A key missing from the cached field-stats inventory gets no column, and
+    DictWriter drops its value. The file must say so: a custody artifact that
+    quietly loses a field while its trailer reads complete=true is exactly the
+    failure the completeness trailer exists to prevent."""
+    await _seed_export_timeline(patched_store)
+    await patched_store.upsert_source_field_stats(
+        case_id="c1",
+        source_id="s1",
+        stats_version=field_stats.EFFECTIVE_STATS_VERSION,
+        events_total=1,
+        payload={
+            "top_level": {},
+            "attributes": {"src_ip": {"distinct": 1, "coverage": 1, "samples": ["10.0.0.4"]}},
+            "attr_keys_truncated": False,
+        },
+    )
+    rows = [
+        {
+            "event_id": "e1",
+            "source_id": "s1",
+            "message": "m1",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "tags": [],
+            # `http_uri` is real on the event but absent from the cached stats.
+            "attributes": {"src_ip": "10.0.0.4", "http_uri": "/login"},
+        },
+    ]
+    fake = _FakeExportService(count_val=1, rows=rows)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format="csv", filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    chunks: list[str] = []
+    await _collect(resp, chunks)
+    text = "".join(chunks)
+
+    assert "attr:http_uri" not in text.splitlines()[0]
+    trailer = text.splitlines()[-1]
+    assert "dropped_attribute_keys=1" in trailer
+    assert "dropped_attribute_values=1" in trailer
+    assert "dropped_keys=http_uri" in trailer
 
 
 @pytest.mark.asyncio

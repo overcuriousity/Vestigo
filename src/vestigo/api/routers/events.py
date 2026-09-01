@@ -8,7 +8,7 @@ import io
 import json
 import logging
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -1346,8 +1346,10 @@ class ExportRequest(BaseModel):
 
 # ── Export streaming helpers ──────────────────────────────────────────────────
 
-# Core scalar columns included in CSV exports (attributes flattened to JSON).
-_CSV_COLUMNS = [
+# Core scalar columns included in every CSV export. Per-event custom fields
+# (``attributes``) get their own ``attr:<key>`` column instead of being
+# dumped into a single JSON blob column — see ``_stream_csv``.
+_CSV_CORE_COLUMNS = [
     "event_id",
     "timestamp",
     "timestamp_desc",
@@ -1357,7 +1359,6 @@ _CSV_COLUMNS = [
     "display_name",
     "message",
     "tags",
-    "attributes",
     "content_hash",
     "file_hash",
     "user_tags",
@@ -1429,8 +1430,25 @@ def _stream_csv(
     *,
     expected: int,
     tally: dict[str, Any],
+    attr_keys: Sequence[str] = (),
 ) -> Generator[str]:
     """Yield CSV rows for all matching events (header first), annotations flattened.
+
+    Every field the timeline's sources carry gets its own column: the core
+    scalar columns (``_CSV_CORE_COLUMNS``) plus one ``attr:<key>`` column per
+    entry in *attr_keys* — the union of attribute keys across the timeline's
+    sources (``_resolve_export_attr_keys``), not just the ones this filtered
+    slice happens to use, so the column set doesn't shift row to row. An
+    event missing a given key writes an empty cell for it (``csv.DictWriter``'s
+    ``restval``).
+
+    A key seen after the field-stats cache was last computed (or beyond its
+    per-source cap) has no column, and reopening the column set mid-stream
+    would invalidate every row already sent — so its values are dropped and
+    the trailer names them (``dropped_attribute_keys``/``…_values``/
+    ``dropped_keys``). Disclosed rather than fatal: every matching *event* is
+    still in the file and still counted, only extra columns are missing, and
+    JSONL remains the lossless record. A stale cache must not become an outage.
 
     A leading ``# applied_time_offsets=…`` comment documents any active
     per-source clock-skew offset; without one the output is byte-identical to
@@ -1438,14 +1456,19 @@ def _stream_csv(
 
     A trailing ``# vestigo_export …`` comment proves completeness against a
     pre-flight ``count()``; a shortfall marks it ``complete=false`` and raises
-    :class:`ExportIncompleteError` (see its docstring).
+    :class:`ExportIncompleteError` (see its docstring). That flag is about
+    *rows* — a file can be row-complete and still have dropped a column.
     """
     buf = io.StringIO()
     if applied_offsets:
         yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
+    fieldnames = [*_CSV_CORE_COLUMNS, *(f"attr:{key}" for key in attr_keys)]
+    known_attr_columns = {f"attr:{key}" for key in attr_keys}
+    dropped_keys: set[str] = set()
+    dropped_values = 0
     writer = csv.DictWriter(
         buf,
-        fieldnames=_CSV_COLUMNS,
+        fieldnames=fieldnames,
         extrasaction="ignore",
         lineterminator="\n",
     )
@@ -1461,9 +1484,19 @@ def _stream_csv(
         tags = row.get("tags")
         if isinstance(tags, list):
             row["tags"] = ";".join(str(t) for t in tags)
-        attrs = row.get("attributes")
+        attrs = row.pop("attributes", None)
         if isinstance(attrs, dict):
-            row["attributes"] = json.dumps(attrs)
+            for key, val in attrs.items():
+                column = f"attr:{key}"
+                if column in known_attr_columns:
+                    row[column] = val
+                else:
+                    # No column for this key: the cached field-stats inventory
+                    # predates the event, or the per-source key cap elided it.
+                    # DictWriter's extrasaction="ignore" would drop the value
+                    # without a word — count it so the trailer can disclose it.
+                    dropped_keys.add(key)
+                    dropped_values += 1
 
         anns = annotations_by_event.get(row["event_id"], [])
         row["user_tags"] = ";".join(
@@ -1485,7 +1518,26 @@ def _stream_csv(
     complete = written == expected
     tally["written"] = written
     tally["complete"] = complete
-    yield f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}\n"
+    tally["dropped_keys"] = dropped_keys
+    # Row completeness and column completeness are separate claims: every
+    # matching event is here, but a key with no column lost its values. Say so
+    # rather than letting `complete=true` stand for both.
+    trailer = (
+        f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}"
+    )
+    if dropped_keys:
+        trailer += (
+            f" dropped_attribute_keys={len(dropped_keys)}"
+            f" dropped_attribute_values={dropped_values}"
+            f" dropped_keys={';'.join(sorted(dropped_keys))}"
+        )
+        _logger.error(
+            "export dropped attribute values with no column: keys=%s values=%s case=%s",
+            sorted(dropped_keys),
+            dropped_values,
+            query.case_id,
+        )
+    yield trailer + "\n"
     if not complete:
         _logger.error(
             "export incomplete (csv): expected=%s written=%s case=%s sources=%s",
@@ -1495,6 +1547,23 @@ def _stream_csv(
             query.source_ids,
         )
         raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
+
+
+async def _resolve_export_attr_keys(
+    case_id: str, source_ids: list[str], field_mappings: dict[str, list[str]] | None
+) -> list[str]:
+    """Attribute keys to give their own column in a CSV export.
+
+    Sourced from the same cached per-source field-stats inventory the field
+    picker reads (``list_fields``), not the filtered query — a full-scan
+    ``arrayJoin(mapKeys(attributes))`` per export would cost as much as the
+    export itself, and the column set stays stable for a given timeline
+    regardless of which filter narrowed the export down.
+    """
+    stats = await ensure_source_field_stats(
+        get_store(), _get_query_service().store, case_id, source_ids
+    )
+    return merged_list_fields(stats, field_mappings)["attributes"]
 
 
 async def _build_export_query(
@@ -1618,8 +1687,14 @@ async def export_events(
     else:
         media_type = "text/csv"
         ext = "csv"
+        attr_keys = await _resolve_export_attr_keys(case_id, eq.source_ids or [], eq.field_mappings)
         content = _stream_csv(
-            eq, annotations_by_event, source_offsets, expected=expected, tally=tally
+            eq,
+            annotations_by_event,
+            source_offsets,
+            expected=expected,
+            tally=tally,
+            attr_keys=attr_keys,
         )
 
     # Audited before streaming starts: an export that fails mid-stream still
