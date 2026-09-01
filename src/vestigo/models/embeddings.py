@@ -17,7 +17,8 @@ if TYPE_CHECKING:
 def embeddings_available() -> bool:
     """Whether embedding features can run in this installation.
 
-    Needs a model *and* somewhere to put the vectors: the local
+    Needs the operator switch (``embeddings_enabled``, off by default), a model
+    *and* somewhere to put the vectors: the local
     sentence-transformers stack importable (the ``embeddings`` extra) or a
     remote OpenAI-compatible endpoint configured, plus a declared vector store.
     A configured-looking instance is not enough on its own — see
@@ -33,9 +34,12 @@ def embeddings_available() -> bool:
     from vestigo.models.availability import (
         cached_result,
         model_configured,
+        subsystem_enabled,
         vector_store_configured,
     )
 
+    if not subsystem_enabled():
+        return False
     if not model_configured() or not vector_store_configured():
         return False
     probed = cached_result()

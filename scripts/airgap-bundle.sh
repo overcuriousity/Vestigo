@@ -5,8 +5,20 @@
 #
 #     scripts/airgap-bundle.sh                    # app + backing services
 #     scripts/airgap-bundle.sh --app-only         # app image only (services already there)
-#     scripts/airgap-bundle.sh --no-embeddings    # skip the ~2 GB torch install
+#     scripts/airgap-bundle.sh --embeddings       # add the ~2 GB local ML stack
+#     scripts/airgap-bundle.sh --no-embeddings    # the default; say it explicitly if you like
 #     scripts/airgap-bundle.sh -o /media/usb      # write the tarball straight to the drive
+#
+# Local embeddings are OUT of the bundle by default. The image can carry torch
+# and sentence-transformers, but it cannot carry the model weights, and an
+# airgapped host is never allowed to fetch them — so a bundle that shipped the
+# extra produced an installation that advertised the whole embedding UI for a
+# model that could never load. Pass --embeddings only if you are also placing
+# the weights on the target (a pre-populated Hugging Face cache, or
+# VESTIGO_EMBEDDING_MODEL pointed at a model directory), or if the target will
+# use VESTIGO_EMBEDDING_API_BASE_URL against an embedding endpoint on its own
+# network. Either way the subsystem stays off until an operator turns on
+# VESTIGO_EMBEDDINGS_ENABLED.
 #
 # What it does: builds the frontend, builds the app image from the prebuilt
 # frontend (so the far side never needs node), saves every image the stack
@@ -28,10 +40,11 @@ cd "$REPO"
 
 OUT_DIR="$REPO"
 APP_ONLY=0
-INSTALL_EMBEDDINGS=1
+INSTALL_EMBEDDINGS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --app-only) APP_ONLY=1 ;;
+    --embeddings) INSTALL_EMBEDDINGS=1 ;;
     --no-embeddings) INSTALL_EMBEDDINGS=0 ;;
     -o) shift; OUT_DIR="${1:?-o needs a directory}" ;;
     -o*) OUT_DIR="${1#-o}" ;;
@@ -158,6 +171,7 @@ VESTIGO_VERSION=$VERSION
 VESTIGO_COMMIT=$COMMIT
 VESTIGO_IMAGE_COUNT=${#IMAGES[@]}
 VESTIGO_BUNDLE_SCOPE=$([ "$APP_ONLY" = 1 ] && echo app-only || echo full)
+VESTIGO_BUNDLE_EMBEDDINGS=$INSTALL_EMBEDDINGS
 EOF
 
 printf 'Vestigo %s (%s)\nBuilt %s\nImages: %s\n' \

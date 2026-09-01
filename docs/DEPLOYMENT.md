@@ -68,8 +68,17 @@ generation); a subsystem that is off renders no UI entry point and — for the A
 tools are not advertised to the model at all. The endpoints refuse independently, so hiding
 is never the only enforcement.
 
-Two of those capabilities are *probed* rather than read off configuration, because a
-configured-looking subsystem that does not answer is the same thing to an analyst as an
+**Embeddings are off until an operator turns them on.** `VESTIGO_EMBEDDINGS_ENABLED`
+defaults to `false`, and it is checked ahead of everything else: nothing is probed, no socket
+is opened, and the subsystem is absent from the analyst UI and from the agent's tool list.
+Admins can flip it in **Settings → Embeddings** without a restart. Off is the honest default
+because the two things embeddings need are the two a fresh install is least likely to have —
+a vector store that answers, and either the model weights on disk or an embedding endpoint on
+the network — and an installation that offers "Improve search quality" for a job that cannot
+finish is worse than one that offers nothing.
+
+With the switch on, two capabilities are *probed* rather than read off configuration, because
+a configured-looking subsystem that does not answer is the same thing to an analyst as an
 unconfigured one. The agent's LLM endpoint must serve its model listing, and embeddings need
 both arms live: the vector store answering `get_collections()`, and — when
 `VESTIGO_EMBEDDING_API_BASE_URL` is set — that endpoint answering a one-token embed. So
@@ -78,8 +87,17 @@ agent's embedding tools, rather than leaving buttons whose jobs fail at the stor
 are cached (`VESTIGO_AGENT_PROBE_TTL_SECONDS`, `VESTIGO_EMBEDDING_PROBE_TTL_SECONDS`, both
 60s by default) and revalidated in the background, so a poll never waits on a hung service
 and a service coming back restores its UI within a TTL — no restart. To declare a deployment
-embedding-free outright, clear `VESTIGO_QDRANT_URL` and `VESTIGO_QDRANT_PATH`; nothing is
-probed then.
+embedding-free outright, leave `VESTIGO_EMBEDDINGS_ENABLED` false; clearing
+`VESTIGO_QDRANT_URL` and `VESTIGO_QDRANT_PATH` also stops anything being probed.
+
+The local model arm asks one more question on a host that is not allowed online
+(`VESTIGO_ALLOW_ONLINE=false`, the default): are the weights actually here? The `embeddings`
+extra being installed proves only that the *library* is, and an airgapped host can never
+download `all-MiniLM-L6-v2` on first use. So with online refused and no remote endpoint, the
+model counts as configured only when the weights are already in this host's Hugging Face
+cache or `VESTIGO_EMBEDDING_MODEL` names a local model directory. An online host is not
+asked — it fetches them on first use. The refusal message on `/api/health` and on the embed
+endpoint names which of these is missing.
 
 The map requires a session: an anonymous `GET /api/health` answers with liveness, version and
 `oidc_enabled` only. One exception to "refuses independently": with
@@ -426,9 +444,21 @@ Two supported routes. Pick by how the host runs Vestigo:
 ```bash
 scripts/airgap-bundle.sh                    # app + all three backing services
 scripts/airgap-bundle.sh -o /media/usb      # write straight to the drive
-scripts/airgap-bundle.sh --no-embeddings    # skip the ~2 GB local embedding stack
+scripts/airgap-bundle.sh --embeddings       # add the ~2 GB local embedding stack
+scripts/airgap-bundle.sh --no-embeddings    # the default, stated explicitly
 scripts/airgap-bundle.sh --app-only         # app image only — see the upgrade caveat
 ```
+
+**The local embedding stack is out of the bundle by default.** The image can carry torch and
+sentence-transformers; it cannot carry the model weights, and the airgapped host it installs
+on is never allowed to fetch them. A bundle that shipped the extra therefore produced an
+installation that looked capable of embedding and was not. Pass `--embeddings` only when the
+target will also have the weights (a pre-populated Hugging Face cache, or
+`VESTIGO_EMBEDDING_MODEL` pointed at a model directory you place there), or when it will use
+`VESTIGO_EMBEDDING_API_BASE_URL` against an embedding endpoint inside its own network — that
+path needs no extra at all. Either way the subsystem stays off until
+`VESTIGO_EMBEDDINGS_ENABLED=true`, and `install.sh` prints which kind of bundle it just
+installed.
 
 It builds the frontend, builds the app image from that prebuilt frontend (so the isolated
 host never resolves the `node:24-alpine` build image), saves every image the stack runs,
@@ -442,8 +472,8 @@ cannot reach the live stack from the wrong directory. Output is
 
 **Step 2 — carry it.** Nothing on the isolated host needs a registry, npm, a build or name
 resolution. It must already have a **container engine**: Docker with the compose plugin, or
-podman with podman-compose. Full bundle size is roughly 2.5–5 GB (`--no-embeddings` roughly
-halves it).
+podman with podman-compose. Bundle size is roughly 1.5–2.5 GB by default; `--embeddings`
+roughly doubles it.
 
 **Step 3 — install or upgrade (airgapped host):**
 

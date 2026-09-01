@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     qdrant_collection_prefix: str = "vestigo"
 
     # Embeddings
+    # Master switch for the whole optional subsystem. Off by default: a stock
+    # install has no vector store it has probed and, where the `embeddings`
+    # extra is present, no model weights it has been online to fetch — so
+    # advertising "Improve search quality" would offer a job that cannot
+    # finish. An operator who wants embeddings turns this on once, in the
+    # admin console or via VESTIGO_EMBEDDINGS_ENABLED, and the two-arm probe
+    # (models/availability.py) decides from there.
+    embeddings_enabled: bool = False
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_device: str = "cpu"
     embedding_batch_size: int = 64

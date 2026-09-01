@@ -312,3 +312,114 @@ def test_the_refusal_claims_no_probe_on_a_cold_cache(monkeypatch):
     detail = availability.unavailable_detail()
     assert "did not answer" not in detail
     assert "not available right now" in detail
+
+
+# ---------------------------------------------------------------------------
+# The operator switch and the local-weights arm
+# ---------------------------------------------------------------------------
+#
+# Both pin the same reported bug from opposite ends: an airgapped Docker
+# install shipped the `embeddings` extra, ran Qdrant, and therefore advertised
+# the whole embedding UI — "Improve search quality" on every timeline — for a
+# model whose weights the box had never been online to fetch.
+
+
+def _settings(monkeypatch, **env: str):
+    for key, value in env.items():
+        monkeypatch.setenv(f"VESTIGO_{key.upper()}", value)
+    get_settings.cache_clear()
+    availability.reset_probe_cache()
+
+
+async def test_the_switch_off_hides_embeddings_however_healthy_both_arms_are(monkeypatch):
+    _arms(monkeypatch, store=True, endpoint=True)
+    _settings(monkeypatch, embeddings_enabled="false")
+    try:
+        assert await availability.embeddings_operational() is False
+        assert embeddings_available() is False
+        assert "switched off" in availability.unavailable_detail()
+    finally:
+        get_settings.cache_clear()
+        availability.reset_probe_cache()
+
+
+async def test_the_switch_on_leaves_the_probe_in_charge(monkeypatch):
+    _arms(monkeypatch, store=False)
+    _settings(monkeypatch, embeddings_enabled="true")
+    try:
+        assert await availability.embeddings_operational() is False
+        _arms(monkeypatch, store=True)
+        availability.reset_probe_cache()
+        assert await availability.embeddings_operational() is True
+    finally:
+        get_settings.cache_clear()
+        availability.reset_probe_cache()
+
+
+def test_the_switch_off_never_probes(monkeypatch):
+    """Not just the answer: an off switch must not open a socket to say so."""
+
+    def _boom() -> bool:
+        raise AssertionError("probed a switched-off subsystem")
+
+    monkeypatch.setattr(availability, "_probe_vector_store", _boom)
+    _settings(monkeypatch, embeddings_enabled="false")
+    try:
+        assert embeddings_available() is False
+    finally:
+        get_settings.cache_clear()
+        availability.reset_probe_cache()
+
+
+def test_local_weights_missing_offline_is_not_a_configured_model(monkeypatch):
+    """The airgap case: extra installed, weights never fetched, online refused."""
+    _settings(monkeypatch, embeddings_enabled="true", allow_online="false")
+    # Asserted rather than left to the venv: whether this checkout installed the
+    # `embeddings` extra says nothing about the weights logic under test.
+    monkeypatch.setattr(availability, "_local_stack_importable", lambda: True)
+    monkeypatch.setattr(availability, "_local_weights_present", lambda: False)
+    try:
+        assert availability.model_configured() is False
+        assert "weights" in availability.unavailable_detail()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_local_weights_missing_online_is_still_configured(monkeypatch):
+    """An online host downloads them on first use — hiding the feature would be wrong."""
+    _settings(monkeypatch, embeddings_enabled="true", allow_online="true")
+    monkeypatch.setattr(availability, "_local_stack_importable", lambda: True)
+    monkeypatch.setattr(availability, "_local_weights_present", lambda: False)
+    try:
+        assert availability.model_configured() is True
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_remote_endpoint_needs_no_local_weights(monkeypatch):
+    _settings(
+        monkeypatch,
+        embeddings_enabled="true",
+        allow_online="false",
+        embedding_api_base_url="http://embed.local/v1",
+    )
+    monkeypatch.setattr(availability, "_local_weights_present", lambda: False)
+    try:
+        assert availability.model_configured() is True
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_model_named_as_a_local_directory_counts_as_present(monkeypatch, tmp_path):
+    model_dir = tmp_path / "all-MiniLM-L6-v2"
+    model_dir.mkdir()
+    _settings(
+        monkeypatch,
+        embeddings_enabled="true",
+        allow_online="false",
+        embedding_model=str(model_dir),
+    )
+    try:
+        assert availability._local_weights_present() is True
+    finally:
+        get_settings.cache_clear()

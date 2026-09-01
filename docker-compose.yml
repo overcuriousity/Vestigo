@@ -118,7 +118,11 @@ services:
 #      context: .
 #      dockerfile: Dockerfile
 #      args:
-#        INSTALL_EMBEDDINGS: "1"
+#        # "1" adds torch + sentence-transformers (~2 GB) for local embedding.
+#        # Leave it "0" unless this host can also obtain the model weights: the
+#        # extra alone does not make embeddings work, and the subsystem stays
+#        # off until VESTIGO_EMBEDDINGS_ENABLED is true either way.
+#        INSTALL_EMBEDDINGS: "0"
 #    ports:
 #      - "8080:8080"
 #    # Ingestion batches, export buffering and any converter subprocess live
@@ -137,6 +141,8 @@ services:
 #      VESTIGO_QDRANT_URL: http://qdrant:6333
 #      # VESTIGO_QDRANT_API_KEY: change-me
 #      VESTIGO_QDRANT_COLLECTION_PREFIX: vestigo
+#      # Off by default; see .env.example for why and for what it needs.
+#      VESTIGO_EMBEDDINGS_ENABLED: "false"
 #      VESTIGO_EMBEDDING_MODEL: all-MiniLM-L6-v2
 #      VESTIGO_EMBEDDING_DEVICE: cpu
 #      VESTIGO_EMBEDDING_BATCH_SIZE: 64

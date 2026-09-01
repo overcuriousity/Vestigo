@@ -22,12 +22,19 @@ So availability is both arms, each actually probed:
   :func:`_probe_local_store`.
 - **The embedding model.** A remote endpoint is probed with a one-token
   ``/embeddings`` request — reachable, authenticated and actually serving the
-  configured model. The *local* arm stays a configuration check
-  (``sentence_transformers`` importable), because proving it works means
-  loading a ~90 MB model, which no health poll can afford and which an
-  airgapped box that never fetched the weights would fail anyway. The honest
-  claim is "the library is installed", and this module does not pretend
-  otherwise.
+  configured model. The *local* arm never loads the model, because proving it
+  works that way means a ~90 MB load no health poll can afford; it asks
+  whether the extra is importable and, on a host that is not allowed online,
+  whether the weights are already in the local cache. That second half is the
+  airgap fix: the reference Docker bundle shipped the extra and ran Qdrant, so
+  it advertised the whole embedding UI for a model it had never been able to
+  download. An online host is not asked, since it fetches the weights on first
+  use.
+
+Ahead of both arms sits an operator switch, ``embeddings_enabled``, off by
+default. It is checked first and short-circuits everything: a subsystem the
+operator has turned off must not open a socket to report that it is off, and
+no probe result can turn it back on.
 
 Structure follows :mod:`vestigo.agent.availability`, for the same reasons it
 has that structure: a TTL cache keyed on a fingerprint of the settings the
@@ -80,6 +87,8 @@ def _fingerprint() -> str:
     """
     settings = get_settings()
     parts = (
+        str(bool(settings.embeddings_enabled)),
+        str(bool(settings.allow_online)),
         settings.qdrant_url or "",
         settings.qdrant_path or "",
         str(bool(settings.qdrant_api_key)),
@@ -90,18 +99,87 @@ def _fingerprint() -> str:
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:16]
 
 
+def subsystem_enabled() -> bool:
+    """The operator's master switch for embeddings.
+
+    Off by default, and checked before anything else: a switched-off subsystem
+    must not open a socket to report that it is off, and no probe result can
+    turn it back on. It exists alongside the probe rather than instead of it:
+    the probe answers "is anything listening", which an operator cannot state
+    for a subsystem they have deliberately not set up. See
+    ``docs/DEPLOYMENT.md`` on optional subsystems.
+    """
+    return bool(get_settings().embeddings_enabled)
+
+
+def _local_stack_importable() -> bool:
+    """Whether the ``embeddings`` extra is installed. Never imports it."""
+    import importlib.util
+
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+def _local_weights_present() -> bool:
+    """Whether the configured local model's weights are already on this host.
+
+    Checked, never fetched, and never loaded: a bare ``config.json`` lookup in
+    the Hugging Face cache costs a stat or two, which is what makes it
+    affordable on the synchronous request path that ``embeddings_available()``
+    sits on. A model name that is an existing directory is a local model
+    already — sentence-transformers accepts a path — so it needs no cache at
+    all.
+
+    Bare names are resolved the way sentence-transformers resolves them: a
+    name with no owner is looked up under ``sentence-transformers/`` too, which
+    is where the default ``all-MiniLM-L6-v2`` actually lives.
+    """
+    name = get_settings().embedding_model
+    if not name:
+        return False
+    if Path(name).is_dir():
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:  # no hub, so no cache to find weights in
+        return False
+    candidates = [name] if "/" in name else [name, f"sentence-transformers/{name}"]
+    for repo in candidates:
+        for filename in ("config.json", "modules.json"):
+            try:
+                hit = try_to_load_from_cache(repo, filename)
+            except Exception:  # a malformed repo id is not a crash, it is a miss
+                continue
+            if isinstance(hit, str):
+                return True
+    return False
+
+
 def model_configured() -> bool:
     """Whether anything on this instance can turn text into a vector.
 
-    True when the local sentence-transformers stack is importable (the
-    ``embeddings`` extra is installed) OR a remote OpenAI-compatible endpoint
-    is configured. Cheap: checks importability, never loads the model.
-    """
-    import importlib.util
+    True when a remote OpenAI-compatible endpoint is configured, or when the
+    local sentence-transformers stack is importable (the ``embeddings`` extra)
+    *and* its weights can actually be obtained.
 
+    That last clause is the airgap fix. The extra being importable used to be
+    the whole local answer, and the module docstring conceded the gap in so
+    many words: "an airgapped box that never fetched the weights would fail
+    anyway". It did — the reference Docker bundle shipped the extra and ran
+    Qdrant, so every timeline offered "Improve search quality" for a model the
+    host had never been online to download. Weights are therefore required
+    exactly where they cannot appear on their own: with ``allow_online`` off.
+    An online host is left alone, because it downloads them on first use and
+    hiding the feature until someone embeds once would be its own bug.
+
+    Still cheap, and still never loads the model.
+    """
     if get_settings().embedding_api_base_url:
         return True
-    return importlib.util.find_spec("sentence_transformers") is not None
+    if not _local_stack_importable():
+        return False
+    if get_settings().allow_online:
+        return True
+    return _local_weights_present()
 
 
 def vector_store_configured() -> bool:
@@ -262,8 +340,8 @@ def _schedule_refresh(fingerprint: str) -> None:
 async def embeddings_operational(*, force: bool = False) -> bool:
     """Whether an embedding job on this instance could actually complete.
 
-    The full answer, and the one ``/api/health`` reports: both arms configured,
-    and both probed. Cached for ``embedding_probe_ttl_seconds``; ``force``
+    The full answer, and the one ``/api/health`` reports: the operator switch
+    on, both arms configured, and both probed. Cached for ``embedding_probe_ttl_seconds``; ``force``
     bypasses the cache, and a fingerprint change bypasses the TTL.
 
     Stale-while-revalidate: a same-fingerprint entry that has merely outlived
@@ -273,6 +351,8 @@ async def embeddings_operational(*, force: bool = False) -> bool:
     poll right after an admin changes something.
     """
     global _cache
+    if not subsystem_enabled():
+        return False
     fingerprint = _fingerprint()
     ttl = get_settings().embedding_probe_ttl_seconds
     if not force and _cache is not None and _cache[2] == fingerprint:
@@ -314,7 +394,25 @@ def unavailable_detail() -> str:
     the vector store was part of this answer at all.
     """
     settings = get_settings()
+    if not subsystem_enabled():
+        return (
+            "Embeddings are switched off for this instance. An administrator can turn "
+            "them on under Settings \u2192 Embeddings (or with "
+            "VESTIGO_EMBEDDINGS_ENABLED=true); everything else about the subsystem is "
+            "checked only after that."
+        )
     if not model_configured():
+        if not settings.embedding_api_base_url and _local_stack_importable():
+            # The extra is here; what is missing is the weights, and this host
+            # is not allowed to fetch them. Saying "install the extra" would
+            # send an airgapped operator a long way in the wrong direction.
+            return (
+                f"The local embedding model ({settings.embedding_model}) has no weights "
+                "on this host, and VESTIGO_ALLOW_ONLINE is false so they cannot be "
+                "downloaded. Pre-populate the Hugging Face cache, point "
+                "VESTIGO_EMBEDDING_MODEL at a local model directory, or configure "
+                "VESTIGO_EMBEDDING_API_BASE_URL for a remote embedding endpoint."
+            )
         return (
             "Embedding support is not installed. Install the 'embeddings' extra "
             "(uv sync --extra embeddings) or configure VESTIGO_EMBEDDING_API_BASE_URL "
