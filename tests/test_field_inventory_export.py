@@ -152,6 +152,31 @@ async def test_separator_is_configurable(patched_store, monkeypatch, separator, 
     assert f".{ext}" in resp.headers["content-disposition"]
 
 
+@pytest.mark.parametrize(
+    ("separator", "expected_suffix"),
+    [
+        ("comma", "-inventory-comma.csv"),
+        ("semicolon", "-inventory-semicolon.csv"),
+        ("pipe", "-inventory-pipe.csv"),
+        ("tab", "-inventory-tab.tsv"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_filename_names_the_separator(patched_store, monkeypatch, separator, expected_suffix):
+    """comma, semicolon and pipe all produced the same filename, so a second
+    export of the same field landed beside the first as `…(1).csv` and the
+    analyst kept opening the original — which is what "the separator picker
+    does nothing" actually was. The file must name the separator it used."""
+    resp, _ = await _export(
+        patched_store,
+        monkeypatch,
+        _FakeInventoryService(2),
+        _request(columns=["value"], separator=separator, order_by="value_asc"),
+    )
+
+    assert resp.headers["content-disposition"].endswith(f'{expected_suffix}"')
+
+
 @pytest.mark.asyncio
 async def test_a_value_containing_the_separator_is_quoted(patched_store, monkeypatch):
     """The inventory of a field whose values contain the chosen separator must

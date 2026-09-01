@@ -97,5 +97,9 @@ export async function downloadFieldInventory(
 
   const ext = inventory.separator === "tab" ? "tsv" : "csv";
   const slug = inventory.field.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "field";
-  triggerDownload(blob, `${caseId}-${timelineId}-${slug}-inventory.${ext}`);
+  // Must match the server's Content-Disposition name exactly. The separator is
+  // part of it because comma, semicolon and pipe otherwise share one filename,
+  // so a second export of the same field saves as `…(1).csv` and the analyst
+  // reopens the first — indistinguishable from the picker doing nothing.
+  triggerDownload(blob, `${caseId}-${timelineId}-${slug}-inventory-${inventory.separator}.${ext}`);
 }

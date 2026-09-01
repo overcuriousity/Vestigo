@@ -1974,7 +1974,11 @@ async def export_field_inventory(
         )
 
     slug = re.sub(r"[^A-Za-z0-9]+", "_", body.field).strip("_") or "field"
-    filename = f"{case_id}-{timeline_id}-{slug}-inventory.{ext}"
+    # The separator is in the name because comma, semicolon and pipe otherwise
+    # all land as `…-inventory.csv`: re-exporting one field with a different
+    # separator saves beside the first as `…(1).csv` while the analyst reopens
+    # the original, which reads exactly like the picker being ignored.
+    filename = f"{case_id}-{timeline_id}-{slug}-inventory-{body.separator}.{ext}"
     return StreamingResponse(
         _stream_field_inventory(
             eq,

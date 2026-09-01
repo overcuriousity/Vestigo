@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to evidence while recording nothing. Details are now coerced JSON-safe in the one place
   every call site passes through, and the three affected call sites write proper ISO-8601.
 
+- **Value-inventory exports name their separator in the filename.** Comma, semicolon and pipe
+  all produced `…-inventory.csv`, so exporting the same field twice with different separators
+  saved the second beside the first as `…-inventory(1).csv` — and an analyst who opened the
+  original saw the old separator and concluded the picker did nothing. The separator was
+  always applied correctly to the file's contents; only the name was ambiguous.
+
 ### Changed
 
 - **CSV exports now give every field its own column** instead of collapsing every per-event
