@@ -320,8 +320,10 @@ and last seen, and — given a second field — how many distinct values of it e
 is the value inventory (#295) made bounded, and it is built to agree with it cell for cell.
 
 **One SELECT core.** `EventQueryService.field_table` (`db/queries.py`) and the streamed
-`iter_field_inventory` share `_inventory_select_core` — `val, count(), min(dated),
-max(dated)` over one `GROUP BY val`, with the no-timestamp sentinel nulled *inside* the
+`iter_field_inventory` share `_inventory_select_core` — `val…, count(), min(dated),
+max(dated)` over one `GROUP BY` of the value columns, of which the table always has one and
+the inventory has one per selected field (#295 grew multi-field combinations) — with the
+no-timestamp sentinel nulled *inside* the
 aggregate so a value seen only on undated events keeps its count and reports no time rather
 than the year 2299. `tests/test_table_clickhouse.py` asserts the two agree on every shared
 cell. The table adds `uniqExactIf(second, second != '')` as `distinct_second`, and runs two

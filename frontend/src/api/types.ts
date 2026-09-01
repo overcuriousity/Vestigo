@@ -1820,7 +1820,8 @@ export interface ExportRequest {
 }
 
 /** Columns a value inventory can carry (#295). `value` is what the file is *of*,
- * so it is always emitted; the column the file is sorted by is appended when the
+ * so it is always emitted — as one written column per selected field, each headed
+ * with that field's token; the column the file is sorted by is appended when the
  * analyst has not ticked it. */
 export type FieldInventoryColumn = "value" | "count" | "first_seen" | "last_seen";
 
@@ -1838,10 +1839,11 @@ export type FieldInventoryOrder =
   | "last_seen_asc"
   | "last_seen_desc";
 
-/** Body for the value-inventory export: one row per distinct value of `field`,
- * within the same filters an events export would use. */
+/** Body for the value-inventory export: one row per distinct value of `fields` —
+ * per distinct *combination* when there is more than one — within the same filters
+ * an events export would use. */
 export interface FieldInventoryRequest {
-  field: string;
+  fields: string[];
   columns: FieldInventoryColumn[];
   separator: FieldInventorySeparator;
   order_by: FieldInventoryOrder;

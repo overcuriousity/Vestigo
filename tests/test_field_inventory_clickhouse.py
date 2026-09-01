@@ -47,6 +47,12 @@ _ROWS: list[tuple[str | None, str | None]] = [
     ("delta", None),
 ]
 
+# The second field, by row index, for the combination inventory. Deliberately
+# ragged: row 3 carries an empty `user`, rows 4/8/9 carry none at all, and row 6
+# carries a `user` while its `src_ip` is empty — a combination that must still be
+# written, because only the *all*-empty one describes no event's values.
+_USERS: dict[int, str] = {0: "alice", 1: "alice", 2: "bob", 3: "", 5: "alice", 6: "carol"}
+
 
 def _event(i: int, value: str | None, ts: str | None, source_id: str = SRC) -> Event:
     return Event(
@@ -63,7 +69,10 @@ def _event(i: int, value: str | None, ts: str | None, source_id: str = SRC) -> E
         timestamp=ts,
         timestamp_desc="Test Time",
         artifact="test:inventory",
-        attributes={} if value is None else {"src_ip": value},
+        attributes={
+            **({} if value is None else {"src_ip": value}),
+            **({"user": _USERS[i]} if i in _USERS else {}),
+        },
     )
 
 
@@ -91,8 +100,15 @@ def _query(**kwargs) -> EventQuery:
 
 def _inventory(service, query, **kwargs) -> dict[str, dict]:
     return {
-        row["value"]: row for row in service.iter_field_inventory(query, "attr:src_ip", **kwargs)
+        row["values"][0]: row
+        for row in service.iter_field_inventory(query, "attr:src_ip", **kwargs)
     }
+
+
+def _combinations(service, query=None, **kwargs) -> dict[tuple[str, ...], dict]:
+    """The two-field inventory, keyed by the combination it describes."""
+    rows = service.iter_field_inventory(query or _query(), ["attr:src_ip", "attr:user"], **kwargs)
+    return {tuple(row["values"]): row for row in rows}
 
 
 def test_inventory_reports_count_and_first_last_seen(service):
@@ -162,7 +178,7 @@ def test_inventory_ordering(service, order, expected):
     either direction rather than to the year 2299 or to the top of a
     most-recent-first file."""
     values = [
-        row["value"]
+        row["values"][0]
         for row in service.iter_field_inventory(_query(), "attr:src_ip", order_by=order)
     ]
 
@@ -205,10 +221,10 @@ def test_inventory_decodes_fixed_string_hash_values(service):
     """
     rows = list(service.iter_field_inventory(_query(), "file_hash"))
 
-    assert [row["value"] for row in rows] == ["a" * 64]
+    assert [row["values"][0] for row in rows] == ["a" * 64]
     assert rows[0]["count"] == len(_ROWS)
 
-    content = {row["value"] for row in service.iter_field_inventory(_query(), "content_hash")}
+    content = {row["values"][0] for row in service.iter_field_inventory(_query(), "content_hash")}
     assert all(isinstance(value, str) for value in content)
     assert f"{0:064d}" in content
 
@@ -224,6 +240,83 @@ def test_count_matches_the_stream_for_a_fixed_string_field(service):
 
     assert expected == len(list(service.iter_field_inventory(_query(), "content_hash")))
     assert expected == len(_ROWS)
+
+
+# ── Several fields: the inventory of a combination ──────────────────────────
+
+
+def test_combination_inventory_counts_the_pair_not_the_values(service):
+    """Each row is one distinct combination, and its count is the number of
+    events carrying *that* combination — not either value's own total."""
+    rows = _combinations(service)
+
+    assert rows[("alpha", "alice")]["count"] == 2
+    assert rows[("alpha", "bob")]["count"] == 1
+    assert rows[("gamma", "alice")]["count"] == 1
+    # `alpha` alone occurs three times; splitting it by `user` is the point.
+    assert sum(r["count"] for k, r in rows.items() if k[0] == "alpha") == 3
+
+
+def test_a_combination_survives_unless_every_part_is_empty(service):
+    """An empty part is an empty cell, not a dropped row — the value it sits
+    beside is still a value the analyst asked to see. Only the all-empty
+    combination, which describes no event's values at all, is excluded."""
+    rows = _combinations(service)
+
+    assert rows[("beta", "")]["count"] == 2  # `user` empty on one row, absent on the other
+    assert rows[("", "carol")]["count"] == 1  # the *first* field may be the empty one
+    assert ("", "") not in rows
+
+
+def test_combination_seen_range_covers_only_that_combination(service):
+    """The first/last seen of a row are those of the events carrying the
+    combination — a pair seen only on undated events still reports no time."""
+    rows = _combinations(service)
+
+    assert rows[("alpha", "alice")]["first_seen"] == "2026-03-01T00:00:00+00:00"
+    assert rows[("alpha", "alice")]["last_seen"] == "2026-03-02T00:00:00+00:00"
+    assert rows[("delta", "")]["first_seen"] is None
+
+
+def test_combination_value_ordering_sorts_across_every_column(service):
+    """`value_asc` is the tuple ordering, left to right — otherwise a file
+    sorted "by value" would look shuffled inside each first-column group."""
+    ordered = list(_combinations(service, order_by="value_asc"))
+
+    assert ordered == [
+        ("", "carol"),
+        ("alpha", "alice"),
+        ("alpha", "bob"),
+        ("beta", ""),
+        ("delta", ""),
+        ("gamma", "alice"),
+    ]
+
+
+def test_count_field_inventory_matches_the_combination_stream(service):
+    """The completeness trailer is proven against this number, so the two must
+    agree on combinations exactly as they do on single values."""
+    fields = ["attr:src_ip", "attr:user"]
+
+    expected = service.count_field_inventory(_query(), fields)
+
+    assert expected == len(list(service.iter_field_inventory(_query(), fields)))
+    assert expected == 6
+
+
+def test_combination_inventory_honours_filters(service):
+    """The same scope rule as the single-field inventory."""
+    rows = _combinations(service, _query(start=datetime.fromisoformat("2026-03-03T00:00:00+00:00")))
+
+    assert set(rows) == {("alpha", "bob"), ("beta", "")}
+
+
+@pytest.mark.parametrize("fields", [[], ["attr:src_ip", "attr:src_ip"]])
+def test_invalid_field_selections_are_rejected(service, fields):
+    with pytest.raises(ValueError):
+        list(service.iter_field_inventory(_query(), fields))
+    with pytest.raises(ValueError):
+        service.count_field_inventory(_query(), fields)
 
 
 def _free(sem: threading.BoundedSemaphore) -> bool:
