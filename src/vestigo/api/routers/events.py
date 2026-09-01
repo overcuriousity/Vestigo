@@ -8,7 +8,7 @@ import io
 import json
 import logging
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any, Literal
@@ -65,7 +65,12 @@ from vestigo.db.postgres import (
     generate_id,
     scope_identity,
 )
-from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
+from vestigo.db.queries import (
+    INVENTORY_MAX_FIELDS,
+    EventQuery,
+    EventQueryService,
+    TagFilter,
+)
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
 from vestigo.models.availability import unavailable_detail
 from vestigo.models.embeddings import embeddings_available
@@ -985,7 +990,10 @@ async def bulk_annotate_by_filter(
             "matched": len(refs),
             "tagged": tagged,
             "filter": body.model_dump(
-                exclude={"annotation_type", "content"}, exclude_none=True, exclude_defaults=True
+                mode="json",
+                exclude={"annotation_type", "content"},
+                exclude_none=True,
+                exclude_defaults=True,
             ),
         },
     )
@@ -1343,8 +1351,10 @@ class ExportRequest(BaseModel):
 
 # ── Export streaming helpers ──────────────────────────────────────────────────
 
-# Core scalar columns included in CSV exports (attributes flattened to JSON).
-_CSV_COLUMNS = [
+# Core scalar columns included in every CSV export. Per-event custom fields
+# (``attributes``) get their own ``attr:<key>`` column instead of being
+# dumped into a single JSON blob column — see ``_stream_csv``.
+_CSV_CORE_COLUMNS = [
     "event_id",
     "timestamp",
     "timestamp_desc",
@@ -1354,7 +1364,6 @@ _CSV_COLUMNS = [
     "display_name",
     "message",
     "tags",
-    "attributes",
     "content_hash",
     "file_hash",
     "user_tags",
@@ -1426,8 +1435,25 @@ def _stream_csv(
     *,
     expected: int,
     tally: dict[str, Any],
+    attr_keys: Sequence[str] = (),
 ) -> Generator[str]:
     """Yield CSV rows for all matching events (header first), annotations flattened.
+
+    Every field the timeline's sources carry gets its own column: the core
+    scalar columns (``_CSV_CORE_COLUMNS``) plus one ``attr:<key>`` column per
+    entry in *attr_keys* — the union of attribute keys across the timeline's
+    sources (``_resolve_export_attr_keys``), not just the ones this filtered
+    slice happens to use, so the column set doesn't shift row to row. An
+    event missing a given key writes an empty cell for it (``csv.DictWriter``'s
+    ``restval``).
+
+    A key seen after the field-stats cache was last computed (or beyond its
+    per-source cap) has no column, and reopening the column set mid-stream
+    would invalidate every row already sent — so its values are dropped and
+    the trailer names them (``dropped_attribute_keys``/``…_values``/
+    ``dropped_keys``). Disclosed rather than fatal: every matching *event* is
+    still in the file and still counted, only extra columns are missing, and
+    JSONL remains the lossless record. A stale cache must not become an outage.
 
     A leading ``# applied_time_offsets=…`` comment documents any active
     per-source clock-skew offset; without one the output is byte-identical to
@@ -1435,14 +1461,19 @@ def _stream_csv(
 
     A trailing ``# vestigo_export …`` comment proves completeness against a
     pre-flight ``count()``; a shortfall marks it ``complete=false`` and raises
-    :class:`ExportIncompleteError` (see its docstring).
+    :class:`ExportIncompleteError` (see its docstring). That flag is about
+    *rows* — a file can be row-complete and still have dropped a column.
     """
     buf = io.StringIO()
     if applied_offsets:
         yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
+    fieldnames = [*_CSV_CORE_COLUMNS, *(f"attr:{key}" for key in attr_keys)]
+    known_attr_columns = {f"attr:{key}" for key in attr_keys}
+    dropped_keys: set[str] = set()
+    dropped_values = 0
     writer = csv.DictWriter(
         buf,
-        fieldnames=_CSV_COLUMNS,
+        fieldnames=fieldnames,
         extrasaction="ignore",
         lineterminator="\n",
     )
@@ -1458,9 +1489,19 @@ def _stream_csv(
         tags = row.get("tags")
         if isinstance(tags, list):
             row["tags"] = ";".join(str(t) for t in tags)
-        attrs = row.get("attributes")
+        attrs = row.pop("attributes", None)
         if isinstance(attrs, dict):
-            row["attributes"] = json.dumps(attrs)
+            for key, val in attrs.items():
+                column = f"attr:{key}"
+                if column in known_attr_columns:
+                    row[column] = val
+                else:
+                    # No column for this key: the cached field-stats inventory
+                    # predates the event, or the per-source key cap elided it.
+                    # DictWriter's extrasaction="ignore" would drop the value
+                    # without a word — count it so the trailer can disclose it.
+                    dropped_keys.add(key)
+                    dropped_values += 1
 
         anns = annotations_by_event.get(row["event_id"], [])
         row["user_tags"] = ";".join(
@@ -1482,7 +1523,27 @@ def _stream_csv(
     complete = written == expected
     tally["written"] = written
     tally["complete"] = complete
-    yield f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}\n"
+    tally["dropped_keys"] = dropped_keys
+    tally["dropped_values"] = dropped_values
+    # Row completeness and column completeness are separate claims: every
+    # matching event is here, but a key with no column lost its values. Say so
+    # rather than letting `complete=true` stand for both.
+    trailer = (
+        f"# vestigo_export complete={str(complete).lower()} rows={written} expected={expected}"
+    )
+    if dropped_keys:
+        trailer += (
+            f" dropped_attribute_keys={len(dropped_keys)}"
+            f" dropped_attribute_values={dropped_values}"
+            f" dropped_keys={';'.join(sorted(dropped_keys))}"
+        )
+        _logger.error(
+            "export dropped attribute values with no column: keys=%s values=%s case=%s",
+            sorted(dropped_keys),
+            dropped_values,
+            query.case_id,
+        )
+    yield trailer + "\n"
     if not complete:
         _logger.error(
             "export incomplete (csv): expected=%s written=%s case=%s sources=%s",
@@ -1492,6 +1553,31 @@ def _stream_csv(
             query.source_ids,
         )
         raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
+
+
+async def _resolve_export_attr_keys(case_id: str, source_ids: list[str]) -> list[str]:
+    """Attribute keys to give their own column in a CSV export.
+
+    Sourced from the same cached per-source field-stats inventory the field
+    picker reads (``list_fields``), not the filtered query — a full-scan
+    ``arrayJoin(mapKeys(attributes))`` per export would cost as much as the
+    export itself, and the column set stays stable for a given timeline
+    regardless of which filter narrowed the export down.
+
+    Deliberately *without* the timeline's field mappings. A mapping is a
+    presentation-layer merge: ``apply_mappings_to_attribute_keys`` hides the
+    raw keys and offers the canonical name in their place, which is right for a
+    picker but wrong here, because the rows this columnises come from
+    ``iter_events`` — which does not run ``project_mapped_fields`` (see its
+    docstring). Merging the header alone would head the file with an
+    always-empty ``attr:<canonical>`` column, give the raw keys no column at
+    all, and drop every one of their values behind a row-complete trailer. An
+    export carries what was ingested, which is also what JSONL carries.
+    """
+    stats = await ensure_source_field_stats(
+        get_store(), _get_query_service().store, case_id, source_ids
+    )
+    return merged_list_fields(stats)["attributes"]
 
 
 async def _build_export_query(
@@ -1615,8 +1701,14 @@ async def export_events(
     else:
         media_type = "text/csv"
         ext = "csv"
+        attr_keys = await _resolve_export_attr_keys(case_id, eq.source_ids or [])
         content = _stream_csv(
-            eq, annotations_by_event, source_offsets, expected=expected, tally=tally
+            eq,
+            annotations_by_event,
+            source_offsets,
+            expected=expected,
+            tally=tally,
+            attr_keys=attr_keys,
         )
 
     # Audited before streaming starts: an export that fails mid-stream still
@@ -1633,7 +1725,7 @@ async def export_events(
         detail={
             "format": body.format,
             "expected": expected,
-            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            "filter": body.filter.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
             **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )
@@ -1655,6 +1747,18 @@ async def export_events(
                 "expected": expected,
                 "written": tally["written"],
                 "complete": tally["complete"],
+                # Row completeness and column completeness are separate claims,
+                # and the audit row is where a later reader looks for either. A
+                # file trailer naming a dropped key is no use to someone reading
+                # the custody record instead of the download.
+                **(
+                    {
+                        "dropped_keys": sorted(tally["dropped_keys"]),
+                        "dropped_attribute_values": tally["dropped_values"],
+                    }
+                    if tally.get("dropped_keys")
+                    else {}
+                ),
             },
         )
 
@@ -1671,7 +1775,9 @@ async def export_events(
 
 #: The four columns a value inventory can carry. `value` is what the file is
 #: *of*, so it is always present; the rest are the analyst's choice, and the
-#: order they ask for is the order they get.
+#: order they ask for is the order they get. With several fields selected,
+#: `value` stands for the whole value part of the row — one written column per
+#: field, headed with that field's token.
 _INVENTORY_COLUMNS = ("value", "count", "first_seen", "last_seen")
 
 #: Named separators rather than a free-text character: a delimited file is
@@ -1684,11 +1790,61 @@ _INVENTORY_SEPARATORS = {"comma": ",", "semicolon": ";", "tab": "\t", "pipe": "|
 class FieldInventoryRequest(BaseModel):
     """Request body for the value-inventory export."""
 
-    field: str = Field(min_length=1, description="Field token, e.g. 'attr:src_ip'")
+    fields: list[str] = Field(
+        min_length=1,
+        max_length=INVENTORY_MAX_FIELDS,
+        description=(
+            "Field tokens, e.g. ['attr:src_ip', 'attr:user']. More than one inventories "
+            "the distinct combinations of their values."
+        ),
+    )
     columns: list[str] = Field(default_factory=lambda: ["value", "first_seen", "last_seen"])
     separator: Literal["comma", "semicolon", "tab", "pipe"] = "comma"
     order_by: str = "count_desc"
     filter: ExportFilter = Field(default_factory=ExportFilter)
+
+
+def _inventory_fields(body: FieldInventoryRequest) -> list[str]:
+    """Validate the requested fields, turning a bad selection into a 400.
+
+    The query layer raises the same refusals (:func:`_inventory_tokens`), but
+    it raises them inside the generator — where the status line is long gone
+    and the only report left is a truncated 200.
+    """
+    tokens = [f.strip() for f in body.fields]
+    if any(not token for token in tokens):
+        raise HTTPException(status_code=400, detail="a field token cannot be empty")
+    if len(set(tokens)) != len(tokens):
+        raise HTTPException(status_code=400, detail="duplicate field in selection")
+    return tokens
+
+
+def _inventory_slug(fields: list[str]) -> str:
+    """Filename stem for an inventory of *fields* — mirrored by the frontend.
+
+    Every field appears, so two inventories of the same timeline that differ
+    only in their second field do not land in the download folder as one name
+    and a browser-appended ``(1)``.
+    """
+    parts = [re.sub(r"[^A-Za-z0-9]+", "_", f).strip("_") for f in fields]
+    return "-".join(p for p in parts if p) or "field"
+
+
+def _inventory_header(columns: list[str], fields: list[str]) -> list[str]:
+    """Expand the `value` column into one header cell per selected field.
+
+    The header names the keys the file is an inventory *of*, so each value
+    column carries its field token rather than a positional `value`/`value_2`
+    — that is what lets a reader join the file back to the events export, and
+    what makes a two-field file self-describing without the request beside it.
+    """
+    header: list[str] = []
+    for column in columns:
+        if column == "value":
+            header.extend(fields)
+        else:
+            header.append(column)
+    return header
 
 
 def _resolve_inventory_columns(columns: list[str], order_by: str) -> list[str]:
@@ -1727,6 +1883,7 @@ async def _audit_inventory_export(
     case_id: str,
     timeline_id: str,
     body: FieldInventoryRequest,
+    fields: list[str],
     columns: list[str],
     expected: int,
     source_offsets: dict[str, int] | None,
@@ -1744,12 +1901,12 @@ async def _audit_inventory_export(
         target_type="timeline",
         target_id=timeline_id,
         detail={
-            "field": body.field,
+            "fields": fields,
             "columns": columns,
             "separator": body.separator,
             "order_by": body.order_by,
             "expected": expected,
-            "filter": body.filter.model_dump(exclude_none=True, exclude_defaults=True),
+            "filter": body.filter.model_dump(mode="json", exclude_none=True, exclude_defaults=True),
             **({"applied_time_offsets": source_offsets} if source_offsets else {}),
         },
     )
@@ -1757,7 +1914,7 @@ async def _audit_inventory_export(
 
 def _stream_field_inventory(
     query: EventQuery,
-    field_token: str,
+    field_tokens: list[str],
     *,
     columns: list[str],
     delimiter: str,
@@ -1766,7 +1923,7 @@ def _stream_field_inventory(
     expected: int,
     tally: dict[str, Any],
 ) -> Generator[str]:
-    """Yield the delimited value inventory for *field_token* (header first).
+    """Yield the delimited value inventory for *field_tokens* (header first).
 
     Same self-describing envelope as the events export — a leading
     ``# applied_time_offsets=…`` comment when a clock-skew offset is active,
@@ -1779,17 +1936,27 @@ def _stream_field_inventory(
         if applied_offsets:
             yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
         writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-        writer.writerow(columns)
+        writer.writerow(_inventory_header(columns, field_tokens))
         yield buf.getvalue()
 
         written = 0
         rows = _get_query_service().iter_field_inventory(
-            query, field_token, order_by=order_by, hold_export_slot=False
+            query, field_tokens, order_by=order_by, hold_export_slot=False
         )
         for row in rows:
             buf.seek(0)
             buf.truncate()
-            writer.writerow(["" if row.get(c) is None else row[c] for c in columns])
+            cells: list[Any] = []
+            for column in columns:
+                if column == "value":
+                    # One cell per selected field, in the order asked for. A
+                    # field that was empty on every event of this combination
+                    # writes an empty cell — the row is still a combination the
+                    # analyst asked to see (only the all-empty one is dropped).
+                    cells.extend("" if v is None else v for v in row["values"])
+                else:
+                    cells.append("" if row.get(column) is None else row[column])
+            writer.writerow(cells)
             yield buf.getvalue()
             written += 1
 
@@ -1802,11 +1969,11 @@ def _stream_field_inventory(
         )
         if not complete:
             _logger.error(
-                "field inventory export incomplete: expected=%s written=%s case=%s field=%s",
+                "field inventory export incomplete: expected=%s written=%s case=%s fields=%s",
                 expected,
                 written,
                 query.case_id,
-                field_token,
+                field_tokens,
             )
             raise ExportIncompleteError(f"export wrote {written} of {expected} distinct values")
     finally:
@@ -1825,16 +1992,23 @@ async def export_field_inventory(
     case: Case = Depends(require_case_read),
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Stream a delimited inventory of one field's distinct values (#295).
+    """Stream a delimited inventory of the distinct values of one or more fields (#295).
 
     One row per distinct value with its count and the first and last time it
     was seen — the aggregate an analyst would otherwise have had to rebuild
     from a full events export. Computed inside the *current* filters, exactly
     like the events export, and stamped with the same ISO-8601 UTC times, so
     the two files join.
+
+    Several fields inventory their distinct *combinations*: one value column
+    per field, and a count and seen range describing the events that carry that
+    exact combination. A combination survives unless every one of its parts is
+    empty, so a value that only ever appears without its partner still gets a
+    row, with an empty cell beside it.
     """
     if body.order_by not in EventQueryService.INVENTORY_ORDERINGS:
         raise HTTPException(status_code=400, detail=f"unknown ordering {body.order_by!r}")
+    fields = _inventory_fields(body)
     columns = _resolve_inventory_columns(body.columns, body.order_by)
     eq, source_offsets = await _build_export_query(case_id, timeline_id, body.filter)
 
@@ -1847,7 +2021,7 @@ async def export_field_inventory(
         _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
         _get_query_service().count_field_inventory,
         eq,
-        body.field,
+        fields,
     )
 
     tally: dict[str, Any] = {"written": None, "complete": None}
@@ -1873,7 +2047,7 @@ async def export_field_inventory(
     store = get_store()
     try:
         await _audit_inventory_export(
-            store, user, case_id, timeline_id, body, columns, expected, source_offsets
+            store, user, case_id, timeline_id, body, fields, columns, expected, source_offsets
         )
     except BaseException:
         # Nothing will drain the stream, so nothing will release the slot.
@@ -1888,19 +2062,24 @@ async def export_field_inventory(
             target_type="timeline",
             target_id=timeline_id,
             detail={
-                "field": body.field,
+                "fields": fields,
                 "expected": expected,
                 "written": tally["written"],
                 "complete": tally["complete"],
             },
         )
 
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", body.field).strip("_") or "field"
-    filename = f"{case_id}-{timeline_id}-{slug}-inventory.{ext}"
+    # The separator is in the name because comma, semicolon and pipe otherwise
+    # all land as `…-inventory.csv`: re-exporting the same fields with a
+    # different separator saves beside the first as `…(1).csv` while the analyst
+    # reopens the original, which reads exactly like the picker being ignored.
+    # The slug carries every field, so a two-field inventory and a one-field one
+    # never collide either.
+    filename = f"{case_id}-{timeline_id}-{_inventory_slug(fields)}-inventory-{body.separator}.{ext}"
     return StreamingResponse(
         _stream_field_inventory(
             eq,
-            body.field,
+            fields,
             columns=columns,
             delimiter=delimiter,
             order_by=body.order_by,

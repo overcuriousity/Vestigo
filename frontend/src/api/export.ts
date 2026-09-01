@@ -60,15 +60,16 @@ function exportFilterPayload(filters: EventFilters): ExportFilterPayload {
 }
 
 export interface FieldInventoryOptions {
-  field: string;
+  fields: string[];
   columns: FieldInventoryColumn[];
   separator: FieldInventorySeparator;
   orderBy: FieldInventoryOrder;
 }
 
 /**
- * Download a value inventory of one field: one row per distinct value with its
- * count and first/last seen, within the current filters (#295).
+ * Download a value inventory: one row per distinct value with its count and
+ * first/last seen, within the current filters (#295). Several fields inventory
+ * their distinct combinations, one written column per field.
  *
  * Streamed and uncapped like the events export — a high-cardinality field can have
  * millions of distinct values — so `opts` carries the same indeterminate progress
@@ -82,7 +83,7 @@ export async function downloadFieldInventory(
   opts?: TransferOptions,
 ): Promise<void> {
   const body: FieldInventoryRequest = {
-    field: inventory.field,
+    fields: inventory.fields,
     columns: inventory.columns,
     separator: inventory.separator,
     order_by: inventory.orderBy,
@@ -96,6 +97,16 @@ export async function downloadFieldInventory(
   );
 
   const ext = inventory.separator === "tab" ? "tsv" : "csv";
-  const slug = inventory.field.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "field";
-  triggerDownload(blob, `${caseId}-${timelineId}-${slug}-inventory.${ext}`);
+  // Must match the server's `Content-Disposition` name (`_inventory_slug`)
+  // exactly. The slug carries every field so a two-field inventory and a
+  // one-field one never collide, and the separator is part of it because comma,
+  // semicolon and pipe otherwise share one filename — a second export of the
+  // same fields saves as `…(1).csv` and the analyst reopens the first, which is
+  // indistinguishable from the picker doing nothing.
+  const slug =
+    inventory.fields
+      .map((f) => f.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, ""))
+      .filter(Boolean)
+      .join("-") || "field";
+  triggerDownload(blob, `${caseId}-${timelineId}-${slug}-inventory-${inventory.separator}.${ext}`);
 }

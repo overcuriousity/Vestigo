@@ -11,6 +11,7 @@ download rather than hand over a silently short inventory.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -36,16 +37,33 @@ async def patched_store(pg_database, monkeypatch):
 
 _ROWS = [
     {
-        "value": "10.0.0.4",
+        "values": ["10.0.0.4"],
         "count": 3,
         "first_seen": "2026-03-01T00:00:00+00:00",
         "last_seen": "2026-03-05T12:00:00+00:00",
     },
     {
-        "value": "10.0.0.9;with-separator",
+        "values": ["10.0.0.9;with-separator"],
         "count": 1,
         "first_seen": None,
         "last_seen": None,
+    },
+]
+
+#: What a two-field inventory yields: the distinct *combinations*, including
+#: one whose second field was empty on every event carrying it.
+_PAIR_ROWS = [
+    {
+        "values": ["10.0.0.4", "alice"],
+        "count": 3,
+        "first_seen": "2026-03-01T00:00:00+00:00",
+        "last_seen": "2026-03-05T12:00:00+00:00",
+    },
+    {
+        "values": ["10.0.0.4", ""],
+        "count": 1,
+        "first_seen": "2026-03-02T00:00:00+00:00",
+        "last_seen": "2026-03-02T00:00:00+00:00",
     },
 ]
 
@@ -58,17 +76,20 @@ class _FakeInventoryService:
         self._count = count_val
         self._rows = _ROWS if rows is None else rows
         self.last_order_by: str | None = None
+        self.last_fields: list[str] | None = None
 
-    def count_field_inventory(self, query, field_token):
+    def count_field_inventory(self, query, field_tokens):
+        self.last_fields = list(field_tokens)
         return self._count
 
-    def iter_field_inventory(self, query, field_token, *, order_by="count_desc", **kwargs):
+    def iter_field_inventory(self, query, field_tokens, *, order_by="count_desc", **kwargs):
         self.last_order_by = order_by
+        self.last_fields = list(field_tokens)
         yield from self._rows
 
 
 def _request(**kwargs) -> events.FieldInventoryRequest:
-    kwargs.setdefault("field", "attr:src_ip")
+    kwargs.setdefault("fields", ["attr:src_ip"])
     return events.FieldInventoryRequest(**kwargs)
 
 
@@ -90,11 +111,12 @@ async def _export(store, monkeypatch, service, body):
 @pytest.mark.asyncio
 async def test_default_columns(patched_store, monkeypatch):
     """value, first seen, last seen — the three the analyst asked for, plus the
-    count the default most-frequent-first ordering sorts by."""
+    count the default most-frequent-first ordering sorts by. The value column is
+    headed with the field it inventories, so the file names its own keys."""
     _, body = await _export(patched_store, monkeypatch, _FakeInventoryService(2), _request())
 
     lines = body.splitlines()
-    assert lines[0] == "value,first_seen,last_seen,count"
+    assert lines[0] == "attr:src_ip,first_seen,last_seen,count"
     assert lines[1] == "10.0.0.4,2026-03-01T00:00:00+00:00,2026-03-05T12:00:00+00:00,3"
 
 
@@ -104,7 +126,7 @@ async def test_count_stays_opt_in_when_the_file_is_not_sorted_by_it(patched_stor
         patched_store, monkeypatch, _FakeInventoryService(2), _request(order_by="value_asc")
     )
 
-    assert body.splitlines()[0] == "value,first_seen,last_seen"
+    assert body.splitlines()[0] == "attr:src_ip,first_seen,last_seen"
 
 
 @pytest.mark.asyncio
@@ -116,7 +138,7 @@ async def test_columns_are_selectable_and_keep_the_requested_order(patched_store
         _request(columns=["count", "value"], order_by="value_asc"),
     )
 
-    assert body.splitlines()[0] == "count,value"
+    assert body.splitlines()[0] == "count,attr:src_ip"
     assert body.splitlines()[1] == "3,10.0.0.4"
 
 
@@ -151,6 +173,31 @@ async def test_separator_is_configurable(patched_store, monkeypatch, separator, 
     assert f".{ext}" in resp.headers["content-disposition"]
 
 
+@pytest.mark.parametrize(
+    ("separator", "expected_suffix"),
+    [
+        ("comma", "-inventory-comma.csv"),
+        ("semicolon", "-inventory-semicolon.csv"),
+        ("pipe", "-inventory-pipe.csv"),
+        ("tab", "-inventory-tab.tsv"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_filename_names_the_separator(patched_store, monkeypatch, separator, expected_suffix):
+    """comma, semicolon and pipe all produced the same filename, so a second
+    export of the same field landed beside the first as `…(1).csv` and the
+    analyst kept opening the original — which is what "the separator picker
+    does nothing" actually was. The file must name the separator it used."""
+    resp, _ = await _export(
+        patched_store,
+        monkeypatch,
+        _FakeInventoryService(2),
+        _request(columns=["value"], separator=separator, order_by="value_asc"),
+    )
+
+    assert resp.headers["content-disposition"].endswith(f'{expected_suffix}"')
+
+
 @pytest.mark.asyncio
 async def test_a_value_containing_the_separator_is_quoted(patched_store, monkeypatch):
     """The inventory of a field whose values contain the chosen separator must
@@ -176,7 +223,7 @@ async def test_ordering_column_is_forced_into_the_file(patched_store, monkeypatc
         _request(columns=["value"], order_by="count_desc"),
     )
 
-    assert body.splitlines()[0] == "value,count"
+    assert body.splitlines()[0] == "attr:src_ip,count"
     assert service.last_order_by == "count_desc"
 
 
@@ -207,6 +254,82 @@ async def test_invalid_column_sets_are_rejected(patched_store, monkeypatch, colu
             "c1", "t1", _request(columns=columns), case=Case(id="c1"), user=_fake_user()
         )
     assert exc.value.status_code == 400
+
+
+# ── Several fields: the inventory of a combination ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_two_fields_head_a_column_each_and_carry_the_combination(patched_store, monkeypatch):
+    """The value part expands to one column per field, in the order asked for,
+    and the count belongs to the combination rather than to either value."""
+    service = _FakeInventoryService(2, rows=_PAIR_ROWS)
+    _, body = await _export(
+        patched_store,
+        monkeypatch,
+        service,
+        _request(fields=["attr:src_ip", "attr:user"], columns=["value", "count"]),
+    )
+
+    lines = body.splitlines()
+    assert lines[0] == "attr:src_ip,attr:user,count"
+    assert lines[1] == "10.0.0.4,alice,3"
+    assert service.last_fields == ["attr:src_ip", "attr:user"]
+
+
+@pytest.mark.asyncio
+async def test_a_combination_with_an_empty_part_is_still_written(patched_store, monkeypatch):
+    """Only the all-empty combination is dropped (in the query layer). A value
+    that only ever appears without its partner keeps its own row and count."""
+    _, body = await _export(
+        patched_store,
+        monkeypatch,
+        _FakeInventoryService(2, rows=_PAIR_ROWS),
+        _request(fields=["attr:src_ip", "attr:user"], columns=["value", "count"]),
+    )
+
+    assert body.splitlines()[2] == "10.0.0.4,,1"
+
+
+@pytest.mark.asyncio
+async def test_the_filename_names_every_field(patched_store, monkeypatch):
+    """Two inventories of the same timeline differing only in their second
+    field must not land in the download folder as one name plus a `(1)`."""
+    resp, _ = await _export(
+        patched_store,
+        monkeypatch,
+        _FakeInventoryService(2, rows=_PAIR_ROWS),
+        _request(fields=["attr:src_ip", "attr:user"]),
+    )
+
+    assert "attr_src_ip-attr_user-inventory-comma.csv" in resp.headers["content-disposition"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        ["attr:src_ip", "attr:src_ip"],  # the same column twice is never meant
+        ["attr:src_ip", "   "],  # an empty slot is not a field
+    ],
+)
+async def test_invalid_field_sets_are_rejected(patched_store, monkeypatch, fields):
+    await _seed_export_timeline(patched_store)
+    monkeypatch.setattr(events, "_get_query_service", lambda: _FakeInventoryService(2))
+
+    with pytest.raises(HTTPException) as exc:
+        await events.export_field_inventory(
+            "c1", "t1", _request(fields=fields), case=Case(id="c1"), user=_fake_user()
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize("fields", [[], [f"attr:f{i}" for i in range(9)]])
+def test_the_field_count_is_bounded_by_the_schema(fields):
+    """Neither no fields nor more than the scan's memory bound allows — refused
+    at validation, before anything opens a scan slot."""
+    with pytest.raises(ValueError):
+        _request(fields=fields)
 
 
 @pytest.mark.asyncio
@@ -241,7 +364,7 @@ async def test_too_large_filter_surfaces_before_streaming(patched_store, monkeyp
     await _seed_export_timeline(patched_store)
 
     class _TooLarge(_FakeInventoryService):
-        def count_field_inventory(self, query, field_token):
+        def count_field_inventory(self, query, field_tokens):
             raise QueryRequestTooLargeError("the filter is too large")
 
         def iter_field_inventory(self, *a, **k):
@@ -261,6 +384,22 @@ async def test_export_is_audited(patched_store, monkeypatch):
     actions = [a.action for a in await patched_store.query_audit(case_id="c1")]
     assert "events.export.field_inventory" in actions
     assert "events.export.field_inventory.result" in actions
+
+
+@pytest.mark.asyncio
+async def test_export_with_a_time_filter_is_still_audited(patched_store, monkeypatch):
+    """A `start`/`end` filter used to fail the audit write outright: the raw
+    ``datetime`` from ``ExportFilter.model_dump()`` reached the audit log's
+    JSON column and blew up in ``record_audit``, which swallows the exception
+    (best-effort logging) — so the export succeeded but silently lost its
+    custody record. The filter must be dumped JSON-safe so a time-scoped
+    export is audited exactly like an unscoped one."""
+    body = _request(filter=events.ExportFilter(start=datetime(2026, 3, 1, tzinfo=UTC)))
+    await _export(patched_store, monkeypatch, _FakeInventoryService(2), body)
+
+    rows = await patched_store.query_audit(case_id="c1", action="events.export.field_inventory")
+    assert len(rows) == 1
+    assert rows[0].detail["filter"]["start"] == "2026-03-01T00:00:00Z"
 
 
 # ── The single streamed-export slot ─────────────────────────────────────────

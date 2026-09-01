@@ -192,7 +192,7 @@ def test_table_and_inventory_agree_on_every_shared_cell(service):
     """The table is the inventory made bounded: same values, counts and seen
     range, from one SELECT core."""
     inventory = {
-        row["value"]: row
+        row["values"][0]: row
         for row in service.iter_field_inventory(_query(), "attr:user", order_by="count_desc")
     }
     table = service.field_table(_query(), "attr:user", 50)

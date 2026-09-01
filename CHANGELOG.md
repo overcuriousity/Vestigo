@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.3] — 2026-09-01
+
+### Fixed
+
+- **Audit rows were silently lost whenever a request carried a time filter.** `record_audit`
+  is best-effort by contract — it logs and swallows rather than failing the request it
+  records — so a detail value the audit JSON column could not store meant the request
+  succeeded and the custody record simply never existed. Any export or bulk-tag whose filter
+  had a start/end range hit exactly that. Bulk annotation is the serious one: it applied tags
+  to evidence while recording nothing. Details are now coerced JSON-safe in the one place
+  every call site passes through, and the three affected call sites write proper ISO-8601.
+
+- **Value-inventory exports name their separator in the filename.** Comma, semicolon and pipe
+  all produced `…-inventory.csv`, so exporting the same field twice with different separators
+  saved the second beside the first as `…-inventory(1).csv` — and an analyst who opened the
+  original saw the old separator and concluded the picker did nothing. The separator was
+  always applied correctly to the file's contents; only the name was ambiguous.
+
+### Added
+
+- **The value inventory takes several fields, not one.** An export can now name up to eight
+  fields and inventories the distinct *combinations* of their values: one column per field,
+  one count and one seen range per combination. A row survives unless every one of its parts
+  is empty, so a value that only ever appears without its partner still gets its own row.
+  Each value column is headed with its field token rather than a positional `value`, which is
+  what lets a reader join the file back to an events export — this changes the single-field
+  header too (`value` → `attr:src_ip`).
+
+- **A method can be focused on the fields you chose, and it sticks (#341).** Narrowing a
+  detector to one field in the Tools sheet used to die with the sheet — the next sweep went
+  back to every field and the findings feed refilled with the fields you had just ruled out.
+  "Focus on this selection" keeps it. The focus is yours alone: it never touches the case
+  team's declared fields, and the rail names every focused method, the fields it now scans
+  and a one-click way to clear it.
+
+### Changed
+
+- **CSV exports now give every field its own column** instead of collapsing every per-event
+  field into a single `attributes` JSON cell. Core scalar columns come first, then one
+  `attr:<key>` column per attribute key in the timeline, alphabetically; an event without a
+  given key writes an empty cell. The column set comes from the timeline's cached field
+  inventory rather than the filtered rows, so narrowing a filter never shifts the columns.
+  A key with no column is now named in the export trailer rather than being dropped in
+  silence. JSONL output is unchanged and remains the lossless record.
+
 ## [1.18.2] — 2026-09-01
 
 ### Fixed

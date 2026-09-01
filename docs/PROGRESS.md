@@ -4,7 +4,60 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-01 (session 220 — embeddings off by default, and the weights arm).
+Last updated: 2026-09-01 (session 222 — release 1.18.3).
+
+## Session 222 — 2026-09-01: release 1.18.3
+
+Combines the export/audit fixes (#342, closing #341) with the multi-field value inventory
+(#343) onto one release branch. Both touched the inventory export's `Content-Disposition`,
+in different directions, and the merge resolves them together rather than picking one:
+
+- The name carries **both** the full field slug and the separator —
+  `<case>-<timeline>-<field>[-<field>…]-inventory-<separator>.<ext>`. Dropping either
+  reintroduces a collision the other PR fixed: without the separator, re-exporting the same
+  fields with a different delimiter saves as `…(1).csv` and the analyst reopens the first
+  file (which is how "the separator picker does nothing" was reported); without every field,
+  two inventories differing only in their second field collide the same way.
+- `frontend/src/api/export.ts` mirrors the server name exactly, since either can be the one
+  the browser uses, and both filename tests were updated to the combined form.
+
+No behaviour beyond the filename changed in the merge.
+
+## Session 221 — 2026-09-01: the value inventory grows a second field
+
+The export answered "which values did this field take, how often, and when" for exactly one
+field. Analysts wanted the pair: which *user* from which *source IP*, counted per pairing.
+
+**One scan, N value columns.** `EventQueryService.iter_field_inventory` and
+`count_field_inventory` now take a sequence of field tokens, resolve one column expression
+per token (each with its own bound parameter name — a shared one would have the second field
+overwrite the first's attribute key), and `GROUP BY` all of them. The row it yields carries
+`values: [...]` in the order asked for instead of a single `value`. `_inventory_select_core`
+grew to take `(expression, alias)` pairs, so the table figure and the inventory still come
+off one SELECT core — the property `tests/test_table_clickhouse.py` pins cell for cell.
+
+**Which combinations exist.** A row is written unless *every* one of its parts is empty:
+the single-field rule (`col != ''`) generalises to `OR` across the columns, not `AND`. A
+value that only ever appears without its partner is still a value the analyst asked to see,
+so it gets its own row with an empty cell beside it; only the all-empty group, which
+describes no event's values at all, is dropped. `value_asc`/`value_desc` expand into the
+tuple ordering across every value column, and every other ordering tie-breaks on all of
+them — the sort stays total, which is what makes a re-run over immutable sources reproduce
+the file.
+
+**The file names its own keys.** Each value column is headed with its field token rather
+than a positional `value`/`value_2`, which is what lets a reader join it back to an events
+export without the request beside it. That changes the single-field header too (`value` →
+`attr:src_ip`), deliberately. The filename carries every field, so two inventories of the
+same timeline that differ only in their second field do not collide in the download folder.
+`INVENTORY_MAX_FIELDS = 8` bounds it: each field multiplies the groups a whole-corpus scan
+holds, so the cap is a memory bound, mirrored in the dialog rather than only enforced.
+
+**The dialog.** One `FieldCombo` per chosen field plus an empty one below it, so a second
+field is always one click away and never in the way; a field already picked is absent from
+the other slots' options; an explicit remove button, because an emptied combo commits
+nothing. The audit rows record `fields` (plural) alongside the columns, separator, ordering
+and expected count they already did.
 
 ## Session 220 — 2026-09-01: the embedding subsystem stops advertising itself
 

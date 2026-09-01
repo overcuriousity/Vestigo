@@ -82,6 +82,15 @@ async function openInventory() {
   fireEvent.keyDown(picker, { key: "Enter" });
 }
 
+/** Pick the *second* field, in the empty slot that appears once the first is
+ * chosen. Its options exclude the field already taken. */
+async function addSecondField(token: string) {
+  const picker = await screen.findByRole("combobox", { name: "Field 2" });
+  fireEvent.focus(picker);
+  fireEvent.change(picker, { target: { value: token } });
+  fireEvent.keyDown(picker, { key: "Enter" });
+}
+
 describe("ExportDialog", () => {
   it("says the browser buffers the file, not just that the server streams it", () => {
     // The old copy — "Streams directly from the backend — no memory limit" —
@@ -163,7 +172,7 @@ describe("ExportDialog — value inventory (#295)", () => {
     ).toBe(true);
   });
 
-  it("sends the field, the chosen columns and separator, and the filters", async () => {
+  it("sends the fields, the chosen columns and separator, and the filters", async () => {
     downloadFieldInventoryMock.mockResolvedValue(undefined);
     await openInventory();
     fireEvent.click(screen.getByRole("button", { name: ";" }));
@@ -175,7 +184,7 @@ describe("ExportDialog — value inventory (#295)", () => {
         "t1",
         { q: "ssh" },
         {
-          field: "attr:src_ip",
+          fields: ["attr:src_ip"],
           // `value` is what the file is of; `count` rides along because the
           // default ordering sorts by it.
           columns: ["value", "first_seen", "last_seen", "count"],
@@ -196,6 +205,52 @@ describe("ExportDialog — value inventory (#295)", () => {
     await waitFor(() =>
       expect(downloadFieldInventoryMock.mock.calls[0][3]).toMatchObject({
         columns: ["value", "last_seen", "count"],
+      }),
+    );
+  });
+
+  it("offers a second field once the first is chosen, and sends both", async () => {
+    // The whole point of the second slot: the file inventories the distinct
+    // *combinations*, so both fields travel in the order they were picked.
+    downloadFieldInventoryMock.mockResolvedValue(undefined);
+    await openInventory();
+    await addSecondField("artifact");
+    fireEvent.click(screen.getByRole("button", { name: /Download \.csv/ }));
+
+    await waitFor(() =>
+      expect(downloadFieldInventoryMock.mock.calls[0][3]).toMatchObject({
+        fields: ["attr:src_ip", "artifact"],
+      }),
+    );
+  });
+
+  it("never offers the same field twice", async () => {
+    await openInventory();
+    const picker = await screen.findByRole("combobox", { name: "Field 2" });
+    fireEvent.focus(picker);
+
+    await waitFor(() => {
+      const options = within(screen.getByRole("listbox")).getAllByRole("option");
+      expect(options.map((o) => o.textContent)).toEqual(
+        expect.arrayContaining([expect.stringContaining("artifact")]),
+      );
+      expect(options.some((o) => o.textContent?.includes("attr:src_ip"))).toBe(false);
+    });
+  });
+
+  it("removing a field takes it out of the request", async () => {
+    // An emptied combo commits nothing, so the remove button is the only way
+    // back from a second field the analyst decided against.
+    downloadFieldInventoryMock.mockResolvedValue(undefined);
+    await openInventory();
+    await addSecondField("artifact");
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove artifact" }));
+    fireEvent.click(screen.getByRole("button", { name: /Download \.csv/ }));
+
+    await waitFor(() =>
+      expect(downloadFieldInventoryMock.mock.calls[0][3]).toMatchObject({
+        fields: ["attr:src_ip"],
       }),
     );
   });
