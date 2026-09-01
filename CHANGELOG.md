@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.2] — 2026-09-01
+
+### Fixed
+
+- **Embeddings are now off by default across every entry point, not just the API.** The
+  `embeddings_enabled` operator switch (default off) was already enforced by
+  `embeddings_available()` in the web API, but `vestigo embed` on the CLI never checked it and
+  could still reach for a model or open a socket to Qdrant on an installation where an operator
+  had deliberately turned the subsystem off. The CLI command now refuses with a clear error
+  instead.
+- The refusal message for a missing local embedding model no longer gets misread as "extra not
+  installed" versus "weights missing" depending on what happens to be on the host running the
+  test suite — the two branches in `unavailable_detail()` are now exercised deterministically.
+
+### Changed
+
+- **Saved views can be renamed in place**, and the view list grows a search box once there are
+  enough views for one to earn its keep. Escape now reliably cancels an in-progress rename
+  instead of silently saving the typed text, and a successful rename no longer risks firing a
+  second, duplicate save request.
+
 ## [1.18.1] — 2026-08-31
 
 ### Fixed
