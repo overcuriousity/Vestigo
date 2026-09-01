@@ -811,3 +811,31 @@ def test_block_at_top_with_after_block_id_is_422(client, admin_bootstrap, store)
         },
     )
     assert resp.status_code == 422, resp.text
+
+
+def test_rename_view(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    view = _create_view(client, case_id, "Original Name")
+
+    resp = client.patch(f"/api/cases/{case_id}/views/{view['id']}", json={"name": "New Name"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["view"]["name"] == "New Name"
+
+    listed = client.get(f"/api/cases/{case_id}/views").json()["views"]
+    assert [v["name"] for v in listed] == ["New Name"]
+
+
+def test_rename_unknown_view_is_404(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    resp = client.patch(f"/api/cases/{case_id}/views/nope", json={"name": "New Name"})
+    assert resp.status_code == 404
+
+
+def test_rename_view_rejects_empty_name(client, admin_bootstrap, store):
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    view = _create_view(client, case_id)
+    resp = client.patch(f"/api/cases/{case_id}/views/{view['id']}", json={"name": ""})
+    assert resp.status_code == 422

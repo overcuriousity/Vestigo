@@ -3727,6 +3727,27 @@ class PostgresStore:
             await session.refresh(view)
             return view
 
+    async def rename_view(self, case_id: str, view_id: str, name: str) -> View | None:
+        """Rename a saved view. Returns None if it doesn't exist in this case.
+
+        A hidden view (kept alive only for a story block) is deliberately
+        renamable too — the analyst may still be looking at it through that
+        story and a name is display metadata, not evidence.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(View).where(View.case_id == case_id, View.id == view_id)
+            )
+            view = result.scalar_one_or_none()
+            if view is None:
+                return None
+            view.name = name
+            await session.commit()
+            await session.refresh(view)
+            return view
+
     async def _case_id_for_story(self, session: Any, story_id: str) -> str | None:
         """The case a story belongs to — the hop a block-level mutation needs
         before it can sweep that case's hidden views."""

@@ -61,6 +61,33 @@ async def test_deleting_unknown_view_reports_not_found(store):
 
 
 @pytest.mark.asyncio
+async def test_rename_view_updates_name(store):
+    await _case_with_view(store)
+    renamed = await store.rename_view("c1", "v1", "Renamed View")
+    assert renamed is not None
+    assert renamed.name == "Renamed View"
+    fetched = await store.get_view("c1", "v1")
+    assert fetched is not None
+    assert fetched.name == "Renamed View"
+
+
+@pytest.mark.asyncio
+async def test_renaming_unknown_view_reports_not_found(store):
+    await store.create_case("c1", "Case One")
+    assert await store.rename_view("c1", "nope", "New Name") is None
+
+
+@pytest.mark.asyncio
+async def test_renaming_a_hidden_view_still_works(store):
+    await _case_with_view(store)
+    await _story_referencing(store, "v1")
+    assert await store.delete_view("c1", "v1") == "hidden"
+    renamed = await store.rename_view("c1", "v1", "Still Referenced")
+    assert renamed is not None
+    assert renamed.name == "Still Referenced"
+
+
+@pytest.mark.asyncio
 async def test_deleting_the_block_purges_the_hidden_view(store):
     await _case_with_view(store)
     _story_id, block_id = await _story_referencing(store, "v1")

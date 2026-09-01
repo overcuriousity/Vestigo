@@ -116,6 +116,12 @@ class ViewCreate(BaseModel):
     filter: dict[str, Any] = Field(default_factory=dict)
 
 
+class ViewRename(BaseModel):
+    """Payload to rename a saved view."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+
+
 class AnnotationCreate(BaseModel):
     """Payload to create an event annotation."""
 
@@ -1603,6 +1609,21 @@ async def create_view(
         query=payload.query,
         view_filter=payload.filter,
     )
+    return {"view": view.to_dict()}
+
+
+@router.patch("/{case_id}/views/{view_id}")
+async def rename_view(
+    view_id: str,
+    payload: ViewRename,
+    case: Case = Depends(require_case_contribute),
+    user: User = Depends(require_password_current),
+) -> dict[str, Any]:
+    """Rename a saved view."""
+    store = get_store()
+    view = await store.rename_view(case.id, view_id, payload.name)
+    if view is None:
+        raise HTTPException(status_code=404, detail="View not found")
     return {"view": view.to_dict()}
 
 
