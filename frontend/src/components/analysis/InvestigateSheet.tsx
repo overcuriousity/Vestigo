@@ -23,7 +23,7 @@
  * than in a separate Method tab: "what does this actually do" is only ever
  * asked while looking at one of a method's findings.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Crosshair, Play, X } from "lucide-react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { METHODS_BY_ID, type MethodId, type MethodMeta } from "./method-registry";
@@ -190,17 +190,44 @@ function MethodBody({
   running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
+  // The knob a focus is stored against. Read from the method's own knobs
+  // rather than assumed to be `"fields"`, so a second field knob could not
+  // silently have its selection focused as if it were this one.
+  const fieldsParam = meta.knobs.find((k) => k.kind === "fields")?.param ?? null;
+
+  // This analyst's own narrowing of the same method (#341) — per user, never
+  // shared, and applied by sending these fields explicitly on every sweep.
+  const { fieldsFor, setFocus, clearFocus } = useMethodFocus(timelineId);
+  const focusedFields = fieldsFor(methodId);
+  const isFocused = focusedFields !== undefined;
+
+  // The picker opens on the focus already in force, not on "auto". A focused
+  // method whose picker reads "auto" describes a sweep that is not happening —
+  // and since the focus controls only appear beside a selection, an unseeded
+  // picker also leaves "Clear focus" unreachable from the sheet that set it.
+  const seededFields = useCallback(
+    (): Record<string, string[] | null> =>
+      fieldsParam && focusedFields ? { [fieldsParam]: focusedFields } : {},
+    [fieldsParam, focusedFields],
+  );
+
   const [values, setValues] = useState<Record<string, string>>({});
   // Field selections are kept apart from the typed knobs: `null` is a real
   // value here ("let the method choose"), which an empty string cannot express.
-  const [fields, setFields] = useState<Record<string, string[] | null>>({});
+  const [fields, setFields] = useState<Record<string, string[] | null>>(seededFields);
 
   // Switching methods must not carry the previous method's typing across —
   // the knobs look the same and the params would silently be the old ones.
+  // Guarded on the method actually changing: re-seeding whenever the focus
+  // changes identity would throw away the analyst's next edit of the picker,
+  // including the edit they are making in order to change the focus.
+  const seededFor = useRef(methodId);
   useEffect(() => {
+    if (seededFor.current === methodId) return;
+    seededFor.current = methodId;
     setValues({});
-    setFields({});
-  }, [methodId]);
+    setFields(seededFields());
+  }, [methodId, seededFields]);
 
   const blocker = knobBlocker(meta, fields);
   // The durable half of the same decision: which fields this method reads at
@@ -209,17 +236,12 @@ function MethodBody({
   const { forMethod, declare, canEdit, saveError } = useFieldOverrides(caseId, timelineId);
   const overrides = forMethod(methodId);
 
-  // This analyst's own narrowing of the same method (#341) — per user, never
-  // shared, and applied by sending these fields explicitly on every sweep.
-  const { fieldsFor, setFocus, clearFocus } = useMethodFocus(timelineId);
-  const focusedFields = fieldsFor(methodId);
-  const isFocused = focusedFields !== undefined;
   // Only an explicit selection can be focused: "let the method choose" is the
   // absence of a field set, so there is nothing to keep.
   const selectedFocusFields = useMemo(() => {
-    const picked = Object.values(fields).find((v) => v !== null && v !== undefined && v.length > 0);
-    return picked ?? null;
-  }, [fields]);
+    const picked = fieldsParam ? fields[fieldsParam] : null;
+    return picked && picked.length > 0 ? picked : null;
+  }, [fields, fieldsParam]);
 
   return (
     <>
@@ -309,7 +331,13 @@ function MethodBody({
             type="button"
             variant="ghost"
             size="sm"
-            disabled={running}
+            // A selection the Run button refuses must not be persisted into
+            // *every* sweep instead: below `picker.minSelected` the endpoint
+            // 422s, and a stored one-field `value_combo` focus would do that on
+            // every load of the rail until the strip cleared it. Clearing stays
+            // available regardless — the way out of a bad focus cannot itself
+            // be gated on the picker being valid.
+            disabled={running || (!isFocused && blocker !== null)}
             title={
               isFocused
                 ? "Stop narrowing this method to these fields"

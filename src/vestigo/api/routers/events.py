@@ -1524,6 +1524,7 @@ def _stream_csv(
     tally["written"] = written
     tally["complete"] = complete
     tally["dropped_keys"] = dropped_keys
+    tally["dropped_values"] = dropped_values
     # Row completeness and column completeness are separate claims: every
     # matching event is here, but a key with no column lost its values. Say so
     # rather than letting `complete=true` stand for both.
@@ -1554,9 +1555,7 @@ def _stream_csv(
         raise ExportIncompleteError(f"export wrote {written} of {expected} matching events")
 
 
-async def _resolve_export_attr_keys(
-    case_id: str, source_ids: list[str], field_mappings: dict[str, list[str]] | None
-) -> list[str]:
+async def _resolve_export_attr_keys(case_id: str, source_ids: list[str]) -> list[str]:
     """Attribute keys to give their own column in a CSV export.
 
     Sourced from the same cached per-source field-stats inventory the field
@@ -1564,11 +1563,21 @@ async def _resolve_export_attr_keys(
     ``arrayJoin(mapKeys(attributes))`` per export would cost as much as the
     export itself, and the column set stays stable for a given timeline
     regardless of which filter narrowed the export down.
+
+    Deliberately *without* the timeline's field mappings. A mapping is a
+    presentation-layer merge: ``apply_mappings_to_attribute_keys`` hides the
+    raw keys and offers the canonical name in their place, which is right for a
+    picker but wrong here, because the rows this columnises come from
+    ``iter_events`` — which does not run ``project_mapped_fields`` (see its
+    docstring). Merging the header alone would head the file with an
+    always-empty ``attr:<canonical>`` column, give the raw keys no column at
+    all, and drop every one of their values behind a row-complete trailer. An
+    export carries what was ingested, which is also what JSONL carries.
     """
     stats = await ensure_source_field_stats(
         get_store(), _get_query_service().store, case_id, source_ids
     )
-    return merged_list_fields(stats, field_mappings)["attributes"]
+    return merged_list_fields(stats)["attributes"]
 
 
 async def _build_export_query(
@@ -1692,7 +1701,7 @@ async def export_events(
     else:
         media_type = "text/csv"
         ext = "csv"
-        attr_keys = await _resolve_export_attr_keys(case_id, eq.source_ids or [], eq.field_mappings)
+        attr_keys = await _resolve_export_attr_keys(case_id, eq.source_ids or [])
         content = _stream_csv(
             eq,
             annotations_by_event,
@@ -1738,6 +1747,18 @@ async def export_events(
                 "expected": expected,
                 "written": tally["written"],
                 "complete": tally["complete"],
+                # Row completeness and column completeness are separate claims,
+                # and the audit row is where a later reader looks for either. A
+                # file trailer naming a dropped key is no use to someone reading
+                # the custody record instead of the download.
+                **(
+                    {
+                        "dropped_keys": sorted(tally["dropped_keys"]),
+                        "dropped_attribute_values": tally["dropped_values"],
+                    }
+                    if tally.get("dropped_keys")
+                    else {}
+                ),
             },
         )
 

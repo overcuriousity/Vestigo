@@ -6315,6 +6315,13 @@ class PostgresStore:
         ``model_dump(mode="json")`` gives proper ISO-8601 rather than
         ``str(datetime)``'s space separator. This is the floor under them, not
         a substitute for it.
+
+        Not total: ``json.dumps`` does not consult ``default=`` for dict *keys*
+        (a tuple or ``datetime`` key raises ``TypeError``) and a self-referential
+        structure raises ``ValueError``. So this is called from inside
+        ``record_audit``'s ``try`` — a detail this cannot coerce must degrade to
+        a logged, missing row like any other audit failure, never to a 500 on the
+        request it exists to record.
         """
         return json.loads(json.dumps(value, default=str))
 
@@ -6363,9 +6370,9 @@ class PostgresStore:
             status_code=status_code,
             ip=ip,
             user_agent=user_agent,
-            detail=self._json_safe(detail) if detail is not None else None,
         )
         try:
+            row.detail = self._json_safe(detail) if detail is not None else None
             async with self.session_factory() as session:
                 session.add(row)
                 await session.commit()

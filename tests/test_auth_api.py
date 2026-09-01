@@ -310,6 +310,40 @@ def test_method_focus_rejects_anything_but_field_token_lists(client, admin_boots
         ), bad
 
 
+def test_method_focus_is_bounded_in_size(client, admin_bootstrap):
+    """The top-level entry and key-length caps only reach the timeline ids.
+
+    Without a cap one level down, a scripted client can hold each of its 500
+    permitted timelines against thousands of methods and thousands of field
+    tokens and grow the user row without bound — the storage sink the
+    whitelist exists to prevent, reached through the one key nested deep
+    enough to escape it.
+    """
+    as_admin(client, admin_bootstrap)
+
+    too_many_methods = {"tl-1": {f"method_{i}": ["attr:x"] for i in range(65)}}
+    too_many_fields = {"tl-1": {"proportion_shift": [f"attr:f{i}" for i in range(257)]}}
+    long_method_id = {"tl-1": {"m" * 129: ["attr:x"]}}
+
+    for bad in (too_many_methods, too_many_fields, long_method_id):
+        assert (
+            client.put(
+                "/api/auth/me/preferences", json={"preferences": {"analysis_method_focus": bad}}
+            ).status_code
+            == 422
+        ), bad
+
+    # A real focus — every method the registry has, on a generous field set —
+    # is nowhere near the caps and must still be accepted.
+    ok = {"tl-1": {f"method_{i}": [f"attr:f{j}" for j in range(64)] for i in range(12)}}
+    assert (
+        client.put(
+            "/api/auth/me/preferences", json={"preferences": {"analysis_method_focus": ok}}
+        ).status_code
+        == 200
+    )
+
+
 def test_update_my_preferences_refuses_anything_not_whitelisted(client, admin_bootstrap):
     """The blob is feature state, not a key/value store every session can write."""
     as_admin(client, admin_bootstrap)

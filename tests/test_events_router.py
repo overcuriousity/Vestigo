@@ -2779,3 +2779,99 @@ async def test_busy_scan_surfaces_as_503_not_500(monkeypatch):
     monkeypatch.setattr(scan_exec, "current_request", lambda: None)
     with pytest.raises(scan_exec.ScanBusyResponse):
         await events._run_regex_guarded(False, busy)
+
+
+@pytest.mark.asyncio
+async def test_export_csv_columns_survive_a_field_mapping(patched_store, monkeypatch):
+    """A timeline's field mappings must not take the raw keys' columns away.
+
+    `apply_mappings_to_attribute_keys` hides a mapped raw key and offers the
+    canonical name in its place, which is right for a picker but wrong for an
+    export: the rows come from `iter_events`, which does not project mapped
+    fields. Merging only the header would head the file with an always-empty
+    `attr:ip_address`, give `src_ip` no column at all, and drop every one of
+    its values behind a `complete=true` trailer.
+    """
+    await _seed_export_timeline(patched_store)
+    await patched_store.update_timeline_field_mappings(
+        "c1", "t1", {"ip_address": ["src_ip", "src_addr"]}
+    )
+    await patched_store.upsert_source_field_stats(
+        case_id="c1",
+        source_id="s1",
+        stats_version=field_stats.EFFECTIVE_STATS_VERSION,
+        events_total=1,
+        payload={
+            "top_level": {},
+            "attributes": {"src_ip": {"distinct": 1, "coverage": 1, "samples": ["10.0.0.4"]}},
+            "attr_keys_truncated": False,
+        },
+    )
+    rows = [
+        {
+            "event_id": "e1",
+            "source_id": "s1",
+            "message": "m1",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "tags": [],
+            "attributes": {"src_ip": "10.0.0.4"},
+        },
+    ]
+    fake = _FakeExportService(count_val=1, rows=rows)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format="csv", filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    chunks: list[str] = []
+    await _collect(resp, chunks)
+    lines = "".join(chunks).splitlines()
+
+    header = lines[0].split(",")
+    assert "attr:src_ip" in header
+    assert "attr:ip_address" not in header
+    assert lines[1].split(",")[header.index("attr:src_ip")] == "10.0.0.4"
+    assert "dropped_attribute_keys" not in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_export_audit_result_names_dropped_columns(patched_store, monkeypatch):
+    """The trailer discloses a dropped column to whoever opens the file. The
+    custody record is where a later reader looks instead, so it has to say so
+    too rather than recording `complete=true` and nothing else."""
+    await _seed_export_timeline(patched_store)
+    await patched_store.upsert_source_field_stats(
+        case_id="c1",
+        source_id="s1",
+        stats_version=field_stats.EFFECTIVE_STATS_VERSION,
+        events_total=1,
+        payload={
+            "top_level": {},
+            "attributes": {"src_ip": {"distinct": 1, "coverage": 1, "samples": ["10.0.0.4"]}},
+            "attr_keys_truncated": False,
+        },
+    )
+    rows = [
+        {
+            "event_id": "e1",
+            "source_id": "s1",
+            "message": "m1",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "tags": [],
+            "attributes": {"src_ip": "10.0.0.4", "http_uri": "/login"},
+        },
+    ]
+    fake = _FakeExportService(count_val=1, rows=rows)
+    monkeypatch.setattr(events, "_get_query_service", lambda: fake)
+    monkeypatch.setattr(events, "EventQueryService", lambda *a, **k: fake)
+
+    body = events.ExportRequest(format="csv", filter=events.ExportFilter())
+    resp = await events.export_events("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    chunks: list[str] = []
+    await _collect(resp, chunks)
+    if resp.background is not None:
+        await resp.background()
+
+    audit = await patched_store.query_audit(action="events.export.result")
+    assert audit[0].detail["dropped_keys"] == ["http_uri"]
+    assert audit[0].detail["dropped_attribute_values"] == 1

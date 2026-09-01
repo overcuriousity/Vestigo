@@ -598,3 +598,24 @@ async def test_record_audit_survives_a_detail_the_json_column_cannot_take(store)
     assert len(rows) == 1
     assert "2026-03-01" in rows[0].detail["when"]
     assert "2026-03-02" in rows[0].detail["nested"]["seen"][0]
+
+
+@pytest.mark.asyncio
+async def test_record_audit_does_not_raise_on_a_detail_it_cannot_coerce(store):
+    """The coercion is a floor under the caller, not a new way to fail.
+
+    ``json.dumps`` does not consult ``default=`` for dict *keys*, so a
+    ``datetime`` key raises ``TypeError`` — out of a method whose contract is
+    that it never fails the request it records. A best-effort logger that can
+    500 an export is worse than the missing row it was added to prevent.
+    """
+    await store.create_case("c1", "Case One")
+
+    await store.record_audit(
+        action="test.uncoercible",
+        case_id="c1",
+        detail={"by_day": {datetime(2026, 3, 1, tzinfo=UTC): 4}},
+    )
+
+    # No row (nothing could be stored), and — the point — no exception.
+    assert await store.query_audit(case_id="c1", action="test.uncoercible") == []
