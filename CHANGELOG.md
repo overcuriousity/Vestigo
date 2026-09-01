@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original saw the old separator and concluded the picker did nothing. The separator was
   always applied correctly to the file's contents; only the name was ambiguous.
 
+### Added
+
+- **A method can be focused on the fields you chose, and it sticks (#341).** Narrowing a
+  detector to one field in the Tools sheet used to die with the sheet — the next sweep went
+  back to every field and the findings feed refilled with the fields you had just ruled out.
+  "Focus on this selection" keeps it. The focus is yours alone: it never touches the case
+  team's declared fields, and the rail names every focused method, the fields it now scans
+  and a one-click way to clear it.
+
 ### Changed
 
 - **CSV exports now give every field its own column** instead of collapsing every per-event

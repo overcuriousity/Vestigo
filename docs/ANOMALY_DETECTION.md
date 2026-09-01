@@ -380,6 +380,42 @@ single run — two questions, two controls); the picker's auto preview applies t
 declaration exactly as the backend does, and the Tools sheet's Methods tab summarizes and
 resets what a timeline declares.
 
+#### Declared fields vs. a personal focus
+
+A declaration answers "which fields should this method consider *for this case*". It does
+not answer "I am reading one field today and the rest is noise" — and answering the second
+question with the first would have one analyst rewriting what every colleague sees in order
+to tidy their own feed.
+
+So there is a second, deliberately smaller mechanism: a **focus** (#341). It is one
+analyst's narrowing of a single method to a chosen field set, stored in that user's own
+`preferences` blob under `analysis_method_focus` (`{timeline_id: {method_id: [field_token,
+…]}}`) and never shared. The sweep applies it by sending those fields as an explicit
+`fields`, which — per the contract above — bypasses `apply_field_overrides` entirely rather
+than competing with it. Nothing new happens on the server: a focused sweep is exactly the
+request an analyst could already make by hand, so the cache fingerprint (which covers
+`params`) separates focused from unfocused answers for free, and `DetectorRun` records the
+fields the run actually scanned, as it does for any explicit selection.
+
+The two are kept apart everywhere they surface, because confusing them is the expensive
+mistake:
+
+| | Declared fields | Focus |
+|---|---|---|
+| Scope | The case team | One analyst |
+| Stored on | `Timeline.field_overrides` | `User.preferences` |
+| Audited | Yes | No — it asserts nothing about the evidence |
+| Applies to | Automatic selection only | The sweep's request for one method |
+| Control | Pin/exclude beside each field chip | "Focus on this selection" in the sheet |
+
+A focus narrows what is **scanned**, not merely what is displayed: a focused method
+produces no findings for the fields it no longer reads. That is what the analyst asked for,
+and it is bounded — the focus is per method, so every *other* method still covers those
+fields. It obeys the same disclosure rule as the mute list and the rail floor: the rail
+carries a strip naming each focused method, the fields it is narrowed to, and a one-click
+way out. An empty field list is treated as no focus at all, since a scan over no fields
+returns an empty result set indistinguishable from "clean".
+
 ### The analysis cache
 
 `GET .../analysis/findings` is memoized in `analysis_cache`, keyed on a SHA-256 of
