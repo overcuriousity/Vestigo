@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.18.3] — 2026-09-01
 
 ### Fixed
 
@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always applied correctly to the file's contents; only the name was ambiguous.
 
 ### Added
+
+- **The value inventory takes several fields, not one.** An export can now name up to eight
+  fields and inventories the distinct *combinations* of their values: one column per field,
+  one count and one seen range per combination. A row survives unless every one of its parts
+  is empty, so a value that only ever appears without its partner still gets its own row.
+  Each value column is headed with its field token rather than a positional `value`, which is
+  what lets a reader join the file back to an events export — this changes the single-field
+  header too (`value` → `attr:src_ip`).
 
 - **A method can be focused on the fields you chose, and it sticks (#341).** Narrowing a
   detector to one field in the Tools sheet used to die with the sheet — the next sweep went

@@ -4,7 +4,24 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-01 (session 221 — the value inventory over several fields).
+Last updated: 2026-09-01 (session 222 — release 1.18.3).
+
+## Session 222 — 2026-09-01: release 1.18.3
+
+Combines the export/audit fixes (#342, closing #341) with the multi-field value inventory
+(#343) onto one release branch. Both touched the inventory export's `Content-Disposition`,
+in different directions, and the merge resolves them together rather than picking one:
+
+- The name carries **both** the full field slug and the separator —
+  `<case>-<timeline>-<field>[-<field>…]-inventory-<separator>.<ext>`. Dropping either
+  reintroduces a collision the other PR fixed: without the separator, re-exporting the same
+  fields with a different delimiter saves as `…(1).csv` and the analyst reopens the first
+  file (which is how "the separator picker does nothing" was reported); without every field,
+  two inventories differing only in their second field collide the same way.
+- `frontend/src/api/export.ts` mirrors the server name exactly, since either can be the one
+  the browser uses, and both filename tests were updated to the combined form.
+
+No behaviour beyond the filename changed in the merge.
 
 ## Session 221 — 2026-09-01: the value inventory grows a second field
 
