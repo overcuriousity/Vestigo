@@ -1,6 +1,10 @@
-"""Tests for PostgresStore's DetectorRun CRUD and case-delete cascade."""
+"""Tests for PostgresStore's DetectorRun CRUD, audit writes and case-delete cascade."""
 
 from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
@@ -561,3 +565,36 @@ async def test_set_source_time_offset_is_case_scoped(store):
     assert await store.set_source_time_offset("c2", "s1", 60) is None
     unchanged = await store.get_source("c1", "s1")
     assert unchanged.time_offset_seconds == 0
+
+
+# ---------------------------------------------------------------------------
+# Audit writes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_audit_survives_a_detail_the_json_column_cannot_take(store):
+    """An audit row must never be lost to a detail value stdlib json refuses.
+
+    ``record_audit`` swallows exceptions by design (best-effort logging), so an
+    unserializable detail is uniquely dangerous: the request it was recording
+    succeeds and the audit row silently never existed. Two export call sites
+    and the bulk-annotate one shipped exactly that, handing a pydantic
+    ``model_dump()`` — native ``datetime`` — straight to the JSON column.
+    """
+    await store.create_case("c1", "Case One")
+    await store.record_audit(
+        action="test.unserializable",
+        case_id="c1",
+        detail={
+            "when": datetime(2026, 3, 1, tzinfo=UTC),
+            "amount": Decimal("1.5"),
+            "ident": UUID("12345678-1234-5678-1234-567812345678"),
+            "nested": {"seen": [datetime(2026, 3, 2, tzinfo=UTC)]},
+        },
+    )
+
+    rows = await store.query_audit(case_id="c1", action="test.unserializable")
+    assert len(rows) == 1
+    assert "2026-03-01" in rows[0].detail["when"]
+    assert "2026-03-02" in rows[0].detail["nested"]["seen"][0]
