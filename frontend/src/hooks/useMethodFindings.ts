@@ -35,6 +35,7 @@ import {
 } from "@/components/analysis/detector-hooks";
 import { useUiStore } from "@/stores/ui";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
+import { useMethodFocus } from "./useMethodFocus";
 import { useMutedMethods } from "./useMutedMethods";
 
 /** Per-method fetch cap, mirrored in the rail's coverage copy. */
@@ -160,9 +161,31 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
     [planById, planLoading, muted],
   );
 
+  // A focused method scans only the fields this analyst chose (#341), sent as
+  // an explicit `fields` — which bypasses the shared `field_overrides` layer
+  // by contract, so one analyst's focus never rewrites what a colleague sees.
+  // `params` is already part of both the server fingerprint and this query's
+  // key, so a focused and an unfocused answer cache separately for free.
+  const { fieldsFor } = useMethodFocus(timelineId);
+  const paramsFor = useCallback(
+    (id: MethodId): Record<string, unknown> => {
+      const fields = fieldsFor(id);
+      return fields ? { fields } : {};
+    },
+    [fieldsFor],
+  );
+
   const cheapResults = useQueries({
     queries: CHEAP_IDS.map((id) =>
-      findingsQueryOptions(caseId, timelineId, id, scopeParams, {}, runnable(id), includeDismissed),
+      findingsQueryOptions(
+        caseId,
+        timelineId,
+        id,
+        scopeParams,
+        paramsFor(id),
+        runnable(id),
+        includeDismissed,
+      ),
     ),
   });
   // Settled, not "not loading": a disabled query is neither, and asking
@@ -179,7 +202,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         timelineId,
         id,
         scopeParams,
-        {},
+        paramsFor(id),
         runnable(id) && cheapSettled,
         includeDismissed,
       ),

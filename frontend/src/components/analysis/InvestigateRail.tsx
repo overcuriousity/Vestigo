@@ -26,8 +26,10 @@ import {
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useSigmaFindings } from "@/hooks/useSigmaFindings";
 import { useMutedMethods } from "@/hooks/useMutedMethods";
+import { useMethodFocus } from "@/hooks/useMethodFocus";
 import { ScopeStrip } from "./ScopeStrip";
 import { DetectorMuteStrip } from "./DetectorMuteStrip";
+import { MethodFocusStrip } from "./MethodFocusStrip";
 import { FindingGroup } from "./FindingGroup";
 import { SigmaFindingRows } from "./SigmaFindings";
 import { AnalysisEmptyState } from "./detector-shared";
@@ -172,6 +174,8 @@ export function InvestigateRail({
   // the feed cannot disagree about what is muted — the sweep uses the very
   // same hook to decide what not to fetch.
   const mute = useMutedMethods(caseId, timelineId);
+  // This analyst's own per-method field narrowing (#341), disclosed below.
+  const { focus, clearFocus } = useMethodFocus(timelineId);
   const muted = mute.muted;
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(
     caseId,
@@ -297,6 +301,10 @@ export function InvestigateRail({
           along with the tab that used to host it. */}
       <GuidancePanel id="investigate-anomalies" />
       <DetectorMuteStrip mute={mute} />
+      {/* A focus narrows what is scanned, so it owes the same disclosure a
+          mute does — with the difference stated, since one is the team's and
+          the other is only this analyst's. */}
+      <MethodFocusStrip focus={focus} onClear={(m) => void clearFocus(m)} />
       <ScopeStrip scope={scope} onOpen={() => onOpenTools("scope")} />
 
       <div className="flex flex-wrap gap-1">

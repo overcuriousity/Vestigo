@@ -34,7 +34,7 @@ function seedUser(preferences: Record<string, unknown> | null) {
     username: "analyst",
     is_admin: false,
     preferences,
-  } as User);
+  } as unknown as User);
 }
 
 beforeEach(() => {

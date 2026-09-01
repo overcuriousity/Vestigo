@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { authApi } from "@/api/auth";
 import { useAuthStore } from "@/stores/auth";
@@ -11,6 +11,9 @@ export const ANALYSIS_METHOD_FOCUS = "analysis_method_focus";
 export type MethodFocus = Record<string, string[]>;
 
 type AllFocus = Record<string, MethodFocus>;
+
+/** One shared empty object, so "no focus" keeps a stable identity — see below. */
+const NO_FOCUS: MethodFocus = Object.freeze({});
 
 function readAll(preferences: Record<string, unknown> | null | undefined): AllFocus {
   const raw = preferences?.[ANALYSIS_METHOD_FOCUS];
@@ -37,8 +40,15 @@ export function useMethodFocus(timelineId: string) {
   const setUser = useAuthStore((s) => s.setUser);
   const queryClient = useQueryClient();
 
-  const all = readAll(user?.preferences);
-  const focus: MethodFocus = all[timelineId] ?? {};
+  // Memoized, and falling back to one shared empty object rather than a fresh
+  // `{}`: `useStreamingSweep` derives its per-method params from `fieldsFor`,
+  // and the rail publishes markers derived from that sweep back into
+  // ExplorerPage state. A focus that changed identity every render would make
+  // that loop — the same hazard useMethodFindings documents for `byMethod`.
+  const focus = useMemo(
+    () => readAll(user?.preferences)[timelineId] ?? NO_FOCUS,
+    [user?.preferences, timelineId],
+  );
 
   const write = useCallback(
     async (next: MethodFocus) => {
