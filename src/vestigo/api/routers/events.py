@@ -65,7 +65,12 @@ from vestigo.db.postgres import (
     generate_id,
     scope_identity,
 )
-from vestigo.db.queries import EventQuery, EventQueryService, TagFilter
+from vestigo.db.queries import (
+    INVENTORY_MAX_FIELDS,
+    EventQuery,
+    EventQueryService,
+    TagFilter,
+)
 from vestigo.db.similarity import EncoderUnavailableError, SimilarityService
 from vestigo.models.availability import unavailable_detail
 from vestigo.models.embeddings import embeddings_available
@@ -1749,7 +1754,9 @@ async def export_events(
 
 #: The four columns a value inventory can carry. `value` is what the file is
 #: *of*, so it is always present; the rest are the analyst's choice, and the
-#: order they ask for is the order they get.
+#: order they ask for is the order they get. With several fields selected,
+#: `value` stands for the whole value part of the row — one written column per
+#: field, headed with that field's token.
 _INVENTORY_COLUMNS = ("value", "count", "first_seen", "last_seen")
 
 #: Named separators rather than a free-text character: a delimited file is
@@ -1762,11 +1769,61 @@ _INVENTORY_SEPARATORS = {"comma": ",", "semicolon": ";", "tab": "\t", "pipe": "|
 class FieldInventoryRequest(BaseModel):
     """Request body for the value-inventory export."""
 
-    field: str = Field(min_length=1, description="Field token, e.g. 'attr:src_ip'")
+    fields: list[str] = Field(
+        min_length=1,
+        max_length=INVENTORY_MAX_FIELDS,
+        description=(
+            "Field tokens, e.g. ['attr:src_ip', 'attr:user']. More than one inventories "
+            "the distinct combinations of their values."
+        ),
+    )
     columns: list[str] = Field(default_factory=lambda: ["value", "first_seen", "last_seen"])
     separator: Literal["comma", "semicolon", "tab", "pipe"] = "comma"
     order_by: str = "count_desc"
     filter: ExportFilter = Field(default_factory=ExportFilter)
+
+
+def _inventory_fields(body: FieldInventoryRequest) -> list[str]:
+    """Validate the requested fields, turning a bad selection into a 400.
+
+    The query layer raises the same refusals (:func:`_inventory_tokens`), but
+    it raises them inside the generator — where the status line is long gone
+    and the only report left is a truncated 200.
+    """
+    tokens = [f.strip() for f in body.fields]
+    if any(not token for token in tokens):
+        raise HTTPException(status_code=400, detail="a field token cannot be empty")
+    if len(set(tokens)) != len(tokens):
+        raise HTTPException(status_code=400, detail="duplicate field in selection")
+    return tokens
+
+
+def _inventory_slug(fields: list[str]) -> str:
+    """Filename stem for an inventory of *fields* — mirrored by the frontend.
+
+    Every field appears, so two inventories of the same timeline that differ
+    only in their second field do not land in the download folder as one name
+    and a browser-appended ``(1)``.
+    """
+    parts = [re.sub(r"[^A-Za-z0-9]+", "_", f).strip("_") for f in fields]
+    return "-".join(p for p in parts if p) or "field"
+
+
+def _inventory_header(columns: list[str], fields: list[str]) -> list[str]:
+    """Expand the `value` column into one header cell per selected field.
+
+    The header names the keys the file is an inventory *of*, so each value
+    column carries its field token rather than a positional `value`/`value_2`
+    — that is what lets a reader join the file back to the events export, and
+    what makes a two-field file self-describing without the request beside it.
+    """
+    header: list[str] = []
+    for column in columns:
+        if column == "value":
+            header.extend(fields)
+        else:
+            header.append(column)
+    return header
 
 
 def _resolve_inventory_columns(columns: list[str], order_by: str) -> list[str]:
@@ -1805,6 +1862,7 @@ async def _audit_inventory_export(
     case_id: str,
     timeline_id: str,
     body: FieldInventoryRequest,
+    fields: list[str],
     columns: list[str],
     expected: int,
     source_offsets: dict[str, int] | None,
@@ -1822,7 +1880,7 @@ async def _audit_inventory_export(
         target_type="timeline",
         target_id=timeline_id,
         detail={
-            "field": body.field,
+            "fields": fields,
             "columns": columns,
             "separator": body.separator,
             "order_by": body.order_by,
@@ -1835,7 +1893,7 @@ async def _audit_inventory_export(
 
 def _stream_field_inventory(
     query: EventQuery,
-    field_token: str,
+    field_tokens: list[str],
     *,
     columns: list[str],
     delimiter: str,
@@ -1844,7 +1902,7 @@ def _stream_field_inventory(
     expected: int,
     tally: dict[str, Any],
 ) -> Generator[str]:
-    """Yield the delimited value inventory for *field_token* (header first).
+    """Yield the delimited value inventory for *field_tokens* (header first).
 
     Same self-describing envelope as the events export — a leading
     ``# applied_time_offsets=…`` comment when a clock-skew offset is active,
@@ -1857,17 +1915,27 @@ def _stream_field_inventory(
         if applied_offsets:
             yield f"# applied_time_offsets={json.dumps(applied_offsets)}\n"
         writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-        writer.writerow(columns)
+        writer.writerow(_inventory_header(columns, field_tokens))
         yield buf.getvalue()
 
         written = 0
         rows = _get_query_service().iter_field_inventory(
-            query, field_token, order_by=order_by, hold_export_slot=False
+            query, field_tokens, order_by=order_by, hold_export_slot=False
         )
         for row in rows:
             buf.seek(0)
             buf.truncate()
-            writer.writerow(["" if row.get(c) is None else row[c] for c in columns])
+            cells: list[Any] = []
+            for column in columns:
+                if column == "value":
+                    # One cell per selected field, in the order asked for. A
+                    # field that was empty on every event of this combination
+                    # writes an empty cell — the row is still a combination the
+                    # analyst asked to see (only the all-empty one is dropped).
+                    cells.extend("" if v is None else v for v in row["values"])
+                else:
+                    cells.append("" if row.get(column) is None else row[column])
+            writer.writerow(cells)
             yield buf.getvalue()
             written += 1
 
@@ -1880,11 +1948,11 @@ def _stream_field_inventory(
         )
         if not complete:
             _logger.error(
-                "field inventory export incomplete: expected=%s written=%s case=%s field=%s",
+                "field inventory export incomplete: expected=%s written=%s case=%s fields=%s",
                 expected,
                 written,
                 query.case_id,
-                field_token,
+                field_tokens,
             )
             raise ExportIncompleteError(f"export wrote {written} of {expected} distinct values")
     finally:
@@ -1903,16 +1971,23 @@ async def export_field_inventory(
     case: Case = Depends(require_case_read),
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Stream a delimited inventory of one field's distinct values (#295).
+    """Stream a delimited inventory of the distinct values of one or more fields (#295).
 
     One row per distinct value with its count and the first and last time it
     was seen — the aggregate an analyst would otherwise have had to rebuild
     from a full events export. Computed inside the *current* filters, exactly
     like the events export, and stamped with the same ISO-8601 UTC times, so
     the two files join.
+
+    Several fields inventory their distinct *combinations*: one value column
+    per field, and a count and seen range describing the events that carry that
+    exact combination. A combination survives unless every one of its parts is
+    empty, so a value that only ever appears without its partner still gets a
+    row, with an empty cell beside it.
     """
     if body.order_by not in EventQueryService.INVENTORY_ORDERINGS:
         raise HTTPException(status_code=400, detail=f"unknown ordering {body.order_by!r}")
+    fields = _inventory_fields(body)
     columns = _resolve_inventory_columns(body.columns, body.order_by)
     eq, source_offsets = await _build_export_query(case_id, timeline_id, body.filter)
 
@@ -1925,7 +2000,7 @@ async def export_field_inventory(
         _uses_regex(bool(eq.q_regex and eq.q), eq.filter_modes, eq.exclusion_modes),
         _get_query_service().count_field_inventory,
         eq,
-        body.field,
+        fields,
     )
 
     tally: dict[str, Any] = {"written": None, "complete": None}
@@ -1951,7 +2026,7 @@ async def export_field_inventory(
     store = get_store()
     try:
         await _audit_inventory_export(
-            store, user, case_id, timeline_id, body, columns, expected, source_offsets
+            store, user, case_id, timeline_id, body, fields, columns, expected, source_offsets
         )
     except BaseException:
         # Nothing will drain the stream, so nothing will release the slot.
@@ -1966,23 +2041,24 @@ async def export_field_inventory(
             target_type="timeline",
             target_id=timeline_id,
             detail={
-                "field": body.field,
+                "fields": fields,
                 "expected": expected,
                 "written": tally["written"],
                 "complete": tally["complete"],
             },
         )
 
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", body.field).strip("_") or "field"
     # The separator is in the name because comma, semicolon and pipe otherwise
-    # all land as `…-inventory.csv`: re-exporting one field with a different
-    # separator saves beside the first as `…(1).csv` while the analyst reopens
-    # the original, which reads exactly like the picker being ignored.
-    filename = f"{case_id}-{timeline_id}-{slug}-inventory-{body.separator}.{ext}"
+    # all land as `…-inventory.csv`: re-exporting the same fields with a
+    # different separator saves beside the first as `…(1).csv` while the analyst
+    # reopens the original, which reads exactly like the picker being ignored.
+    # The slug carries every field, so a two-field inventory and a one-field one
+    # never collide either.
+    filename = f"{case_id}-{timeline_id}-{_inventory_slug(fields)}-inventory-{body.separator}.{ext}"
     return StreamingResponse(
         _stream_field_inventory(
             eq,
-            body.field,
+            fields,
             columns=columns,
             delimiter=delimiter,
             order_by=body.order_by,

@@ -1177,18 +1177,54 @@ _TABLE_SORT_SQL: dict[str, str] = {
 }
 
 
-def _inventory_select_core(col_expr: str, dated_expr: str, *, extra: str = "") -> str:
+def _inventory_select_core(
+    columns: Sequence[tuple[str, str]], dated_expr: str, *, extra: str = ""
+) -> str:
     """The SELECT list the value inventory and the table figure share.
 
-    ``value, count, first_seen, last_seen`` over one ``GROUP BY val`` — lifted
-    out so the streamed inventory (#295) and the bounded table can never
-    disagree about what a row's count or seen range means. *extra* appends
-    further aggregates (the table's ``distinct_second``).
+    ``value…, count, first_seen, last_seen`` over one ``GROUP BY`` of the value
+    columns — lifted out so the streamed inventory (#295) and the bounded table
+    can never disagree about what a row's count or seen range means. *columns*
+    is ``(expression, alias)`` per value column: the table always passes one,
+    the inventory passes one per selected field, and the count and seen range
+    then describe the combination rather than either value alone. *extra*
+    appends further aggregates (the table's ``distinct_second``).
     """
+    values = ", ".join(f"{expr} AS {alias}" for expr, alias in columns)
     return (
-        f"SELECT {col_expr} AS val, count() AS c, "
+        f"SELECT {values}, count() AS c, "
         f"min({dated_expr}) AS first_seen, max({dated_expr}) AS last_seen{extra}"
     )
+
+
+#: Cap on how many fields one value inventory may combine. Each extra field
+#: multiplies the number of groups the scan holds, so this is a memory bound on
+#: a query the analyst pays for at whole-corpus scale — not a UI preference.
+INVENTORY_MAX_FIELDS = 8
+
+
+def _inventory_aliases(count: int) -> list[str]:
+    """Column aliases for the value columns of an inventory scan."""
+    return [f"val{i}" for i in range(count)]
+
+
+def _inventory_tokens(field_tokens: Sequence[str] | str) -> list[str]:
+    """Normalise the requested field(s) to a validated, ordered list.
+
+    A bare string is accepted so the single-field call reads as it always did.
+    Duplicates are rejected rather than deduplicated: a repeated field would
+    write the same column twice and group on it twice, which is never what was
+    meant, and silently dropping it would hand back a file whose columns do not
+    match the request.
+    """
+    tokens = [field_tokens] if isinstance(field_tokens, str) else list(field_tokens)
+    if not tokens:
+        raise ValueError("at least one field is required")
+    if len(tokens) > INVENTORY_MAX_FIELDS:
+        raise ValueError(f"at most {INVENTORY_MAX_FIELDS} fields can be combined")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("duplicate field in inventory selection")
+    return tokens
 
 
 def _foreground_scan(fn):
@@ -2580,40 +2616,56 @@ class EventQueryService:
     #: A value with no known time (every occurrence on a no-timestamp event)
     #: sorts last in *either* direction — ``NULLS LAST`` on the descending
     #: orderings too, because "most recent first" putting the unknowns on top
-    #: is not what the analyst asked for.
+    #: is not what the analyst asked for. The two ``value_*`` entries are the
+    #: exception: they are expanded across every value column in field order
+    #: (see :py:meth:`iter_field_inventory`), so what is mapped here is only
+    #: their direction.
     INVENTORY_ORDERINGS: dict[str, str] = {
         "count_desc": "c DESC",
         "count_asc": "c ASC",
-        "value_asc": "val ASC",
-        "value_desc": "val DESC",
+        "value_asc": "val0 ASC",
+        "value_desc": "val0 DESC",
         "first_seen_asc": "first_seen ASC NULLS LAST",
         "first_seen_desc": "first_seen DESC NULLS LAST",
         "last_seen_asc": "last_seen ASC NULLS LAST",
         "last_seen_desc": "last_seen DESC NULLS LAST",
     }
 
-    def _inventory_scope(self, query: EventQuery, field_token: str) -> tuple[str, Any, str]:
-        """Return ``(where, parameters, column_expr)`` for an inventory scan.
+    def _inventory_scope(
+        self, query: EventQuery, field_tokens: Sequence[str]
+    ) -> tuple[str, Any, list[str]]:
+        """Return ``(where, parameters, column_exprs)`` for an inventory scan.
 
         Shared by the streaming inventory and its pre-flight distinct count so
         the two agree on the scope down to the character — the count is what
         the export's completeness trailer is proven against, and a WHERE clause
         that drifted between them would turn a correct export into a reported
         shortfall.
+
+        With more than one field the scan groups on the *combination*, and a
+        row survives unless **every** part of it is empty: a value that only
+        ever co-occurs with a missing second field is still a value the analyst
+        asked to see, so it is written with an empty cell beside it rather than
+        dropped. Only the all-empty group — which describes no event's values
+        at all — is excluded, which is exactly the single-field rule generalised.
         """
         self.store.init_schema()
         where, parameters = self._build_where(query)
-        col_expr = _field_column_expr(
-            field_token,
-            parameters,
-            "field_key",
-            field_mappings=query.field_mappings,
-            source_offsets=query.source_offsets,
-        )
-        return f"{where} AND {col_expr} != ''", parameters, col_expr
+        col_exprs = [
+            _field_column_expr(
+                token,
+                parameters,
+                f"field_key_{i}",
+                field_mappings=query.field_mappings,
+                source_offsets=query.source_offsets,
+            )
+            for i, token in enumerate(field_tokens)
+        ]
+        non_empty = " OR ".join(f"{expr} != ''" for expr in col_exprs)
+        return f"{where} AND ({non_empty})", parameters, col_exprs
 
-    def count_field_inventory(self, query: EventQuery, field_token: str) -> int:
-        """Number of distinct non-empty values of *field_token* under *query*.
+    def count_field_inventory(self, query: EventQuery, field_tokens: Sequence[str]) -> int:
+        """Number of distinct non-empty value combinations of *field_tokens*.
 
         Pre-flight for the value-inventory export, with the same two jobs the
         events export's ``count()`` has: it is the row count the completeness
@@ -2633,12 +2685,18 @@ class EventQueryService:
         to turn "the export refuses on the fields it was built for" into "the
         export works".
         """
+        tokens = _inventory_tokens(field_tokens)
         with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
-            where, parameters, col_expr = self._inventory_scope(query, field_token)
+            where, parameters, col_exprs = self._inventory_scope(query, tokens)
+            aliases = _inventory_aliases(len(col_exprs))
+            select = ", ".join(
+                f"{expr} AS {alias}" for expr, alias in zip(col_exprs, aliases, strict=True)
+            )
+            group = ", ".join(aliases)
             result = self._select(
                 f"SELECT count() FROM ("
-                f"SELECT {col_expr} AS val FROM {self.store.database}.events "
-                f"WHERE {where} GROUP BY val"
+                f"SELECT {select} FROM {self.store.database}.events "
+                f"WHERE {where} GROUP BY {group}"
                 f") {heavy_scan_settings()}",
                 parameters=parameters,
             )
@@ -2648,18 +2706,22 @@ class EventQueryService:
     def iter_field_inventory(
         self,
         query: EventQuery,
-        field_token: str,
+        field_tokens: Sequence[str],
         *,
         order_by: str = "count_desc",
         block_size: int = 10_000,
         hold_export_slot: bool = True,
     ) -> Iterator[dict[str, Any]]:
-        """Yield one ``{value, count, first_seen, last_seen}`` row per distinct value.
+        """Yield one ``{values, count, first_seen, last_seen}`` row per distinct combination.
 
         The value inventory an analyst exports instead of every event (#295):
         the same ``_build_where`` as every other aggregation here, so it always
         describes the currently-filtered view, and offset-corrected times, so
-        it joins cleanly with an events export of the same timeline.
+        it joins cleanly with an events export of the same timeline. ``values``
+        holds one entry per requested field, in the order they were asked for;
+        with several fields the row describes the *combination*, its count is
+        the number of events carrying that combination, and its seen range
+        covers exactly those events.
 
         Three deliberate details:
 
@@ -2694,27 +2756,40 @@ class EventQueryService:
         inside the generator would be waiting after the headers are already
         gone (see ``api/routers/events.py::export_field_inventory``).
 
-        Every ordering breaks ties on the value, so re-running an export over
-        unchanged (immutable) sources reproduces the same file.
+        Every ordering breaks ties on the value columns, left to right, so
+        re-running an export over unchanged (immutable) sources reproduces the
+        same file.
         """
-        try:
-            order_sql = self.INVENTORY_ORDERINGS[order_by]
-        except KeyError:
-            raise ValueError(f"unknown inventory ordering {order_by!r}") from None
+        tokens = _inventory_tokens(field_tokens)
+        if order_by not in self.INVENTORY_ORDERINGS:
+            raise ValueError(f"unknown inventory ordering {order_by!r}")
+        order_sql = self.INVENTORY_ORDERINGS[order_by]
 
-        where, parameters, col_expr = self._inventory_scope(query, field_token)
+        where, parameters, col_exprs = self._inventory_scope(query, tokens)
+        aliases = _inventory_aliases(len(col_exprs))
         eff = effective_ts_sql(query.source_offsets)
         dated = f"if({VESTIGO_NOT_SENTINEL_SQL}, {eff}, NULL)"
-        tie_break = "" if order_sql.startswith("val ") else ", val ASC"
+        # A tuple ordering sorts on the columns left to right; the value
+        # orderings *are* that sort, so they expand across every value column
+        # rather than only the first, and every other ordering appends it as
+        # its tie-break. Either way the sort is total, which is what makes a
+        # re-run over immutable sources reproduce the file byte for byte.
+        value_tie_break = ", ".join(f"{alias} ASC" for alias in aliases)
+        if order_by.startswith("value_"):
+            direction = "DESC" if order_by.endswith("_desc") else "ASC"
+            order_clause = ", ".join(f"{alias} {direction}" for alias in aliases)
+        else:
+            order_clause = f"{order_sql}, {value_tie_break}"
         sql = (
-            f"{_inventory_select_core(col_expr, dated)} "
+            f"{_inventory_select_core(list(zip(col_exprs, aliases, strict=True)), dated)} "
             f"FROM {self.store.database}.events "
             f"WHERE {where} "
-            f"GROUP BY val "
-            f"ORDER BY {order_sql}{tie_break} "
+            f"GROUP BY {', '.join(aliases)} "
+            f"ORDER BY {order_clause} "
             f"{heavy_scan_settings()}, max_block_size = {int(block_size)}"
         )
 
+        n = len(aliases)
         with EXPORT_SCAN_GATE if hold_export_slot else contextlib.nullcontext():
             # Cancellable admission (#300), driven by hand because the release
             # point is inside the generator loop, not at block exit.
@@ -2726,13 +2801,14 @@ class EventQueryService:
                     if scanning:
                         slot.__exit__(None, None, None)
                         scanning = False
-                    for value, count, first_seen, last_seen in block:
+                    for row in block:
+                        count, first_seen, last_seen = row[n], row[n + 1], row[n + 2]
                         yield {
-                            # `value` is `bytes` when the token resolved to a
+                            # A value is `bytes` when its token resolved to a
                             # FixedString(64) column (`content_hash`,
                             # `file_hash`) — the CSV writer would stringify
                             # that as `b'3f2a…\x00'`.
-                            "value": decode_fixed_string(value),
+                            "values": [decode_fixed_string(v) for v in row[:n]],
                             "count": int(count),
                             "first_seen": ensure_utc_iso(first_seen) if first_seen else None,
                             "last_seen": ensure_utc_iso(last_seen) if last_seen else None,
@@ -4385,7 +4461,7 @@ class EventQueryService:
         def top_n() -> Any:
             return self._select(
                 f"""
-                {_inventory_select_core(col_expr, dated, extra=extra)}
+                {_inventory_select_core([(col_expr, "val")], dated, extra=extra)}
                 FROM {database}.events
                 {scope}
                 GROUP BY val

@@ -89,7 +89,8 @@ The current vocabulary is defined and implemented in
 - Export filtered results or full annotated timeline as CSV/JSONL.
 - Export a value inventory of any field — each distinct value with its count and the
   first and last time it was seen — over the same filtered view, with the columns and
-  separator the analyst picks.
+  separator the analyst picks. Several fields inventory their distinct *combinations*:
+  one column per field, one count per combination.
 - Time histogram and per-source color stripes in the Explorer.
 - Chart-based visualization of any aggregation (`docs/VISUALIZE.md`; `docs/ROADMAP.md`
   tracks the remaining chart families).

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Download } from "lucide-react";
+import { Download, X } from "lucide-react";
 import { downloadExport, downloadFieldInventory } from "@/api/export";
 import { vizApi } from "@/api/viz";
 import { FieldCombo } from "@/components/ui/FieldCombo";
@@ -54,6 +54,10 @@ const ORDERINGS: { id: FieldInventoryOrder; label: string }[] = [
   { id: "last_seen_desc", label: "Last seen (newest first)" },
 ];
 
+/** Mirrors the server's `INVENTORY_MAX_FIELDS`: each extra field multiplies the
+ * groups the whole-corpus scan holds, so the cap is a memory bound, not taste. */
+const INVENTORY_MAX_FIELDS = 8;
+
 const SELECT_CLASS =
   "h-8 w-full rounded border border-[var(--color-border)] bg-[var(--color-bg-surface)] px-2 text-xs text-[var(--color-fg-primary)]";
 
@@ -69,7 +73,10 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
   const [mode, setMode] = useState<Mode>("events");
   const [format, setFormat] = useState<"csv" | "jsonl">("csv");
 
-  const [field, setField] = useState<string | null>(null);
+  // One picked field per entry, in the order chosen — the export's column order.
+  // An empty trailing slot is rendered separately rather than held here, so
+  // "nothing chosen yet" is never a field in the request.
+  const [fields, setFields] = useState<string[]>([]);
   const [picked, setPicked] = useState<FieldInventoryColumn[]>(["first_seen", "last_seen"]);
   const [separator, setSeparator] = useState<FieldInventorySeparator>("comma");
   const [orderBy, setOrderBy] = useState<FieldInventoryOrder>("count_desc");
@@ -90,7 +97,34 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
   }, [picked, orderBy]);
 
   const inventoryExt = separator === "tab" ? "tsv" : "csv";
-  const distinct = fieldsQuery.data?.fields.find((f) => f.token === field)?.distinct ?? null;
+  // The first field's distinct count is a floor, not an estimate, once a second
+  // field is in play: combining can only split groups, never merge them. Said
+  // that way rather than dropped, because "how long is this file" is the
+  // question the number is there to answer.
+  const distinct = fieldsQuery.data?.fields.find((f) => f.token === fields[0])?.distinct ?? null;
+
+  const fieldOptions = useMemo(
+    () =>
+      (fieldsQuery.data?.fields ?? []).map((f) => ({
+        value: f.token,
+        label: f.token,
+        hint: f.distinct != null ? `${f.distinct.toLocaleString()} distinct` : undefined,
+      })),
+    [fieldsQuery.data],
+  );
+
+  /** Set slot *index* to *token*; an empty token removes the slot entirely.
+   *
+   * A field already picked elsewhere is refused by omitting it from the other
+   * slots' options, so this only has to handle the add/replace/remove cases. */
+  const setFieldAt = (index: number, token: string) => {
+    setFields((prev) => {
+      const next = [...prev];
+      if (!token) next.splice(index, 1);
+      else next[index] = token;
+      return next;
+    });
+  };
 
   // The response is a chunked stream with no `Content-Length`, so progress can
   // only ever be bytes-so-far against an unknown total — an indeterminate bar.
@@ -104,7 +138,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
             caseId,
             timelineId,
             filters,
-            { field: field!, columns, separator, orderBy },
+            { fields, columns, separator, orderBy },
             o,
           ),
     onSuccess: () => setOpen(false),
@@ -115,7 +149,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
       ? total !== null
         ? `Download all ${total.toLocaleString()} matching events with current filters applied.`
         : "Download all matching events with current filters applied."
-      : "Download one row per distinct value of a field — with how often it occurs and when it was first and last seen — computed over the same filtered view.";
+      : "Download one row per distinct value of a field — or per distinct combination of several — with how often it occurs and when it was first and last seen, computed over the same filtered view.";
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -174,36 +208,72 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
             <>
               <div>
                 <label className="mb-2 block text-xs text-[var(--color-fg-muted)]">
-                  Field
+                  {fields.length > 1 ? "Fields" : "Field"}
                 </label>
-                {/* One `FieldCombo`, as everywhere else that asks which
-                    field: this list runs to hundreds of tokens in a real
-                    timeline, so typing a prefix to narrow it is the whole
-                    point — and the placeholder still states which of the three
-                    states the list is in. Without it a failed or in-flight
-                    `viz/fields` renders as an empty picker with the Download
-                    button permanently disabled and nothing saying why. */}
-                <FieldCombo
-                  aria-label="Field"
-                  disabled={download.active || fieldsQuery.isPending || fieldsQuery.isError}
-                  placeholder={
-                    fieldsQuery.isPending
-                      ? "Loading fields…"
-                      : fieldsQuery.isError
-                        ? "Could not load fields"
-                        : "Choose a field…"
-                  }
-                  options={(fieldsQuery.data?.fields ?? []).map((f) => ({
-                    value: f.token,
-                    label: f.token,
-                    hint:
-                      f.distinct != null
-                        ? `${f.distinct.toLocaleString()} distinct`
-                        : undefined,
-                  }))}
-                  value={field ?? ""}
-                  onChange={(v) => setField(v || null)}
-                />
+                {/* One `FieldCombo` per chosen field plus an empty one below,
+                    so a second field is always one click away and never in the
+                    way: nothing is required beyond the first. `FieldCombo` is
+                    what every other "which field?" surface uses — this list
+                    runs to hundreds of tokens in a real timeline, so typing a
+                    prefix to narrow it is the whole point — and the
+                    placeholder still states which of the three states the list
+                    is in. Without it a failed or in-flight `viz/fields`
+                    renders as an empty picker with the Download button
+                    permanently disabled and nothing saying why. */}
+                <div className="space-y-2">
+                  {/* The empty trailing slot disappears at the cap — an
+                      offer the server would refuse is worse than no offer. */}
+                  {(fields.length < INVENTORY_MAX_FIELDS ? [...fields, ""] : fields).map(
+                    (token, index) => {
+                      const first = index === 0;
+                      const taken = new Set(fields.filter((_, i) => i !== index));
+                      return (
+                        <div key={`${token || "empty"}-${index}`} className="flex gap-2">
+                          <FieldCombo
+                            className="flex-1"
+                            aria-label={first ? "Field" : `Field ${index + 1}`}
+                            disabled={
+                              download.active || fieldsQuery.isPending || fieldsQuery.isError
+                            }
+                            placeholder={
+                              fieldsQuery.isPending
+                                ? "Loading fields…"
+                                : fieldsQuery.isError
+                                  ? "Could not load fields"
+                                  : first
+                                    ? "Choose a field…"
+                                    : "Add another field (optional)…"
+                            }
+                            options={fieldOptions.filter((o) => !taken.has(o.value))}
+                            value={token}
+                            onChange={(v) => setFieldAt(index, v)}
+                          />
+                          {/* An emptied combo commits nothing (`FieldCombo`
+                              only emits `""` where the caller offers it as a
+                              row), so dropping a field needs its own control
+                              rather than a box the analyst can clear. */}
+                          {token ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`Remove ${token}`}
+                              disabled={download.active}
+                              onClick={() => setFieldAt(index, "")}
+                            >
+                              <X size={13} />
+                            </Button>
+                          ) : null}
+                        </div>
+                      );
+                    },
+                  )}
+                </div>
+                {fields.length >= INVENTORY_MAX_FIELDS ? (
+                  <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
+                    {INVENTORY_MAX_FIELDS} fields is the most one inventory can combine —
+                    each one multiplies the number of groups the scan holds.
+                  </p>
+                ) : null}
                 {fieldsQuery.isError ? (
                   <div className="mt-1.5 flex items-center gap-2">
                     <p className="text-xs text-[var(--color-danger)]">
@@ -250,7 +320,10 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
                 </div>
                 <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
                   {COLUMN_LABELS[sortColumn(orderBy)]} is written because the file is sorted
-                  by it. Value is always the first column.
+                  by it.{" "}
+                  {fields.length > 1
+                    ? "The value columns come first, one per field, headed with its field name."
+                    : "Value is always the first column, headed with the field name."}
                 </p>
               </div>
 
@@ -288,7 +361,12 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
 
               <p className="text-xs text-[var(--color-fg-muted)]">
                 {distinct != null
-                  ? `About ${distinct.toLocaleString()} rows before filtering. `
+                  ? fields.length > 1
+                    ? `At least ${distinct.toLocaleString()} rows before filtering — combining fields only splits groups further. `
+                    : `About ${distinct.toLocaleString()} rows before filtering. `
+                  : ""}
+                {fields.length > 1
+                  ? "A row is written unless every one of its fields is empty, so a value that only ever appears without its partner still gets one, with an empty cell beside it. "
                   : ""}
                 Times are ISO-8601 UTC, the same format the events export writes, so the
                 two files join. A value only ever seen on events without a timestamp gets
@@ -317,7 +395,7 @@ export function ExportDialog({ caseId, timelineId, filters, total }: Props) {
             <Button
               variant="accent"
               size="sm"
-              disabled={download.active || (mode === "inventory" && !field)}
+              disabled={download.active || (mode === "inventory" && fields.length === 0)}
               onClick={() => download.submit()}
             >
               <Download size={13} />

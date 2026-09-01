@@ -41,7 +41,7 @@ describe("value-inventory download filename", () => {
       "t1",
       {} as EventFilters,
       {
-        field: "attr:src_ip",
+        fields: ["attr:src_ip"],
         columns: ["value"],
         separator: separator as "comma" | "semicolon" | "pipe" | "tab",
         orderBy: "value_asc",
@@ -58,7 +58,7 @@ describe("value-inventory download filename", () => {
         "c1",
         "t1",
         {} as EventFilters,
-        { field: "attr:src_ip", columns: ["value"], separator, orderBy: "value_asc" },
+        { fields: ["attr:src_ip"], columns: ["value"], separator, orderBy: "value_asc" },
       );
       return triggerDownloadMock.mock.calls[0][1];
     };
