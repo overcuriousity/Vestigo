@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Audit rows were silently lost whenever a request carried a time filter.** `record_audit`
+  is best-effort by contract — it logs and swallows rather than failing the request it
+  records — so a detail value the audit JSON column could not store meant the request
+  succeeded and the custody record simply never existed. Any export or bulk-tag whose filter
+  had a start/end range hit exactly that. Bulk annotation is the serious one: it applied tags
+  to evidence while recording nothing. Details are now coerced JSON-safe in the one place
+  every call site passes through, and the three affected call sites write proper ISO-8601.
+
+### Changed
+
+- **CSV exports now give every field its own column** instead of collapsing every per-event
+  field into a single `attributes` JSON cell. Core scalar columns come first, then one
+  `attr:<key>` column per attribute key in the timeline, alphabetically; an event without a
+  given key writes an empty cell. The column set comes from the timeline's cached field
+  inventory rather than the filtered rows, so narrowing a filter never shifts the columns.
+  A key with no column is now named in the export trailer rather than being dropped in
+  silence. JSONL output is unchanged and remains the lossless record.
+
 ## [1.18.2] — 2026-09-01
 
 ### Fixed
