@@ -16,6 +16,8 @@ the remaining 1.x work by payoff-per-effort:
 4. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
 5. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
 6. **D10** / **D16** — heaviest lifts, last of the detector line.
+7. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
+   Hayabusa engine half lives in `overcuriousity/hayabusa-processor`.
 
 Milestones 2–3 are polish, picked up opportunistically. Milestone 9 is additive work on
 shipped subsystems. Milestones 6 (streaming ingest) and 7 (forensic examination) are future
@@ -411,10 +413,132 @@ redesigned. Order across tracks: **G1 → G2 ∥ V1 → G3 → V2/V3 → G4 → 
   hybrid sparse+dense (Qdrant-native BM25/SPLADE) versus leaving keyword search to
   ClickHouse `search_blob` — the wrong answer duplicates a query system.
 
+## Milestone 11 — external enrichment processors, first consumer Hayabusa (designed 2026-09-02)
+
+Windows EVTX signature detection with [Hayabusa](https://github.com/Yamato-Security/hayabusa)
+arrives as an **enricher whose columns feed the statistical detectors** — not a fifteenth
+detector, not a Timesketch-style imported timeline (standing decision below). The Hayabusa
+half is a **separate, optional component in its own repository**,
+[`overcuriousity/hayabusa-processor`](https://github.com/overcuriousity/hayabusa-processor).
+Vestigo core gains only the generic, processor-agnostic wiring: an HTTP protocol any external
+processor can implement, and one enricher class built from a processor's manifest. No
+Hayabusa-specific code lands in this repository.
+
+Flow: the analyst opens the enrichers dialog on the timeline screen, picks the processor,
+uploads the `.evtx` files, and runs it. Vestigo forwards the files to the processor, the
+processor runs the engine, Vestigo joins the result rows onto the timeline's events and
+writes the columns back through the existing staging and partition rewrite.
+
+Verified on 2026-09-02, and load-bearing for every item:
+
+- **Registration exists and stays a module-level list** (`enrichers/registry.py`). What is
+  missing is the contract: `Enricher` is value-shaped (regex over attribute *values*,
+  `enrich_value(raw_value)`, memoized per value); a processor is record-shaped (one verdict
+  per `(file, record)` from an external input). Everything from staging on is reusable
+  unchanged — rows are staged per `event_id` with a `fields` map, applied by `mapUpdate`
+  over a LEFT JOIN in one `REPLACE PARTITION`, `SourceEnrichment` records the config hash.
+- **Vestigo does not hold the `.evtx`.** `evtx2vestigo` runs on the analyst's machine and
+  the retained source is its Parquet, so the engine input is a new upload. Every event row
+  carries `attributes['evtx_record_id']`, `events.source_file` (the `.evtx` basename) and
+  `events.file_hash` (sha256 of that `.evtx`), plus `Channel` and `Computer` — the join key.
+- **Rebuilding the engine's JSON input from ClickHouse rows is lossy** (Hayabusa
+  `eventkey_alias.txt` against the converter): System and EventData fields round-trip,
+  UserData does not — the converter flattens to `UserData_<Container>_<Leaf>` with `_` and
+  Hayabusa's container names contain `_` themselves. Hence the raw `.evtx` upload.
+- **Hayabusa correlation rules** (`event_count`, `value_count`, `temporal`,
+  `temporal_ordered`) emit `RecordID` `-` and cannot join to a row.
+
+- [ ] **P1 — Processor protocol `v1`.** Written down in a new `docs/ENRICHERS.md` before code
+  (the enrichers subsystem has no reference doc today; this becomes it). HTTP, bearer token
+  shared per processor, versioned path `/v1/`:
+  - `GET /v1/manifest` → processor `key`, `display_name`, `description`, processor
+    `version`, `engine` (`name`, `version`, `rules_hash`), `config_hash`, `input`
+    (`accepted_extensions`, `multiple`), `join` (ordered list of result column → event
+    column or attribute key; Hayabusa: `source_file` → `events.source_file`, `record_id` →
+    `attributes['evtx_record_id']`, `channel` → `attributes['Channel']` as a check),
+    `output_fields` (each with `name`, `kind` scalar|set|numeric, `sentinel`, `series`
+    bool), optional `findings` (`level_field`, `rule_field`, `rule_id_field`).
+  - `POST /v1/runs` multipart files → `202 {run_id}`; `GET /v1/runs/{id}` →
+    `status` queued|running|completed|failed, `progress`, `warnings[]`, `error`;
+    `GET /v1/runs/{id}/result` JSONL, one row `{"join": {...}, "fields": {...}}`, rows with
+    `"join": null` carry `"window": {start, end}` and `fields` (non-record hits);
+    `DELETE /v1/runs/{id}`.
+  - Reachability is operator-configured (localhost or LAN) and independent of
+    `VESTIGO_ALLOW_ONLINE`, like PostgreSQL — document that in `TECH_STACK.md` §6.
+- [ ] **P2 — `ExternalProcessorEnricher`.** One generic class in `enrichers/external.py`
+  built from a manifest; registered at startup from a new `external_processors` setting
+  (list of `{url, token}`, env-only for the token, `SettingSpec` in the registry). Availability
+  = manifest reachable and protocol version supported, re-checked through
+  `refresh_availability` like an asset upload. Eligibility = every join attribute key
+  present on at least one event (`mapContains` existence scan, same 3 s fail-open cap as
+  the regex scan). `config_hash` = the manifest's `config_hash` plus the input file hashes.
+  `output_fields` from the manifest; derived keys keep the `<attr_key>:<field>` contract
+  with the first join attribute as parent (`evtx_record_id:hayabusa_rule`), so
+  `derived_suffixes`, Explorer sorting and the re-run skip rule need no change.
+  `finalize_enrichment_apply`'s suffix-uniqueness rule applies: refuse to register a
+  processor whose suffixes collide with another enricher's.
+- [ ] **P3 — Input upload and retention.** The enrichers dialog renders a file picker when
+  the manifest declares `input`; the run route becomes multipart. Files are retained
+  content-addressed under `source_retention_path/enricher-inputs/<sha256>`, size-capped by
+  `max_upload_bytes`, audited (`enricher.input`), included in `transfer/` export and
+  import. They are inputs, not Sources: no events derive from them directly, the Parquet
+  did that. Re-running with the same files and the same manifest `config_hash` is a no-op
+  by provenance, exactly as GeoIP today.
+- [ ] **P4 — The join and its failure modes.** Load the result rows into a dict keyed by the
+  join tuple (hits only, small), stream the source's events through `iter_source_events`,
+  emit staged rows on match. Every outcome counted per source and written to the job
+  result and `SourceEnrichment.detail`: `joined`, `ambiguous` (two events for one key —
+  a triage directory can hold two `Security.evtx`, so basename alone can collide; the
+  check column decides, else neither is applied), `unmatched` (result row with no
+  event), `windows` (rows with `join: null`). Zero joins fails the run: the files were
+  made over different evidence. `SourceEnrichment` gains a `detail` JSON column (engine
+  version, rules hash, input hashes, counts) — the engine version and ruleset are what
+  make a rerun in March the same run as one in January.
+- [ ] **P5 — Sentinel and series declaration.** `finalize_enrichment_apply` takes a
+  `defaults` map from the manifest's sentinels and applies it where the LEFT JOIN misses;
+  the rewrite reads the whole partition anyway, so unmatched rows cost no staging. With
+  `no_detection` on every unmatched row the column is 100 % covered, classifies
+  `categorical`, and proportion shift gets a correct denominator — an empty value would
+  land it under the 5 % sparse rule and out of every auto-selection. Fields declared
+  `series: false` (the `;`-joined sets) are skipped by value-novelty and sequence
+  auto-selection through a registry-fed exclusion beside `_SYNTHETIC_FIELDS`, not inside
+  it (that set means "stamped by the pipeline"); explicit `fields=` still takes them.
+  Document both in `ANOMALY_DETECTION.md`'s field-classification section.
+- [ ] **P6 — Findings projection, second phase.** When the manifest carries `findings`, the
+  rail gets an entry under *Named techniques* that reads the columns back (one finding per
+  `(rule, source)`, representative event at the highest level, score from the level) plus
+  the window rows from P4 as window findings with no event anchor and a disclosed count.
+  Dispositions reuse the Sigma runner's pattern (system annotations, `detector` = rule id,
+  `list_confirmed_keys` preserved on re-apply). MITRE tactics land as `origin: system`
+  tags for Explorer filtering — a projection of the columns, never the record of truth.
+  Plan gate: `not_applicable` unless a processor is registered and a source in scope
+  carries the join keys; `reason_facts` names which is missing.
+- [ ] **P7 — Tests.** A fake processor (FastAPI app in `tests/`, no engine) serving a
+  manifest and a canned result over the demo case or an EVTX-shaped fixture: join counts,
+  ambiguity refusal, sentinel coverage, series exclusion, provenance detail, export/import
+  round-trip of the retained inputs, and the capability predicate. No Hayabusa binary in
+  this repository's CI, ever.
+
+**Not planned here:** importing Hayabusa CSV/JSONL as a Source (standing decision);
+`metrics`/`logon-summary`/`computer-metrics` (already computed over ClickHouse);
+`pivot-keywords-list`; automatic de-duplication against the Sigma runner — community rules
+exist in both engines, so the same rule can surface twice on an EVTX timeline until W5
+logsource scoping lands. A CLI path: enrichment runs through the web interface only.
+
 ## Standing decisions (with revisit triggers)
 
 Decisions, not work items — each stays as decided unless its trigger fires.
 
+- **Engine output is enrichment, never a Source and never a detector of its own**
+  (2026-09-02, Milestone 11). Timesketch's Hayabusa integration is a CSV profile uploaded
+  as a timeline: rows that are verdicts, with no `content_hash`/`byte_offset` into
+  evidence. Ingesting that here would give derived data the provenance columns of
+  evidence. As a standalone detector it would produce a flat alert list; as columns, the
+  primary-rule field becomes an n-gram, cadence and proportion-shift series for free.
+  Engines live in their own repositories behind the processor protocol; Vestigo ships the
+  wiring, not the engine. Trigger: a user whose only artifact is an engine export from a
+  pipeline (Velociraptor, LimaCharlie) with no `.evtx` reachable — then design a clearly
+  labelled derived-source kind, not a quiet import.
 - **Embeddings are a triage/relevance layer, never a scored detector** (2026-09-01, with
   Milestone 10). The reason PCA was skipped applies with full force: a cosine distance is
   not an explanation an analyst can defend. Semantic surfaces return neighbors and name
