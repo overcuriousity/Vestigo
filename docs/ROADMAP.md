@@ -40,9 +40,13 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   resolves per query; concurrency sizes `HEAVY_SCAN_GATE`, a `BoundedSemaphore` imported by
   value into four modules, so rebinding the global would not reach them. Needs the gate
   behind an accessor, plus a decision about what resizing means for held slots.
-- [ ] **Surface the scan-budget risk in the admin console.** `/api/health` carries
-  `scan_budget` with `risk: ok | over_budget | unbounded` and nothing renders it. Belongs
-  next to the Scan guardrails group on Admin → Settings, as a banner naming the remedy.
+- [ ] **A fourth `scan_budget` risk for an unusably small per-query cap.** `risk` only
+  compares `total_bytes + cache_bytes` against the ceiling, so a large
+  `VESTIGO_STAT_SCAN_CONCURRENCY` reports `ok` while every slice is too small to scan with —
+  N=10 on the reference ceiling leaves 409.6 MiB and fails the enrichment partition rewrite
+  with `MEMORY_LIMIT_EXCEEDED` (session-223). Needs a floor to compare against (the rewrite
+  is the binding query, not a detector GROUP BY) and copy naming the ceiling, not N, as the
+  remedy. Documented in `docs/DEPLOYMENT.md` "The N trap" until then.
 - [ ] **Show env-pinned settings as pinned in the admin console.** A field set in the
   environment silently wins over the stored override, so an admin can flip a toggle, get a
   200 and see nothing change. Serve the pinned-field set from the settings API and render

@@ -498,7 +498,7 @@ function compute() {
   const set = document.getElementById("out-settings");
   set.textContent = "";
   row(set, "<code>VESTIGO_STAT_SCAN_CONCURRENCY</code>", String(need.concurrency), m((x) => String(x.concurrency)),
-    `Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+${K.foreground_slots}) on the memory budget, so it needs a restart.`);
+    `Heavy scans admitted at once; the rest queue. Charts use a separate lane. Also the divisor (+${K.foreground_slots}) on the memory budget and on max_threads, so it needs a restart — and so raising it past this figure buys no throughput against a fixed ClickHouse ceiling: it cuts the same total into smaller, more spill-bound slices until a sweep or the enrichment rewrite fails outright. If sweeps queue, raise max_server_memory_usage instead.`);
   row(set, "<code>VESTIGO_STAT_SCAN_MAX_THREADS</code>", "0 (auto)", "0 (auto)",
     `Auto resolves to ${need.threads} at the minimum${max ? ` and ${max.threads} at full spend` : ""} — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
   row(set, "→ chart-lane width (derived)", String(chartThreadsFor(need.threads)), m((x) => String(chartThreadsFor(x.threads))),

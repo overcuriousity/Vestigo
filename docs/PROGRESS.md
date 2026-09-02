@@ -4,7 +4,38 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-01 (session 222 — release 1.18.3).
+Last updated: 2026-09-02 (session 223 — the scan-budget divisor in the docs).
+
+## Session 223 — 2026-09-02: the N trap, documented where it is set
+
+A production enrichment job failed with `MEMORY_LIMIT_EXCEEDED ... maximum: 409.60 MiB` in
+`finalize_enrichment_apply`. Nothing was wrong with the code: the deployment ran
+`VESTIGO_STAT_SCAN_CONCURRENCY=10` against the reference 9.5 GiB ceiling, and
+`(9.5 − 3.5) × 0.8 ÷ 12` is exactly 409.6 MiB. The docs had two independent problems that
+made that arithmetic impossible to check from the outside:
+
+- **The divisor was written as `budget ÷ concurrency` in three places** — `DEPLOYMENT.md`'s
+  three-ceilings list, its worked-example table (2.4 GiB where the shipped stack resolves
+  1.2) and its `/api/health` sample JSON, plus `config.py`'s comment on
+  `stat_scan_max_memory_bytes` and `tests/test_scan_budget.py`'s module docstring. It has
+  been `÷ (N + 2)` since the chart lane landed (#300); `ANOMALY_DETECTION.md`, `.env.example`,
+  `_scan.py`'s own docstring and the sizing calculator were already correct, which is why the
+  discrepancy survived. Every stale copy now matches `detect_scan_memory_budget`, and the
+  sample JSON gained the `foreground` block it always served.
+- **Nothing said raising N is the wrong answer to a queueing sweep.** New `DEPLOYMENT.md`
+  section "The N trap" with the N → cap → threads table, the enrichment rewrite as the query
+  that fails first, and the reason `risk` stays `ok` throughout: it compares the *total*,
+  which N does not change. The same warning is now on the `stat_scan_concurrency` setting
+  spec (where an admin actually types the number), in `config.py`, and on the sizing page's
+  concurrency row.
+
+`ScanBudgetCard` rendered `total_bytes` as `per_query × concurrency`, an equation that does
+not hold — it now names both lanes. Also corrected: the "raise both together" warning on
+`memory.xml` vs `mem_limit`, since raising only the container limit leaves the pinned ceiling
+as the effective one and changes nothing.
+
+The gap the incident actually exposes — `risk` never checking whether a *slice* is usable —
+is a `ROADMAP.md` item, not a fix here.
 
 ## Session 222 — 2026-09-01: release 1.18.3
 

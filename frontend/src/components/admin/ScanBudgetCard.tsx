@@ -12,7 +12,8 @@ const COPY: Record<ScanBudget["risk"], { title: string; body: (b: ScanBudget) =>
   ok: {
     title: "Scan budget fits under ClickHouse's ceiling",
     body: (b) =>
-      `${gib(b.total_bytes)} of scans (${gib(b.per_query_bytes)} × ${b.concurrency}) plus ` +
+      `${gib(b.total_bytes)} of scans (${gib(b.per_query_bytes)} × ${b.concurrency} heavy ` +
+      `slots + ${gib(b.foreground.per_query_bytes)} × ${b.foreground.concurrency} chart slots) plus ` +
       `${gib(b.cache_bytes)} of server caches under a ${gib(b.clickhouse_ceiling_bytes)} ceiling, ` +
       `leaving ${gib(b.headroom_bytes)} for background merges.`,
   },

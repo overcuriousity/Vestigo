@@ -47,7 +47,8 @@ Local detection remains as the fallback for before the probe has run (and for
 the CLI, which never probes) — and as a *cap* on a ceiling ClickHouse could
 only derive rather than be given (:func:`scan_memory_ceiling`). On its own it is
 exactly the assumption that failed in production: a full-docker stack on a 64 GiB host detected 64 GiB *from the app
-container*, authorized 0.8 x 64 / 2 = 25.6 GiB per query, and ClickHouse — with
+container*, authorized 0.8 x 64 / 2 = 25.6 GiB per query (the divisor was the bare
+concurrency then; today's N + 2 makes it 12.8, which is no better an idea), and ClickHouse — with
 no container limit and no ``max_server_memory_usage`` — was OOM-killed by the
 kernel with nothing in its own log (session-186). Asking ClickHouse what it is
 allowed to use removes the guess.

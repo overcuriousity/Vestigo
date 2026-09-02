@@ -670,7 +670,13 @@ _SPECS: tuple[SettingSpec, ...] = (
         "scans",
         "Concurrent heavy scans",
         "Scans allowed against ClickHouse at once; the rest queue. Guards against an "
-        "OOM-kill of the server. The enrichment partition rewrite takes a slot too.",
+        "OOM-kill of the server. The enrichment partition rewrite takes a slot too. "
+        "It is also the divisor on the scan memory budget (budget / (N + 2)) and on "
+        "max_threads, so raising it buys no throughput against a fixed ClickHouse "
+        "ceiling — it only cuts the same total into smaller, more spill-bound slices, "
+        "until a sweep or the enrichment rewrite fails with MEMORY_LIMIT_EXCEEDED. "
+        "Check the per-query cap above after changing it; if sweeps queue, raise "
+        "max_server_memory_usage instead.",
         restart_required=True,
     ),
     SettingSpec(

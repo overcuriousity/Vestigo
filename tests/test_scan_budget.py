@@ -2,9 +2,12 @@
 
 The heavy-scan memory budget is a *total* across concurrent scans — pinned
 via ``VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`` or auto-sized to a ratio of detected
-RAM (cgroup-aware) — and each query's ``max_memory_usage`` is budget /
-``VESTIGO_STAT_SCAN_CONCURRENCY``. ``HEAVY_SCAN_GATE`` enforces that no more than
-that many detector scans run at once.
+RAM (cgroup-aware) — and each heavy query's ``max_memory_usage`` is budget /
+(``VESTIGO_STAT_SCAN_CONCURRENCY`` + 2), the two extra slots being the foreground
+chart lane's share. ``HEAVY_SCAN_GATE`` enforces that no more than
+``VESTIGO_STAT_SCAN_CONCURRENCY`` detector scans run at once. The tests below
+drive the pure resolver, whose ``concurrency`` argument is that already-summed
+divisor — see ``detect_scan_memory_budget`` for the caller that sums it.
 """
 
 from __future__ import annotations

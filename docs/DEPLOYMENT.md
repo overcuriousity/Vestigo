@@ -339,8 +339,10 @@ like a healthy service.
 
    A `max_server_memory_usage` of 0 and a ratio of 0.9 mean nothing was merged.
 3. **Vestigo's scan budget** (`VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`) — a *total across
-   concurrent heavy scans*; each query is granted budget ÷ `VESTIGO_STAT_SCAN_CONCURRENCY`
-   as its `max_memory_usage`. Must sit below (2).
+   concurrent heavy scans*; each query is granted budget ÷ (`VESTIGO_STAT_SCAN_CONCURRENCY`
+   + 2) as its `max_memory_usage`, the two extra slots being the chart lane's reserved share
+   (above). Must sit below (2). **N is a divisor, not just a queue depth** — see the trap
+   below.
 
 Left at its `0` (auto) default, (3) is **derived from (2)**: at startup the app asks
 ClickHouse what ceiling it runs under (`system.server_settings`, falling back to
@@ -349,24 +351,28 @@ the remainder for merges and caches. One number to set, read from the service it
 
 Only when that probe finds no ceiling does the app fall back to measuring its own container —
 and that fallback is the trap: in a full-docker stack it reads the whole host and sizes a
-budget as though ClickHouse owned the machine. On a 64 GiB host that is 64 × 0.8 ÷ 2 = **25.6
-GiB granted to a single query** while three other services are resident. The app says so,
-loudly, at startup and in `/api/health`.
+budget as though ClickHouse owned the machine. On a 64 GiB host at the default N that is
+64 × 0.8 ÷ 4 = **12.8 GiB granted to a single query** while three other services are resident.
+The app says so, loudly, at startup and in `/api/health`.
 
 ### Checking what actually resolved
 
 `GET /api/health` (authenticated) carries a `scan_budget` block:
 
 ```json
-{"risk": "ok", "per_query_bytes": 2576980377, "total_bytes": 5153960754,
+{"risk": "ok", "per_query_bytes": 1288490188, "total_bytes": 5153960752,
  "cache_bytes": 3758096384, "cache_breakdown": {"mark_cache_size": 2147483648,
  "index_mark_cache_size": 536870912, "primary_index_cache_size": 1073741824},
- "headroom_bytes": 1288490190, "clickhouse_ceiling_bytes": 10200547328,
+ "headroom_bytes": 1288490192, "clickhouse_ceiling_bytes": 10200547328,
  "clickhouse_ceiling_is_explicit": true, "budget_ceiling_bytes": 10200547328,
  "local_detected_bytes": 34359738368, "source": "clickhouse", "concurrency": 2,
- "pending_concurrency": null, "max_threads": 6, "max_threads_source": "clickhouse",
- "detected_cores": 12}
+ "pending_concurrency": null,
+ "foreground": {"concurrency": 4, "per_query_bytes": 644245094, "max_threads": 3},
+ "max_threads": 6, "max_threads_source": "clickhouse", "detected_cores": 12}
 ```
+
+`total_bytes` is `per_query_bytes × (concurrency + 2)`, not `× concurrency` — the two chart
+slots are part of the same total.
 
 `risk` is what to act on, and it is also rendered on the admin **Settings** page above the
 "Scans" group:
@@ -399,10 +405,53 @@ waiting for a restart; until then both halves keep using the old one, so the tot
 exceeds what the gate admits.
 
 Heavy scans are admission-controlled (default 2), and the enrichment partition rewrite takes
-a slot too — so the worst case is `concurrency × per-query cap`, not one query's cap. That
+a slot too — so the worst case is the whole `total_bytes`, i.e. `per-query cap × (concurrency
++ 2)` with the chart lane included, not one query's cap. That
 rewrite also holds its slot through the merges its `REPLACE PARTITION` queues
 (`VESTIGO_ENRICHMENT_APPLY_MERGE_WAIT_SECONDS`, default 300; set it to 0 when ClickHouse has
 a `max_server_memory_usage`, which bounds merges directly).
+
+### The N trap: concurrency is a divisor, not a queue depth
+
+`VESTIGO_STAT_SCAN_CONCURRENCY` is the one scan setting that changes a number it does not
+name. Raising it does **not** buy throughput against a fixed ClickHouse ceiling — it splits
+the same total into more, smaller slices, and it slices threads too. On the reference 9.5 GiB
+ceiling:
+
+| N | per-query cap | `max_threads` (20 cores) |
+| --- | --- | --- |
+| 2 | 1.2 GiB | 10 |
+| 4 | 819 MiB | 5 |
+| 10 | **409.6 MiB** | 2 |
+
+At N = 10 a detector sweep gets a tenth of a GiB and two threads, and the **enrichment
+partition rewrite** — which takes a heavy slot like anything else, but is a full
+`INSERT SELECT` copy of the source's partition with a `grace_hash` join, not a GROUP BY —
+fails outright:
+
+```
+DB::Exception: Query memory limit exceeded: would use 413.16 MiB
+(attempt to allocate chunk of 4.16 MiB), maximum: 409.60 MiB. (MEMORY_LIMIT_EXCEEDED)
+```
+
+in `enrichers/jobs.py::_apply_staged_rows`. The job log reads `failed after covering 1/1
+sources; 0 source(s) left unenriched` — the scan and the staging completed, only the apply
+did not, so the derived values sit in the scratch table and `events` is untouched. Nothing is
+corrupt; re-run the enrichment once the cap is raised.
+
+**`risk` will not warn you about this.** `scan_budget_report` asks whether the aggregate
+(`total_bytes + cache_bytes`) fits under the ceiling — at N = 10 it still does, exactly as it
+does at N = 2, because the total is the same total. It never asks whether the resulting
+*per-query* cap is large enough to run anything. Read `per_query_bytes` yourself: on any real
+corpus it belongs in the GiB range, and a value in the hundreds of MiB means the heavy lane is
+oversubscribed regardless of what `risk` says.
+
+If sweeps queue, the fix is a larger ceiling (`max_server_memory_usage` **and** the container
+limit, raised together), not a larger N. Leave N at 2–4 unless `per_query_bytes` stays
+comfortably in the GiB range at the value you pick — the [sizing
+calculator](https://overcuriousity.github.io/Vestigo/sizing/) derives a safe N from the ceiling
+and the corpus for exactly this reason, and will not hand you one whose slice is too small to
+scan with.
 
 ### Worked example: 32 GiB host, full-docker (the shipped defaults)
 
@@ -412,7 +461,8 @@ a `max_server_memory_usage`, which bounds merges directly).
 | ClickHouse server limit | 9.5 GiB | `deploy/clickhouse/memory.xml` (under 0.8 × 12 GiB) |
 | ClickHouse caches (mark + index-mark + primary-index) | 3.5 GiB | `memory.xml` |
 | Vestigo scan budget (total) | 4.8 GiB | auto: 0.8 × (9.5 − 3.5) GiB |
-| → per-query cap | 2.4 GiB | budget ÷ concurrency (2) |
+| → per-query cap | 1.2 GiB | budget ÷ (concurrency + 2) = ÷ 4 |
+| → per-chart cap | 0.6 GiB | 2 reserved slots ÷ 4 chart queries |
 | → merge headroom | 1.2 GiB | 9.5 − 4.8 − 3.5, reported as `headroom_bytes` |
 | Postgres / Qdrant / App | 4 / 4 / 4 GiB | `mem_limit` (Qdrant only with embeddings) |
 
@@ -421,8 +471,12 @@ parts through it, and on a large timeline it is the difference between scanning 
 scanning from disk.
 
 Scaling up follows the same shape — on a 64 GiB host, a 34 GiB ClickHouse container with a
-27 GiB server limit leaves an auto budget of 0.8 × (27 − 3.5) = 18.8 GiB total, 9.4 GiB per
-query, and ~12 GiB for the OS. A pinned `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` is honoured
+27 GiB server limit leaves an auto budget of 0.8 × (27 − 3.5) = 18.8 GiB total, 4.7 GiB per
+query, and ~12 GiB for the OS. **Raise `memory.xml` and the container limit together.**
+Raising only `mem_limit` changes nothing: the pinned `max_server_memory_usage` is still the
+lower of the two, so a 12 GiB→71 GiB container bump on a 96 GiB host leaves the whole stack
+running on the reference 9.5 GiB ceiling — and `scan_budget` will keep saying `ok`, because
+9.5 GiB is a ceiling everything genuinely fits under. A pinned `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` is honoured
 verbatim and **bypasses the cache subtraction** — it is a decision, not a derivation. Keep
 concurrency at 2 even with a single analyst: opening the Investigate surface fires several
 detectors at once, and the gate is what makes them queue instead of stack. Raising it adds no

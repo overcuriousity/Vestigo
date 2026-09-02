@@ -231,7 +231,9 @@ class Settings(BaseSettings):
     # are bounded structurally instead.
     stat_scan_external_sort_bytes: int = 4_000_000_000
     # Total memory budget for heavy scans, shared across concurrent scans:
-    # each query's max_memory_usage is budget / concurrency. 0 (default) =
+    # each query's max_memory_usage is budget / (concurrency + 2), the two
+    # extra slots being the foreground chart lane's reserved share (see
+    # db/_scan.py::detect_scan_memory_budget). 0 (default) =
     # auto: memory-ratio × detected RAM (cgroup limit when containerized,
     # physical RAM otherwise; see db/_scan.py). Set a nonzero value to pin
     # it — required when ClickHouse runs on a different host than the app
@@ -246,6 +248,15 @@ class Settings(BaseSettings):
     # parallel detector requests each carry the full per-query cap and can
     # stack past the ClickHouse host's RAM — observed as a kernel OOM-kill
     # of clickhouse-server, not a clean query error.
+    #
+    # It is also the *divisor* on the memory budget and on max_threads, which
+    # is what makes raising it the wrong answer to "sweeps are queueing": the
+    # total is fixed by ClickHouse's ceiling, so a larger N only cuts it into
+    # smaller, more spill-bound slices. On the reference 9.5 GiB ceiling N=10
+    # leaves 409.6 MiB per query — under what the enrichment partition rewrite
+    # needs, and `scan_budget_report` still calls it "ok" because the *total*
+    # is unchanged. Raise the ceiling instead. See docs/DEPLOYMENT.md
+    # "The N trap".
     stat_scan_concurrency: int = Field(default=2, ge=1)
     # Write-side guardrail for the enrichment partition rewrite
     # (db/clickhouse.py::finalize_enrichment_apply). The stat_scan_* settings
