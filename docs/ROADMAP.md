@@ -4,8 +4,10 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-09-01, v1.18.1):** one open issue (#307, folded into Milestone 10 as
-G1). Phase 3 is complete and the queue is feature-shaped. **Milestone 10 — AI agent log
+**State (verified 2026-09-02, v1.18.3):** three open issues — #307 (Milestone 10 G1), #345
+(Milestone 11, Hayabusa) and #346 (THOR scanner, a candidate second consumer of the
+Milestone 11 protocol; no design yet). Phase 3 is complete and the queue is feature-shaped.
+Every item below was re-verified against the code on 2026-09-02; counts are from that day. **Milestone 10 — AI agent log
 investigation — is the 2.0 thrust and outranks everything below**; the numbered list orders
 the remaining 1.x work by payoff-per-effort:
 
@@ -49,10 +51,6 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   with `MEMORY_LIMIT_EXCEEDED` (session-223). Needs a floor to compare against (the rewrite
   is the binding query, not a detector GROUP BY) and copy naming the ceiling, not N, as the
   remedy. Documented in `docs/DEPLOYMENT.md` "The N trap" until then.
-- [ ] **Show env-pinned settings as pinned in the admin console.** A field set in the
-  environment silently wins over the stored override, so an admin can flip a toggle, get a
-  200 and see nothing change. Serve the pinned-field set from the settings API and render
-  those inputs disabled with a "pinned by `VESTIGO_*`" hint.
 - [ ] **Per-source progress on a resumed enrichment run.** `run_resume_job` reports status
   only. Minimal shape: an optional `on_source_done` callback on `_apply_staged_rows`, with
   the route seeding `total` from the staged-source count it already computes.
@@ -63,11 +61,12 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   degrading the query is the one wrong option.
 - [ ] **Generate frontend API types from OpenAPI** (`openapi-typescript`) to replace the
   hand-mirrored `frontend/src/api/types.ts`. The duplication compounds: 1240 lines when
-  filed, 1549 today.
+  filed, 2009 on 2026-09-02.
 - [ ] **Split `api/routers/events.py`** along the read/aggregate/export seams — 3100 lines
-  on 2026-07-20, 3319 on 2026-07-29, growing without anyone touching it deliberately.
-- [ ] **README screenshot grid.** The README is laid out for a 2×2 grid but ships one
-  Explorer shot. Capture at one window size: Analysis with findings and the Method panel,
+  on 2026-07-20, 3319 on 2026-07-29, 4010 on 2026-09-02, growing without anyone touching
+  it deliberately.
+- [ ] **README screenshot grid.** The README ships no screenshot at all today (logo and
+  badges only; `docs/screenshots/` does not exist). Capture at one window size: Analysis with findings and the Method panel,
   a Story with a live view embed, the Agent with an applied finding, a re-shot Explorer.
 
 ### Frontend design-system consistency (audit 2026-07-30)
@@ -78,11 +77,12 @@ primitive, so every author re-decides at the call site.
 
 The ratchet exists — `frontend/src/test/designSystem.test.ts`. Undefined `var(--…)` is a
 hard check at zero; arbitrary `text-[Npx]` and raw `<button>` outside `components/ui/` are
-budgeted per file in `designSystemBudget.ts`, seeded at 119 each. The budget only falls:
+budgeted per file in `designSystemBudget.ts` (62 files; totals on 2026-09-02: 125 font
+sizes, 116 raw buttons). The budget only falls:
 exceeding an entry fails, and so does *beating* one without lowering it. **Every item below
 burns its numbers out of that file**; the migration is done when the file is `{}`.
 
-- [ ] **Type scale in `@theme`, and burn down the 118 arbitrary font sizes.** A correctness
+- [ ] **Type scale in `@theme`, and burn down the 126 arbitrary font sizes.** A correctness
   item: `html[data-density="compact"]` rebases `font-size` to scale the UI, and every
   `text-[10px]`-style escape ignores it — compact density does not do what it claims on
   those sites. Pick five named steps for *this* app (`micro / body / lead / section /
@@ -102,14 +102,15 @@ burns its numbers out of that file**; the migration is done when the file is `{}
   screen demonstrates it. Proposed inversion: guidance attaches to the control at the moment
   of use. The 2026-08-07 redesign narrowed this but did not close it.
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand
-  store, so it is per-browser. The backend half exists (`User.preferences`,
-  `update_user_preferences`); the work is a preferences passthrough on `PATCH /auth/me`.
-- [ ] **`IconButton` primitive / the 119 raw `<button>`s** across 46 files, against 57 that
-  import `Button`. Burn down opportunistically, lowering budgets as files are cleaned.
-- [ ] **Icon size scale.** Ten distinct values in use; 11 vs 12 vs 13 is drift, not a
-  decision. Collapse to three (`inline` 12, `control` 16, `feature` 20) during the
+  store (`collapsedGuidance`, persisted to localStorage), so it is per-browser. The backend
+  half is complete — `PUT /auth/me/preferences` exists with a whitelist and
+  `authApi.updatePreferences` wraps it; the work is moving the store's read/write to it.
+- [ ] **`IconButton` primitive / the 121 raw `<button>`s** outside `components/ui/`, against
+  the files that import `Button`. Burn down opportunistically, lowering budgets as files are cleaned.
+- [ ] **Icon size scale.** Eighteen distinct `size={N}` values in use (12, 13, 11, 14 and 10
+  make up most of them); 11 vs 12 vs 13 is drift, not a decision. Collapse to three (`inline` 12, `control` 16, `feature` 20) during the
   `Card`/`SectionLabel` passes.
-- [ ] **`aria-live` for background work.** Exactly one `aria-live` in the frontend: the job
+- [ ] **`aria-live` for background work.** Three `aria-live` regions in the frontend; the job
   tray, toasts and streaming agent output announce nothing. Follow the event grid's
   `aria-rowcount` pattern.
 - [ ] **Heading structure.** 39 heading elements across 211 component files. Mostly resolved
@@ -189,8 +190,7 @@ definitions — the core adaptation, and why no detector carries hidden state be
   import records no audit row while a failed export does; `_insert_source_events` lets an
   untrusted Arrow stream size its own record batches, bounded only by the 200 GiB total cap
   and not per batch; the frontend buffers a whole archive in memory instead of navigating to
-  the URL; orphan `events/*.arrow` members are skipped silently while orphan blobs warn;
-  `ImportCaseDialog` doesn't reset state on reopen; adding an `_IMPORT_SPECS` entity breaks
+  the URL; `ImportCaseDialog` doesn't reset state on reopen; adding an `_IMPORT_SPECS` entity breaks
   reading current-format archives without a `FORMAT_VERSION` bump — decide
   missing-stem-as-empty vs. mandatory bump and write it down.
 - [ ] **W8 — Query-time field extraction (schema-on-read).** Define a virtual field as a
@@ -297,8 +297,10 @@ N3 inherits: the response status is spelled **`status_code`**, not `http_status`
 what `nginx2vestigo` emits, and the point is that a pcap timeline and a webserver-log
 timeline filter identically.
 
-- [ ] **N3 — HTTP payload: hashes in the timeline, bytes on the analyst's disk.** Three
-  deliberately separated tiers:
+- [ ] **N3 — HTTP payload: hashes in the timeline, bytes on the analyst's disk.**
+  `--reassemble http` already emits method, URI, protocol, status, request/response byte
+  counts, content encoding and decode/incomplete flags; what is missing is exactly the
+  three tiers below. Three deliberately separated tiers:
   1. *Always:* cheap metadata (`http_host`, `http_content_type`, `http_content_length`,
      `http_user_agent`, `http_referer`) plus `http_response_body_sha256`. The full-body hash
      is the forensically valuable part, costs 32 bytes, and allows pivoting against
@@ -406,14 +408,15 @@ redesigned. Order across tracks: **G1 → G2 ∥ V1 → G3 → V2/V3 → G4 → 
   agent tools (A13) inherit it together. Degrades to vector order when unconfigured —
   reranking is an upgrade, never a requirement.
 - [ ] **V3 — Qdrant modernization.** Matryoshka output dimension (768/512/256/128) as an
-  `EmbeddingConfig` field — hash-covered, so dimension changes keep the identity
+  `EmbeddingConfig` field — `vector_dimension` already exists there as a declared
+  collection size and is hash-covered; truncation on top of it keeps the identity
   semantics; scalar quantization for large cases; payload indexes on session id and
   role so semantic search filters *within* a session or to one side of the
   conversation. One design question flagged honestly for the round rather than assumed:
   hybrid sparse+dense (Qdrant-native BM25/SPLADE) versus leaving keyword search to
   ClickHouse `search_blob` — the wrong answer duplicates a query system.
 
-## Milestone 11 — external enrichment processors, first consumer Hayabusa (designed 2026-09-02)
+## Milestone 11 — external enrichment processors, first consumer Hayabusa (designed 2026-09-02, issue #345)
 
 Windows EVTX signature detection with [Hayabusa](https://github.com/Yamato-Security/hayabusa)
 arrives as an **enricher whose columns feed the statistical detectors** — not a fifteenth
