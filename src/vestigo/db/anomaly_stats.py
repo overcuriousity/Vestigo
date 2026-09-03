@@ -2320,11 +2320,17 @@ class StatisticalAnomalyService:
         total_by_key: dict[str, int] = {}
         if attr_key_by_token:
             # The allowlist per attribute key, for the keys this pass scans.
+            # Two tokens can name one key (``user`` and ``attr:user``), but the
+            # key's rows are one set, counted once and emitted once — under the
+            # first token, which is what the findings are stamped with. So that
+            # token's allowlist is the only one the SQL may suppress: unioning
+            # both would drop a value the page-level ``_apply_allowlist`` keeps,
+            # silently and without making the total inexact.
             allow_by_key: dict[str, list[str]] = {}
             for token, key in attr_key_by_token.items():
-                vals = _sql_allow_keys(allowlist, token)
-                if vals:
-                    allow_by_key.setdefault(key, []).extend(vals)
+                if key in allow_by_key:
+                    continue
+                allow_by_key[key] = _sql_allow_keys(allowlist, token)
             rows_by_key, total_by_key, batched_inexact = self._batched_attr_novelty_rows(
                 base_params,
                 sorted(set(attr_key_by_token.values())),
@@ -2333,7 +2339,7 @@ class StatisticalAnomalyService:
                 windows=windows,
                 source_offsets=source_offsets,
                 suspect_totals=suspect_totals,
-                allow_by_key={k: sorted(set(v)) for k, v in allow_by_key.items()},
+                allow_by_key={k: v for k, v in allow_by_key.items() if v},
                 exclude_event_ids=exclude_event_ids,
             )
             inexact += batched_inexact
@@ -2341,11 +2347,20 @@ class StatisticalAnomalyService:
             # two tokens can name one key, and the key's findings are one set.
             n_total += sum(total_by_key.values())
 
+        emitted_attr_keys: set[str] = set()
         for field_token in scan_fields:
             if field_token in attr_key_by_token:
                 # Duplicate tokens naming the same key share the rows — the
                 # old loop ran the identical query twice for identical rows.
-                rows = rows_by_key.get(attr_key_by_token[field_token], [])
+                # Emit them once, under the first token: the key's total was
+                # added to n_total once above, so emitting per token would let
+                # len(findings) exceed total_findings and hide the rail's
+                # "showing N of M" row on a page that really is capped.
+                attr_key = attr_key_by_token[field_token]
+                if attr_key in emitted_attr_keys:
+                    continue
+                emitted_attr_keys.add(attr_key)
+                rows = rows_by_key.get(attr_key, [])
                 all_findings.extend(
                     self._novelty_rows_to_findings(
                         case_id,
@@ -3254,11 +3269,23 @@ class StatisticalAnomalyService:
             # Allowlist values are `str(float)`; bind them back as numbers so
             # the SQL compares what the finding compared.
             allow_nums: list[float] = []
+            unbindable_allow = 0
             for raw in _sql_allow_keys(allowlist, field_token):
                 try:
                     allow_nums.append(float(raw))
                 except ValueError:
-                    continue
+                    # Still suppressed on the page (_apply_allowlist compares
+                    # allowlist_value as a string), but the count scan never
+                    # saw it — say so rather than promise an exact total the
+                    # page cannot reach.
+                    unbindable_allow += 1
+            if unbindable_allow:
+                inexact.append(
+                    f"{unbindable_allow:,} allowlist "
+                    f"{'entry' if unbindable_allow == 1 else 'entries'} on {field_token} "
+                    "are not numeric and could not be bound into the scan; suppression "
+                    "applied to the page only, so the total may include allowlisted findings"
+                )
             suppress, field_inexact = _sql_suppression(
                 viol_params,
                 key_expr="val",
