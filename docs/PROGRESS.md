@@ -4,8 +4,8 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 231 — the companion count actually splits its slot's
-memory cap; the declaration was made after the clause was built).
+Last updated: 2026-09-03 (session 231 — exact finding totals shipped as 1.19.2; the fan-out
+that never divided, and the review findings on #349).
 
 ## Session 231 — 2026-09-03: the fan-out that never divided
 

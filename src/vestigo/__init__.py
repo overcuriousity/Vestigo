@@ -1,3 +1,3 @@
 """Vestigo — local-first forensic log investigation platform."""
 
-__version__ = "1.19.1"
+__version__ = "1.19.2"

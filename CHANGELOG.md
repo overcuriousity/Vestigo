@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.2] — 2026-09-03
+
+### Fixed
+
+- **`total_findings` is exact.** Five methods — value novelty (and its batched attribute
+  pass), value combos, numeric range, charset and entropy — put the request limit (or 25 per
+  field) into the aggregation SQL and reported the size of what came back as the total, so
+  value combos could never say more than 50. Every method now meets the contract written
+  down in `docs/ANOMALY_DETECTION.md` §"Totals and truncation": the total is counted across
+  the full analysed scope, after allowlist and normal-event suppression, before the display
+  cap, by a companion count statement over the same `core` as the page. A suppression set
+  past 1,000 entries falls back to the page filter and says so (`total_findings_exact: false`
+  plus a warning), which the UI renders as "N+".
+- **The page is the true top-`limit` by the reported score.** Per-field pages are
+  `max(stat_per_field_limit, limit)` — the setting is a floor now, since a global top-50 may
+  be 50 values of one field. Temporal novelty and combos order by the best per-window score
+  instead of summed window counts; charset evaluates its per-character surprise in SQL and
+  orders by it instead of `length(novel)`; numeric range binds its allowlist as numbers, since
+  `str(9000.0)` and `toString(9000.)` disagree.
+- The page and its companion count run under one gate slot and now actually split it: the
+  `SETTINGS` clause was built one line before the fan-out was declared, so both statements
+  carried the full per-slot memory cap; and the fan-out divided memory but not threads, so a
+  full gate of paged detectors was twice the core count. Both halves are pinned on the
+  emitted SQL.
+- "Show more" on one timeline raised the page of an identically configured method on every
+  other timeline; the page key carries case and timeline now.
+
+### Added
+
+- The Investigate rail says what it is not showing: "showing N of M findings — Show more"
+  under any method whose page is smaller than its exact total, in the rail and the sheet, at
+  a session-only page size (50, then 80). Group counts sum the exact totals; the strip badge
+  shows the exact total, or "M+" with the reason as a tooltip when it is inexact.
+- Findings responses carry `total_findings_exact`, and hydration fetches in 500-id chunks.
+
 ## [1.19.1] — 2026-09-03
 
 ### Added
