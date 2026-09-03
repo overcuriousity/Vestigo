@@ -4,8 +4,32 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 230 — the exact total comes from a scan that can spill,
-plus seven smaller fixes from the PR #349 review).
+Last updated: 2026-09-03 (session 231 — the companion count actually splits its slot's
+memory cap; the declaration was made after the clause was built).
+
+## Session 231 — 2026-09-03: the fan-out that never divided
+
+Session 230 wrote that the page and its companion count "declare `scan_fanout(2)` so
+they split its memory cap rather than each taking it whole". They did not. `scan_fanout`
+is a ContextVar the clause builder reads at build time, and `_page_and_total` built its
+`SETTINGS` clause one line *before* declaring the fan-out — so both statements carried
+the full per-slot `max_memory_usage` and the undivided spill thresholds, and the
+`copy_context()` handed each worker a width nothing inside it ever read. Reproduced by
+capturing the SQL through a fake client: both statements at the full budget, half
+expected. Six call sites — value novelty, value combos, numeric range, charset, entropy —
+so every admitted heavy slot on a paged detector committed twice its reservation, the
+over-commit the declaration was introduced (#305) to prevent.
+
+The fix is the call order: the clause and both SQL strings are now built inside the
+`with scan_fanout(2)` block. Each statement runs at half the slot's cap and spills at
+half the thresholds, which the `GROUP BY` beneath both can do; that is the designed
+trade from session 230, now actually made. How it shipped: the only test over these
+scans asserted `heavy_scan_settings() in sql` — the *full* clause — on every statement,
+pinning the bug rather than the contract. It now bounds each statement to the solo or
+halved cap and requires every companion count to run halved beside its page, and two
+new tests assert `max_memory_usage == budget // 2` on the emitted SQL and `budget // 4`
+under an outer fan-out. `ANOMALY_DETECTION.md` now says where the clause must be built
+and why a test, not a docstring, is what holds it.
 
 ## Session 230 — 2026-09-03: an exact total that survives a big corpus
 

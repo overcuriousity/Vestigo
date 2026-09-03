@@ -251,8 +251,13 @@ from one string is the point: a total describing a different filter than the pag
 annotates is worse than no total, and two hand-written statements drift on the first edit
 to a `HAVING`. The two run concurrently under the caller's one gate slot, declaring the
 fan-out (`db/_scan.py::scan_fanout`) so they split its memory cap rather than each taking
-it whole; wall clock stays roughly one scan's and the extra cost is ClickHouse-side.
-Sources are immutable, so both statements see the same data.
+it whole: each carries half the slot's `max_memory_usage` and spills at half the usual
+thresholds, and the `GROUP BY` beneath both is the spillable path that makes that hold.
+The declaration only divides a clause built while it is in effect, so the clause is built
+inside it — `tests/test_anomaly_stats.py` asserts the halved cap on the SQL that leaves
+the service, because a clause built one line earlier ships the full cap twice and nothing
+but an OOM would say so. Wall clock stays roughly one scan's and the extra cost is
+ClickHouse-side. Sources are immutable, so both statements see the same data.
 
 **The rule this file carries going forward: a frameless window (`count() OVER ()`) is
 allowed only over a structurally bounded row set — otherwise the count is its own
