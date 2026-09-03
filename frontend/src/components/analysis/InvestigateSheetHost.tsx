@@ -15,6 +15,7 @@ import { InvestigateSheet } from "./InvestigateSheet";
 import { ScopeChangeDialog } from "./ScopeChangeDialog";
 import { useMethodFindings } from "@/hooks/useMethodFindings";
 import { useScopeChange } from "@/hooks/useScopeChange";
+import { scopeOf, useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import type { MethodId } from "./method-registry";
 import type { Event } from "@/api/types";
 
@@ -32,6 +33,7 @@ export function InvestigateSheetHost({
   onClose,
   onOpenMethod,
   onRunMethod,
+  onAddDetector,
   onTagFilter,
   onDrillField,
   onJumpToTime,
@@ -47,6 +49,8 @@ export function InvestigateSheetHost({
   onOpenMethod: (method: MethodId) => void;
   /** Open the method's sheet already running it. */
   onRunMethod: (method: MethodId) => void;
+  /** Open the detector wizard, optionally on one method. */
+  onAddDetector: (method?: MethodId) => void;
   onTagFilter?: (tag: string) => void;
   /** Drill into the grid's filters — a template in Tools, a value in finding mode. */
   onDrillField?: (field: string, value: string) => void;
@@ -90,10 +94,39 @@ export function InvestigateSheetHost({
     setRanFromFinding(false);
   }, [sheet.kind, methodKey, rankKey, autorun]);
 
+  // Finding mode addresses a row of the rail's list, which the rail fetched
+  // under the *configured* entry's params and scope — so the sheet must read
+  // the same query, or it renders a different list than the row clicked.
+  // Method mode with the analyst's own knobs runs under the panel scope.
+  const { byMethod: entries, isLoaded: detectorsLoaded } = useTimelineDetectors(
+    caseId,
+    timelineId,
+  );
+  const entry = sheet.kind === "finding" ? entries.get(sheet.method) : undefined;
+  // The rail stays interactive beside the sheet, so the detector whose finding
+  // is open can be removed while it is open. Without this the query would fall
+  // back to the panel scope with empty params and fire a *fresh* scan for a
+  // detector that no longer exists — an unprompted heavy run, and a different
+  // finding at that rank than the row that was clicked.
+  const entryGone = sheet.kind === "finding" && detectorsLoaded && entry === undefined;
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
-    enabled: sheet.kind === "finding" || (sheet.kind === "method" && runParams !== null),
-    params: runParams ?? {},
+    enabled:
+      (sheet.kind === "finding" && entry !== undefined) ||
+      (sheet.kind === "method" && runParams !== null),
+    params: runParams ?? entry?.params ?? {},
+    // The entry's own scope, for the re-run too. "Run with these" tweaks a
+    // configured detector's knobs; dropping its frame back to the panel's
+    // would answer a different question — and for a baseline-framed method
+    // that question has no baseline to answer it with at all.
+    scope: entry ? scopeOf(entry) : undefined,
   });
+
+  // Closing is the honest answer to "what you were reading is gone" — leaving
+  // the overlay up would show a stale finding under a detector that is no
+  // longer configured.
+  useEffect(() => {
+    if (entryGone) onClose();
+  }, [entryGone, onClose]);
 
   const finding = sheet.kind === "finding" ? findings.data?.results[sheet.rank] : undefined;
 
@@ -109,6 +142,9 @@ export function InvestigateSheetHost({
           methodId={sheet.method}
           finding={finding}
           scope={findings.data.scope}
+          // The knobs open on what produced the finding above them, not on
+          // the method's defaults.
+          initialParams={entry?.params}
           onRun={(params) => {
             setRunParams(params);
             setRanFromFinding(true);
@@ -120,7 +156,9 @@ export function InvestigateSheetHost({
       ) : sheet.kind === "finding" ? (
         // The rail addresses a finding as (method, rank), so the sheet can open
         // before the query lands or after a refetch shortened the list. Both
-        // used to render nothing at all, which reads as a dead click.
+        // used to render nothing at all, which reads as a dead click. This is
+        // also where "Run with these" lands, so the knobs keep showing what
+        // was submitted rather than snapping back to defaults.
         <InvestigateSheet
           caseId={caseId}
           timelineId={timelineId}
@@ -128,6 +166,7 @@ export function InvestigateSheetHost({
           onClose={onClose}
           mode="method"
           methodId={sheet.method}
+          initialParams={runParams ?? entry?.params}
           onRun={setRunParams}
           query={findings}
         />
@@ -156,6 +195,7 @@ export function InvestigateSheetHost({
           // prose panel is what made the gate a lock in practice, whatever the
           // endpoint allowed.
           onRunMethod={onRunMethod}
+          onAddDetector={onAddDetector}
           onRequestScopeChange={(next) => scopeChange.request(next)}
           onTagFilter={onTagFilter}
           onDrillField={onDrillField}
@@ -169,7 +209,6 @@ export function InvestigateSheetHost({
         open={scopeChange.pending !== null}
         current={scopeChange.currentScope}
         next={scopeChange.pending ?? { frame: "self" }}
-        methodsToRerun={scopeChange.methodsToRerun}
         affectedVerdicts={scopeChange.affectedVerdicts}
         onConfirm={scopeChange.confirm}
         onCancel={scopeChange.cancel}

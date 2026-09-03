@@ -80,6 +80,7 @@ import { ColumnPicker } from "@/components/explorer/ColumnPicker";
 import { TimelineHistogram } from "@/components/explorer/TimelineHistogram";
 import { FieldHistogramModal } from "@/components/viz/FieldHistogramModal";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
+import { DetectorWizard } from "@/components/analysis/DetectorWizard";
 import { InvestigateSheetHost } from "@/components/analysis/InvestigateSheetHost";
 import { RailResizeHandle } from "@/components/analysis/RailResizeHandle";
 import type { MethodId } from "@/components/analysis/method-registry";
@@ -391,6 +392,11 @@ export function ExplorerPage() {
     ids: new Set(),
   });
   const [similarAnchor, setSimilarAnchor] = useState<Event | null>(null);
+  /** The detector wizard: open, and on which method (edit) if any. */
+  const [wizard, setWizard] = useState<{ open: boolean; method: MethodId | null }>({
+    open: false,
+    method: null,
+  });
   /** What the Investigate overlay is showing, if anything. */
   const [sheet, setSheet] = useState<
     | { kind: "finding"; method: MethodId; rank: number }
@@ -1742,6 +1748,7 @@ export function ExplorerPage() {
                       <InvestigateRail
                         caseId={caseId!}
                         timelineId={timelineId!}
+                        onAddDetector={(m) => setWizard({ open: true, method: m ?? null })}
                         onSelectFinding={(method, rank) =>
                           setSheet({ kind: "finding", method, rank })
                         }
@@ -1776,12 +1783,26 @@ export function ExplorerPage() {
                     onRunMethod={(method: MethodId) =>
                       setSheet({ kind: "method", method, autorun: true })
                     }
+                    onAddDetector={(m) => setWizard({ open: true, method: m ?? null })}
                     onTagFilter={handleTagDrill}
                     onDrillField={handleDrillField}
                     onJumpToTime={handleJumpToTime}
                     similarAnchor={similarAnchor}
                     onSimilarClose={() => setSimilarAnchor(null)}
                     onSelectEvent={(ev) => handleExpandEvent(ev)}
+                  />
+                )}
+
+                {/* The detector wizard: the only way a detector gets onto a
+                    timeline. Nothing runs unprompted. */}
+                {investigatePanelOpen && timeline && (
+                  <DetectorWizard
+                    caseId={caseId!}
+                    timelineId={timelineId!}
+                    open={wizard.open}
+                    onOpenChange={(open) => setWizard((w) => ({ ...w, open }))}
+                    initialMethod={wizard.method}
+                    onOpenSignatures={() => setSheet({ kind: "tools", section: "signatures" })}
                   />
                 )}
 

@@ -41,11 +41,28 @@ vi.mock("@/hooks/useMethodFindings", () => ({
   METHOD_LIMIT: 50,
 }));
 
+const configured = vi.hoisted(() => ({ entries: [] as Record<string, unknown>[] }));
+vi.mock("@/hooks/useTimelineDetectors", () => ({
+  useTimelineDetectors: () => ({
+    entries: configured.entries,
+    byMethod: new Map(configured.entries.map((e) => [e.method, e])),
+    isLoaded: true,
+    set: async () => ({}),
+    remove: async () => ({}),
+    canEdit: true,
+    isSaving: false,
+    saveError: null,
+  }),
+  scopeOf: (e: { frame: string; baseline_id: string | null }) =>
+    e.frame === "baseline" && e.baseline_id
+      ? { frame: "baseline", baseline_id: e.baseline_id }
+      : { frame: "self" },
+}));
+
 vi.mock("@/hooks/useScopeChange", () => ({
   useScopeChange: () => ({
     pending: null,
     currentScope: { frame: "self", baseline_id: null, baseline_name: null },
-    methodsToRerun: 0,
     affectedVerdicts: 0,
     request: () => {},
     cancel: () => {},
@@ -53,18 +70,25 @@ vi.mock("@/hooks/useScopeChange", () => ({
   }),
 }));
 
+/** Every render of the sheet, so the props it was handed are inspectable. */
+const sheets = vi.hoisted(() => ({ current: [] as Record<string, unknown>[] }));
 vi.mock("@/components/analysis/InvestigateSheet", () => ({
   InvestigateSheet: ({
     mode,
+    initialParams,
     onRun,
   }: {
     mode: string;
+    initialParams?: Record<string, unknown>;
     onRun?: (p: Record<string, unknown>) => void;
-  }) => (
-    <button data-testid={`sheet-${mode}`} onClick={() => onRun?.({ fields: "attr:user_agent" })}>
-      run
-    </button>
-  ),
+  }) => {
+    sheets.current.push({ mode, initialParams });
+    return (
+      <button data-testid={`sheet-${mode}`} onClick={() => onRun?.({ fields: "attr:user_agent" })}>
+        run
+      </button>
+    );
+  },
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -82,14 +106,113 @@ function renderHost(sheet: SheetRequest) {
       onClose={() => {}}
       onOpenMethod={() => {}}
       onRunMethod={() => {}}
+      onAddDetector={() => {}}
     />,
     { wrapper },
   );
 }
 
+describe("InvestigateSheetHost configured entries", () => {
+  it("opens a finding under the configured entry's params and scope, so it matches the rail", () => {
+    calls.current = [];
+    configured.entries = [
+      {
+        method: "value_novelty",
+        params: { fields: ["user"] },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    renderHost({ kind: "finding", method: "value_novelty", rank: 0 });
+    expect(calls.current.at(-1)).toMatchObject({
+      method: "value_novelty",
+      enabled: true,
+      params: { fields: ["user"] },
+      scope: { frame: "baseline", baseline_id: "b1" },
+    });
+    configured.entries = [];
+  });
+
+  it("opens the knob form on the params that produced the finding, not on defaults", () => {
+    // A form showing "auto" under a finding computed from stored settings
+    // offers to re-run a question nobody asked: pressing Run with these sent
+    // empty params, which is a different scan presented as a re-run of the one
+    // on screen.
+    sheets.current = [];
+    configured.entries = [
+      {
+        method: "sequence_novelty",
+        params: { series_field: "attr:computer_name" },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    renderHost({ kind: "finding", method: "sequence_novelty", rank: 0 });
+    expect(sheets.current.at(-1)).toMatchObject({
+      mode: "finding",
+      initialParams: { series_field: "attr:computer_name" },
+    });
+    configured.entries = [];
+  });
+
+  it("keeps the entry's own scope when its knobs are re-run from the finding", () => {
+    // "Run with these" tweaks a configured detector's parameters. Falling back
+    // to the panel frame asks a different question — and for a baseline-framed
+    // method, one with no baseline to answer it.
+    calls.current = [];
+    configured.entries = [
+      {
+        method: "proportion_shift",
+        params: { fields: ["user"] },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    const { getByTestId } = renderHost({ kind: "finding", method: "proportion_shift", rank: 0 });
+    fireEvent.click(getByTestId("sheet-finding"));
+    expect(calls.current.at(-1)).toMatchObject({
+      params: { fields: "attr:user_agent" },
+      scope: { frame: "baseline", baseline_id: "b1" },
+    });
+    configured.entries = [];
+  });
+
+  it("stops querying and closes when the detector is removed while its finding is open", () => {
+    // The rail stays interactive beside the sheet. With the entry gone the
+    // query used to fall back to the panel scope with empty params — a fresh,
+    // unprompted scan for a detector that was just deleted, answering a
+    // different question than the row that was clicked.
+    calls.current = [];
+    configured.entries = [
+      { method: "value_novelty", params: { fields: ["user"] }, frame: "self", baseline_id: null },
+    ];
+    const onClose = vi.fn();
+    const sheet: SheetRequest = { kind: "finding", method: "value_novelty", rank: 0 };
+    const props = {
+      caseId: "c1",
+      timelineId: "t1",
+      railWidth: 320,
+      sheet,
+      onClose,
+      onOpenMethod: () => {},
+      onRunMethod: () => {},
+      onAddDetector: () => {},
+    };
+    const { rerender } = render(<InvestigateSheetHost {...props} />, { wrapper });
+    expect(calls.current.at(-1)).toMatchObject({ enabled: true });
+
+    configured.entries = [];
+    rerender(<InvestigateSheetHost {...props} />);
+
+    expect(calls.current.at(-1)).toMatchObject({ enabled: false });
+    expect(onClose).toHaveBeenCalled();
+  });
+});
+
 describe("InvestigateSheetHost run parameters", () => {
   it("drops a custom run when the same method's finding is opened", () => {
     calls.current = [];
+    configured.entries = [{ method: "value_novelty", params: {}, frame: "self", baseline_id: null }];
     const { rerender, getByTestId } = renderHost({ kind: "method", method: "value_novelty" });
 
     // Run it with knobs the analyst typed.
@@ -111,6 +234,7 @@ describe("InvestigateSheetHost run parameters", () => {
         onClose={() => {}}
         onOpenMethod={() => {}}
         onRunMethod={() => {}}
+        onAddDetector={() => {}}
       />,
     );
     // `toMatchObject` treats `{}` as "any object", so the params are compared
@@ -122,6 +246,7 @@ describe("InvestigateSheetHost run parameters", () => {
 
   it("drops a custom run when a different rank of the same method is opened", () => {
     calls.current = [];
+    configured.entries = [{ method: "value_novelty", params: {}, frame: "self", baseline_id: null }];
     const sheetAt = (rank: number): SheetRequest => ({
       kind: "finding",
       method: "value_novelty",
@@ -147,6 +272,7 @@ describe("InvestigateSheetHost run parameters", () => {
         onClose={() => {}}
         onOpenMethod={() => {}}
         onRunMethod={() => {}}
+        onAddDetector={() => {}}
       />,
     );
     expect(calls.current.at(-1)!.params).toEqual({});

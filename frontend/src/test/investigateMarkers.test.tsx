@@ -23,6 +23,34 @@ import type { AnomalyMarker } from "@/api/types";
 vi.mock("@/hooks/useTimelineReadiness", () => ({
   useTimelineReadiness: () => ({ stillIngesting: false, nothingToAnalyse: false }),
 }));
+vi.mock("@/hooks/useSigmaFindings", () => ({
+  useSigmaFindings: () => ({ findings: [], isLoading: false, available: false }),
+}));
+
+// Nothing runs unprompted, so the sweep under test needs every method
+// configured on the timeline — the shape the real hooks read.
+vi.mock("@/api/timelines", async () => {
+  const { METHODS } = await import("@/components/analysis/method-registry");
+  return {
+    timelinesApi: {
+      get: async () => ({
+        id: "t1",
+        case_id: "c1",
+        detectors: METHODS.map((m) => ({
+          method: m.id,
+          params: {},
+          frame: "self",
+          baseline_id: null,
+          added_by: null,
+          added_at: "",
+        })),
+      }),
+    },
+  };
+});
+vi.mock("@/api/cases", () => ({ casesApi: { get: async () => ({ id: "c1" }) } }));
+vi.mock("@/lib/caseAccess", () => ({ canContributeToCase: () => true }));
+vi.mock("@/api/baselines", () => ({ baselinesApi: { list: async () => ({ baselines: [] }) } }));
 
 /** One timestamped finding for a method that maps to a marker. */
 const NOVELTY = {
@@ -101,6 +129,7 @@ describe("marker publication", () => {
             timelineId="t1"
             onSelectFinding={() => {}}
             onOpenTools={() => {}}
+            onAddDetector={() => {}}
             onSelectEvent={() => {}}
             onAnomalyMarkers={setMarkers}
           />
@@ -108,9 +137,11 @@ describe("marker publication", () => {
       );
     }
 
-    const { findByText } = render(<Host />, { wrapper });
+    const { findByTestId } = render(<Host />, { wrapper });
     // The finding does reach the histogram...
-    await findByText("1");
+    await waitFor(async () =>
+      expect((await findByTestId("marker-count")).textContent).toBe("1"),
+    );
     const settled = renders;
     await new Promise((r) => setTimeout(r, 100));
     // ...and publishing it does not keep re-entering. A handful of renders may

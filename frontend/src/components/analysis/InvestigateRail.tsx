@@ -12,12 +12,15 @@
  * value says something is unusual here. The rail has to say which kind of
  * claim the analyst is reading before it says anything else.
  *
- * The old five-tab split is gone. So is the Advanced accordion: per-method
- * controls live in the sheet, where there is room for them.
+ * Nothing runs unprompted. The rail runs exactly the detectors configured on
+ * the timeline (`useTimelineDetectors`), names each one in the strip above
+ * the feed, and otherwise shows the way into the wizard. Per-method controls
+ * live in the sheet and the wizard, where there is room for them.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { AlertTriangle, Eye, EyeOff } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { AlertTriangle, Eye, EyeOff, Plus } from "lucide-react";
 import { EVIDENCE_CLASSES, METHODS, type MethodId } from "./method-registry";
 import {
   useIncludeDismissed,
@@ -25,11 +28,10 @@ import {
 } from "@/hooks/useMethodFindings";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
 import { useSigmaFindings } from "@/hooks/useSigmaFindings";
-import { useMutedMethods } from "@/hooks/useMutedMethods";
-import { useMethodFocus } from "@/hooks/useMethodFocus";
-import { ScopeStrip } from "./ScopeStrip";
-import { DetectorMuteStrip } from "./DetectorMuteStrip";
-import { MethodFocusStrip } from "./MethodFocusStrip";
+import { useTimelineDetectors } from "@/hooks/useTimelineDetectors";
+import { baselinesApi } from "@/api/baselines";
+import { Button } from "@/components/ui/Button";
+import { DetectorStrip } from "./DetectorStrip";
 import { FindingGroup } from "./FindingGroup";
 import { SigmaFindingRows } from "./SigmaFindings";
 import { AnalysisEmptyState } from "./detector-shared";
@@ -44,49 +46,6 @@ import type { AnomalyMarker, Event } from "@/api/types";
 const DETECTOR_BY_API_KEY = Object.fromEntries(
   DETECTORS.map((d) => [d.detector, d]),
 );
-
-/**
- * The analyst questions from the design round, surviving as filters over one
- * stream rather than as containers. Containers would put a finding somewhere
- * you have to remember to look; a filter never hides anything by default.
- */
-const PRESETS: {
-  id: string;
-  label: string;
-  methods: MethodId[] | null;
-  /** Whether Sigma hits — the only non-method findings — survive this filter. */
-  sigma: boolean;
-}[] = [
-  { id: "all", label: "Everything", methods: null, sigma: true },
-  // The one preset that is *only* Sigma. It shipped as "Evidence integrity"
-  // because nothing could ever fill the Named group, so a Known-bad pill would
-  // have filtered to a guaranteed-empty list.
-  { id: "known", label: "Known-bad", methods: [], sigma: true },
-  {
-    id: "changed",
-    label: "Changed vs. baseline",
-    methods: ["proportion_shift", "value_distribution_drift", "frequency"],
-    sigma: false,
-  },
-  {
-    id: "repeats",
-    label: "Repeating",
-    methods: ["interval_periodicity", "sequence_novelty", "log_template"],
-    sigma: false,
-  },
-  {
-    id: "unusual",
-    label: "Unusual values",
-    methods: ["value_novelty", "value_combo", "charset", "entropy"],
-    sigma: false,
-  },
-  {
-    id: "integrity",
-    label: "Evidence integrity",
-    methods: ["timestamp_order", "numeric_range"],
-    sigma: false,
-  },
-];
 
 /**
  * Nothing to analyse — said once for the whole rail, with somewhere to go.
@@ -136,6 +95,8 @@ interface Props {
   onOpenTools: (
     section?: "methods" | "signatures" | "explore" | "scope",
   ) => void;
+  /** Open the detector wizard — on one method to edit it, or on the list. */
+  onAddDetector: (method?: MethodId) => void;
   onSelectEvent: (event: Event) => void;
   onJumpToTime?: (ts: string, eventId?: string, windowEnd?: string) => void;
   /** Drill a finding's field/value into the grid's filters. */
@@ -158,6 +119,7 @@ export function InvestigateRail({
   timelineId,
   onSelectFinding,
   onOpenTools,
+  onAddDetector,
   onSelectEvent,
   onJumpToTime,
   onDrillField,
@@ -166,26 +128,18 @@ export function InvestigateRail({
   onFrequencyDrill,
   onTagFilter,
 }: Props) {
-  const { byMethod, scope, done, total, planLoading } = useStreamingSweep(
-    caseId,
-    timelineId,
-  );
-  // Read from the hook rather than from the sweep's return, so the strip and
-  // the feed cannot disagree about what is muted — the sweep uses the very
-  // same hook to decide what not to fetch.
-  const mute = useMutedMethods(caseId, timelineId);
-  // This analyst's own per-method field narrowing (#341), disclosed below.
-  const { focus, clearFocus } = useMethodFocus(timelineId);
-  const muted = mute.muted;
+  const { byMethod, done, total, planLoading } = useStreamingSweep(caseId, timelineId);
+  // The list the sweep runs, read from the same hook so the strip and the
+  // feed cannot disagree about what is configured.
+  const detectors = useTimelineDetectors(caseId, timelineId);
   const { stillIngesting, nothingToAnalyse } = useTimelineReadiness(
     caseId,
     timelineId,
   );
   const { includeDismissed, setIncludeDismissed } = useIncludeDismissed();
-  const [preset, setPreset] = useState("all");
   // Findings below their method's `railFloor` are out of the ranked feed until
   // asked for. Session state, not persisted: it is a reading choice about this
-  // sweep, and a floor silently still-lifted from last week would be the same
+  // view, and a floor silently still-lifted from last week would be the same
   // undisclosed filtering it exists to avoid.
   const [showWeak, setShowWeak] = useState(false);
   // The Named-techniques group's only source. Empty until Sigma is
@@ -193,34 +147,36 @@ export function InvestigateRail({
   // not been run is not a finding about anything.
   const { findings: sigmaFindings } = useSigmaFindings(caseId, timelineId);
 
-  const active = PRESETS.find((p) => p.id === preset) ?? PRESETS[0];
-  // Muted methods leave `visible` entirely rather than rendering as an empty
-  // group. An empty group reads as "checked, clear" — the one misread this
-  // whole surface is built to prevent — and a muted method was not checked.
-  // The strip above carries the count instead.
+  // Only to name a chip's baseline; the entry carries the id.
+  const { data: baselines } = useQuery({
+    queryKey: ["baselines", caseId, timelineId],
+    queryFn: () => baselinesApi.list(caseId, timelineId),
+    enabled: detectors.entries.some((e) => e.frame === "baseline"),
+  });
+  const baselineNames = useMemo(
+    () => Object.fromEntries((baselines?.baselines ?? []).map((b) => [b.id, b.name])),
+    [baselines],
+  );
+
+  // Unconfigured methods leave `visible` entirely rather than rendering as an
+  // empty group. An empty group reads as "checked, clear" — the one misread
+  // this whole surface is built to prevent — and an unconfigured method was
+  // not checked.
   const visible = useMemo(
-    () =>
-      METHODS.filter(
-        (m) =>
-          (active.methods === null || active.methods.includes(m.id)) &&
-          !muted.has(m.id) &&
-          byMethod[m.id],
-      ),
-    [active, byMethod, muted],
+    () => METHODS.filter((m) => byMethod[m.id]?.configured),
+    [byMethod],
   );
 
   // Publish findings onto the histogram and grid. Without this the marks the
   // old panel put there simply vanish, and the timeline stops showing where
   // the findings are — which is most of how an analyst navigates to them.
   //
-  // Muted methods are filtered here too, not just out of `visible`: disabling
-  // the query does not evict what react-query already cached, so a method
-  // muted mid-session keeps returning findings. "A muted detector leaves the
-  // feed, the histogram and the grid marks" has to hold on this pass as well.
+  // Filtered to configured methods here too, not just in `visible`: disabling
+  // a query does not evict what react-query already cached, so a detector
+  // removed mid-session keeps returning findings until the cache turns over.
   const markers = useMemo(() => {
     const out: AnomalyMarker[] = [];
-    for (const meta of METHODS) {
-      if (muted.has(meta.id)) continue;
+    for (const meta of visible) {
       const state = byMethod[meta.id];
       if (!state) continue;
       const detectorMeta = DETECTOR_BY_API_KEY[meta.id];
@@ -243,7 +199,7 @@ export function InvestigateRail({
       }
     }
     return out;
-  }, [byMethod, muted]);
+  }, [byMethod, visible]);
 
   // Publication is keyed on the markers' *content*, not on the array's
   // identity. The parent stores what it receives in state, so an identity that
@@ -255,7 +211,7 @@ export function InvestigateRail({
   markersRef.current = markers;
   const markerSig = markers
     .map((m) => `${m.ts}|${m.eventId ?? ""}|${m.detector}`)
-    .join("");
+    .join("");
 
   useEffect(() => {
     if (!onAnomalyMarkers) return;
@@ -263,25 +219,16 @@ export function InvestigateRail({
     return () => onAnomalyMarkers([]);
   }, [markerSig, onAnomalyMarkers]);
 
-  // Muted methods this preset would otherwise have shown. Distinguishes "this
-  // preset is empty because nothing applies" from "…because you silenced it".
-  const presetMuted = METHODS.filter(
-    (m) =>
-      (active.methods === null || active.methods.includes(m.id)) &&
-      muted.has(m.id),
-  );
-  const skipped = visible.filter((m) => byMethod[m.id].status !== "applicable");
   const errored = visible.filter((m) => byMethod[m.id].error);
-  const showSigma = active.sigma && sigmaFindings.length > 0;
+  const showSigma = sigmaFindings.length > 0;
   const anyFindings =
     visible.some((m) => byMethod[m.id].findings.length > 0) || showSigma;
-  // Both empty states are claims about *what this preset shows*, so they are
-  // counted over `visible` — the sweep's global done/total would let a preset
-  // whose own methods never ran inherit "clear" from methods it hides.
-  const visibleRunnable = visible.filter(
-    (m) => byMethod[m.id].status === "applicable",
-  );
-  const visibleSettled = visibleRunnable.every((m) => !byMethod[m.id].pending);
+  // Gated on the timeline having actually been fetched: an empty `entries`
+  // while the query is in flight is "not yet", not "none", and rendering the
+  // empty state over it flashes exactly the "nothing here" misread this
+  // surface exists to avoid.
+  const nothingConfigured = detectors.isLoaded && detectors.entries.length === 0;
+  const allSettled = visible.every((m) => !byMethod[m.id].pending);
 
   // Said before anything else, and instead of everything else: a findings list
   // over a timeline with no events is not "clear", it is unanswered.
@@ -300,29 +247,49 @@ export function InvestigateRail({
           moved here with the findings it explains rather than being dropped
           along with the tab that used to host it. */}
       <GuidancePanel id="investigate-anomalies" />
-      <DetectorMuteStrip mute={mute} />
-      {/* A focus narrows what is scanned, so it owes the same disclosure a
-          mute does — with the difference stated, since one is the team's and
-          the other is only this analyst's. */}
-      <MethodFocusStrip focus={focus} onClear={(m) => void clearFocus(m)} />
-      <ScopeStrip scope={scope} onOpen={() => onOpenTools("scope")} />
+
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-fg-muted)]">
+          Detectors
+        </span>
+        {detectors.canEdit && (
+          <Button
+            variant="ghost"
+            size="sm"
+            data-testid="add-detector"
+            onClick={() => onAddDetector()}
+          >
+            <Plus size={11} /> Add detector
+          </Button>
+        )}
+      </div>
+      <DetectorStrip
+        entries={detectors.entries}
+        byMethod={byMethod}
+        baselineNames={baselineNames}
+        canEdit={detectors.canEdit}
+        onEdit={(m) => onAddDetector(m)}
+        // The rejection is already rendered as `saveError` below; swallowing
+        // it here only keeps a failed DELETE from surfacing as an unhandled
+        // promise rejection.
+        onRemove={(m) => void detectors.remove(m).catch(() => {})}
+      />
+      {detectors.saveError && (
+        <p data-testid="detector-save-error" className="text-xs text-[var(--color-danger)]">
+          Not saved: {detectors.saveError}
+        </p>
+      )}
+
+      {/* Nothing runs until somebody chooses it, and the rail says so rather
+          than showing an empty feed that reads as "clear". Sigma hits are the
+          one thing that can be here without a configured detector. */}
+      {nothingConfigured && !showSigma && (
+        <AnalysisEmptyState hint="Nothing runs until you choose it. Each detector answers one kind of question — the wizard says which.">
+          <span data-testid="no-detectors">No detectors configured on this timeline.</span>
+        </AnalysisEmptyState>
+      )}
 
       <div className="flex flex-wrap gap-1">
-        {PRESETS.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => setPreset(p.id)}
-            aria-pressed={preset === p.id}
-            className={cn(
-              "rounded-full border px-2 py-0.5 text-[10px] font-medium transition-base",
-              preset === p.id
-                ? "border-[var(--color-accent)] bg-[var(--color-accent-dim)] text-[var(--color-accent)]"
-                : "border-[var(--color-border)] text-[var(--color-fg-secondary)] hover:border-[var(--color-border-strong)]",
-            )}
-          >
-            {p.label}
-          </button>
-        ))}
         {/* The reveal. A dismissal is presentation-only on the server and
             reversible there, so the UI owes a way back to it — without this a
             mis-click removes a finding from every surface permanently. */}
@@ -364,7 +331,7 @@ export function InvestigateRail({
         </p>
       )}
 
-      {/* One method failing must not take the stream with it. */}
+      {/* One detector failing must not take the stream with it. */}
       {errored.length > 0 && (
         <p
           data-testid="method-errors"
@@ -376,7 +343,15 @@ export function InvestigateRail({
           />
           <span>
             {errored.map((m) => m.label).join(", ")} failed to run. Other
-            methods are unaffected — open Tools to retry.
+            detectors are unaffected —{" "}
+            <button
+              type="button"
+              onClick={() => onOpenTools("methods")}
+              className="text-[var(--color-accent)] hover:underline"
+            >
+              open Tools to retry
+            </button>
+            .
           </span>
         </p>
       )}
@@ -411,56 +386,15 @@ export function InvestigateRail({
         />
       ))}
 
-      {/* "No findings" is a claim that every method that could run *here*, ran.
-          It may not be made while the plan is still resolving (nothing is
-          runnable yet, so the check is vacuously true), while any of this
-          preset's methods is still pending, or when none of them was runnable
-          at all — a preset whose methods all need setup checked nothing. */}
-      {!anyFindings &&
-        !planLoading &&
-        visibleRunnable.length > 0 &&
-        visibleSettled && (
-          <AnalysisEmptyState hint="Open Tools to run a method the gate skipped, or set a baseline to enable the comparison methods.">
-            No findings under this scope.
-          </AnalysisEmptyState>
-        )}
-
-      {/* Every method under this preset gated off. Not the same statement as
-          "nothing found" — nothing ran. And when the reason nothing ran is that
-          the analyst muted it, saying "no method applies" would blame the gate
-          for a choice somebody made: two different situations, two states.
-          Both are guarded by `!anyFindings` because a preset can list findings
-          that came from no method at all: Known-bad is `methods: []` and draws
-          entirely on Sigma, so it has zero runnable methods *by construction*
-          and would otherwise disclaim the rule hits printed right above it. */}
-      {!anyFindings &&
-        !planLoading &&
-        visibleRunnable.length === 0 &&
-        presetMuted.length > 0 && (
-          <AnalysisEmptyState hint="Unmute a detector in the strip above to put it back in the sweep, or open Tools to run one without unmuting it.">
-            Every detector for this view is muted.
-          </AnalysisEmptyState>
-        )}
-      {!anyFindings &&
-        !planLoading &&
-        visibleRunnable.length === 0 &&
-        presetMuted.length === 0 && (
-          <AnalysisEmptyState hint="Open Tools to see why each was skipped and run one anyway, or set a baseline to enable the comparison methods.">
-            No method applies to this data yet.
-          </AnalysisEmptyState>
-        )}
-
-      {/* A skipped method is never a zero — a zero reads as "checked, clear",
-          and these were not checked. The count routes into the accounting. */}
-      {skipped.length > 0 && (
-        <button
-          data-testid="skipped-summary"
-          onClick={() => onOpenTools("methods")}
-          className="w-full rounded border border-dashed border-[var(--color-border)] px-2 py-1.5 text-left text-[11px] text-[var(--color-fg-muted)] transition-base hover:border-[var(--color-border-strong)] hover:text-[var(--color-fg-secondary)]"
-        >
-          {skipped.length} method{skipped.length === 1 ? "" : "s"} not
-          applicable here — see why, or run anyway
-        </button>
+      {/* "No findings" is a claim that every configured detector ran and
+          answered. Not while the plan is resolving, not while the configured
+          list itself is still loading (nothing is pending yet because nothing
+          is known to run), not while any is pending, and not when nothing is
+          configured — that state is named above. */}
+      {!anyFindings && !planLoading && detectors.isLoaded && !nothingConfigured && allSettled && (
+        <AnalysisEmptyState hint="Edit a detector's fields or scope from its chip, or add another kind of question.">
+          No findings from the configured detectors.
+        </AnalysisEmptyState>
       )}
     </div>
   );

@@ -23,6 +23,14 @@ describe("method registry", () => {
     }
   });
 
+  it("tells a beginner when each method is worth configuring", () => {
+    for (const m of METHODS) {
+      expect(m.useWhen.startsWith("Use this when")).toBe(true);
+      expect(m.useWhen.length).toBeGreaterThan(30);
+      expect(m.useWhen.length).toBeLessThan(200);
+    }
+  });
+
   it("declares knobs only for params the backend accepts", () => {
     // Mirrors METHOD_PARAMS in api/routers/analysis.py. A knob the backend
     // rejects would 422 on rerun; the endpoint rejects unknown keys rather

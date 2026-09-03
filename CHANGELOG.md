@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] — 2026-09-03
+
+### Changed
+
+- **Detectors are opt-in.** Opening a timeline no longer runs every applicable statistical
+  detector. The Investigate rail runs only the detectors configured on the timeline through
+  the new detector wizard (choose → configure → confirm), stored as a shared, audited list
+  (`Timeline.detectors`, `PUT`/`DELETE …/timelines/{id}/detectors/{method}`, validated with
+  the findings endpoint's own models). Each entry carries its own frame and baseline; the
+  panel scope now applies only to ad hoc runs from the sheet and the Explore tab. The demo
+  case ships five pre-configured. Migration 0034.
+- The agent gains the read-only `list_configured_detectors` tool.
+- Deleting a baseline definition now unconfigures the detectors framed on it, rather than
+  leaving entries whose findings request 404s. Each removal is audited separately and the
+  DELETE response names the methods that went. Past detector runs are unaffected — they
+  snapshot the windows they used.
+- Case export now carries the `added_by` of each configured detector through the archive's
+  username map, so a restored case credits the analyst who configured it rather than the
+  importer.
+
+### Fixed
+
+- The Tools sheet judged every configured detector by the analysis plan, which is computed
+  under the panel scope — so a detector configured with a baseline of its own read as
+  "needs a baseline" while the rail showed the findings it had produced from that baseline.
+  A row whose entry runs under a different frame now shows no gate verdict at all.
+- The finding sheet's knob form opened on defaults rather than on the params that produced
+  the finding above it, so "Run with these" re-ran the method with empty params under the
+  panel frame and presented it as a re-run of the finding on screen. The form is seeded from
+  the configured entry, and the re-run keeps that entry's own scope.
+- The Investigate rail no longer flashes "No detectors configured on this timeline." while
+  the timeline query is still in flight.
+- Tools' "Add detector" is hidden from members who cannot configure detectors, as the rail's
+  already was, rather than leading them to a permanently disabled Apply.
+
+### Removed
+
+- **Breaking for API clients:** `PATCH …/timelines/{id}/muted-methods` and the
+  `muted_methods` timeline field (migration 0034 drops the column); the
+  `analysis_method_focus` user preference; the Investigate rail's preset pills and the
+  "N methods not applicable — run anyway" summary. All of them only subtracted from the
+  unprompted sweep, which no longer exists.
+
 ## [1.18.3] — 2026-09-01
 
 ### Fixed

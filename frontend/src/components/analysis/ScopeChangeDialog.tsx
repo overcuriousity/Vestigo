@@ -26,7 +26,6 @@ export function ScopeChangeDialog({
   open,
   current,
   next,
-  methodsToRerun,
   affectedVerdicts,
   onConfirm,
   onCancel,
@@ -34,19 +33,18 @@ export function ScopeChangeDialog({
   open: boolean;
   current: AnalysisScope;
   next: { frame: "self" | "baseline"; baselineId?: string; baselineName?: string | null };
-  methodsToRerun: number;
   affectedVerdicts: number;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
   return (
     <RadixDialog.Root open={open} onOpenChange={(o) => !o && onCancel()}>
-      <DialogContent title="Change the scope every method runs under">
+      <DialogContent title="Change the panel scope">
         <p className="text-sm text-[var(--color-fg-secondary)]">
           Switching from <strong>{describe({ frame: current.frame, name: current.baseline_name })}</strong>{" "}
-          to <strong>{describe({ frame: next.frame, name: next.baselineName })}</strong> re-runs{" "}
-          <strong>{methodsToRerun}</strong> method{methodsToRerun === 1 ? "" : "s"} against a
-          different comparison.
+          to <strong>{describe({ frame: next.frame, name: next.baselineName })}</strong> changes what
+          ad hoc runs from a method's sheet and the Explore tab compare against. Configured
+          detectors keep the scope they were configured with.
         </p>
 
         {affectedVerdicts > 0 && (

@@ -95,12 +95,10 @@ burns its numbers out of that file**; the migration is done when the file is `{}
 - [ ] **Extract a `ui/Callout` primitive.** `EmbeddingStatusBanner`, `UploadDialog`'s
   duplicate warning and others hand-roll the same banner. Distinct from `Card` — a callout
   interrupts, a card contains; they should not collapse into one primitive.
-- [ ] **Just-in-time guidance restructure (Investigate panel).** Needs its own design round;
-  the diagnosis is settled, the shape is not. Copy now lives in `lib/guidance.tsx`, but
-  placement is the actual complaint: ~120 words of ordered list in the faintest text in the
-  app, in a 320px panel, teaching Normal/Dismiss/Confirm at the one moment nothing on
-  screen demonstrates it. Proposed inversion: guidance attaches to the control at the moment
-  of use. The 2026-08-07 redesign narrowed this but did not close it.
+- [ ] **Just-in-time guidance, remaining half.** The detector wizard (2026-09-03) attached
+  each knob's help text to its control. Still in the faintest text in a 320px panel: the
+  Normal/Dismiss/Confirm copy in `lib/guidance.tsx`, taught before anything on screen
+  demonstrates it. Proposed inversion unchanged: attach it to the verdict bar.
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand
   store (`collapsedGuidance`, persisted to localStorage), so it is per-browser. The backend
   half is complete — `PUT /auth/me/preferences` exists with a whitelist and
@@ -532,6 +530,15 @@ logsource scoping lands. A CLI path: enrichment runs through the web interface o
 
 Decisions, not work items — each stays as decided unless its trigger fires.
 
+- **Detectors are opt-in; nothing runs unprompted** (2026-09-03, Milestone 12, shipped).
+  One configuration per method per timeline (`Timeline.detectors` is list-shaped so that
+  rule can be lifted without a migration), shared and audited, run on open through the
+  findings cache rather than through a job; the mute list, the per-user focus and the
+  preset pills are gone rather than kept beside it. Trigger for instances: a request to
+  run one method twice with different fields on one timeline — then thread an instance id
+  through the rail, sheet and query keys. Trigger for a job: a single configured scan
+  exceeding the request timeout in the field. Not planned: any change to the legacy
+  `/anomalies` endpoint, the CLI, or the Sigma runner, which stays opt-in on its own tab.
 - **Engine output is enrichment, never a Source and never a detector of its own**
   (2026-09-02, Milestone 11). Timesketch's Hayabusa integration is a CSV profile uploaded
   as a timeline: rows that are verdicts, with no `content_hash`/`byte_offset` into

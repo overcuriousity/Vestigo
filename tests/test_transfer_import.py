@@ -722,6 +722,102 @@ class TestCreatedByAttribution:
         assert not any("system" in w for w in result.warnings)
 
 
+class TestConfiguredDetectors:
+    """`Timeline.detectors` is a JSON list carrying two kinds of reference.
+
+    The baseline ids inside it ride the generic JSON rewrite (`_remap_json_ids`),
+    like a chart config's. `added_by` is a *user* id, which the entity map does
+    not cover at all — without its own handling, every configured detector on a
+    restored case credits an account that exists nowhere on this instance.
+    """
+
+    async def _restored_timeline(self, store, case_id):
+        async with store.session_factory() as s:
+            return (
+                await s.execute(select(pg.Timeline).where(pg.Timeline.case_id == case_id))
+            ).scalar_one()
+
+    async def _case_with_a_configured_detector(self, store, owner_id, added_by):
+        case, src, tl = await _rich_case(store, owner_id)
+        baseline = await _add(
+            store,
+            pg.BaselineDefinition,
+            case_id=case.id,
+            timeline_id=tl.id,
+            name="week before",
+            baseline_start=datetime(2026, 1, 1, tzinfo=UTC),
+            baseline_end=datetime(2026, 1, 8, tzinfo=UTC),
+            suspect_windows=[
+                {
+                    "id": "w1",
+                    "label": "day",
+                    "start": "2026-01-09T00:00:00Z",
+                    "end": "2026-01-10T00:00:00Z",
+                }
+            ],
+        )
+        async with store.session_factory() as s:
+            timeline = await s.get(pg.Timeline, tl.id)
+            timeline.detectors = [
+                {
+                    "method": "frequency",
+                    "params": {},
+                    "frame": "baseline",
+                    "baseline_id": baseline.id,
+                    "added_by": added_by,
+                    "added_at": "2026-02-01T00:00:00+00:00",
+                }
+            ]
+            await s.commit()
+        return case, src, baseline
+
+    async def test_baseline_id_points_at_the_restored_definition(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        case, src, baseline = await self._case_with_a_configured_detector(store, alice.id, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=alice)
+
+        timeline = await self._restored_timeline(store, result.case_id)
+        [entry] = timeline.detectors
+        async with store.session_factory() as s:
+            restored_baseline = (
+                await s.execute(
+                    select(pg.BaselineDefinition).where(
+                        pg.BaselineDefinition.case_id == result.case_id
+                    )
+                )
+            ).scalar_one()
+        assert entry["baseline_id"] != baseline.id  # a fresh id, like every other row
+        assert entry["baseline_id"] == restored_baseline.id
+
+    async def test_added_by_maps_through_username(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await self._case_with_a_configured_detector(store, bob.id, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=bob)
+
+        timeline = await self._restored_timeline(store, result.case_id)
+        assert timeline.detectors[0]["added_by"] == alice.id
+
+    async def test_added_by_of_a_vanished_user_falls_back_to_the_importer(self, store, tmp_path):
+        alice = await _add(store, pg.User, username="alice", is_admin=False, is_active=True)
+        bob = await _add(store, pg.User, username="bob", is_admin=False, is_active=True)
+        case, src, _ = await self._case_with_a_configured_detector(store, bob.id, alice.id)
+        archive = await _export(store, case, src, tmp_path)
+        async with store.session_factory() as s:
+            await s.execute(delete(pg.User).where(pg.User.id == alice.id))
+            await s.commit()
+
+        result = await import_case(store, lambda: FakeClickHouse(), archive, owner=bob)
+
+        timeline = await self._restored_timeline(store, result.case_id)
+        assert timeline.detectors[0]["added_by"] == bob.id
+        assert any("alice" in w for w in result.warnings)
+
+
 class TestIdMapScaling:
     """The substitution alternation is expensive to build and cheap to apply,
     so it must be built exactly once. Growing the map during the revive loop

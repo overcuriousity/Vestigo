@@ -198,16 +198,47 @@ async def delete_baseline_definition(
     case: Case = Depends(require_case_contribute),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
-    """Delete a baseline definition. Past runs that referenced it stay replayable."""
+    """Delete a baseline definition. Past runs that referenced it stay replayable.
+
+    Detectors configured against it go with it. A configured entry is a
+    question the rail asks on every open, and one framed on a definition that
+    no longer exists is a question nobody can answer: the findings request
+    404s and the wizard cannot even show the analyst what it is framed on.
+    Each removal is audited separately, and the response names them, so the
+    UI can say what the delete took with it rather than letting detectors
+    quietly vanish from the strip.
+    """
     store = get_store()
     deleted = await store.delete_baseline_definition(case_id, timeline_id, baseline_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Baseline definition not found")
+    unconfigured = await store.remove_timeline_detectors_for_baseline(
+        case_id, timeline_id, baseline_id
+    )
+    for entry in unconfigured:
+        await store.record_audit(
+            action="timeline.remove_detector",
+            actor=user,
+            case_id=case_id,
+            target_type="timeline",
+            target_id=timeline_id,
+            detail={
+                "method": entry.get("method"),
+                "previous": entry,
+                "new": None,
+                "reason": f"baseline {baseline_id} deleted",
+            },
+        )
     await store.record_audit(
         action="baseline.delete",
         actor=user,
         case_id=case_id,
         target_type="baseline_definition",
         target_id=baseline_id,
+        detail={"unconfigured_detectors": [e.get("method") for e in unconfigured]},
     )
-    return {"deleted": True, "baseline_id": baseline_id}
+    return {
+        "deleted": True,
+        "baseline_id": baseline_id,
+        "unconfigured_detectors": [e.get("method") for e in unconfigured],
+    }

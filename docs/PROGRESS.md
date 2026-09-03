@@ -4,7 +4,85 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-02 (session 223 — the scan-budget divisor in the docs).
+Last updated: 2026-09-03 (session 226 — second review pass on the detector wizard branch).
+
+## Session 226 — 2026-09-03: the panel scope stops speaking for a configured detector
+
+Four findings from a second review of the branch, and three of them are the same mistake in
+different places: a surface reading the *panel* scope while describing a detector that runs
+under its own.
+
+The Tools sheet's Methods tab judged every configured entry by the analysis plan, which is
+fetched once under the panel scope — so the demo's three baseline-framed detectors rendered
+dashed, countless and offering "Set a baseline" while the rail beside them was showing the
+findings they had produced from the baseline they already have. `MethodState` now carries
+`planApplies`, and a row whose entry runs under a different frame shows no gate verdict at
+all: the gate never looked at that question, and advice about a different run is withheld
+rather than restated.
+
+The finding sheet opened its knob form on defaults even though the finding above it came
+from the entry's stored params, so "Run with these" submitted `{}` — which also dropped the
+entry's scope override — and re-ran a different question presented as a re-run of the one on
+screen. The form is seeded from the entry now, and the re-run keeps the entry's own frame;
+for a baseline-framed method the old behaviour asked a question with no baseline to answer
+it.
+
+The rail's "No detectors configured on this timeline." ignored `isLoaded`, which exists for
+exactly this, and flashed on every cold Explorer open before the list landed. Both that
+empty state and the "No findings" one now wait for the timeline query. And Tools' "Add
+detector" was unconditional where the rail's is behind `canEdit`, so a read-only member
+could walk choose → configure → confirm and only then meet a permanently disabled Apply.
+
+## Session 225 — 2026-09-03: review fixes on the detector wizard branch
+
+Six findings from the PR review, all real, none of them the one the review led with — the
+importer already remaps a detector's `baseline_id`, because `Timeline.detectors` is a JSON
+column and `_revive` runs every JSON column through `_remap_json_ids`. What it did *not*
+carry was `added_by`: a user id, which the entity map does not cover, and which the
+exporter's `created_by` sweep could not see inside a JSON column either. Both ends now
+handle it, so a restored case credits the analyst who configured the detector.
+
+The rest: deleting a baseline definition left every detector framed on it pointing at
+nothing — a 404 per rail open, a chip reading "vs baseline", and a wizard that seeded the
+dead id, enabled Apply and 422'd on it. The definition now takes those entries with it,
+audited one row each, with the methods named in the response and in the Scope tab; the
+wizard also drops a `baselineId` the fetched list does not contain, so a stale id can never
+re-enable Next. Removing a detector while its finding sheet was open flipped the sheet's
+query to the panel scope with empty params and fired a *fresh* scan for the detector just
+deleted — the one thing this milestone exists to prevent; the query is now disabled and the
+sheet closes. Tools' "Retry" ran a different question than the one that failed (empty
+params, panel scope) and so could report success while the chip still showed `!`; it
+refetches the entry's own query. Plus a swallowed rejection on the strip's remove, and
+`SELECT … FOR UPDATE` on the detector list's read-modify-write, which two analysts
+configuring different methods could otherwise silently narrow to one.
+
+`ScopeStrip` went with the mute strip it outlived. The agent schema ledger in
+`test_agent_schema.py` now records 42,986/43,000 — the 14 chars are deliberate, as
+`docs/AGENT.md` already said, and the comment no longer stops at 42,285.
+
+## Session 224 — 2026-09-03: opt-in detectors — the wizard replaces the unprompted sweep
+
+Milestone 12, designed and shipped in one session. Opening a timeline used to fan out one
+findings request per applicable method over recommender-chosen fields: up to twelve heavy
+scans nobody asked for, read as noise, and the three mechanisms built to tame it (shared
+mute list, per-user focus, preset pills) none of which *configured* anything. Now nothing
+runs unprompted: `Timeline.detectors` (migration 0034, drops `muted_methods`) holds the
+analyst's configured entries, one per method, each with its own params, frame and
+baseline; `PUT`/`DELETE …/detectors/{method}` validate with the findings endpoint's own
+models and audit every change; `useStreamingSweep` iterates that list. The wizard is a
+three-step dialog reusing `method-registry.ts` (new `useWhen` line per method) and the knob
+form extracted from the sheet into `MethodKnobForm`, with each knob's help text attached
+to the control — which closes the just-in-time guidance item. The demo timeline ships five
+entries, each asserted to find something.
+
+One deviation from the roadmap text: per-detector edit and remove live in a
+`DetectorStrip` above the feed rather than on the evidence-class group headers — the
+groups interleave methods by rank, so a control per detector on a header would either
+split the feed or repeat. The scope-change dialog stopped promising re-runs: entries carry
+their own scope, so a panel scope change touches only ad hoc runs. The new agent tool took
+the tool-schema budget to 42,986 of 43,000; its docstring is one line for that reason.
+
+Verified with the backend and frontend suites (no browser run this session).
 
 ## Session 223 — 2026-09-02: the N trap, documented where it is set
 

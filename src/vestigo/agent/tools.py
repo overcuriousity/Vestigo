@@ -208,6 +208,10 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         embeddings_gated=True,
     ),
     ToolInfo("list_baselines", "List saved baseline definitions (range + suspect windows)."),
+    ToolInfo(
+        "list_configured_detectors",
+        "The detectors the case team configured on this timeline (method, params, frame, baseline) — what the Investigate rail runs.",
+    ),
     ToolInfo("list_stories", "List this case's stories (the analyst's report documents)."),
     ToolInfo("read_story", "Read a story's ordered blocks — markdown text and embed references."),
     ToolInfo("list_dispositions", "List analyst verdicts on anomaly findings."),
@@ -2319,6 +2323,20 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             _EVENT_NOTE,
             reduced=any(_event_reduced(r.event or {}, scope.fidelity) for r in result.results),
         )
+
+    @server.tool()
+    async def list_configured_detectors() -> dict[str, Any]:
+        """Detectors analysts configured on this timeline — what the rail runs. Read-only."""
+        from vestigo.api.deps import get_store
+
+        timeline = await get_store().get_timeline(scope.case_id, scope.timeline_id)
+        detectors = list(timeline.detectors or []) if timeline is not None else []
+        return {
+            "detectors": detectors,
+            "total": len(detectors),
+            "note": "Configured by analysts; this is what the Investigate rail runs. "
+            "run_anomaly_detector runs a method ad hoc without changing this list.",
+        }
 
     @server.tool()
     async def list_baselines() -> dict[str, Any]:

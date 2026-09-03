@@ -121,6 +121,18 @@ export interface Source {
   converter_script_id?: string | null;
 }
 
+/** One configured detector, as stored on the Timeline. */
+export interface DetectorEntry {
+  /** A method id from `components/analysis/method-registry`. */
+  method: string;
+  /** Exactly what `/analysis/findings` takes as `params` for this method. */
+  params: Record<string, unknown>;
+  frame: "self" | "baseline";
+  baseline_id: string | null;
+  added_by: string | null;
+  added_at: string;
+}
+
 export interface Timeline {
   id: string;
   case_id: string;
@@ -145,11 +157,10 @@ export interface Timeline {
   /** Data-derived default grid columns, shared by everyone with access. */
   recommended_columns: RecommendedColumns | null;
   /**
-   * Analysis methods kept out of this timeline's unprompted sweep, shared by
-   * everyone with access. A reading preference, never a gate — the analysis
-   * plan ignores it and a muted method still runs when asked for by name.
+   * The detectors analysts configured for this timeline — the only thing the
+   * Investigate rail runs. One entry per method; shared and audited.
    */
-  muted_methods: string[];
+  detectors: DetectorEntry[];
   /**
    * Per-method field declarations: `{method_id: {field_token: boolean}}`, where
    * `true` pins a field into that detector's automatic selection and `false`

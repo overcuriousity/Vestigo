@@ -47,17 +47,6 @@ vi.mock("@/api/baselines", () => ({
   },
 }));
 
-const muted = vi.hoisted(() => ({ current: new Set<string>() }));
-vi.mock("@/hooks/useMutedMethods", () => ({
-  useMutedMethods: () => ({
-    muted: muted.current,
-    isMuted: (id: string) => muted.current.has(id),
-    toggle: () => {},
-    unmuteAll: () => {},
-    canEdit: true,
-    isSaving: false,
-  }),
-}));
 
 const capabilities = vi.hoisted(() => ({ current: { embeddings: true, sigma: true } }));
 vi.mock("@/api/health", () => ({ useCapabilities: () => capabilities.current }));
@@ -83,6 +72,21 @@ vi.mock("@/hooks/useTimelineReadiness", () => ({
   useTimelineReadiness: () => readiness.current,
 }));
 
+const detectors = vi.hoisted(() => ({ canEdit: true }));
+vi.mock("@/hooks/useTimelineDetectors", () => ({
+  useTimelineDetectors: () => ({
+    entries: [],
+    byMethod: new Map(),
+    isLoaded: true,
+    set: async () => ({}),
+    remove: async () => ({}),
+    canEdit: detectors.canEdit,
+    isSaving: false,
+    saveError: null,
+  }),
+  scopeOf: () => ({ frame: "self" }),
+}));
+
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
@@ -93,10 +97,15 @@ function state(id: string, over: Record<string, unknown> = {}) {
     meta: METHODS_BY_ID[id as keyof typeof METHODS_BY_ID],
     plan: { method: id, status: "applicable", reason: "", reason_facts: {}, cost_class: "cheap" },
     status: "applicable",
+    planApplies: true,
     findings: [],
     total: 0,
     isLoading: false,
     error: false,
+    pending: false,
+    refetch: () => {},
+    configured: true,
+    entry: { method: id, params: {}, frame: "self", baseline_id: null, added_by: null, added_at: "" },
     ...over,
   };
 }
@@ -151,6 +160,7 @@ function renderTools(
       section="methods"
       onRunMethod={() => {}}
       onOpenMethod={() => {}}
+      onAddDetector={() => {}}
       onRequestScopeChange={() => {}}
       {...props}
     />,
@@ -163,7 +173,7 @@ describe("ToolsSheet", () => {
     capabilities.current = { embeddings: true, sigma: true };
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
     baselineStore.current = { activeBaselineId: null };
-    muted.current = new Set();
+    detectors.canEdit = true;
     dispositions.rows = [];
     dispositions.removed = [];
   });
@@ -201,16 +211,82 @@ describe("ToolsSheet", () => {
     expect(onRunMethod).toHaveBeenCalledWith("numeric_range");
   });
 
-  it("lists every method, ran and skipped, in one accounting", () => {
-    renderTools();
-    expect(screen.getAllByTestId(/^method-row-/)).toHaveLength(METHODS.length);
+  it("retries the query that failed, not an ad hoc run of the same method", () => {
+    // Routing Retry through `onRunMethod` ran the method with empty params
+    // under the panel scope — a different question than the configured entry's
+    // failing one, which could report success while the rail's chip still
+    // showed the failure.
+    const onRunMethod = vi.fn();
+    const refetch = vi.fn();
+    renderTools({ onRunMethod }, {}, {
+      entropy: state("entropy", { error: true, refetch }),
+    });
+    within(screen.getByTestId("method-row-entropy"))
+      .getByRole("button", { name: /retry/i })
+      .click();
+    expect(refetch).toHaveBeenCalled();
+    expect(onRunMethod).not.toHaveBeenCalled();
   });
 
-  it("states how many were considered, ran and skipped", () => {
+  it("lists only configured detectors and offers the wizard for the rest", () => {
+    const onAddDetector = vi.fn();
+    renderTools({ onAddDetector }, {}, {
+      entropy: state("entropy", { configured: false, entry: undefined }),
+    });
+    expect(screen.getAllByTestId(/^method-row-/)).toHaveLength(METHODS.length - 1);
+    expect(screen.queryByTestId("method-row-entropy")).toBeNull();
+    screen.getByTestId("tools-add-detector").click();
+    expect(onAddDetector).toHaveBeenCalled();
+  });
+
+  it("does not judge a detector by a gate verdict computed under another scope", () => {
+    // The plan is fetched once, under the *panel* scope. A detector configured
+    // with a baseline of its own runs a question the gate never looked at, and
+    // rendering "needs a baseline" over it — dashed, countless, offering a
+    // setup action — contradicted the rail, which was showing that detector's
+    // findings from the baseline it already has.
+    renderTools({}, {}, {
+      proportion_shift: state("proportion_shift", {
+        status: "needs_setup",
+        planApplies: false,
+        total: 4,
+        plan: {
+          method: "proportion_shift",
+          status: "needs_setup",
+          reason: "needs a baseline window to compare against",
+          reason_facts: {},
+          cost_class: "heavy",
+        },
+        entry: {
+          method: "proportion_shift",
+          params: {},
+          frame: "baseline",
+          baseline_id: "bl-1",
+          added_by: null,
+          added_at: "",
+        },
+      }),
+    });
+    const row = screen.getByTestId("method-row-proportion_shift");
+    expect(row).not.toHaveTextContent("needs a baseline window");
+    expect(within(row).queryByRole("button", { name: /set a baseline/i })).toBeNull();
+    expect(screen.getByTestId("method-count-proportion_shift")).toHaveTextContent("4");
+  });
+
+  it("does not offer the wizard to a member who cannot configure detectors", () => {
+    // Walking choose → configure → confirm only to meet a permanently disabled
+    // Apply is a control that was never theirs, offered anyway.
+    detectors.canEdit = false;
     renderTools();
+    expect(screen.queryByTestId("tools-add-detector")).toBeNull();
+  });
+
+  it("states how many are configured and how many ran", () => {
+    renderTools({}, {}, { entropy: state("entropy", { configured: false, entry: undefined }) });
     const summary = screen.getByTestId("methods-summary");
-    expect(summary).toHaveTextContent(String(METHODS.length));
-    expect(summary).toHaveTextContent(/skipped/i);
+    expect(summary).toHaveTextContent(`${METHODS.length - 1} configured`);
+    expect(summary).toHaveTextContent(/ran/);
+    expect(summary).not.toHaveTextContent(/skipped/i);
   });
 
   it("carries the signature and exploration surfaces rather than scattering them", () => {
@@ -337,49 +413,6 @@ describe("ToolsSheet", () => {
     );
     expect(screen.getByTestId("method-count-frequency")).toHaveTextContent("—");
     expect(screen.getByTestId("method-detail-frequency")).toHaveTextContent(/too few buckets/i);
-  });
-
-  it("never shows a count for a muted method", () => {
-    // Its query was never issued, so `total === 0` here means "not asked", not
-    // "asked and clear" — a zero would be exactly the misread this whole
-    // surface exists to prevent.
-    muted.current = new Set(["value_novelty"]);
-    renderTools();
-    expect(screen.queryByTestId("method-count-value_novelty")).toBeNull();
-    expect(screen.getByTestId("method-detail-value_novelty")).toHaveTextContent(/muted/i);
-  });
-
-  it("keeps a muted method runnable rather than making the mute a lock", () => {
-    // Same contract the gate is held to: a method left out of the sweep is
-    // still a method an analyst can ask for by name.
-    const onRunMethod = vi.fn();
-    muted.current = new Set(["value_novelty"]);
-    renderTools({ onRunMethod });
-    within(screen.getByTestId("method-row-value_novelty"))
-      .getByRole("button", { name: /run anyway/i })
-      .click();
-    expect(onRunMethod).toHaveBeenCalledWith("value_novelty");
-  });
-
-  it("counts muted methods apart from both ran and skipped", () => {
-    // Folding them into "skipped" credits the gate with an analyst's decision;
-    // folding them into "ran" is a plain lie about what was examined.
-    muted.current = new Set(["value_novelty"]);
-    expect(screen.queryByTestId("methods-summary")).toBeNull();
-    renderTools();
-    expect(screen.getByTestId("methods-summary")).toHaveTextContent(/1 muted/i);
-  });
-
-  it("lists a muted method rather than dropping it from the accounting", () => {
-    // The rail hides it; Tools is the surface that has to be able to name and
-    // reverse it, the same rule the template mute follows.
-    muted.current = new Set(["value_novelty"]);
-    renderTools();
-    expect(screen.getAllByTestId(/^method-row-/)).toHaveLength(METHODS.length);
-    expect(screen.getByTestId("method-mute-value_novelty")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
   });
 
   it("requests the baseline frame when a definition is already selected", () => {

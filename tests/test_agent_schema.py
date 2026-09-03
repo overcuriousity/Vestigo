@@ -54,6 +54,11 @@ from vestigo.db.postgres import User
 # `test_total_schema_budget`, which forces them on so the number is the same
 # everywhere. The jump from 42,500 is the two `embeddings_gated` tools this
 # guard never used to measure, not new prose.
+# 2026-09-03: 42,798 → 42,986 with `list_configured_detectors` (M12; 34 tools),
+# ceiling unchanged. The 14 chars of headroom left are deliberate, not an
+# oversight — see docs/AGENT.md: that tool's docstring is one line for this
+# reason, and the next tool added has to pay for itself by trimming elsewhere
+# rather than by moving this number.
 SCHEMA_BUDGET_CHARS = 43_000
 
 

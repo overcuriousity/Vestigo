@@ -23,7 +23,7 @@
  */
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Layers, ScanLine } from "lucide-react";
+import { Layers, Plus, ScanLine } from "lucide-react";
 import { METHODS, METHODS_BY_ID, type MethodId } from "./method-registry";
 import { MethodRow } from "./MethodRow";
 import { useStreamingSweep } from "@/hooks/useMethodFindings";
@@ -35,9 +35,9 @@ import { NormalValuesList } from "./WindowsNormality";
 import { SimilarEvents } from "./SimilarEvents";
 import { baselinesApi } from "@/api/baselines";
 import { useCapabilities } from "@/api/health";
-import { useMutedMethods } from "@/hooks/useMutedMethods";
 import { useFieldOverrides } from "@/hooks/useFieldOverrides";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
+import { useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import { useBaselineStore } from "@/stores/baseline";
 import { useUiStore } from "@/stores/ui";
 import { Button } from "@/components/ui/Button";
@@ -54,6 +54,8 @@ interface Props {
   section?: ToolsSection;
   onRunMethod: (method: MethodId) => void;
   onOpenMethod: (method: MethodId) => void;
+  /** Open the detector wizard, optionally straight on one method (edit). */
+  onAddDetector: (method?: MethodId) => void;
   /** Never applies a scope change directly — it invalidates every cached
    * method at once and reframes every verdict already recorded, so the host
    * routes it through a confirm. */
@@ -92,6 +94,7 @@ export function ToolsSheet({
   section,
   onRunMethod,
   onOpenMethod,
+  onAddDetector,
   onRequestScopeChange,
   onTagFilter,
   onDrillField,
@@ -100,9 +103,12 @@ export function ToolsSheet({
   onSelectEvent,
 }: Props) {
   const { byMethod, scope } = useStreamingSweep(caseId, timelineId);
+  // Same gate the rail's own "Add detector" is behind. A read-only member who
+  // can walk choose → configure → confirm and only then meet a permanently
+  // disabled Apply has been offered a control that was never theirs.
+  const { canEdit: canConfigure } = useTimelineDetectors(caseId, timelineId);
   const { embeddings, sigma } = useCapabilities();
   const { nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
-  const mute = useMutedMethods(caseId, timelineId);
   // The timeline's field declarations, summarized here because the control that
   // sets them lives in one method's field picker: a decision the whole case
   // inherits needs somewhere it can be read back and undone in one place.
@@ -134,19 +140,14 @@ export function ToolsSheet({
   // timeline emptying out — which would otherwise render an empty sheet.
   const activeTab = tabs.some((t) => t.id === tab) ? tab : DEFAULT_TAB;
 
-  const states = METHODS.map((m) => byMethod[m.id]).filter(Boolean);
-  // `pending`, not just the plan status: on first open the heavy set is still
-  // queued behind `cheapSettled`, and counting it as run claims an accounting
-  // that has not happened yet. A method still in flight is neither ran nor
-  // skipped, so it is named separately rather than folded into either.
-  // Muted methods are counted apart from both. Folding them into "skipped"
-  // would credit the gate with a decision an analyst made, and folding them
-  // into "ran" would be a straightforward lie about what was examined.
-  const muteCount = states.filter((s) => mute.isMuted(s.meta.id)).length;
-  const unmuted = states.filter((s) => !mute.isMuted(s.meta.id));
-  const running = unmuted.filter((s) => s.status === "applicable" && s.pending).length;
-  const ran = unmuted.filter((s) => s.status === "applicable" && !s.error && !s.pending).length;
-  const skipped = unmuted.filter((s) => s.status !== "applicable").length;
+  // Only configured detectors are counted: an unconfigured method was not
+  // asked, and listing it here with a count would be the "checked, clear"
+  // misread this surface exists to prevent. `pending`, not just the plan
+  // status: on first open the heavy set is still queued behind `cheapSettled`.
+  const configured = METHODS.map((m) => byMethod[m.id]).filter((s) => s?.configured);
+  const running = configured.filter((s) => s.pending).length;
+  const failed = configured.filter((s) => s.error).length;
+  const ran = configured.filter((s) => !s.error && !s.pending).length;
 
   const openBaselineBuilder = () => setBaselineBuilderOpen(true);
 
@@ -182,11 +183,26 @@ export function ToolsSheet({
             data-testid="methods-summary"
             className="mb-2 text-[11px] text-[var(--color-fg-muted)]"
           >
-            {METHODS.length} considered · {ran} ran · {skipped} skipped
+            {configured.length} configured · {ran} ran
             {running > 0 && ` · ${running} still running`}
-            {muteCount > 0 && (
-              <span className="text-[var(--color-warning)]"> · {muteCount} muted</span>
+            {failed > 0 && (
+              <span className="text-[var(--color-warning)]"> · {failed} failed</span>
             )}
+          </p>
+          {canConfigure && (
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="tools-add-detector"
+              className="mb-2"
+              onClick={() => onAddDetector()}
+            >
+              <Plus size={11} /> Add detector
+            </Button>
+          )}
+          <p className="mb-2 text-xs text-[var(--color-fg-muted)]">
+            Only configured detectors run. A method the analysis gate marks not applicable can
+            still be configured — the gate is advice.
           </p>
           {declared.length > 0 && (
             <div
@@ -235,18 +251,15 @@ export function ToolsSheet({
             </div>
           )}
           <div className="space-y-1">
-            {METHODS.map((meta) =>
-              byMethod[meta.id] ? (
-                <MethodRow
-                  key={meta.id}
-                  state={byMethod[meta.id]}
-                  onRun={onRunMethod}
-                  onOpen={onOpenMethod}
-                  onSetupBaseline={openBaselineBuilder}
-                  mute={mute}
-                />
-              ) : null,
-            )}
+            {configured.map((state) => (
+              <MethodRow
+                key={state.meta.id}
+                state={state}
+                onRun={onRunMethod}
+                onOpen={onOpenMethod}
+                onSetupBaseline={openBaselineBuilder}
+              />
+            ))}
           </div>
         </section>
       )}

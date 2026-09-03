@@ -911,6 +911,50 @@ def baseline_windows() -> list[dict[str, str]]:
     ]
 
 
+@dataclass(frozen=True)
+class DemoDetector:
+    """One detector the demo timeline ships pre-configured.
+
+    Chosen so the first open of the Investigate rail shows real findings and a
+    worked example of what the wizard produces — every entry is asserted to
+    find something in ``tests/test_demo_detector_coverage_clickhouse.py``.
+    """
+
+    method: str
+    params: dict[str, Any]
+    #: ``baseline`` entries resolve to the demo's one baseline definition.
+    frame: str = "self"
+
+
+#: On the "Full incident" timeline. Two windowless methods that work the
+#: moment ingestion finishes, three comparisons against the three quiet weeks.
+DEMO_DETECTORS: tuple[DemoDetector, ...] = (
+    DemoDetector("value_novelty", {}),
+    DemoDetector("timestamp_order", {}),
+    DemoDetector("frequency", {"series_field": "artifact"}, frame="baseline"),
+    # Host order is what lateral movement changes; the default series
+    # (``artifact``) is one value per demo source and would say nothing.
+    DemoDetector("sequence_novelty", {"series_field": "attr:computer_name"}, frame="baseline"),
+    DemoDetector("proportion_shift", {}, frame="baseline"),
+)
+
+
+def detector_entries(baseline_id: str, user_id: str) -> list[dict[str, Any]]:
+    """The stored shape of :data:`DEMO_DETECTORS`, in the order the rail shows them."""
+    added_at = scenario.BASELINE_END.isoformat()
+    return [
+        {
+            "method": d.method,
+            "params": dict(d.params),
+            "frame": d.frame,
+            "baseline_id": baseline_id if d.frame == "baseline" else None,
+            "added_by": user_id,
+            "added_at": added_at,
+        }
+        for d in DEMO_DETECTORS
+    ]
+
+
 def tag_annotation_rows(
     resolved: Sequence[tuple[DemoAnnotation, str, str]], case_id: str, user_id: str
 ) -> list[dict[str, Any]]:

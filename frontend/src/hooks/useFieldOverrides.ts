@@ -9,7 +9,7 @@
  * they say it, per method: the same field is meaningless to `numeric_range` and
  * excellent for `value_novelty`, so a declaration is never global.
  *
- * Shared server state on the Timeline for the same reason `muted_methods` is —
+ * Shared server state on the Timeline for the same reason `detectors` is —
  * "status codes are not a range field" is a finding about the data that the
  * next analyst inherits, and every change is audited.
  *

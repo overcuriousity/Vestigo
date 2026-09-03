@@ -169,6 +169,7 @@ small-context local models.
 | `field_scatter` | | Sampled (x, y) numeric pairs for two fields, plus full-data correlation/regression. Samples are drawn in a stable hash order, so an identical query redraws identical points. |
 | `compare` | | Two filtered layers of the same timeline (time/terms/numeric). |
 | `run_anomaly_detector` | core | Run a statistical detector; persists a `DetectorRun`. Exposes the same tuning surface and bounds as the HTTP endpoint. |
+| `list_configured_detectors` | | The detectors analysts configured on the timeline — the list the Investigate rail runs. Read-only; `run_anomaly_detector` stays the ad hoc path. |
 | `propose_finding` | core | Finding card with applicable Explorer filters; conversation-bound only. |
 | `propose_chart` | | Chart card, validated by executing the underlying query. On `/mcp` it is described as, and returns, the figure itself — see `open_url` below. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
@@ -683,6 +684,9 @@ narrower set and CI's full one — 513 chars apart — and could pass locally on
 overflowed in CI. The test now forces `embeddings_available()` true, so the number is the
 same everywhere: **42,798 over 33 tools, ceiling 43,000**. That one-off move is the tools the
 guard never counted, not new prose; the rule is unchanged for everything after it.
+`list_configured_detectors` (2026-09-03, Milestone 12) took it to **42,986 over 34 tools**,
+ceiling unchanged — its docstring is one line for exactly this reason. The next tool added
+has to pay for itself by trimming elsewhere (see A13).
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

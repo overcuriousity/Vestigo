@@ -22,6 +22,8 @@ import { Spinner } from "@/components/ui/Spinner";
 import { DateTimeField } from "@/components/ui/DateTimeField";
 import { InfoHint } from "@/components/ui/InfoHint";
 import { useBaselineStore, type ArmedTarget } from "@/stores/baseline";
+import { useTimelineDetectors } from "@/hooks/useTimelineDetectors";
+import { METHODS_BY_ID, type MethodId } from "./method-registry";
 import type { BaselineDefinition, DispositionKind } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { GLOSSARY } from "@/lib/glossary";
@@ -117,6 +119,8 @@ export function BaselineSection({ caseId, timelineId }: Props) {
     setMarkMode(false);
   }, [pendingRange, armed, setMarkMode]);
 
+  const configuredDetectors = useTimelineDetectors(caseId, timelineId);
+
   const invalidate = () => qc.invalidateQueries({ queryKey: ["baselines", caseId, timelineId] });
 
   const saveMut = useMutation({
@@ -140,14 +144,31 @@ export function BaselineSection({ caseId, timelineId }: Props) {
     meta: { silentError: true },
   });
 
+  // Deleting a definition also unconfigures every detector framed on it: an
+  // entry whose baseline is gone is a question that can no longer be asked.
+  // The row says so before the click, and this says what actually went — a
+  // detector disappearing from the strip with no explanation would read as a
+  // bug in the strip.
+  const [unconfigured, setUnconfigured] = useState<string[]>([]);
   const deleteMut = useMutation({
     mutationFn: (id: string) => baselinesApi.remove(caseId, timelineId, id),
-    onSuccess: (_res, id) => {
+    onSuccess: (res, id) => {
       if (activeBaselineId === id) setActiveBaselineId(null);
       if (editingId === id) resetDraft();
+      setUnconfigured(res.unconfigured_detectors ?? []);
       invalidate();
+      // The strip and the sweep read the timeline, not the baseline list.
+      qc.invalidateQueries({ queryKey: ["timeline", caseId, timelineId] });
+      qc.invalidateQueries({ queryKey: ["timelines", caseId] });
     },
   });
+
+  const methodLabel = (id: string) => METHODS_BY_ID[id as MethodId]?.label ?? id;
+  /** Configured detectors framed on this definition — named before the delete. */
+  const usedBy = (baselineId: string) =>
+    configuredDetectors.entries
+      .filter((e) => e.baseline_id === baselineId)
+      .map((e) => e.method as string);
 
   const errors = useMemo(() => validate(draft), [draft]);
   const dirty = draft.baseline.start !== "" || draft.suspects.length > 0 || draft.name !== "";
@@ -284,6 +305,15 @@ export function BaselineSection({ caseId, timelineId }: Props) {
         {!isLoading && definitions.length === 0 && (
           <div className="text-xs text-[var(--color-fg-muted)]">None yet.</div>
         )}
+        {unconfigured.length > 0 && (
+          <div
+            data-testid="baseline-unconfigured-detectors"
+            className="rounded border border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-fg-secondary)]"
+          >
+            Also unconfigured, because they compared against it:{" "}
+            {unconfigured.map(methodLabel).join(", ")}.
+          </div>
+        )}
         {definitions.map((d) => (
           <div
             key={d.id}
@@ -320,7 +350,13 @@ export function BaselineSection({ caseId, timelineId }: Props) {
             <button
               className="shrink-0 rounded p-0.5 text-[var(--color-fg-muted)] hover:text-[var(--color-danger)]"
               onClick={() => deleteMut.mutate(d.id)}
-              title="Delete definition"
+              title={
+                usedBy(d.id).length > 0
+                  ? `Delete definition — also unconfigures ${usedBy(d.id)
+                      .map(methodLabel)
+                      .join(", ")}`
+                  : "Delete definition"
+              }
             >
               <Trash2 size={12} />
             </button>

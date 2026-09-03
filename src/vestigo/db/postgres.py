@@ -373,22 +373,23 @@ class Timeline(Base):
     # ``vestigo/columns/`` for the payload shape and how it is produced.
     recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    # Analysis methods the analysts on this case have muted for this timeline:
-    # a list of ``db/analysis_plan.py::METHOD_IDS`` entries. Shared rather than
-    # per-browser, because "this source's clocks are a mess, stop surfacing it"
-    # is a finding about the *data* that the next analyst inherits.
+    # The detectors an analyst has configured for this timeline — the only
+    # thing the Investigate rail runs. Entries are
+    # ``{method, params, frame, baseline_id, added_by, added_at}``; ``params``
+    # is the same object ``/analysis/findings`` accepts for that method and is
+    # validated with the same models before it is stored, so nothing here can
+    # describe a run the runner would refuse. At most one entry per method:
+    # the shape is a list so that rule can be lifted later without a migration.
     #
-    # A reading preference, never a gate: the plan endpoint does not consult
-    # this (a mute is not a claim that the method *cannot* produce a finding),
-    # and ``/analysis/findings`` still runs a muted method when asked for it
-    # directly. All it does is keep the method out of the unprompted sweep, and
-    # the rail is required to disclose the count it is holding back.
-    muted_methods: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Shared, not per-browser, and audited on every change: which detectors an
+    # investigation runs is a decision the next analyst inherits. Nothing runs
+    # unprompted — an empty list is an empty rail, never a sweep.
+    detectors: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Per-method field decisions the analysts on this case have declared for
     # this timeline: ``{method_id: {field_token: bool}}``, where True pins a
     # field into that detector's *automatic* field selection and False takes it
-    # out. Shared for the same reason ``muted_methods`` is — "an HTTP status
+    # out. Shared because "an HTTP status
     # code is not a range field" is a finding about the data, not a browser
     # preference, and the recommenders type fields syntactically so they cannot
     # discover it themselves.
@@ -426,7 +427,7 @@ class Timeline(Base):
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
             "recommended_columns": self.recommended_columns,
-            "muted_methods": self.muted_methods or [],
+            "detectors": self.detectors or [],
             "field_overrides": self.field_overrides or {},
             "is_embedded": is_embedded,
             "is_stale": is_stale,
@@ -3380,39 +3381,118 @@ class PostgresStore:
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
 
-    async def update_timeline_muted_methods(
+    async def set_timeline_detector(
         self,
         case_id: str,
         timeline_id: str,
-        muted_methods: list[str] | None,
+        entry: dict[str, Any],
     ) -> Timeline | None:
-        """Replace a timeline's muted analysis methods (None/empty clears them).
+        """Add or replace the configured detector for ``entry["method"]``.
 
-        Stored sorted and de-duplicated so the audit trail's before/after is a
-        comparison of sets rather than of insertion orders. Validation of the
-        ids against ``METHOD_IDS`` happens at the API layer, where an unknown id
-        can be reported as a 422 rather than silently persisted.
+        One entry per method: an existing entry is replaced *in place*, so the
+        rail's order — the order analysts added things — survives an edit.
+        ``added_by``/``added_at`` are the caller's; validation of the entry
+        against the runner's models happens at the API layer.
 
-        Returns the updated timeline with sources eagerly loaded, or None if it
-        doesn't exist.
+        The whole list is one JSON column, so this is a read-modify-write and
+        the row is locked for the duration: two analysts configuring *different*
+        methods concurrently would otherwise each write the list they read, one
+        entry silently lost while both audit rows claim success.
+
+        Returns the updated timeline with sources eagerly loaded, or None.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Timeline).where(
-                    Timeline.case_id == case_id,
-                    Timeline.id == timeline_id,
-                )
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
             )
             timeline = result.scalar_one_or_none()
             if timeline is None:
                 return None
-            timeline.muted_methods = sorted(set(muted_methods)) if muted_methods else None
+            current = list(timeline.detectors or [])
+            index = next(
+                (i for i, e in enumerate(current) if e.get("method") == entry["method"]), None
+            )
+            if index is None:
+                current.append(entry)
+            else:
+                current[index] = entry
+            timeline.detectors = current
             await session.commit()
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
+
+    async def remove_timeline_detector(
+        self,
+        case_id: str,
+        timeline_id: str,
+        method: str,
+    ) -> Timeline | None:
+        """Remove the configured detector for ``method`` (no-op if absent).
+
+        An emptied list is stored as None so "nothing configured" has one
+        representation. Locked like ``set_timeline_detector``, and for the same
+        reason. Returns the updated timeline, or None if it does not exist.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            remaining = [e for e in (timeline.detectors or []) if e.get("method") != method]
+            timeline.detectors = remaining or None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def remove_timeline_detectors_for_baseline(
+        self,
+        case_id: str,
+        timeline_id: str,
+        baseline_id: str,
+    ) -> list[dict[str, Any]]:
+        """Drop every configured detector framed on ``baseline_id``.
+
+        Called when that baseline definition is deleted. A baseline-framed
+        entry whose definition is gone is not a detector any more: the rail's
+        request 404s, the chip degrades to a bare "vs baseline", and the wizard
+        seeds an id its own picker cannot show — a dead end that never says so.
+        Removing the entries with the definition keeps "what is configured" a
+        list of questions that can actually be asked; the caller audits each
+        removal, so nothing disappears off the record.
+
+        Returns the entries that were removed, in stored order (empty when none
+        referenced it, or the timeline does not exist).
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return []
+            current = list(timeline.detectors or [])
+            removed = [e for e in current if e.get("baseline_id") == baseline_id]
+            if not removed:
+                return []
+            timeline.detectors = [e for e in current if e.get("baseline_id") != baseline_id] or None
+            await session.commit()
+            return removed
 
     async def update_timeline_field_overrides(
         self,

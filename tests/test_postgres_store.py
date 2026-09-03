@@ -287,8 +287,8 @@ async def test_init_schema_adopts_pre_alembic_db(blank_pg_database):
         await conn.execute(text("ALTER TABLE cases DROP COLUMN is_demo"))
         # 0024 adds the per-timeline recommended grid columns.
         await conn.execute(text("ALTER TABLE timelines DROP COLUMN recommended_columns"))
-        # 0028 adds the per-timeline muted analysis methods.
-        await conn.execute(text("ALTER TABLE timelines DROP COLUMN muted_methods"))
+        # 0034 adds the per-timeline configured detectors.
+        await conn.execute(text("ALTER TABLE timelines DROP COLUMN detectors"))
         # 0029 adds the per-timeline, per-method field overrides.
         await conn.execute(text("ALTER TABLE timelines DROP COLUMN field_overrides"))
     await s.init_schema()
