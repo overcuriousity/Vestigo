@@ -15,11 +15,14 @@ import pytest
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
     _CHARSET_GROUP_PROBE_LIMIT,
+    _HYDRATE_CHUNK,
     _MAX_CHARSET_GROUPED_ROWS,
     _MAX_CHARSET_SIZE,
+    _SQL_SUPPRESSION_MAX,
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
+    StatAnomalyResult,
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
@@ -33,6 +36,7 @@ from vestigo.db.anomaly_stats import (
     _g_statistic_k,
     _greenwood_p,
     _poisson_rate_g,
+    _sql_suppression,
     _tvd,
     _window_preds,
     effective_ts_sql,
@@ -127,6 +131,92 @@ def _svc(responses: list[FakeQueryResult]) -> StatisticalAnomalyService:
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
     svc.ch = FakeClickHouseStore(FakeClient(responses))
     return svc
+
+
+# ---------------------------------------------------------------------------
+# Totals contract: exact counts, SQL-side suppression, chunked hydration
+# ---------------------------------------------------------------------------
+
+
+def test_result_total_is_exact_by_default():
+    r = StatAnomalyResult(
+        status="ok", detector="value_combo", method="self-baseline", baseline_size=0
+    )
+    assert r.total_findings_exact is True
+
+
+def test_sql_suppression_binds_both_sets_under_the_bound():
+    params: dict[str, Any] = {}
+    frag, reasons = _sql_suppression(
+        params,
+        key_expr="val",
+        evt_expr="evt_id",
+        allow_keys=["a", "b"],
+        exclude_event_ids={"e1"},
+    )
+    assert "NOT has({allow:Array(String)}, val)" in frag
+    assert "NOT has({excl:Array(String)}, evt_id)" in frag
+    assert params["allow"] == ["a", "b"]
+    assert params["excl"] == ["e1"]
+    assert reasons == []
+
+
+def test_sql_suppression_is_empty_without_sets():
+    params: dict[str, Any] = {}
+    frag, reasons = _sql_suppression(
+        params, key_expr="val", evt_expr="evt_id", allow_keys=[], exclude_event_ids=None
+    )
+    assert frag == ""
+    assert params == {}
+    assert reasons == []
+
+
+def test_sql_suppression_falls_back_when_a_set_is_too_large():
+    """A set past the bind bound is applied to the page instead — and says so."""
+    params: dict[str, Any] = {}
+    big = {f"e{i}" for i in range(_SQL_SUPPRESSION_MAX + 1)}
+    frag, reasons = _sql_suppression(
+        params, key_expr="val", evt_expr="evt_id", allow_keys=["a"], exclude_event_ids=big
+    )
+    # The allowlist still binds; only the oversized set falls back.
+    assert "NOT has({allow:Array(String)}, val)" in frag
+    assert "excl" not in frag
+    assert "excl" not in params
+    assert len(reasons) == 1
+    assert "page only" in reasons[0]
+    assert f"{_SQL_SUPPRESSION_MAX + 1:,}" in reasons[0]
+
+
+def test_sql_suppression_without_key_expr_skips_the_allowlist():
+    params: dict[str, Any] = {}
+    frag, _ = _sql_suppression(
+        params, key_expr=None, evt_expr="evt_id", allow_keys=["a"], exclude_event_ids={"e"}
+    )
+    assert "allow" not in frag and "allow" not in params
+    assert "excl" in frag
+
+
+def test_hydration_is_chunked():
+    """Hydration binds one parameter per id, so it must fetch in bounded batches."""
+    svc = _svc([])
+    n = _HYDRATE_CHUNK * 2 + 200
+    svc.ch.events_by_id = {f"e{i}": {"event_id": f"e{i}"} for i in range(n)}
+    findings = [
+        ValueFinding(
+            field="f",
+            value=str(i),
+            count=1,
+            score=1.0,
+            first_seen=None,
+            event_id=f"e{i}",
+            event=None,
+            details={},
+        )
+        for i in range(n)
+    ]
+    svc._hydrate_finding_events("c", ["s"], findings)
+    assert [len(c) for c in svc.ch.hydration_calls] == [_HYDRATE_CHUNK, _HYDRATE_CHUNK, 200]
+    assert findings[n - 1].event == {"event_id": f"e{n - 1}"}
 
 
 # ---------------------------------------------------------------------------

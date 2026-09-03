@@ -382,6 +382,19 @@ _MOTIF_GREENWOOD_MIN_INTERVALS = 10
 COMBO_FIELD_SEP = ","
 COMBO_VALUE_SEP = "\x1f"
 
+# Suppression (allowlist values, normal-marked representative events) is bound
+# into the detector SQL so `total_findings` is counted *after* it — a count
+# that ignored suppression would report findings the analyst has already
+# ruled out. Each set rides as one Array(String) parameter; past this many
+# entries it is applied to the page instead and the total is marked inexact,
+# rather than risking the query's parameter block (`http_max_uri_size`).
+_SQL_SUPPRESSION_MAX = 1000
+
+# `get_events_by_ids` binds one parameter per id (`string_in_clause`), and a
+# few thousand of them overflow ClickHouse's field-length limit ("Field value
+# too long"). Representative events are hydrated in batches of this size.
+_HYDRATE_CHUNK = 500
+
 # ---------------------------------------------------------------------------
 # Analysis windows
 # ---------------------------------------------------------------------------
@@ -1042,7 +1055,14 @@ class StatAnomalyResult:
     # For the frequency detector this is counted before the per-event
     # normal-annotation exclusion (which runs on a hydrated candidate buffer),
     # so it can overcount by at most the handful of excluded events.
+    #
+    # The contract (docs/ANOMALY_DETECTION.md §"Totals and truncation"): the
+    # exact number of findings across the full analysed scope, after
+    # suppression, before the display cap. A run that could not count exactly
+    # sets ``total_findings_exact`` False and says why in ``warnings``; a
+    # client renders such a total as "N+", never as "N".
     total_findings: int = 0
+    total_findings_exact: bool = True
 
 
 @dataclass
@@ -1184,6 +1204,57 @@ def _apply_allowlist(findings: list[Any], allowlist: set[tuple[str, str]] | None
         for f in findings
         if (f.details.get("allowlist_field"), f.details.get("allowlist_value")) not in allowlist
     ]
+
+
+def _sql_allow_keys(allowlist: set[tuple[str, str]] | None, field_token: str) -> list[str]:
+    """The allowlisted values for one ``allowlist_field``, sorted for stable SQL params."""
+    if not allowlist:
+        return []
+    return sorted(v for f, v in allowlist if f == field_token)
+
+
+def _sql_suppression(
+    params: dict[str, Any],
+    *,
+    key_expr: str | None,
+    evt_expr: str,
+    allow_keys: list[str],
+    exclude_event_ids: set[str] | None,
+) -> tuple[str, list[str]]:
+    """Bind suppression into a detector scan so its count is post-suppression.
+
+    Returns ``(fragment, reasons)``. *fragment* is ``""`` or one or two
+    ``AND NOT has(...)`` clauses for the caller's ``HAVING``/``WHERE``: the
+    allowlist against *key_expr* (skipped when the caller has no key
+    expression) and the normal-marked event ids against *evt_expr*. Each set
+    is bound as ``params["allow"]`` / ``params["excl"]`` only while it fits
+    :data:`_SQL_SUPPRESSION_MAX`; a larger one is left for the caller's
+    page-level filter and named in *reasons*, which the caller surfaces as a
+    warning and as ``total_findings_exact=False``.
+    """
+    clauses: list[str] = []
+    reasons: list[str] = []
+    if allow_keys and key_expr is not None:
+        if len(allow_keys) <= _SQL_SUPPRESSION_MAX:
+            params["allow"] = list(allow_keys)
+            clauses.append(f"NOT has({{allow:Array(String)}}, {key_expr})")
+        else:
+            reasons.append(
+                f"allowlist ({len(allow_keys):,} entries) exceeds the "
+                f"{_SQL_SUPPRESSION_MAX:,}-entry SQL bound; suppression applied to the page "
+                "only, so the total may include allowlisted findings"
+            )
+    if exclude_event_ids:
+        if len(exclude_event_ids) <= _SQL_SUPPRESSION_MAX:
+            params["excl"] = sorted(exclude_event_ids)
+            clauses.append(f"NOT has({{excl:Array(String)}}, {evt_expr})")
+        else:
+            reasons.append(
+                f"normal-marked events ({len(exclude_event_ids):,} entries) exceed the "
+                f"{_SQL_SUPPRESSION_MAX:,}-entry SQL bound; suppression applied to the page "
+                "only, so the total may include findings marked normal"
+            )
+    return ("".join(f" AND {c}" for c in clauses), reasons)
 
 
 def _freq_finding(
@@ -1631,13 +1702,18 @@ class StatisticalAnomalyService:
         Called on the final (post-suppression, post-limit) finding slice, so
         at most ``limit`` events are fetched — the detector scans themselves
         only aggregate ``argMin(event_id, ...)`` and never read the fat
-        message/attributes columns. Findings whose id is missing from the
-        result keep their :func:`_stub_event` fallback.
+        message/attributes columns. Fetched :data:`_HYDRATE_CHUNK` ids at a
+        time, since each id is its own bound parameter. Findings whose id is
+        missing from the result keep their :func:`_stub_event` fallback.
         """
         ids = [f.event_id for f in findings if f.event_id]
         if not ids:
             return
-        by_id = self.ch.get_events_by_ids(case_id, source_ids, ids)
+        by_id: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(ids), _HYDRATE_CHUNK):
+            by_id.update(
+                self.ch.get_events_by_ids(case_id, source_ids, ids[i : i + _HYDRATE_CHUNK])
+            )
         for f in findings:
             if f.event_id and f.event_id in by_id:
                 f.event = by_id[f.event_id]
