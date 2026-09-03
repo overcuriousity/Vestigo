@@ -1662,6 +1662,13 @@ class AgentProposal(Base):
         String(32), nullable=False, default="annotation", server_default="annotation"
     )
     payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # What confirming actually did: ``{applied, story_id|block_id, reason}``.
+    # A confirmed proposal may apply nothing (title taken, story deleted), and
+    # the transcript re-renders long after the confirm response is gone — so
+    # the outcome is persisted rather than inferred. Null on every row decided
+    # before 0035, and on annotation proposals, which report their outcome
+    # through the annotations they wrote.
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1684,6 +1691,7 @@ class AgentProposal(Base):
             "status": self.status,
             "kind": self.kind,
             "payload": self.payload,
+            "result": self.result,
             "tag": self.tag,
             "comment": self.comment,
             "rationale": self.rationale,
@@ -4077,6 +4085,56 @@ class PostgresStore:
             await session.refresh(story)
             return story
 
+    async def create_story_if_title_free(
+        self, case_id: str, story_id: str, title: str, description: str | None, user: str
+    ) -> Story | None:
+        """Create a story unless the case already has one under that title.
+
+        Returns ``None`` when the title is taken (case-insensitive), so the
+        caller can report an unapplied confirm instead of silently making a
+        second document under one name. Check and insert share a transaction
+        serialized per ``(case, title)`` by a Postgres advisory lock, which is
+        what a plain read-then-insert could not promise: two analysts
+        confirming the same proposed title at once both passed the read.
+
+        Deliberately not a unique index. Analysts creating stories by hand may
+        name two documents alike — this is only the agent path's promise not
+        to duplicate a name behind their back.
+        """
+        import hashlib
+
+        normalized = title.strip().lower()
+        # A signed 64-bit key, because that is the shape pg_advisory_xact_lock
+        # takes. Collisions cost an unrelated pair of confirms a moment of
+        # serialization, nothing more.
+        lock_key = int.from_bytes(
+            hashlib.sha256(f"{case_id}\x00{normalized}".encode()).digest()[:8],
+            "big",
+            signed=True,
+        )
+        async with self.session_factory() as session:
+            async with session.begin():
+                await session.execute(select(func.pg_advisory_xact_lock(lock_key)))
+                existing = await session.execute(
+                    select(Story.id).where(
+                        Story.case_id == case_id,
+                        func.lower(func.trim(Story.title)) == normalized,
+                    )
+                )
+                if existing.first() is not None:
+                    return None
+                story = Story(
+                    id=story_id,
+                    case_id=case_id,
+                    title=title,
+                    description=description,
+                    created_by=user,
+                    updated_by=user,
+                )
+                session.add(story)
+            await session.refresh(story)
+            return story
+
     async def get_story(self, case_id: str, story_id: str) -> Story | None:
         """Return a story by case and story IDs."""
         async with self.session_factory() as session:
@@ -5442,6 +5500,26 @@ class PostgresStore:
             if result.rowcount == 0:
                 await session.commit()
                 return None
+            await session.commit()
+            row = await session.execute(
+                select(AgentProposal).where(AgentProposal.id == proposal_id)
+            )
+            return row.scalar_one_or_none()
+
+    async def set_agent_proposal_result(
+        self, proposal_id: str, result: dict[str, Any]
+    ) -> AgentProposal | None:
+        """Record what applying a decided proposal actually did.
+
+        Written after the apply, separately from ``decide_agent_proposal``:
+        the decision is the atomic, once-only transition, while the outcome
+        is the report about it. A failure here loses the report, never the
+        decision.
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                update(AgentProposal).where(AgentProposal.id == proposal_id).values(result=result)
+            )
             await session.commit()
             row = await session.execute(
                 select(AgentProposal).where(AgentProposal.id == proposal_id)

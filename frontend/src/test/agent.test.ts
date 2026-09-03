@@ -218,6 +218,7 @@ describe("proposal events → Explorer filter mapping", () => {
       status: "confirmed",
     kind: "annotation" as const,
     payload: null,
+    result: null,
       tag: "suspicious",
       comment: null,
       rationale: "clustered auth failures",

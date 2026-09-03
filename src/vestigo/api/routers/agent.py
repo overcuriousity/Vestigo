@@ -1133,7 +1133,14 @@ async def _apply_story_proposal(
 
     A title that collided since propose time is reported honestly rather than
     raised: the proposal is decided either way, and two stories under one name
-    is a worse outcome than an unapplied confirm the analyst can redo.
+    is a worse outcome than an unapplied confirm the analyst can redo. The
+    collision check and the insert are serialized per (case, title) inside
+    ``create_story_if_title_free``, so two confirms racing on one title cannot
+    both pass it.
+
+    The outcome is persisted on the proposal (``result``), because the card
+    that renders this proposal outlives the confirm response and must not
+    claim a story it did not create.
     """
     import uuid as _uuid
 
@@ -1148,18 +1155,27 @@ async def _apply_story_proposal(
         reason = "the proposal carries no title"
     elif len(title) > STORY_TITLE_MAX_CHARS:
         reason = f"title exceeds {STORY_TITLE_MAX_CHARS} characters"
-    elif any(s.title.strip().lower() == title.lower() for s in await store.list_stories(case_id)):
-        reason = f"a story titled {title!r} already exists"
     else:
-        story = await store.create_story(
+        story = await store.create_story_if_title_free(
             case_id,
             _uuid.uuid4().hex,
             title,
             payload.get("description"),
             user=user.username,
         )
-        applied = True
-        story_dict = story.to_dict()
+        if story is None:
+            reason = f"a story titled {title!r} already exists"
+        else:
+            applied = True
+            story_dict = story.to_dict()
+    recorded = await store.set_agent_proposal_result(
+        decided.id,
+        {
+            "applied": applied,
+            "story_id": story_dict["id"] if story_dict else None,
+            "reason": reason,
+        },
+    )
     await store.record_audit(
         action="agent.story_confirm",
         actor=user,
@@ -1175,7 +1191,7 @@ async def _apply_story_proposal(
         },
     )
     return {
-        "proposal": decided.to_dict(),
+        "proposal": (recorded or decided).to_dict(),
         "applied": applied,
         "story": story_dict,
         "reason": reason,
@@ -1280,6 +1296,18 @@ async def _apply_story_block_proposal(
                 block_dict = block.to_dict()
         except ValueError as exc:
             reason = str(exc)
+    # Persisted for the same reason as on the story proposal: the card renders
+    # from the stored transcript long after the confirm response is gone, and
+    # a confirmed-but-unapplied block must not read as written.
+    recorded = await store.set_agent_proposal_result(
+        decided.id,
+        {
+            "applied": applied,
+            "story_id": payload.get("story_id"),
+            "block_id": block_dict["id"] if block_dict else None,
+            "reason": reason,
+        },
+    )
     await store.record_audit(
         action="agent.story_block_confirm",
         actor=user,
@@ -1294,7 +1322,7 @@ async def _apply_story_block_proposal(
         },
     )
     return {
-        "proposal": decided.to_dict(),
+        "proposal": (recorded or decided).to_dict(),
         "applied": applied,
         "block": block_dict,
         "reason": reason,

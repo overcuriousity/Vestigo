@@ -31,6 +31,16 @@ management) and `api/routers/agent.py` (HTTP/SSE layer).
     first, so the block references a persisted object like every other embed. A
     story deleted since propose time still decides the proposal and reports
     `applied: false` with a reason. See `docs/STORIES.md`.
+  - What a confirm actually did is persisted on the proposal itself
+    (`AgentProposal.result` = `{applied, story_id, block_id?, reason}`) for the
+    two story kinds, not only returned in the confirm response. The card
+    re-renders from the stored transcript long after that response is gone, and
+    `status: confirmed` alone cannot distinguish a story the agent's proposal
+    created from one that merely took the same name first — a permanent false
+    "created by <analyst>" is the wrong failure on a provenance surface. Null on
+    annotation proposals (they report through the annotations they wrote) and on
+    rows decided before 1.19.1, where the cards fall back to their old
+    inference.
   `run_anomaly_detector` is the only other write-shaped tool (it persists a
   `DetectorRun`, same as an analyst-triggered scan).
   - **Origin is provenance, not a visibility class.** A confirmed

@@ -62,19 +62,32 @@ export function StoryProposalCard({ caseId, conversationId, proposal }: Props) {
 
   const deciding = confirmMutation.isPending || rejectMutation.isPending;
 
-  // Resolved by title rather than kept from the confirm response: a confirmed
-  // proposal re-renders from the persisted transcript on the next page load,
-  // where the mutation's result is gone but the story it created is not. The
-  // propose-time uniqueness check is what makes the title a usable handle.
+  // A confirmed proposal re-renders from the persisted transcript on the next
+  // page load, where the mutation's result is gone — so the outcome comes off
+  // the proposal's own `result`, which the confirm persisted. That matters
+  // because a confirm can apply nothing (the title was taken since propose
+  // time) and the transcript would otherwise claim a story the agent never
+  // made, linking to the unrelated one that took the name.
+  const result = proposal.result;
+  const unapplied = result?.applied === false;
+
   const { data: stories } = useQuery({
     queryKey: ["stories", caseId],
     queryFn: () => storiesApi.list(caseId),
-    enabled: proposal.status === "confirmed",
+    enabled: proposal.status === "confirmed" && !unapplied,
   });
+  // `result.story_id` is the handle; the title is only the fallback for rows
+  // confirmed before the outcome was persisted. Either way the story is
+  // looked up rather than linked blind, so one deleted since the confirm
+  // simply drops the button.
   const created =
-    stories?.find(
-      (s) => s.title.trim().toLowerCase() === (payload?.title ?? "").trim().toLowerCase(),
-    ) ?? null;
+    (result?.story_id
+      ? stories?.find((s) => s.id === result.story_id)
+      : result
+        ? null
+        : stories?.find(
+            (s) => s.title.trim().toLowerCase() === (payload?.title ?? "").trim().toLowerCase(),
+          )) ?? null;
 
   if (proposal.status === "rejected") {
     return (
@@ -114,7 +127,15 @@ export function StoryProposalCard({ caseId, conversationId, proposal }: Props) {
         <p className="mt-1.5 text-[var(--color-fg-secondary)]">{proposal.rationale}</p>
       )}
 
-      {proposal.status === "confirmed" ? (
+      {proposal.status === "confirmed" && unapplied ? (
+        <div className="mt-2 flex items-start gap-1 text-[var(--color-warning)]">
+          <CircleX size={13} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">
+            Confirmed{proposal.decided_by ? ` by ${userName(proposal.decided_by)}` : ""}, but no
+            story was created{result?.reason ? ` — ${result.reason}` : ""}.
+          </span>
+        </div>
+      ) : proposal.status === "confirmed" ? (
         <div className="mt-2 flex items-center justify-between gap-2">
           <span className="flex items-center gap-1 text-[var(--color-success)]">
             <CircleCheck size={13} className="shrink-0" />

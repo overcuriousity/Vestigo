@@ -42,6 +42,7 @@ function proposal(overrides: Partial<AgentProposal> = {}): AgentProposal {
     created_at: null,
     decided_by: null,
     decided_at: null,
+    result: null,
     ...overrides,
   };
 }

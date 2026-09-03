@@ -133,8 +133,10 @@ async def update_story(
 
     Only fields present in the request body are touched, so
     ``{"description": null}`` clears the description while ``{"title": "x"}``
-    leaves it alone. A supplied title must be non-blank — the same rule
-    ``POST`` applies, rather than letting PATCH blank it out.
+    leaves it alone. A supplied title must be non-blank and within
+    ``STORY_TITLE_MAX_CHARS`` — the same two rules ``POST`` applies, rather
+    than letting a rename blank the title out or run past ``Story.title``'s
+    column width, where the driver's truncation error surfaces as a 500.
     """
     await _get_story_or_404(case.id, story_id)
     sent = body.model_fields_set
@@ -142,6 +144,10 @@ async def update_story(
     if "title" in sent:
         if not (body.title or "").strip():
             raise HTTPException(status_code=422, detail="title cannot be blank")
+        if len(body.title.strip()) > STORY_TITLE_MAX_CHARS:
+            raise HTTPException(
+                status_code=422, detail=f"title exceeds {STORY_TITLE_MAX_CHARS} characters"
+            )
         title = body.title.strip()
     story = await get_store().update_story(
         case.id,

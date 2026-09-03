@@ -146,6 +146,7 @@ function proposal(itemKind: ProposalItemKind): AgentProposal {
     created_at: null,
     decided_by: null,
     decided_at: null,
+    result: null,
   };
 }
 

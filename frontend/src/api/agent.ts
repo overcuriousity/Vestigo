@@ -380,6 +380,13 @@ export interface StoryProposalPayload {
   description: string | null;
 }
 
+export interface ProposalResult {
+  applied: boolean;
+  story_id: string | null;
+  block_id?: string | null;
+  reason: string | null;
+}
+
 export interface AgentProposal {
   id: string;
   conversation_id: string;
@@ -390,6 +397,11 @@ export interface AgentProposal {
   kind: "annotation" | "story" | "story_block";
   /** Kind-specific body — the story or story-block target, else null. */
   payload: StoryBlockProposalPayload | StoryProposalPayload | null;
+  /** What confirming actually did. Null on annotation proposals, on anything
+   * still `proposed`, and on rows decided before the outcome was persisted —
+   * a confirm can legitimately apply nothing (title taken, story deleted),
+   * and `status` alone cannot say which. */
+  result: ProposalResult | null;
   tag: string | null;
   comment: string | null;
   rationale: string;

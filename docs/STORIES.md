@@ -120,9 +120,10 @@ for both the HTTP router and the agent's `propose_story_block`).
 | `event_ref` | `{event_id, source_id, caption?}` (caption ≤ 1000 chars) |
 
 Titles are capped at `STORY_TITLE_MAX_CHARS` (255, mirroring the column) on
-both write paths — the HTTP router and the agent's `propose_story`. The column
-is where an over-long one surfaced before: as a driver error, i.e. a 500 on a
-typo.
+every write path — `POST /stories`, the rename on `PATCH /stories/{id}`, and
+the agent's `propose_story`. The column is where an over-long one surfaced
+before: as a driver error, i.e. a 500 on a typo, and a rename is the likeliest
+way to paste one in.
 
 `schemas.CONTENT_SHAPES` carries one example payload per kind, pinned against
 the models by a test. It is what `propose_story_block` advertises in its
@@ -499,7 +500,13 @@ propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
   then proposes. A title already taken (or already pending from this
   conversation) is refused at propose time and reported honestly at confirm
   time, since the title is the handle both the analyst and the agent use to
-  find the document. Existed only from 1.19.1: before it, a case with no
+  find the document. `create_story_if_title_free` does that check and the
+  insert in one transaction serialized per `(case, title)` by a Postgres
+  advisory lock, so two analysts confirming the same proposed title at once
+  cannot both pass a check that was true a moment earlier. It is deliberately
+  not a unique index: analysts naming two documents alike by hand is their
+  call, and this is only the agent path's promise not to duplicate a name
+  behind their back. Existed only from 1.19.1: before it, a case with no
   stories was a dead end — the agent could be asked for a report and had no
   way to make the document to put it in, and `propose_story_block`'s "not
   found — list_stories" pointed at a list it already knew was empty.

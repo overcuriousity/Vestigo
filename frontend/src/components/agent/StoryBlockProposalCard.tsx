@@ -222,7 +222,20 @@ export function StoryBlockProposalCard({ caseId, conversationId, proposal }: Pro
         <p className="mt-1.5 text-[var(--color-fg-secondary)]">{proposal.rationale}</p>
       )}
 
-      {proposal.status === "confirmed" ? (
+      {proposal.status === "confirmed" && proposal.result?.applied === false ? (
+        // A confirm can decide the proposal and still add nothing — the story
+        // was deleted since propose time, a stored chart spec no longer
+        // validates. The toast that said so is gone by the next page load, so
+        // the persisted outcome is what the transcript reads from.
+        <div className="mt-2 flex items-start gap-1 text-[var(--color-warning)]">
+          <CircleX size={13} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 break-words">
+            Confirmed{proposal.decided_by ? ` by ${userName(proposal.decided_by)}` : ""}, but
+            nothing was added
+            {proposal.result?.reason ? ` — ${proposal.result.reason}` : ""}.
+          </span>
+        </div>
+      ) : proposal.status === "confirmed" ? (
         <div className="mt-2 flex items-center justify-between gap-2">
           <span className="flex items-center gap-1 text-[var(--color-success)]">
             <CircleCheck size={13} className="shrink-0" />
