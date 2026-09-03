@@ -59,7 +59,17 @@ from vestigo.db.postgres import User
 # oversight — see docs/AGENT.md: that tool's docstring is one line for this
 # reason, and the next tool added has to pay for itself by trimming elsewhere
 # rather than by moving this number.
-SCHEMA_BUDGET_CHARS = 43_000
+# 2026-09-03: 42,986 -> 43,858 with `propose_story` (35 tools) and the per-kind
+# `content` shapes on `propose_story_block`; ceiling to 44,000. The previous
+# entry's rule was applied first and the three story docstrings were rewritten
+# compact (-970 chars) before this number moved. What the remaining 872 buys is
+# *retries*, which are the expensive thing: a tool call the model cannot get
+# right costs a whole model request carrying this entire list again. A real
+# turn spent six of them guessing `content`'s shape (2026-09-03), and an empty
+# case could not be given a report at all. One prevented retry pays the 872
+# back ~49 times over. Prose that does not remove a retry still does not
+# belong here.
+SCHEMA_BUDGET_CHARS = 44_000
 
 
 def _scope(case_id: str = "c1", timeline_id: str = "t1") -> AgentScope:

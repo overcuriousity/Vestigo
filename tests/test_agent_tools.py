@@ -2877,18 +2877,16 @@ async def test_propose_story_block_validates(store):
 
 
 async def test_a_stringified_top_level_argument_is_parsed_before_the_tool_body(store):
-    """Top-level arguments never reach a tool as text, which is why only
-    *nested* ones need `ObjectArgModel`.
+    """A *well-formed* stringified top-level argument never reaches the body.
 
     Two independent layers parse them: pydantic-ai's ``args_as_dict`` on the
     way in, and the MCP SDK's ``pre_parse_json``
     (``mcp/server/fastmcp/utilities/func_metadata.py``) for any parameter
     whose annotation is not ``str`` — the same "an object is the only thing a
     string could have meant" rule `_admits_json_object` applies one level
-    down. So ``content`` arrives as a dict, and ``propose_story_block``'s
-    ``isinstance`` guard is unreachable belt-and-braces. Pinned here because
-    the day that stops being true, the guard is the thing standing between a
-    string and a silent substring match on ``"chart_spec" in content``.
+    down. Both give up on a string that is not valid JSON, which is why
+    ``propose_story_block`` accepts ``str`` and parses it itself; see
+    `test_propose_story_block_names_the_defect_in_malformed_json`.
     """
     await store.init_schema()
     await store.create_case("c1", "Case One")
@@ -2904,6 +2902,211 @@ async def test_a_stringified_top_level_argument_is_parsed_before_the_tool_body(s
     assert result["status"] == "proposed"
     (p,) = await store.list_agent_proposals(conv.id)
     assert p.payload["content"] == {"text": "## parsed"}
+
+
+async def test_propose_story_records_a_story_proposal(store):
+    """The agent can propose the document it was asked to write into.
+
+    Without this a case with no stories was a dead end: `propose_story_block`
+    needs a `story_id` and the agent had no way to make one.
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    result = await _call(
+        server,
+        "propose_story",
+        {
+            "title": "  Verifikation der Ergebnisse  ",
+            "description": " Abschluss ",
+            "rationale": "no report yet",
+        },
+    )
+    assert result["status"] == "proposed"
+    # The note is the whole reason this does not chain: a story has no id
+    # until the analyst confirms, and a model that invents one wastes a turn.
+    assert "list_stories" in result["note"]
+
+    (p,) = await store.list_agent_proposals(conv.id)
+    assert p.kind == "story"
+    assert p.payload == {"title": "Verifikation der Ergebnisse", "description": "Abschluss"}
+    assert p.rationale == "no report yet"
+    # Proposing writes nothing.
+    assert await store.list_stories("c1") == []
+
+
+async def test_propose_story_refuses_a_name_already_taken_or_pending(store):
+    """Both "it exists" and "you already asked" are named, and differently.
+
+    A proposal is not a story, so a model that cannot tell the two apart
+    re-proposes the same document every turn — the same blindness that made it
+    probe `propose_story_block` with throwaway test blocks (2026-09-03).
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    await store.create_story("c1", "s1", "Verifikation", None, user="alice")
+    taken = await _call(server, "propose_story", {"title": "  verifikation "})
+    assert "already exists" in taken["error"]
+    assert "s1" in taken["error"]
+
+    first = await _call(server, "propose_story", {"title": "Zweiter Bericht"})
+    assert first["status"] == "proposed"
+    again = await _call(server, "propose_story", {"title": "zweiter bericht"})
+    assert "already proposed" in again["error"]
+    assert first["proposal_id"] in again["error"]
+
+    # A decided proposal is no longer pending — the analyst rejected it, so
+    # proposing it again is a legitimate move rather than a duplicate.
+    await store.decide_agent_proposal(first["proposal_id"], status="rejected", decided_by="alice")
+    retry = await _call(server, "propose_story", {"title": "Zweiter Bericht"})
+    assert retry["status"] == "proposed"
+
+
+async def test_propose_story_validates_its_title(store):
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    assert "title is required" in (await _call(server, "propose_story", {"title": "   "}))["error"]
+    # The column is String(255); an over-long title would otherwise surface as
+    # a driver error at confirm time, i.e. a 500 on the analyst's click.
+    long = await _call(server, "propose_story", {"title": "x" * 256})
+    assert "255" in long["error"]
+    assert await store.list_agent_proposals(conv.id) == []
+
+
+async def test_propose_story_block_points_an_empty_case_at_propose_story(store):
+    """ "Not found — list_stories" is a dead end when list_stories is empty."""
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    empty = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "whatever", "block_kind": "markdown", "content": {"text": "x"}},
+    )
+    assert "propose_story" in empty["error"]
+
+    # With a story in the case, a wrong id is just a wrong id.
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    wrong = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "ghost", "block_kind": "markdown", "content": {"text": "x"}},
+    )
+    assert "list_stories" in wrong["error"]
+    assert "propose_story" not in wrong["error"]
+
+
+async def test_propose_story_block_names_the_defect_in_malformed_json(store):
+    """A model that closes an object with `")` gets told what is wrong.
+
+    Neither parsing layer can recover such a string, so before the tool took
+    ``str`` the model saw pydantic's "Input should be a valid dictionary" —
+    which names neither the malformed JSON nor the shape a markdown block
+    needs. A real turn spent six retries on it (2026-09-03).
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    broken = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "markdown", "content": '{"text": "## Bewertung")'},
+    )
+    assert "not valid JSON" in broken["error"]
+    assert '{"text": "..."}' in broken["error"]
+
+    # Bare prose is a plausible guess at an opaque `content`; it must teach
+    # the shape too rather than fall through as a substring-matchable string.
+    prose = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "markdown", "content": "## Bewertung"},
+    )
+    assert '{"text": "..."}' in prose["error"]
+
+    # The other plausible guess: right kind, wrong key.
+    wrong_key = await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s1", "block_kind": "markdown", "content": {"markdown": "## Bewertung"}},
+    )
+    assert '{"text": "..."}' in wrong_key["error"]
+
+    assert await store.list_agent_proposals(conv.id) == []
+
+
+async def test_read_story_reports_this_conversation_s_pending_proposals(store):
+    """A proposal is invisible in `blocks`/`block_count` until confirmed.
+
+    A model that cannot see its own pending work reads its proposal as a
+    no-op and probes the API with throwaway "test" blocks, which land in the
+    analyst's confirmation queue as junk (observed 2026-09-03).
+    """
+    await store.init_schema()
+    await store.create_case("c1", "Case One")
+    await store.create_story("c1", "s1", "Report", None, user="alice")
+    await store.create_story("c1", "s2", "Other", None, user="alice")
+    conv = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    other = await store.create_agent_conversation("c1", "t1", "u1", model_id="m")
+    server = build_tool_server(_scope_with_conversation("c1", "t1", conv.id))
+
+    proposed = await _call(
+        server,
+        "propose_story_block",
+        {
+            "story_id": "s1",
+            "block_kind": "markdown",
+            "content": {"text": "## Abschließende Bewertung"},
+            "rationale": "conclusion",
+        },
+    )
+    # Another story of the same conversation, and another conversation's work
+    # on this one: neither belongs in this story's answer.
+    await _call(
+        server,
+        "propose_story_block",
+        {"story_id": "s2", "block_kind": "markdown", "content": {"text": "elsewhere"}},
+    )
+    await store.create_agent_proposal(
+        case_id="c1",
+        timeline_id="t1",
+        conversation_id=other.id,
+        rationale="",
+        kind="story_block",
+        payload={"story_id": "s1", "block_kind": "markdown", "content": {"text": "theirs"}},
+    )
+
+    read = await _call(server, "read_story", {"story_id": "s1"})
+    assert read["block_count"] == 0
+    assert read["blocks"] == []
+    assert read["pending_proposals"] == [
+        {
+            "proposal_id": proposed["proposal_id"],
+            "block_kind": "markdown",
+            "after_block_id": None,
+            "rationale": "conclusion",
+        }
+    ]
+
+    # A decided proposal stops being pending — it is a block or it is gone.
+    await store.decide_agent_proposal(
+        proposed["proposal_id"], status="rejected", decided_by="alice"
+    )
+    settled = await _call(server, "read_story", {"story_id": "s1"})
+    assert "pending_proposals" not in settled
 
 
 async def test_propose_story_block_checks_referent_scope(store):

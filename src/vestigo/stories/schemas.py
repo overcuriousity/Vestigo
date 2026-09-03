@@ -19,6 +19,12 @@ BLOCK_KINDS = ("markdown", "view_ref", "chart_ref", "event_ref")
 #: Hard cap on rows a view block may freeze into a snapshot.
 VIEW_BLOCK_ROW_CAP = 1000
 
+#: Ceiling on a story title, mirroring ``Story.title``'s ``String(255)``.
+#: Enforced by both write paths (the HTTP router and the agent's
+#: ``propose_story``) because the column is where an over-long one would
+#: otherwise surface — as a driver error, i.e. a 500 on a typo.
+STORY_TITLE_MAX_CHARS = 255
+
 #: Ceiling on an ``event_ref`` caption. A caption is a one-line label under a
 #: frozen event, not a second narrative block — that's what markdown is for.
 MAX_CAPTION_CHARS = 1000
@@ -70,6 +76,24 @@ _CONTENT_MODELS: dict[str, type[BaseModel]] = {
     "chart_ref": ChartRefContent,
     "event_ref": EventRefContent,
 }
+
+
+#: One example payload per block kind, written the way a model should emit it.
+#: Advertised in ``propose_story_block``'s docstring and echoed back on every
+#: content error, because the JSON schema for an opaque ``content`` object says
+#: nothing about which keys a kind needs — a model that guesses ``{"markdown":
+#: ...}`` for a markdown block gets a bare "field required" and no way to learn
+#: the answer. ``tests/test_stories_store.py`` pins each hint against its
+#: model's required fields so the two cannot drift.
+CONTENT_SHAPES: dict[str, str] = {
+    "markdown": '{"text": "..."}',
+    "view_ref": '{"view_id": "...", "timeline_id": "...", "display": {"limit": 200}}',
+    "chart_ref": '{"chart_id": "...", "timeline_id": "..."}',
+    "event_ref": '{"event_id": "...", "source_id": "...", "caption": "..."}',
+}
+
+#: Fallback for an unknown kind — names the kinds rather than a shape.
+CONTENT_SHAPE_HINT: str = "one of " + ", ".join(f"{k} {v}" for k, v in CONTENT_SHAPES.items())
 
 
 def validate_block_content(kind: str, content: dict) -> dict:

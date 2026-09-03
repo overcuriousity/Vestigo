@@ -119,6 +119,18 @@ for both the HTTP router and the agent's `propose_story_block`).
 | `chart_ref` | `{chart_id, timeline_id}` — the chart carries its own filters, see below |
 | `event_ref` | `{event_id, source_id, caption?}` (caption ≤ 1000 chars) |
 
+Titles are capped at `STORY_TITLE_MAX_CHARS` (255, mirroring the column) on
+both write paths — the HTTP router and the agent's `propose_story`. The column
+is where an over-long one surfaced before: as a driver error, i.e. a 500 on a
+typo.
+
+`schemas.CONTENT_SHAPES` carries one example payload per kind, pinned against
+the models by a test. It is what `propose_story_block` advertises in its
+docstring and echoes back on a content error: the JSON schema for an opaque
+`content` object says nothing about which keys a kind needs, and a model that
+guessed `{markdown: …}` for a markdown block used to get a bare "field
+required" with no way to learn the answer.
+
 A block's `timeline_id`, `view_id`, `chart_id` and `source_id` are additionally
 checked against the case by `vestigo.stories.refs.validate_block_scope`. Shape
 validation alone let a foreign or mistyped id through, to surface much later as
@@ -469,10 +481,35 @@ propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
   per-response budget (`STORY_TEXT_TRUNCATE` / `STORY_TEXT_BUDGET`), and marks
   every cut with `truncated`/`text_length` — the agent has no way to fetch a
   cut block's tail, so a cut it cannot see is a cut it would summarize as the
-  whole block.
+  whole block. It also returns `pending_proposals` — this conversation's
+  undecided `story_block` proposals for that story. A proposal is not a block
+  and does not move `block_count`, so without this the agent reads its own
+  proposal as a no-op and either re-proposes or probes the API with a
+  throwaway "test" block, which lands in the analyst's confirmation queue as
+  junk to decline.
+- `propose_story(title, description?, rationale)` — conversation-bound,
+  records an `AgentProposal` (`kind="story"`, `payload={title, description}`)
+  and writes nothing. Confirming creates an **empty** story; blocks are
+  proposed and confirmed separately, because a document that arrived
+  pre-filled would skip the per-block sign-off this subsystem is built on.
+  It deliberately does not chain: the story has no id until the analyst acts,
+  so the tool's result tells the model to wait rather than invent one.
+  `Story` has no `origin` column — what records the agent's hand is the
+  `agent.story_confirm` audit row and the `origin: agent` on every block it
+  then proposes. A title already taken (or already pending from this
+  conversation) is refused at propose time and reported honestly at confirm
+  time, since the title is the handle both the analyst and the agent use to
+  find the document. Existed only from 1.19.1: before it, a case with no
+  stories was a dead end — the agent could be asked for a report and had no
+  way to make the document to put it in, and `propose_story_block`'s "not
+  found — list_stories" pointed at a list it already knew was empty.
 - `propose_story_block(story_id, block_kind, content, after_block_id?,
   rationale)` — conversation-bound, records an `AgentProposal`
-  (`kind="story_block"`, target in `payload`) and writes nothing. Confirming
+  (`kind="story_block"`, target in `payload`) and writes nothing. `content` is
+  declared `dict | str`: a stringified object that neither pydantic-ai nor the
+  MCP SDK's `pre_parse_json` could parse (a model closing an object with `")`)
+  reaches the tool body, where the error names the malformed JSON *and* the
+  expected shape instead of pydantic's "Input should be a valid dictionary". Confirming
   creates the block with `origin: agent`. A `chart_ref` may carry
   `{chart_spec, name}` instead of a `chart_id` — the spec is validated by
   executing it at propose time, and confirming saves the chart and embeds it in
@@ -488,10 +525,14 @@ propose→confirm. See `docs/AGENT.md` for the tool registry and deny layers.
   it into the stored config's `filters` key (below), so a confirmed proposal
   embeds the slice the agent proposed over, not the whole timeline.
 
-**Deliberate parity boundary:** block edit/move/delete and export stay
-analyst-only. Parity covers analytical contribution, not document arrangement
-or the attestation act — an export is a human sign-off by design. Revisit
-trigger: a user asks the agent to restructure a story.
+**Deliberate parity boundary:** block edit/move/delete, story rename/delete and
+export stay analyst-only. Parity covers analytical contribution — writing the
+report and, since 1.19.1, proposing the document to write it in — not document
+arrangement or the attestation act; an export is a human sign-off by design.
+Story *creation* sits on the contribution side because refusing it left the
+agent unable to answer "write me a report" on a fresh case at all, which is not
+a boundary anyone chose. Rearranging or deleting what already exists stays off.
+Revisit trigger: a user asks the agent to restructure a story.
 
 ## The demo case's story
 

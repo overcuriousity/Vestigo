@@ -332,3 +332,33 @@ async def test_at_top_and_after_block_id_are_mutually_exclusive(store):
             after_block_id="b1",
             at_top=True,
         )
+
+
+def test_content_shape_hints_match_the_models():
+    """Every hint names its kind's required fields, and only real kinds.
+
+    The hints are what `propose_story_block` advertises and echoes back on an
+    error; a hint that has drifted from its model teaches the wrong shape,
+    which is worse than the bare pydantic message it replaced.
+    """
+    import json
+
+    from vestigo.stories.schemas import (
+        _CONTENT_MODELS,
+        BLOCK_KINDS,
+        CONTENT_SHAPE_HINT,
+        CONTENT_SHAPES,
+    )
+
+    assert set(CONTENT_SHAPES) == set(BLOCK_KINDS)
+    for kind, hint in CONTENT_SHAPES.items():
+        example = json.loads(hint)
+        required = {
+            name for name, f in _CONTENT_MODELS[kind].model_fields.items() if f.is_required()
+        }
+        assert required <= set(example), f"{kind} hint omits {required - set(example)}"
+        assert set(example) <= set(_CONTENT_MODELS[kind].model_fields), (
+            f"{kind} hint names a field the model does not have"
+        )
+    for kind in BLOCK_KINDS:
+        assert kind in CONTENT_SHAPE_HINT

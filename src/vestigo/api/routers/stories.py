@@ -26,7 +26,12 @@ from vestigo.core.config import get_settings
 from vestigo.db.postgres import UNSET, Case, StaleBlockError, StoryBlock, User
 from vestigo.stories.export import SnapshotTooLargeError, resolve_story_snapshot
 from vestigo.stories.refs import validate_block_scope
-from vestigo.stories.schemas import canonical_hash, canonical_json, validate_block_content
+from vestigo.stories.schemas import (
+    STORY_TITLE_MAX_CHARS,
+    canonical_hash,
+    canonical_json,
+    validate_block_content,
+)
 
 router = APIRouter(prefix="/api/cases", tags=["stories"])
 
@@ -91,6 +96,10 @@ async def create_story(
     """Create a story."""
     if not (body.title or "").strip():
         raise HTTPException(status_code=422, detail="title is required")
+    if len(body.title.strip()) > STORY_TITLE_MAX_CHARS:
+        raise HTTPException(
+            status_code=422, detail=f"title exceeds {STORY_TITLE_MAX_CHARS} characters"
+        )
     store = get_store()
     story = await store.create_story(
         case.id, uuid.uuid4().hex, body.title.strip(), body.description, user=user.username

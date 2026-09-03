@@ -16,8 +16,8 @@ management) and `api/routers/agent.py` (HTTP/SSE layer).
   analyst click applies filters (through the normal URL-driven filter path,
   `frontend/src/lib/queryParams.ts`).
 - **Propose→confirm writes.** The agent itself never writes an annotation.
-  `propose_annotation` and `propose_story_block` (available only once a
-  conversation is bound) record an
+  `propose_annotation`, `propose_story` and `propose_story_block` (available
+  only once a conversation is bound) record an
   `AgentProposal` row — it does not touch `annotations` or `story_blocks`. An
   analyst confirms or rejects via `POST .../proposals/{id}/confirm|reject`; the
   decide is an atomic `UPDATE … WHERE status='proposed'`, so a second
@@ -39,9 +39,11 @@ management) and `api/routers/agent.py` (HTTP/SSE layer).
     (`USER_VISIBLE_ANNOTATION_ORIGINS = ("user", "agentic-analysis")`); only
     `origin="system"` stays outside that set.
   - Every decision is audited (`agent.annotation_confirm` /
-    `agent.annotation_reject`, `agent.story_block_confirm` /
-    `agent.story_block_reject`, keyed to `target_type="agent_proposal"`).
-  - `propose_annotation`, `propose_story_block`, `propose_finding` and the
+    `agent.annotation_reject`, `agent.story_confirm` / `agent.story_reject`,
+    `agent.story_block_confirm` / `agent.story_block_reject`, keyed to
+    `target_type="agent_proposal"`).
+  - `propose_annotation`, `propose_story`, `propose_story_block`,
+    `propose_finding` and the
     decide endpoints are **absent from the external `/mcp` transport** — only
     an in-app conversation binds the `conversation_id` that gates the tools'
     registration. Story *read* tools are exposed there like every other read
@@ -173,6 +175,7 @@ small-context local models.
 | `propose_finding` | core | Finding card with applicable Explorer filters; conversation-bound only. |
 | `propose_chart` | | Chart card, validated by executing the underlying query. On `/mcp` it is described as, and returns, the figure itself — see `open_url` below. |
 | `propose_annotation` | core | Propose tagging/commenting events; conversation-bound only, analyst must confirm. |
+| `propose_story` | core | Propose creating a story (the report document); conversation-bound only, analyst must confirm. |
 | `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
 | `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
 | `similar_events` | | Events similar to an existing event (embeddings-gated: absent when embeddings are unconfigured). |
@@ -687,6 +690,16 @@ guard never counted, not new prose; the rule is unchanged for everything after i
 `list_configured_detectors` (2026-09-03, Milestone 12) took it to **42,986 over 34 tools**,
 ceiling unchanged — its docstring is one line for exactly this reason. The next tool added
 has to pay for itself by trimming elsewhere (see A13).
+
+`propose_story` plus the per-kind `content` shapes on `propose_story_block`
+(2026-09-03) took it to **43,858 over 35 tools**, ceiling 44,000. The trimming
+rule was applied first — the three story docstrings were rewritten compact,
+−970 chars — before the number moved. What the remaining 872 buys is *retries*,
+and a retry is the expensive unit: a tool call the model cannot get right costs
+a whole model request carrying this entire list again. A real turn spent six of
+them guessing `content`'s shape, and a case with no stories could not be given
+a report at all. One prevented retry pays the 872 back roughly fifty times.
+Prose that does not remove a retry still does not belong in a schema.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

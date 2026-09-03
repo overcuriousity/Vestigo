@@ -10,7 +10,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { BookOpenText, CircleCheck, CircleX } from "lucide-react";
-import { agentApi, type AgentProposal } from "@/api/agent";
+import { agentApi, type AgentProposal, type StoryBlockProposalPayload } from "@/api/agent";
 import { ApiError } from "@/api/client";
 import { eventsApi } from "@/api/events";
 import { storiesApi } from "@/api/stories";
@@ -124,7 +124,9 @@ function Missing({ what }: { what: string }) {
 export function StoryBlockProposalCard({ caseId, conversationId, proposal }: Props) {
   const queryClient = useQueryClient();
   const queryKey = ["agent-proposals", caseId, conversationId];
-  const payload = proposal.payload;
+  // Narrowed by the card's own contract: `proposalOfKind` only hands this
+  // component a `story_block` proposal, whose payload is this shape.
+  const payload = proposal.payload as StoryBlockProposalPayload | null;
   const userName = useUserNames();
 
   // The target story may have been renamed or deleted since the proposal —
