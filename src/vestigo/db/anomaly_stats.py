@@ -3574,6 +3574,11 @@ class StatisticalAnomalyService:
 
         all_findings: list[CharsetFinding] = []
         evaluated_fields = 0
+        # Per-field (and per-group) page is at least `limit`; `n_total` sums
+        # each field's exact SQL count (docs §"Totals and truncation").
+        page = max(per_field_limit, limit)
+        n_total = 0
+        inexact: list[str] = []
         run_warnings: list[str] = [*override_notes]
         # Every way a grouped run can deviate from "each group scored against
         # its own alphabet" is accumulated here and reported in `warnings`, so
@@ -3832,7 +3837,15 @@ class StatisticalAnomalyService:
             viol_params: dict[str, Any] = {**base_params}
             bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
-            viol_params["plim"] = per_field_limit
+            viol_params["plim"] = page
+            suppress, field_inexact = _sql_suppression(
+                viol_params,
+                key_expr="val",
+                evt_expr="evt_id",
+                allow_keys=_sql_allow_keys(allowlist, field_token),
+                exclude_event_ids=exclude_event_ids,
+            )
+            inexact += field_inexact
             win_idx_sel = ""
             win_idx_group = ""
             detect_clause = ""
@@ -3846,10 +3859,35 @@ class StatisticalAnomalyService:
                 win_idx_group = ", win_idx"
                 detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
 
+            # The score — the same per-novel-character surprise sum Python
+            # reports below — is computed in the SQL so the page is ordered by
+            # it: `length(novel)` was only a proxy, and two rare-ish characters
+            # can outrank one never-seen one or not. The rare characters and
+            # their distinct-value counts ride in as parallel arrays; a
+            # character outside them was never seen and takes the +1-smoothed
+            # maximum. `n_total` counts every flagged row after suppression.
+            def _rarity(learn: _CharsetLearn | None) -> tuple[list[str], list[float], float]:
+                if learn is None:
+                    return [], [], 0.0
+                # Only characters outside the reference can be novel; the
+                # common ones would ride along for nothing.
+                ref = set(learn.reference)
+                chars = sorted(c for c in learn.char_counts if c not in ref)
+                return chars, [float(learn.char_counts[c]) for c in chars], float(learn.n_vals)
+
             if group_field is None:
                 viol_params["base"] = evaluated[0].reference
+                viol_params["rc"], viol_params["rn"], viol_params["nv"] = _rarity(evaluated[0])
+                score_sql = (
+                    "arraySum(c -> if(indexOf({rc:Array(String)}, c) > 0,"
+                    " -log({rn:Array(Float64)}[greatest(indexOf({rc:Array(String)}, c), 1)]"
+                    " / greatest({nv:Float64}, 1)),"
+                    " log({nv:Float64} + 1)), novel)"
+                )
                 viol_sql = f"""
-                    SELECT val, novel, cnt, first_seen, evt_id{win_idx_group}
+                    SELECT val, novel, cnt, first_seen, evt_id{win_idx_group},
+                           {score_sql} AS score,
+                           count() OVER () AS n_total
                     FROM (
                         SELECT
                             val,
@@ -3871,8 +3909,8 @@ class StatisticalAnomalyService:
                             GROUP BY val{win_idx_group}
                         )
                     )
-                    WHERE length(novel) > 0
-                    ORDER BY length(novel) DESC, cnt ASC
+                    WHERE length(novel) > 0{suppress}
+                    ORDER BY score DESC, cnt ASC
                     LIMIT {{plim:UInt32}}
                     {heavy_scan_settings()}
                 """
@@ -3884,6 +3922,18 @@ class StatisticalAnomalyService:
                 viol_params["has_fb"] = 1 if fallback is not None else 0
                 viol_params["skip"] = [learn.group for learn in wide]
                 viol_params["tlim"] = _MAX_CHARSET_GROUPED_ROWS
+                per_group = [_rarity(learn) for learn in evaluated]
+                viol_params["rcs"] = [r[0] for r in per_group]
+                viol_params["rns"] = [r[1] for r in per_group]
+                viol_params["nvs"] = [r[2] for r in per_group]
+                viol_params["fb_rc"], viol_params["fb_rn"], viol_params["fb_nv"] = _rarity(fallback)
+                # Same `gidx` routing as the reference sets: a group's own
+                # rarity, else the fallback's.
+                score_sql = (
+                    "arraySum(c -> if(indexOf(g_rc, c) > 0,"
+                    " -log(g_rn[greatest(indexOf(g_rc, c), 1)] / greatest(g_nv, 1)),"
+                    " log(g_nv + 1)), novel)"
+                )
                 # `greatest(gidx, 1)` because ClickHouse evaluates both `if`
                 # branches and rejects array index 0; the guarded index is only
                 # read when gidx > 0, and an out-of-range index yields an empty
@@ -3906,7 +3956,9 @@ class StatisticalAnomalyService:
                 # explicit costs one array parameter and means the routing does
                 # not depend on that argument holding.
                 viol_sql = f"""
-                    SELECT val, grp, novel, cnt, first_seen, evt_id{win_idx_group}
+                    SELECT val, grp, novel, cnt, first_seen, evt_id{win_idx_group},
+                           {score_sql} AS score,
+                           count() OVER () AS n_total
                     FROM (
                         SELECT
                             val,
@@ -3922,6 +3974,12 @@ class StatisticalAnomalyService:
                                 ),
                                 arrayDistinct(extractAll(val, '(?s).'))
                             ) AS novel,
+                            if(gidx = 0, {{fb_rc:Array(String)}},
+                               {{rcs:Array(Array(String))}}[greatest(gidx, 1)]) AS g_rc,
+                            if(gidx = 0, {{fb_rn:Array(Float64)}},
+                               {{rns:Array(Array(Float64))}}[greatest(gidx, 1)]) AS g_rn,
+                            if(gidx = 0, {{fb_nv:Float64}},
+                               {{nvs:Array(Float64)}}[greatest(gidx, 1)]) AS g_nv,
                             cnt, first_seen, evt_id{win_idx_group}
                         FROM (
                             SELECT
@@ -3947,13 +4005,14 @@ class StatisticalAnomalyService:
                                    AND NOT has({{skip:Array(String)}}, grp))
                         )
                     )
-                    WHERE length(novel) > 0
-                    ORDER BY length(novel) DESC, cnt ASC
+                    WHERE length(novel) > 0{suppress}
+                    ORDER BY score DESC, cnt ASC
                     LIMIT {{plim:UInt32}} BY grp
                     LIMIT {{tlim:UInt32}}
                     {heavy_scan_settings()}
                 """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            n_total += int(vrows[0][-1]) if vrows else 0
             if group_field is not None and len(vrows) >= _MAX_CHARSET_GROUPED_ROWS:
                 # The per-group budget (`LIMIT plim BY grp`) is preserved, but the
                 # global ceiling under it is not per-group: the ordering is by
@@ -3970,19 +4029,20 @@ class StatisticalAnomalyService:
 
             for vrow in vrows:
                 grp: str | None = None
+                # Trailing `score`/`n_total` are the scan's, not the row's.
                 if group_field is None:
                     if windows is None:
-                        val, novel, cnt, first_seen, evt_id = vrow
+                        val, novel, cnt, first_seen, evt_id = vrow[:5]
                         window: TimeWindow | None = None
                     else:
-                        val, novel, cnt, first_seen, evt_id, win_idx = vrow
+                        val, novel, cnt, first_seen, evt_id, win_idx = vrow[:6]
                         wi = int(win_idx)
                         window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 elif windows is None:
-                    val, grp, novel, cnt, first_seen, evt_id = vrow
+                    val, grp, novel, cnt, first_seen, evt_id = vrow[:6]
                     window = None
                 else:
-                    val, grp, novel, cnt, first_seen, evt_id, win_idx = vrow
+                    val, grp, novel, cnt, first_seen, evt_id, win_idx = vrow[:7]
                     wi = int(win_idx)
                     window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 novel_chars = [str(c) for c in (novel or [])]
@@ -4138,8 +4198,10 @@ class StatisticalAnomalyService:
             case_id=case_id,
             source_ids=source_ids,
             allowlist=allowlist,
-            warnings=run_warnings,
+            warnings=[*run_warnings, *dict.fromkeys(inexact)],
             windows=windows,
+            total_findings=n_total,
+            total_findings_exact=not inexact,
         )
 
     # ------------------------------------------------------------------

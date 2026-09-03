@@ -2603,8 +2603,8 @@ def test_charset_self_baseline_flags_rare_char():
             column_names=["c", "n", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul", 0.0, 1)],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2645,8 +2645,17 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
         FakeQueryResult(result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]),
         FakeQueryResult(
             # val, novel, cnt, first_seen, evt_id, win_idx
-            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0)],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0, 0.0, 1)],
+            column_names=[
+                "val",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+                "n_total",
+            ],
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
@@ -2679,10 +2688,10 @@ def test_charset_excludes_normal_marked_events_and_limits():
         ),
         FakeQueryResult(
             result_rows=[
-                ("x$", ["$"], 1, fs, "evt-drop"),
-                ("y%", ["%"], 1, fs, "evt-keep"),
+                ("x$", ["$"], 1, fs, "evt-drop", 0.0, 2),
+                ("y%", ["%"], 1, fs, "evt-keep", 0.0, 2),
             ],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2692,6 +2701,85 @@ def test_charset_excludes_normal_marked_events_and_limits():
     assert [f.event_id for f in result.results] == ["evt-keep"]
     # Hydration happens once, on the surviving slice only.
     assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+def test_charset_orders_by_score_in_sql_and_counts_exactly():
+    """The page is the true top-N by the score the finding reports, not by how
+    many novel characters a value happens to contain."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("a", 90, 100), ("$", 2, 100), ("%", 1, 100)],
+                column_names=["c", "n", "n_vals"],
+            ),
+            FakeQueryResult(
+                result_rows=[(f"x{i}%", ["%"], 1, fs, f"e{i}", 4.6151, 730) for i in range(50)],
+                column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
+            ),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        limit=80,
+        allowlist={("attr:user", "ok$")},
+        exclude_event_ids={"e-x"},
+    )
+    assert len(result.results) == 50
+    assert result.total_findings == 730
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    assert "ORDER BY score DESC, cnt ASC" in sql
+    assert "count() OVER () AS n_total" in sql
+    # The rare characters and their counts ride in as parallel arrays so the
+    # SQL sums the same per-character surprise Python reports.
+    assert p["rc"] == ["$", "%"]
+    assert p["rn"] == [2.0, 1.0]
+    assert p["nv"] == 100.0
+    assert "log({nv:Float64} + 1)" in sql
+    assert "NOT has({allow:Array(String)}, val)" in sql
+    assert p["allow"] == ["ok$"]
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+
+
+def test_charset_grouped_binds_per_group_rarity_for_the_sql_score():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # per-group learn rows: grp, c, n, n_vals
+            FakeQueryResult(
+                result_rows=[
+                    ("h1", "a", 90, 100),
+                    ("h1", "$", 1, 100),
+                    ("h2", "a", 40, 50),
+                    ("h2", "%", 2, 50),
+                ],
+                column_names=["grp", "c", "n", "n_vals"],
+            ),
+            FakeQueryResult(result_rows=[], column_names=[]),  # probe
+            FakeQueryResult(result_rows=[], column_names=[]),  # violations
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "ORDER BY score DESC, cnt ASC" in sql
+    assert "LIMIT {plim:UInt32} BY grp" in sql
+    assert "count() OVER () AS n_total" in sql
+    assert p["grps"] == ["h1", "h2"]
+    assert p["rcs"] == [["$"], ["%"]]
+    assert p["rns"] == [[1.0], [2.0]]
+    assert p["nvs"] == [100.0, 50.0]
+    assert "{fb_rc:Array(String)}" in sql and "{fb_nv:Float64}" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -5265,8 +5353,8 @@ def test_charset_group_field_partitions_alphabets():
         # One violation scan for every group — host-b's row is the only one
         # whose value carries a character outside its own group's alphabet.
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-b", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-b", ["\x00"], 2, fs, "evt-nul", 0.0, 1)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -5369,8 +5457,18 @@ def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
         ),
         # host-b was never in the baseline: scored by the fallback.
         FakeQueryResult(
-            result_rows=[("abа", "host-b", ["а"], 3, fs, "evt-hom", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("abа", "host-b", ["а"], 3, fs, "evt-hom", 0, 0.0, 1)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+                "n_total",
+            ],
         ),
     ]
     # The probe runs before the fallback learn: host-a is known, host-b is not,
@@ -5516,8 +5614,18 @@ def test_charset_wide_group_is_dropped_not_scored_by_fallback():
         FakeQueryResult(result_rows=[("host-a",), ("host-prose",)], column_names=["grp"]),
         # Defensive: even if a host-prose row reached Python it is not scored.
         FakeQueryResult(
-            result_rows=[("文字", "host-prose", ["文"], 2, fs, "evt-cjk", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("文字", "host-prose", ["文"], 2, fs, "evt-cjk", 0, 0.0, 1)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+                "n_total",
+            ],
         ),
     ]
     client = RecordingClient(responses)
@@ -5567,8 +5675,18 @@ def test_charset_thin_group_is_scored_by_fallback_not_dropped():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("abа", "host-new", ["а"], 3, fs, "evt-hom", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("abа", "host-new", ["а"], 3, fs, "evt-hom", 0, 0.0, 1)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+                "n_total",
+            ],
         ),
     ]
     client = RecordingClient(responses)
@@ -5620,8 +5738,8 @@ def test_charset_self_baseline_thin_group_falls_back_to_merged_scope():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-tiny", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-tiny", ["\x00"], 2, fs, "evt-nul", 0.0, 1)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     client = RecordingClient(responses)
@@ -5715,9 +5833,10 @@ def test_charset_grouped_row_ceiling_is_reported_not_silent():
         # Exactly the ceiling: the query hit its LIMIT, so more rows existed.
         FakeQueryResult(
             result_rows=[
-                (f"ab\x00{i}", f"host-{i}", ["\x00"], 2, fs, f"evt-{i}") for i in range(ceiling)
+                (f"ab\x00{i}", f"host-{i}", ["\x00"], 2, fs, f"evt-{i}", 0.0, ceiling)
+                for i in range(ceiling)
             ],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -5739,8 +5858,8 @@ def test_charset_grouped_row_ceiling_is_quiet_below_it():
             column_names=["grp", "c", "n", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-a", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-a", ["\x00"], 2, fs, "evt-nul", 0.0, 1)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -5765,8 +5884,8 @@ def test_charset_fallback_warnings_name_the_field():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-x", ["\x00"], 2, fs, "evt-u")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-x", ["\x00"], 2, fs, "evt-u", 0.0, 1)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score", "n_total"],
         ),
         # attr:path — every group is well-evidenced, so no fallback is needed.
         FakeQueryResult(

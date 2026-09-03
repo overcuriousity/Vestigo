@@ -1188,6 +1188,16 @@ temporal mode a novel character was never seen at all, so each contributes the
 characters *and their unicode codepoints* (`U+0000`, …) in `details`, so
 invisible characters are visible in the report.
 
+The same sum is evaluated **in the SQL** — the rare characters and their
+distinct-value counts ride in as parallel array parameters (per group, plus the
+fallback's, in grouped runs) — and the scan orders by it, so the page is the true
+top-`limit` by the score each finding reports. It used to order by how many novel
+characters a value contained, which is only a proxy: one never-seen character can
+outscore two rare ones. Each field's page is at least `limit` (per group under
+`group_field`) and `total_findings` is the exact post-suppression count
+(`count() OVER ()`), per the
+[totals contract](#totals-and-truncation-what-total_findings-promises).
+
 ### Caveats
 
 - **Per-identifier scoping is opt-in via `group_field`.** AMiner's `CharsetDetector`
