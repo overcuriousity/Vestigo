@@ -4,8 +4,51 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 228 — review fixes on the story tools, and a nested-layer
-regression that closed the detector wizard).
+Last updated: 2026-09-03 (session 229 — exact finding totals: five detectors stopped
+reporting the page size as the count, and the rail says what it is not showing).
+
+## Session 229 — 2026-09-03: `total_findings` means what it says
+
+Live-testing value combos on a production case never showed more than 50 findings, and the
+strip badge read exactly 50. The cause was structural, not a bug in one place: five methods
+— value novelty (and its batched attribute pass), value combos, numeric range, charset,
+entropy — put a small `LIMIT` (the request limit, or 25 per field) into the aggregation
+itself and reported the size of what came back as `total_findings`. Value combos was the
+worst case: its SQL limit *was* the request limit, so the total could never exceed it. The
+other seven methods were already honest (timestamp order counts from per-source summaries,
+log templates use `count() OVER ()`, frequency builds its list in Python; the five
+candidate-capped methods warn when their 1,000–2,000-row caps trip).
+
+`LIMIT` was never what bounded the scan — the `GROUP BY` over the corpus is the cost and
+`HEAVY_SCAN_SETTINGS` bounds it — so the fix costs one window column per statement. The
+contract is now written down (`ANOMALY_DETECTION.md` §"Totals and truncation"): the count is
+exact across the full analysed scope, after suppression, before the display cap; the page is
+the true top-`limit` by the reported score; the only non-display truncation is a candidate
+cap, and it warns. Concretely: `count() OVER ()` (`PARTITION BY key` in the batched pass,
+`sum(hits)` where a group fans out per suspect window) in the same statement; allowlist and
+normal-marked events bound into the `HAVING` so the count is post-suppression (a set past
+1,000 entries falls back to the page filter and marks the total inexact, with a warning);
+per-field pages of `max(stat_per_field_limit, limit)` — the setting is now a floor, since a
+global top-50 may be 50 values of one field; temporal novelty/combos order by the best
+per-window score instead of summed window counts; charset evaluates its per-character
+surprise sum in SQL and orders by it instead of by `length(novel)`, which could rank two
+rare characters over one never-seen one. Hydration fetches in 500-id chunks, the one hard
+limit that remains. `StatAnomalyResult.total_findings_exact` and the API field of the same
+name carry the flag.
+
+On the rail: a per-method page size in a session-only store (50, then 80 — deliberately not
+persisted, since a lifted page from last week is the same undisclosed state the rail exists
+to avoid), "showing N of M <method> findings — Show more" under any method whose page is
+smaller than its total, group counts as the sum of exact totals, and "M+" with the reason as
+tooltip when the server could not count exactly. The sheet's method mode says the same.
+
+Verified against live ClickHouse: new `test_value_combo_totals_clickhouse.py`, the batched
+novelty and grouped charset suites extended with exact-total and ordering assertions (a
+`limit=1` page must hold the maximum score of an unlimited run), and the demo coverage test
+still finds something with every method.
+
+Not done, noted: `useTriageCoverage` → `useDetectorSweep` (the legacy `/anomalies` sweep at
+a fixed 50) has no callers at all and can go; `PatternsView` keeps its own 50→150→500 steps.
 
 ## Session 228 — 2026-09-03: what a confirm actually did, and one duplicated npm package
 

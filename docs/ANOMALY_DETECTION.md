@@ -232,7 +232,7 @@ The contract, for every method:
   cap attaches a warning, and `total_findings` is then exact relative to the disclosed
   pool.
 
-Why this needs saying: until 1.20 five methods (value novelty and its batched attribute
+Why this needs saying: before this contract landed, five methods (value novelty and its batched attribute
 pass, value combos, numeric range, charset, entropy) put a small `LIMIT` — the request
 limit, or 25 per field — into the aggregation itself and reported the size of what came
 back as the total. The count badge read "50" for a corpus with forty thousand rare
