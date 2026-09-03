@@ -824,6 +824,16 @@ self-baseline flags combinations appearing ≤ the rarity floor; temporal flags
 combinations absent from the baseline window but present after the split. The
 score is the same `−log(count / total events)`.
 
+**Totals and paging** follow the [contract above](#totals-and-truncation-what-total_findings-promises):
+`total_findings` is the exact number of rare combinations across the scope, counted
+in the same statement (`count() OVER ()`; in temporal mode `sum(hits) OVER ()`, one
+hit per suspect window a combination appears in) after the allowlist and normal-marked
+representatives have been bound into the `HAVING`. Temporal mode pages by each
+combination's *best* per-window score — the smallest `count / window total` over its
+hit windows — so the top-`limit` groups hold the true top-`limit` findings; ordering
+by the summed window counts, as it did before, could rank a combination hit twice in
+a large window above one hit once in a small one.
+
 **Field selection differs in one way:** you must give it at least two fields (the
 picker enforces 2–4). Auto mode does **not** enumerate every pair — with 15
 candidate fields that would be 105 combinations, 105 queries, and a result set no

@@ -1925,10 +1925,10 @@ def test_value_combo_self_baseline_returns_rare_combos():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("login_ok", "03:00", 1, fs, "evt-a"),
-                ("login_ok", "09:00", 3, fs, "evt-b"),
+                ("login_ok", "03:00", 1, fs, "evt-a", 2),
+                ("login_ok", "09:00", 3, fs, "evt-b", 2),
             ],
-            column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -1952,8 +1952,8 @@ def test_value_combo_binds_distinct_prefixes_for_attr_fields():
         [
             FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
             FakeQueryResult(
-                result_rows=[("a", "b", 1, datetime(2024, 1, 1, tzinfo=UTC), "e")],
-                column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
+                result_rows=[("a", "b", 1, datetime(2024, 1, 1, tzinfo=UTC), "e", 1)],
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "n_total"],
             ),
         ]
     )
@@ -1979,10 +1979,20 @@ def test_value_combo_temporal_flags_new_combos():
         FakeQueryResult(result_rows=[(300, 80)], column_names=["bl_total", "w0_total"]),
         FakeQueryResult(
             result_rows=[
-                # v0, v1, baseline_cnt, w0_cnt, w0_first, w0_evt
-                ("admin", "10.0.0.9", 0, 2, fs, "evt-x"),
+                # v0, v1, baseline_cnt, w0_cnt, w0_first, w0_evt, hits, best, n_total
+                ("admin", "10.0.0.9", 0, 2, fs, "evt-x", 1, 0.025, 1),
             ],
-            column_names=["v0", "v1", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+            column_names=[
+                "v0",
+                "v1",
+                "baseline_cnt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+                "hits",
+                "best",
+                "n_total",
+            ],
         ),
     ]
     svc = _svc(responses)
@@ -2030,10 +2040,10 @@ def test_value_combo_excludes_normal_marked_events():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("a", "1", 1, fs, "evt-keep"),
-                ("b", "2", 1, fs, "evt-drop"),
+                ("a", "1", 1, fs, "evt-keep", 2),
+                ("b", "2", 1, fs, "evt-drop", 2),
             ],
-            column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
+            column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2041,6 +2051,142 @@ def test_value_combo_excludes_normal_marked_events():
         "c1", ["s1"], fields=["attr:x", "attr:y"], exclude_event_ids={"evt-drop"}
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
+
+
+def test_value_combo_total_is_the_sql_count_not_the_page():
+    """`total_findings` is what the scan counted, not how many rows came back."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [(f"a{i}", "b", 1, fs, f"e{i}", 4000) for i in range(50)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=rows,
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], limit=50)
+    assert len(result.results) == 50
+    assert result.total_findings == 4000
+    assert result.total_findings_exact is True
+
+
+def test_value_combo_suppression_is_bound_into_the_sql():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_value_combos(
+        "c1",
+        ["s1"],
+        fields=["attr:a", "attr:b"],
+        allowlist={("attr:a,attr:b", "x\x1fy")},
+        exclude_event_ids={"e9"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "count() OVER () AS n_total" in sql
+    assert "NOT has({allow:Array(String)}, concat(v0, '\x1f', v1))" in sql
+    assert p["allow"] == ["x\x1fy"]
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+    assert p["excl"] == ["e9"]
+    assert result.total_findings == 0
+    assert result.total_findings_exact is True
+
+
+def test_value_combo_oversized_exclusion_marks_the_total_inexact():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    big = {f"e{i}" for i in range(_SQL_SUPPRESSION_MAX + 1)}
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("a", "b", 1, fs, "e1", 7), ("c", "d", 1, fs, "zz", 7)],
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], exclude_event_ids=big)
+    # The page is still filtered; the count could not be.
+    assert [f.event_id for f in result.results] == ["zz"]
+    assert result.total_findings == 7
+    assert result.total_findings_exact is False
+    assert any("page only" in w for w in result.warnings)
+
+
+def test_value_combo_temporal_orders_by_best_window_score():
+    """The page is the true top-N by the score the finding reports."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80, 20)], column_names=["bl", "w0", "w1"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("s0", datetime(2024, 1, 3, tzinfo=UTC), datetime(2024, 1, 4, tzinfo=UTC)),
+            TimeWindow("s1", datetime(2024, 1, 5, tzinfo=UTC), datetime(2024, 1, 6, tzinfo=UTC)),
+        ),
+    )
+    svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], windows=windows)
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "ORDER BY best ASC" in sql
+    assert "sum(hits) OVER () AS n_total" in sql
+    assert "(w0_cnt > 0) + (w1_cnt > 0) AS hits" in sql
+    assert p["w0_total"] == 80.0
+    assert p["w1_total"] == 20.0
+
+
+def test_value_combo_temporal_total_counts_window_hits_not_groups():
+    """One group hit in two suspect windows is two findings — the total says so."""
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("s0", datetime(2024, 1, 3, tzinfo=UTC), datetime(2024, 1, 4, tzinfo=UTC)),
+            TimeWindow("s1", datetime(2024, 1, 5, tzinfo=UTC), datetime(2024, 1, 6, tzinfo=UTC)),
+        ),
+    )
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80, 20)], column_names=["bl", "w0", "w1"]),
+            FakeQueryResult(
+                result_rows=[("a", "b", 0, 2, fs, "e0", 1, fs, "e1", 2, 0.025, 9)],
+                column_names=[
+                    "v0",
+                    "v1",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "w1_cnt",
+                    "w1_first",
+                    "w1_evt",
+                    "hits",
+                    "best",
+                    "n_total",
+                ],
+            ),
+        ]
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], windows=windows)
+    assert len(result.results) == 2
+    assert result.total_findings == 9
 
 
 # ---------------------------------------------------------------------------

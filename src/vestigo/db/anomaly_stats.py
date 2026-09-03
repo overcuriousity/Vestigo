@@ -1217,7 +1217,7 @@ def _sql_suppression(
     params: dict[str, Any],
     *,
     key_expr: str | None,
-    evt_expr: str,
+    evt_expr: str | None,
     allow_keys: list[str],
     exclude_event_ids: set[str] | None,
 ) -> tuple[str, list[str]]:
@@ -1231,6 +1231,12 @@ def _sql_suppression(
     :data:`_SQL_SUPPRESSION_MAX`; a larger one is left for the caller's
     page-level filter and named in *reasons*, which the caller surfaces as a
     warning and as ``total_findings_exact=False``.
+
+    A caller whose representative event is per *window* (one ``w{i}_evt``
+    column each) passes ``evt_expr=None``: the ids are still bound as
+    ``params["excl"]`` when they fit, and the caller writes its own per-window
+    ``NOT has({excl:Array(String)}, w{i}_evt)`` — testing ``"excl" in params``
+    to know whether it may.
     """
     clauses: list[str] = []
     reasons: list[str] = []
@@ -1247,7 +1253,8 @@ def _sql_suppression(
     if exclude_event_ids:
         if len(exclude_event_ids) <= _SQL_SUPPRESSION_MAX:
             params["excl"] = sorted(exclude_event_ids)
-            clauses.append(f"NOT has({{excl:Array(String)}}, {evt_expr})")
+            if evt_expr is not None:
+                clauses.append(f"NOT has({{excl:Array(String)}}, {evt_expr})")
         else:
             reasons.append(
                 f"normal-marked events ({len(exclude_event_ids):,} entries) exceed the "
@@ -2594,21 +2601,37 @@ class StatisticalAnomalyService:
             )
             run_warnings += _window_size_warnings(windows, suspect_totals)
 
+        # Suppression rides in the SQL so `n_total` (the window count over the
+        # post-HAVING groups — the exact number of findings the scan produced)
+        # is counted after it. The allowlist key is the same flattened tuple
+        # the finding carries as `allowlist_value`.
+        combo_key = (
+            "concat(" + f", '{COMBO_VALUE_SEP}', ".join(f"v{i}" for i in range(len(exprs))) + ")"
+        )
+        allow_keys = _sql_allow_keys(allowlist, COMBO_FIELD_SEP.join(combo_fields))
         if windows is None:
             params["floor"] = rarity_floor
             params["lim"] = limit
+            suppress, inexact = _sql_suppression(
+                params,
+                key_expr=combo_key,
+                evt_expr="evt_id",
+                allow_keys=allow_keys,
+                exclude_event_ids=exclude_event_ids,
+            )
             sql = f"""
                 SELECT
                     {val_cols},
                     count() AS cnt,
                     min({eff}) AS first_seen,
-                    toString(argMin(event_id, {eff})) AS evt_id
+                    toString(argMin(event_id, {eff})) AS evt_id,
+                    count() OVER () AS n_total
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
                   AND {non_empty}
                 GROUP BY {group_by}
-                HAVING cnt <= {{floor:UInt32}}
+                HAVING cnt <= {{floor:UInt32}}{suppress}
                 ORDER BY cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}}
                 {heavy_scan_settings()}
@@ -2616,19 +2639,44 @@ class StatisticalAnomalyService:
         else:
             bp, sps = _window_preds(windows, params, source_offsets)
             params["lim"] = limit
+            suppress, inexact = _sql_suppression(
+                params,
+                key_expr=combo_key,
+                evt_expr=None,
+                allow_keys=allow_keys,
+                exclude_event_ids=exclude_event_ids,
+            )
             w_blocks = ",\n                    ".join(
                 f"countIf({sp}) AS w{i}_cnt,"
                 f" minIf({eff}, {sp}) AS w{i}_first,"
                 f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                 for i, sp in enumerate(sps)
             )
-            w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+            # One finding per (group, suspect window with a hit): `hits` is how
+            # many findings the group yields, and a hit whose representative
+            # event was marked normal is not one. `best` is the group's best
+            # per-window score, monotone in the smallest window share, so the
+            # top-`lim` groups by it hold the true top-`lim` findings.
+            w_hits = [
+                f"(w{i}_cnt > 0 AND NOT has({{excl:Array(String)}}, w{i}_evt))"
+                if "excl" in params
+                else f"(w{i}_cnt > 0)"
+                for i in range(len(sps))
+            ]
+            for i, total in enumerate(suspect_totals):
+                params[f"w{i}_total"] = float(max(total, 1))
+            shares = ", ".join(
+                f"if({hit}, w{i}_cnt / {{w{i}_total:Float64}}, 0)" for i, hit in enumerate(w_hits)
+            )
             union_pred = " OR ".join([bp, *sps])
             sql = f"""
                 SELECT
                     {val_cols},
                     countIf({bp}) AS baseline_cnt,
-                    {w_blocks}
+                    {w_blocks},
+                    {" + ".join(w_hits)} AS hits,
+                    arrayMin(arrayFilter(x -> x > 0, [{shares}])) AS best,
+                    sum(hits) OVER () AS n_total
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
@@ -2636,14 +2684,16 @@ class StatisticalAnomalyService:
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({union_pred})
                 GROUP BY {group_by}
-                HAVING baseline_cnt = 0 AND ({w_sum}) > 0
-                ORDER BY ({w_sum}) ASC
+                HAVING baseline_cnt = 0 AND hits > 0{suppress}
+                ORDER BY best ASC, {group_by}
                 LIMIT {{lim:UInt32}}
                 {heavy_scan_settings()}
             """
 
         rows = self.ch.client.query(sql, parameters=params).result_rows
         n_fields = len(exprs)
+        n_total = int(rows[0][-1]) if rows else 0
+        run_warnings += inexact
 
         def _combo_finding(
             values: list[str], cnt: int, denominator: int, first_seen: Any, evt_id: Any
@@ -2702,6 +2752,8 @@ class StatisticalAnomalyService:
                     )
                     all_findings.append(finding)
 
+        # The page is filtered again here — a no-op when the SQL bound the
+        # sets, and the whole suppression when one was too large to bind.
         all_findings = _apply_allowlist(all_findings, allowlist)
         if exclude_event_ids:
             all_findings = [
@@ -2719,7 +2771,8 @@ class StatisticalAnomalyService:
             results=results,
             warnings=run_warnings,
             windows=windows.payload() if windows is not None else None,
-            total_findings=len(all_findings),
+            total_findings=n_total,
+            total_findings_exact=not inexact,
         )
 
     # ------------------------------------------------------------------
