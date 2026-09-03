@@ -210,7 +210,7 @@ async def _artifacts(
         chart_ids[chart.name] = saved.id
 
     full_timeline = timeline_ids["Full incident"]
-    await store.create_baseline_definition(
+    baseline = await store.create_baseline_definition(
         case_id=case_id,
         timeline_id=full_timeline,
         name="May 2026 — three quiet weeks vs the intrusion",
@@ -219,6 +219,10 @@ async def _artifacts(
         suspect_windows=metadata.baseline_windows(),
         created_by=user_id,
     )
+    # The detectors the analyst "already configured": what the rail runs on
+    # first open, and a filled-in example of the wizard's output.
+    for entry in metadata.detector_entries(baseline.id, user_id):
+        await store.set_timeline_detector(case_id, full_timeline, entry)
 
     for title, yaml_text in metadata.SIGMA_RULES:
         content_hash = hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()

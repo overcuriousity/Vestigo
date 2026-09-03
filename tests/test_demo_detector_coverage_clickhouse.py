@@ -19,7 +19,7 @@ import pytest_asyncio
 
 from vestigo.db.anomaly_stats import AnalysisWindows, StatisticalAnomalyService, TimeWindow
 from vestigo.db.clickhouse import ClickHouseStore
-from vestigo.demo import scenario
+from vestigo.demo import metadata, scenario
 from vestigo.demo.build import build_demo_case
 
 pytestmark = pytest.mark.clickhouse
@@ -224,3 +224,41 @@ def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_st
             f"gate skipped {method} on the demo case ({plan.reason}: {plan.reason_facts}), "
             "but this file asserts that method finds something here"
         )
+
+
+#: Service function per configured method, for the seeded-detector check.
+_SERVICE_BY_METHOD = {
+    "value_novelty": "find_value_novelty",
+    "timestamp_order": "find_order_violations",
+    "frequency": "find_frequency_anomalies",
+    "sequence_novelty": "find_sequence_novelty",
+    "proportion_shift": "find_proportion_shifts",
+}
+
+
+def test_seeded_detectors_validate_against_the_runner():
+    """Every entry the demo stores must be one the endpoint would accept."""
+    from vestigo.api.routers.analysis import DetectorEntryIn, validate_detector_entry
+
+    entries = metadata.detector_entries(baseline_id="b", user_id="u")
+    for entry in entries:
+        validate_detector_entry(
+            entry["method"],
+            DetectorEntryIn(
+                params=entry["params"], frame=entry["frame"], baseline_id=entry["baseline_id"]
+            ),
+        )
+    methods = [e["method"] for e in entries]
+    assert len(methods) == len(set(methods)), "one entry per method"
+
+
+@pytest.mark.parametrize("entry", [pytest.param(d, id=d.method) for d in metadata.DEMO_DETECTORS])
+def test_seeded_detector_finds_something(demo, ch_store, entry):
+    """The first thing a new user sees must not be an empty rail."""
+    case_id, sources, windows = demo
+    service = StatisticalAnomalyService(ch_store)
+    kwargs = dict(entry.params)
+    if entry.frame == "baseline":
+        kwargs["windows"] = windows
+    result = getattr(service, _SERVICE_BY_METHOD[entry.method])(case_id, sources, **kwargs)
+    assert _findings(result), f"seeded {entry.method} found nothing in the demo case"
