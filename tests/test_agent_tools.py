@@ -76,6 +76,29 @@ def _rows(payload: Any) -> list[dict[str, Any]]:
     return [dict(zip(payload["columns"], row, strict=True)) for row in payload["rows"]]
 
 
+async def test_list_configured_detectors_reads_the_timeline_list(store):
+    await store.init_schema()
+    await store.create_case(case_id="c1", name="c", owner_id="u1")
+    await store.create_timeline(case_id="c1", timeline_id="t1", name="t")
+    await store.set_timeline_detector(
+        "c1",
+        "t1",
+        {
+            "method": "value_novelty",
+            "params": {"fields": ["user"]},
+            "frame": "self",
+            "baseline_id": None,
+            "added_by": "u1",
+            "added_at": "2026-09-03T00:00:00+00:00",
+        },
+    )
+    server = build_tool_server(_scope("c1", "t1"))
+    result = await _call(server, "list_configured_detectors")
+    assert result["total"] == 1
+    assert [d["method"] for d in result["detectors"]] == ["value_novelty"]
+    assert result["detectors"][0]["params"] == {"fields": ["user"]}
+
+
 async def test_list_baselines_returns_timeline_definitions(store):
     await store.init_schema()
     await store.create_baseline_definition(
