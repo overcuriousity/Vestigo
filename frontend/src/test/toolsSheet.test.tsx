@@ -16,6 +16,7 @@ import { METHODS, METHODS_BY_ID } from "@/components/analysis/method-registry";
 
 const sweep = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("@/hooks/useMethodFindings", () => ({
+  useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
   useStreamingSweep: () => sweep.current,
   useMethodFindings: () => ({ data: undefined, isLoading: false }),
   useIncludeDismissed: () => ({ includeDismissed: false, setIncludeDismissed: () => {} }),

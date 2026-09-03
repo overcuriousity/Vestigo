@@ -26,6 +26,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Play, X } from "lucide-react";
 import type { UseQueryResult } from "@tanstack/react-query";
+import { fmtNum } from "@/lib/format";
 import { METHODS_BY_ID, type MethodId } from "./method-registry";
 import { EVIDENCE_CLASSES } from "./method-registry";
 import { ToolsSheet } from "./ToolsSheet";
@@ -39,6 +40,7 @@ import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
 import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
 import { Button } from "@/components/ui/Button";
+import { useFindingsPage } from "@/hooks/useMethodFindings";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 import type { AnalysisScope, MethodFindings, MethodResult } from "@/api/analysis";
@@ -219,6 +221,9 @@ function MethodResults({
   const results = query.data?.results ?? [];
   const scored = results.filter((f): f is AnomalyFinding => !isTemplateRow(f));
   const templates = results.filter(isTemplateRow);
+  const page = useFindingsPage(methodId);
+  const total = query.data?.total_findings ?? 0;
+  const totalExact = query.data?.total_findings_exact ?? true;
 
   if (query.isFetching) {
     return (
@@ -256,6 +261,29 @@ function MethodResults({
                 onSelect={() => {}}
               />
             ))}
+          {/* The same disclosure the rail makes: a page smaller than the
+              total is a display cap, named as such, with the next step. */}
+          {results.length < total && (
+            <div
+              data-testid={`sheet-truncation-${methodId}`}
+              className="flex items-center justify-between gap-2 rounded border border-dashed border-[var(--color-border)] px-2 py-1.5 text-xs text-[var(--color-fg-muted)]"
+            >
+              <span>
+                showing {fmtNum(results.length)} of {fmtNum(total)}
+                {totalExact ? "" : "+"} findings
+              </span>
+              {page.canRaise && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={page.raise}
+                  className="h-auto px-1.5 py-0.5 font-normal text-[var(--color-fg-secondary)]"
+                >
+                  Show more
+                </Button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </>

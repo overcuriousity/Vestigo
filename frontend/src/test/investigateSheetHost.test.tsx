@@ -19,6 +19,7 @@ import { InvestigateSheetHost, type SheetRequest } from "@/components/analysis/I
 const calls = vi.hoisted(() => ({ current: [] as Record<string, unknown>[] }));
 
 vi.mock("@/hooks/useMethodFindings", () => ({
+  useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
   useMethodFindings: (
     _c: string,
     _t: string,

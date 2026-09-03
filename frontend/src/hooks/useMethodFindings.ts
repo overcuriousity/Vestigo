@@ -38,11 +38,20 @@ import {
   SHOW_DISMISSED_KEY,
 } from "@/components/analysis/detector-hooks";
 import { useUiStore } from "@/stores/ui";
+import {
+  DEFAULT_FINDINGS_LIMIT,
+  canRaise,
+  limitOf,
+  useFindingsLimitStore,
+} from "@/stores/findingsLimit";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
 import { scopeOf, useTimelineDetectors, type KnownDetectorEntry } from "./useTimelineDetectors";
 
-/** Per-method fetch cap, mirrored in the rail's coverage copy. */
-export const METHOD_LIMIT = 50;
+/**
+ * The page size a method starts at. The live value is per method in
+ * `useFindingsLimitStore`; this is exported for the copy that names it.
+ */
+export const METHOD_LIMIT = DEFAULT_FINDINGS_LIMIT;
 
 /**
  * The reveal toggle, as one store flag rather than per-view state.
@@ -66,6 +75,7 @@ function findingsQueryOptions(
   params: Record<string, unknown>,
   enabled: boolean,
   includeDismissed: boolean,
+  limit: number,
 ) {
   return {
     queryKey: [
@@ -77,7 +87,9 @@ function findingsQueryOptions(
       scopeParams.frame,
       scopeParams.baseline_id ?? "none",
       JSON.stringify(params),
-      METHOD_LIMIT,
+      // In the key: a larger page is a different answer, and the server cache
+      // keys on it too, so raising it is an explicit recompute.
+      limit,
       includeDismissed ? SHOW_DISMISSED_KEY : HIDE_DISMISSED_KEY,
     ],
     queryFn: () =>
@@ -85,7 +97,7 @@ function findingsQueryOptions(
         ...scopeParams,
         method,
         params,
-        limit: METHOD_LIMIT,
+        limit,
         ...(includeDismissed ? { include_dismissed: true } : {}),
       }),
     enabled,
@@ -110,6 +122,7 @@ export function useMethodFindings(
   const globalScope = useScopeParams();
   const scopeParams = opts.scope ?? globalScope;
   const { includeDismissed } = useIncludeDismissed();
+  const limit = useFindingsLimitStore((s) => limitOf(s.byMethod, method));
   return useQuery<MethodFindings>(
     findingsQueryOptions(
       caseId,
@@ -119,8 +132,16 @@ export function useMethodFindings(
       opts.params ?? {},
       opts.enabled,
       includeDismissed,
+      limit,
     ),
   );
+}
+
+/** The page a method is on, and the one step it can take from there. */
+export function useFindingsPage(method: MethodId) {
+  const limit = useFindingsLimitStore((s) => limitOf(s.byMethod, method));
+  const raise = useFindingsLimitStore((s) => s.raise);
+  return { limit, canRaise: canRaise(limit), raise: () => raise(method) };
 }
 
 export interface MethodState {
@@ -128,7 +149,14 @@ export interface MethodState {
   plan: MethodPlanEntry | undefined;
   status: MethodPlanEntry["status"];
   findings: MethodFindings["results"];
+  /** Exact count across the scope — what was found, not what is drawn. */
   total: number;
+  /** False when the server could not count exactly; render the total as "N+". */
+  totalExact: boolean;
+  /** The page this method's findings are capped at, and whether it can grow. */
+  limit: number;
+  canRaise: boolean;
+  raise: () => void;
   isLoading: boolean;
   /**
    * Expected to produce an answer, and hasn't yet. Distinct from `isLoading`:
@@ -186,6 +214,8 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
   // not a mute, not a per-user focus. One list, shared, audited.
   const { entries, byMethod: entryByMethod } = useTimelineDetectors(caseId, timelineId);
   const runnable = useCallback((id: MethodId) => entryByMethod.has(id), [entryByMethod]);
+  const limitByMethod = useFindingsLimitStore((s) => s.byMethod);
+  const raiseLimit = useFindingsLimitStore((s) => s.raise);
 
   const optionsFor = (id: MethodId, enabled: boolean) => {
     const entry = entryByMethod.get(id);
@@ -197,6 +227,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
       entry?.params ?? {},
       enabled && entry !== undefined,
       includeDismissed,
+      limitOf(limitByMethod, id),
     );
   };
 
@@ -256,6 +287,10 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         status: plan?.status ?? "applicable",
         findings: data?.results ?? [],
         total: data?.total_findings ?? 0,
+        totalExact: data?.total_findings_exact ?? true,
+        limit: limitOf(limitByMethod, meta.id),
+        canRaise: canRaise(limitOf(limitByMethod, meta.id)),
+        raise: () => raiseLimit(meta.id),
         isLoading: Boolean(query?.isFetching),
         // A method the plan says to run is pending until its query has
         // actually produced something — including while it is still disabled
@@ -274,7 +309,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see queryDeps above
-  }, [...queryDeps, planById, runnable, entryByMethod, panelFrame, panelBaseline]);
+  }, [...queryDeps, planById, runnable, entryByMethod, panelFrame, panelBaseline, limitByMethod, raiseLimit]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
   const settled = expected.filter((m) => !byMethod[m.id].pending).length;

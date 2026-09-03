@@ -60,7 +60,10 @@ export interface MethodFindings {
   method: MethodId;
   status: string;
   results: MethodResult[];
+  /** Exact count across the full scope, after suppression, before `limit`. */
   total_findings: number;
+  /** False when the runner could not count exactly — render as "N+", never "N". */
+  total_findings_exact: boolean;
   dismissed_count?: number;
   warnings: string[];
   scope: AnalysisScope;

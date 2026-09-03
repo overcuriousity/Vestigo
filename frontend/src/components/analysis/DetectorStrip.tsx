@@ -10,6 +10,7 @@
 import { Pencil, X } from "lucide-react";
 import type { MethodState } from "@/hooks/useMethodFindings";
 import type { KnownDetectorEntry } from "@/hooks/useTimelineDetectors";
+import { fmtNum } from "@/lib/format";
 import { METHODS_BY_ID, type MethodId } from "./method-registry";
 
 interface Props {
@@ -50,9 +51,24 @@ export function DetectorStrip({
             {meta.label}
             <span className="text-[var(--color-fg-muted)]">· {scope}</span>
             {/* A dash while queued, a mark on error — never a zero for a
-                detector that has not answered yet. */}
-            <span className="font-mono" title={state?.error ? "Failed to run" : undefined}>
-              {state?.pending ? "…" : state?.error ? "!" : String(state?.total ?? 0)}
+                detector that has not answered yet. The number is the exact
+                total across the scope, not the page; a total the server could
+                not make exact reads "N+" with its reason as the tooltip. */}
+            <span
+              className="font-mono"
+              title={
+                state?.error
+                  ? "Failed to run"
+                  : state && !state.totalExact
+                    ? (state.warnings[0] ?? "The total could not be counted exactly")
+                    : undefined
+              }
+            >
+              {state?.pending
+                ? "…"
+                : state?.error
+                  ? "!"
+                  : `${fmtNum(state?.total ?? 0)}${state && !state.totalExact ? "+" : ""}`}
             </span>
             {canEdit && (
               <>
