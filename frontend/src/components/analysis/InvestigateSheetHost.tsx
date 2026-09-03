@@ -114,7 +114,11 @@ export function InvestigateSheetHost({
       (sheet.kind === "finding" && entry !== undefined) ||
       (sheet.kind === "method" && runParams !== null),
     params: runParams ?? entry?.params ?? {},
-    scope: runParams === null && entry ? scopeOf(entry) : undefined,
+    // The entry's own scope, for the re-run too. "Run with these" tweaks a
+    // configured detector's knobs; dropping its frame back to the panel's
+    // would answer a different question — and for a baseline-framed method
+    // that question has no baseline to answer it with at all.
+    scope: entry ? scopeOf(entry) : undefined,
   });
 
   // Closing is the honest answer to "what you were reading is gone" — leaving
@@ -138,6 +142,9 @@ export function InvestigateSheetHost({
           methodId={sheet.method}
           finding={finding}
           scope={findings.data.scope}
+          // The knobs open on what produced the finding above them, not on
+          // the method's defaults.
+          initialParams={entry?.params}
           onRun={(params) => {
             setRunParams(params);
             setRanFromFinding(true);
@@ -149,7 +156,9 @@ export function InvestigateSheetHost({
       ) : sheet.kind === "finding" ? (
         // The rail addresses a finding as (method, rank), so the sheet can open
         // before the query lands or after a refetch shortened the list. Both
-        // used to render nothing at all, which reads as a dead click.
+        // used to render nothing at all, which reads as a dead click. This is
+        // also where "Run with these" lands, so the knobs keep showing what
+        // was submitted rather than snapping back to defaults.
         <InvestigateSheet
           caseId={caseId}
           timelineId={timelineId}
@@ -157,6 +166,7 @@ export function InvestigateSheetHost({
           onClose={onClose}
           mode="method"
           methodId={sheet.method}
+          initialParams={runParams ?? entry?.params}
           onRun={setRunParams}
           query={findings}
         />

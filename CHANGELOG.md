@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   username map, so a restored case credits the analyst who configured it rather than the
   importer.
 
+### Fixed
+
+- The Tools sheet judged every configured detector by the analysis plan, which is computed
+  under the panel scope — so a detector configured with a baseline of its own read as
+  "needs a baseline" while the rail showed the findings it had produced from that baseline.
+  A row whose entry runs under a different frame now shows no gate verdict at all.
+- The finding sheet's knob form opened on defaults rather than on the params that produced
+  the finding above it, so "Run with these" re-ran the method with empty params under the
+  panel frame and presented it as a re-run of the finding on screen. The form is seeded from
+  the configured entry, and the re-run keeps that entry's own scope.
+- The Investigate rail no longer flashes "No detectors configured on this timeline." while
+  the timeline query is still in flight.
+- Tools' "Add detector" is hidden from members who cannot configure detectors, as the rail's
+  already was, rather than leading them to a permanently disabled Apply.
+
 ### Removed
 
 - **Breaking for API clients:** `PATCH …/timelines/{id}/muted-methods` and the

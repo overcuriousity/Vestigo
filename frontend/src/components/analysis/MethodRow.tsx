@@ -11,6 +11,10 @@
  *                     action instead of "run anyway", which here would only
  *                     produce a guaranteed-empty scan.
  *
+ * All three are the plan's verdict under the *panel* scope, so a detector
+ * configured with a frame of its own gets none of them (`planApplies`): the
+ * gate never looked at the question that detector actually asks.
+ *
  * The reason is never rendered as a bare verdict. "Not applicable" is a shrug;
  * "no field parses as numeric (0 of 19 sampled)" is a claim someone can check
  * and argue with, which is the standard this panel is held to.
@@ -52,7 +56,12 @@ export function MethodRow({
   onOpen: (method: MethodId) => void;
   onSetupBaseline: () => void;
 }) {
-  const { meta, plan, status } = state;
+  const { meta, plan, planApplies } = state;
+  // The gate's verdict is computed under the panel scope. A detector running
+  // under its own frame was not the question the gate answered, so its verdict
+  // is not shown here rather than shown about the wrong run — see
+  // `MethodState.planApplies`.
+  const status = planApplies ? state.status : "applicable";
   const gated = status !== "applicable";
   const detail = gated ? facts(plan?.reason_facts) : null;
   // The runner's own verdict about the data, only meaningful once it has run.

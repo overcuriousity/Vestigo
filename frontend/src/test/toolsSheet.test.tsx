@@ -72,6 +72,21 @@ vi.mock("@/hooks/useTimelineReadiness", () => ({
   useTimelineReadiness: () => readiness.current,
 }));
 
+const detectors = vi.hoisted(() => ({ canEdit: true }));
+vi.mock("@/hooks/useTimelineDetectors", () => ({
+  useTimelineDetectors: () => ({
+    entries: [],
+    byMethod: new Map(),
+    isLoaded: true,
+    set: async () => ({}),
+    remove: async () => ({}),
+    canEdit: detectors.canEdit,
+    isSaving: false,
+    saveError: null,
+  }),
+  scopeOf: () => ({ frame: "self" }),
+}));
+
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
@@ -82,6 +97,7 @@ function state(id: string, over: Record<string, unknown> = {}) {
     meta: METHODS_BY_ID[id as keyof typeof METHODS_BY_ID],
     plan: { method: id, status: "applicable", reason: "", reason_facts: {}, cost_class: "cheap" },
     status: "applicable",
+    planApplies: true,
     findings: [],
     total: 0,
     isLoading: false,
@@ -157,6 +173,7 @@ describe("ToolsSheet", () => {
     capabilities.current = { embeddings: true, sigma: true };
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
     baselineStore.current = { activeBaselineId: null };
+    detectors.canEdit = true;
     dispositions.rows = [];
     dispositions.removed = [];
   });
@@ -220,6 +237,48 @@ describe("ToolsSheet", () => {
     expect(screen.queryByTestId("method-row-entropy")).toBeNull();
     screen.getByTestId("tools-add-detector").click();
     expect(onAddDetector).toHaveBeenCalled();
+  });
+
+  it("does not judge a detector by a gate verdict computed under another scope", () => {
+    // The plan is fetched once, under the *panel* scope. A detector configured
+    // with a baseline of its own runs a question the gate never looked at, and
+    // rendering "needs a baseline" over it — dashed, countless, offering a
+    // setup action — contradicted the rail, which was showing that detector's
+    // findings from the baseline it already has.
+    renderTools({}, {}, {
+      proportion_shift: state("proportion_shift", {
+        status: "needs_setup",
+        planApplies: false,
+        total: 4,
+        plan: {
+          method: "proportion_shift",
+          status: "needs_setup",
+          reason: "needs a baseline window to compare against",
+          reason_facts: {},
+          cost_class: "heavy",
+        },
+        entry: {
+          method: "proportion_shift",
+          params: {},
+          frame: "baseline",
+          baseline_id: "bl-1",
+          added_by: null,
+          added_at: "",
+        },
+      }),
+    });
+    const row = screen.getByTestId("method-row-proportion_shift");
+    expect(row).not.toHaveTextContent("needs a baseline window");
+    expect(within(row).queryByRole("button", { name: /set a baseline/i })).toBeNull();
+    expect(screen.getByTestId("method-count-proportion_shift")).toHaveTextContent("4");
+  });
+
+  it("does not offer the wizard to a member who cannot configure detectors", () => {
+    // Walking choose → configure → confirm only to meet a permanently disabled
+    // Apply is a control that was never theirs, offered anyway.
+    detectors.canEdit = false;
+    renderTools();
+    expect(screen.queryByTestId("tools-add-detector")).toBeNull();
   });
 
   it("states how many are configured and how many ran", () => {

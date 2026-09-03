@@ -70,18 +70,25 @@ vi.mock("@/hooks/useScopeChange", () => ({
   }),
 }));
 
+/** Every render of the sheet, so the props it was handed are inspectable. */
+const sheets = vi.hoisted(() => ({ current: [] as Record<string, unknown>[] }));
 vi.mock("@/components/analysis/InvestigateSheet", () => ({
   InvestigateSheet: ({
     mode,
+    initialParams,
     onRun,
   }: {
     mode: string;
+    initialParams?: Record<string, unknown>;
     onRun?: (p: Record<string, unknown>) => void;
-  }) => (
-    <button data-testid={`sheet-${mode}`} onClick={() => onRun?.({ fields: "attr:user_agent" })}>
-      run
-    </button>
-  ),
+  }) => {
+    sheets.current.push({ mode, initialParams });
+    return (
+      <button data-testid={`sheet-${mode}`} onClick={() => onRun?.({ fields: "attr:user_agent" })}>
+        run
+      </button>
+    );
+  },
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -121,6 +128,50 @@ describe("InvestigateSheetHost configured entries", () => {
       method: "value_novelty",
       enabled: true,
       params: { fields: ["user"] },
+      scope: { frame: "baseline", baseline_id: "b1" },
+    });
+    configured.entries = [];
+  });
+
+  it("opens the knob form on the params that produced the finding, not on defaults", () => {
+    // A form showing "auto" under a finding computed from stored settings
+    // offers to re-run a question nobody asked: pressing Run with these sent
+    // empty params, which is a different scan presented as a re-run of the one
+    // on screen.
+    sheets.current = [];
+    configured.entries = [
+      {
+        method: "sequence_novelty",
+        params: { series_field: "attr:computer_name" },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    renderHost({ kind: "finding", method: "sequence_novelty", rank: 0 });
+    expect(sheets.current.at(-1)).toMatchObject({
+      mode: "finding",
+      initialParams: { series_field: "attr:computer_name" },
+    });
+    configured.entries = [];
+  });
+
+  it("keeps the entry's own scope when its knobs are re-run from the finding", () => {
+    // "Run with these" tweaks a configured detector's parameters. Falling back
+    // to the panel frame asks a different question — and for a baseline-framed
+    // method, one with no baseline to answer it.
+    calls.current = [];
+    configured.entries = [
+      {
+        method: "proportion_shift",
+        params: { fields: ["user"] },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    const { getByTestId } = renderHost({ kind: "finding", method: "proportion_shift", rank: 0 });
+    fireEvent.click(getByTestId("sheet-finding"));
+    expect(calls.current.at(-1)).toMatchObject({
+      params: { fields: "attr:user_agent" },
       scope: { frame: "baseline", baseline_id: "b1" },
     });
     configured.entries = [];

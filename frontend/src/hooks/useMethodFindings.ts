@@ -159,6 +159,17 @@ export interface MethodState {
   /** The stored entry this method runs under; absent when not configured. */
   entry?: KnownDetectorEntry;
   configured: boolean;
+  /**
+   * Whether `plan`/`status` are about *this* detector's question.
+   *
+   * The gate is fetched once, under the panel scope. A configured entry runs
+   * under its own frame, so when the two disagree the plan's verdict answers a
+   * run nobody asked for — a baseline-framed detector reads as "needs a
+   * baseline" while the rail is showing the findings it produced from the
+   * baseline it already has. Advice about a different question is withheld
+   * rather than restated.
+   */
+  planApplies: boolean;
 }
 
 const CHEAP_IDS = METHODS.filter((m) => m.costClass === "cheap").map((m) => m.id);
@@ -217,6 +228,12 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
     q.isError,
   ]);
 
+  // Primitives, not the object: `useScopeParams` builds a fresh one per render,
+  // so depending on it would churn `byMethod`'s identity every render — which
+  // the comment above `queryDeps` explains is a render loop, not a slowdown.
+  const panelFrame = scopeParams.frame;
+  const panelBaseline = scopeParams.baseline_id ?? null;
+
   const byMethod = useMemo(() => {
     const results = new Map<MethodId, (typeof cheapResults)[number]>();
     CHEAP_IDS.forEach((id, i) => results.set(id, cheapResults[i]));
@@ -227,6 +244,12 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
       const query = results.get(meta.id);
       const data = query?.data as MethodFindings | undefined;
       const plan = planById[meta.id];
+      const entry = entryByMethod.get(meta.id);
+      const entryScope = entry ? scopeOf(entry) : null;
+      const planApplies =
+        !entryScope ||
+        (entryScope.frame === panelFrame &&
+          (entryScope.baseline_id ?? null) === panelBaseline);
       out[meta.id] = {
         meta,
         plan,
@@ -244,13 +267,14 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         dataStatus: data?.status,
         warnings: data?.warnings ?? [],
         refetch: () => void query?.refetch(),
-        entry: entryByMethod.get(meta.id),
-        configured: entryByMethod.has(meta.id),
+        entry,
+        configured: entry !== undefined,
+        planApplies,
       };
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see queryDeps above
-  }, [...queryDeps, planById, runnable, entryByMethod]);
+  }, [...queryDeps, planById, runnable, entryByMethod, panelFrame, panelBaseline]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
   const settled = expected.filter((m) => !byMethod[m.id].pending).length;

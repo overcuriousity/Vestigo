@@ -37,6 +37,7 @@ import { baselinesApi } from "@/api/baselines";
 import { useCapabilities } from "@/api/health";
 import { useFieldOverrides } from "@/hooks/useFieldOverrides";
 import { useTimelineReadiness } from "@/hooks/useTimelineReadiness";
+import { useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import { useBaselineStore } from "@/stores/baseline";
 import { useUiStore } from "@/stores/ui";
 import { Button } from "@/components/ui/Button";
@@ -102,6 +103,10 @@ export function ToolsSheet({
   onSelectEvent,
 }: Props) {
   const { byMethod, scope } = useStreamingSweep(caseId, timelineId);
+  // Same gate the rail's own "Add detector" is behind. A read-only member who
+  // can walk choose → configure → confirm and only then meet a permanently
+  // disabled Apply has been offered a control that was never theirs.
+  const { canEdit: canConfigure } = useTimelineDetectors(caseId, timelineId);
   const { embeddings, sigma } = useCapabilities();
   const { nothingToAnalyse } = useTimelineReadiness(caseId, timelineId);
   // The timeline's field declarations, summarized here because the control that
@@ -184,15 +189,17 @@ export function ToolsSheet({
               <span className="text-[var(--color-warning)]"> · {failed} failed</span>
             )}
           </p>
-          <Button
-            variant="outline"
-            size="sm"
-            data-testid="tools-add-detector"
-            className="mb-2"
-            onClick={() => onAddDetector()}
-          >
-            <Plus size={11} /> Add detector
-          </Button>
+          {canConfigure && (
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="tools-add-detector"
+              className="mb-2"
+              onClick={() => onAddDetector()}
+            >
+              <Plus size={11} /> Add detector
+            </Button>
+          )}
           <p className="mb-2 text-xs text-[var(--color-fg-muted)]">
             Only configured detectors run. A method the analysis gate marks not applicable can
             still be configured — the gate is advice.

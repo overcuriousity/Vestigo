@@ -54,6 +54,13 @@ export type SheetMode =
       methodId: MethodId;
       finding: MethodResult;
       scope: AnalysisScope;
+      /**
+       * The params the finding on screen was produced under — the configured
+       * entry's own. The knob form opens on these, so "Run with these" means
+       * what it says: a form showing defaults under a finding computed from
+       * stored settings offers to re-run a question nobody asked.
+       */
+      initialParams?: Record<string, unknown>;
       /** Re-runs the method with the knobs as typed, in method mode. */
       onRun?: (params: Record<string, unknown>) => void;
       running?: boolean;
@@ -61,6 +68,8 @@ export type SheetMode =
   | {
       mode: "method";
       methodId: MethodId;
+      /** Opens the knobs on these instead of on the method's defaults. */
+      initialParams?: Record<string, unknown>;
       /** Runs the method with the knob values as typed. */
       onRun: (params: Record<string, unknown>) => void;
       query: UseQueryResult<MethodFindings>;
@@ -109,6 +118,7 @@ function MethodBody({
   caseId,
   timelineId,
   methodId,
+  initialParams,
   onRun,
   runLabel = "Run",
   running,
@@ -117,6 +127,8 @@ function MethodBody({
   caseId: string;
   timelineId: string;
   methodId: MethodId;
+  /** Opens the knobs on these instead of on the method's defaults. */
+  initialParams?: Record<string, unknown>;
   /**
    * Runs the method with the knobs as typed. Present in both modes: a form of
    * inputs with no way to submit them is a control that lies about being one,
@@ -127,7 +139,7 @@ function MethodBody({
   running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
-  const [params, setParams] = useState<Record<string, unknown>>({});
+  const [params, setParams] = useState<Record<string, unknown>>(initialParams ?? {});
   const [blocker, setBlocker] = useState<string | null>(null);
   const onFormChange = useCallback((p: Record<string, unknown>, b: string | null) => {
     setParams(p);
@@ -156,6 +168,7 @@ function MethodBody({
           caseId={caseId}
           timelineId={timelineId}
           methodId={methodId}
+          initialParams={initialParams}
           onChange={onFormChange}
         />
         {onRun && (
@@ -276,6 +289,7 @@ function FindingBody({
   methodId,
   finding,
   scope,
+  initialParams,
   onRun,
   running,
 }: {
@@ -284,6 +298,7 @@ function FindingBody({
   methodId: MethodId;
   finding: MethodResult;
   scope: AnalysisScope;
+  initialParams?: Record<string, unknown>;
   onRun?: (params: Record<string, unknown>) => void;
   running?: boolean;
 }) {
@@ -360,10 +375,14 @@ function FindingBody({
         </dd>
       </dl>
 
+      {/* Seeded with the entry's stored params: the knobs an analyst reads
+          under a finding are the ones that produced it, and "Run with these"
+          re-asks that question with whatever they change. */}
       <MethodBody
         caseId={caseId}
         timelineId={timelineId}
         methodId={methodId}
+        initialParams={initialParams}
         onRun={onRun}
         runLabel="Run with these"
         running={running}
@@ -506,6 +525,7 @@ export function InvestigateSheet({
               methodId={rest.methodId}
               finding={rest.finding}
               scope={rest.scope}
+              initialParams={rest.initialParams}
               onRun={rest.onRun}
               running={rest.running}
             />
@@ -516,6 +536,7 @@ export function InvestigateSheet({
                 caseId={caseId}
                 timelineId={timelineId}
                 methodId={rest.methodId}
+                initialParams={rest.initialParams}
                 onRun={rest.onRun}
                 running={rest.query.isFetching}
               />

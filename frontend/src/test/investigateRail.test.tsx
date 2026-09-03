@@ -33,11 +33,13 @@ const detectors = vi.hoisted(() => ({
   entries: [] as Record<string, unknown>[],
   removed: [] as string[],
   canEdit: true,
+  isLoaded: true,
 }));
 vi.mock("@/hooks/useTimelineDetectors", () => ({
   useTimelineDetectors: () => ({
     entries: detectors.entries,
     byMethod: new Map(detectors.entries.map((e) => [e.method, e])),
+    isLoaded: detectors.isLoaded,
     set: async () => ({}),
     remove: async (m: string) => {
       detectors.removed.push(m);
@@ -152,6 +154,8 @@ function renderRail(
 describe("InvestigateRail", () => {
   beforeEach(() => {
     readiness.current = { stillIngesting: false, nothingToAnalyse: false };
+    detectors.isLoaded = true;
+    detectors.canEdit = true;
     dismissed.current = {
       includeDismissed: false,
       setIncludeDismissed: () => {},
@@ -187,6 +191,16 @@ describe("InvestigateRail", () => {
     expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
     fireEvent.click(screen.getByTestId("add-detector"));
     expect(onAddDetector).toHaveBeenCalledWith();
+  });
+
+  it("claims neither 'nothing configured' nor 'no findings' while the list is loading", () => {
+    // An empty `entries` before the timeline query lands is "not yet", not
+    // "none". Rendering either verdict over it flashes the exact "nothing
+    // here" misread this surface exists to avoid.
+    detectors.isLoaded = false;
+    renderRail({ byMethod: {}, done: 0, total: 0 });
+    expect(screen.queryByTestId("no-detectors")).toBeNull();
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
   });
 
   it("names each configured detector with its scope and count, editable and removable", async () => {

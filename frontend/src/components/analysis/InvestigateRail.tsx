@@ -223,7 +223,11 @@ export function InvestigateRail({
   const showSigma = sigmaFindings.length > 0;
   const anyFindings =
     visible.some((m) => byMethod[m.id].findings.length > 0) || showSigma;
-  const nothingConfigured = detectors.entries.length === 0;
+  // Gated on the timeline having actually been fetched: an empty `entries`
+  // while the query is in flight is "not yet", not "none", and rendering the
+  // empty state over it flashes exactly the "nothing here" misread this
+  // surface exists to avoid.
+  const nothingConfigured = detectors.isLoaded && detectors.entries.length === 0;
   const allSettled = visible.every((m) => !byMethod[m.id].pending);
 
   // Said before anything else, and instead of everything else: a findings list
@@ -383,9 +387,11 @@ export function InvestigateRail({
       ))}
 
       {/* "No findings" is a claim that every configured detector ran and
-          answered. Not while the plan is resolving, not while any is pending,
-          and not when nothing is configured — that state is named above. */}
-      {!anyFindings && !planLoading && !nothingConfigured && allSettled && (
+          answered. Not while the plan is resolving, not while the configured
+          list itself is still loading (nothing is pending yet because nothing
+          is known to run), not while any is pending, and not when nothing is
+          configured — that state is named above. */}
+      {!anyFindings && !planLoading && detectors.isLoaded && !nothingConfigured && allSettled && (
         <AnalysisEmptyState hint="Edit a detector's fields or scope from its chip, or add another kind of question.">
           No findings from the configured detectors.
         </AnalysisEmptyState>
