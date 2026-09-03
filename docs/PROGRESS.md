@@ -4,7 +4,43 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 227 — story tooling, from a real agent transcript).
+Last updated: 2026-09-03 (session 228 — review fixes on the story tools, and a nested-layer
+regression that closed the detector wizard).
+
+## Session 228 — 2026-09-03: what a confirm actually did, and one duplicated npm package
+
+Review of PR #348 turned up three defects, all fixed here, plus one the user hit live.
+
+`POST /stories` and `propose_story` both capped the title at `STORY_TITLE_MAX_CHARS`; the
+rename on `PATCH /stories/{id}` did not, so the path an analyst is likeliest to paste into
+still reached `String(255)` as an asyncpg truncation error — a 500 on a typo, the exact
+failure the cap exists to prevent.
+
+The bigger one was a claim the transcript could not back. A confirmed `story` proposal whose
+title had been taken since propose time reports `applied: false`, but the card rendered the
+success state anyway: "created by <analyst>" plus an *Open story* button that resolved the
+story **by title** — i.e. the unrelated document that took the name. The toast saying
+otherwise is gone by the next page load; the false provenance claim is permanent. The
+outcome is now persisted on the proposal itself (`AgentProposal.result`, migration 0035) for
+both story kinds, and the card reads it: the link goes by id, an unapplied confirm says so,
+and rows decided before 0035 keep the old inference behind a null. `story_block` had the
+same latent defect (a story deleted since propose time) and gets the same treatment.
+
+`_apply_story_proposal`'s duplicate-title check was read-then-insert, so two analysts
+confirming the same proposed title concurrently both passed it — which is what the docstring
+promised would not happen. `create_story_if_title_free` now does the check and the insert in
+one transaction serialized per `(case, title)` by a Postgres advisory lock. Deliberately not
+a unique index: an analyst naming two documents alike by hand is their call, and this is only
+the agent path's promise not to duplicate a name behind their back.
+
+Separately, and reported mid-session: clicking a field in the detector wizard's "Fields to
+scan" popover closed the whole wizard. Nothing in `DetectorWizard` or `AnomalyFieldPicker` was
+at fault — `package-lock.json` carried a second copy of `@radix-ui/react-dismissable-layer`
+(same version) nested under `react-dialog`, so Dialog and Popover held *separate* layer
+registries, the popover's layer never joined the dialog's, and every click inside the portalled
+popover read as a click outside the dialog. `npm dedupe` collapses the duplicated subtree (369
+lockfile lines); `src/test/dialogPopoverNesting.test.tsx` is the regression test and fails
+again if the tree grows a second copy.
 
 ## Session 227 — 2026-09-03: the story tools stop costing a turn
 
