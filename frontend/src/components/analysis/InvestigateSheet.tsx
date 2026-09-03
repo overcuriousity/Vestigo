@@ -23,7 +23,7 @@
  * than in a separate Method tab: "what does this actually do" is only ever
  * asked while looking at one of a method's findings.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Play, X } from "lucide-react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { METHODS_BY_ID, type MethodId } from "./method-registry";
