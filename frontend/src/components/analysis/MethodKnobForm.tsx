@@ -239,7 +239,7 @@ export function MethodKnobForm({
             </label>
           )}
           {verbose && (
-            <p className="mt-1 text-[11px] text-[var(--color-fg-muted)]">{knobHelp(knob)}</p>
+            <p className="mt-1 text-xs text-[var(--color-fg-muted)]">{knobHelp(knob)}</p>
           )}
         </div>
       ))}

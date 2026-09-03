@@ -213,9 +213,12 @@ half — how to size the budget and read what resolved — is
 
 ### The analysis gate: which methods are offered up front
 
-The Investigate rail does not run every method on open. `db/analysis_plan.py` answers,
-per method and without scanning a single event, whether that method *can* produce a
-finding on this data; `GET .../analysis/plan` serves the verdicts. Inputs are the
+No statistical method runs unprompted. The Investigate rail runs exactly the detectors an
+analyst configured on the timeline (next section); the gate's job is to advise the
+wizard. `db/analysis_plan.py` answers, per method and without scanning a single event,
+whether that method *can* produce a finding on this data; `GET .../analysis/plan` serves
+the verdicts, which the wizard shows on each method's card and the Tools accounting
+repeats for each configured one. Inputs are the
 per-source `field_stats` cache and one timestamp-range probe, both already paid for
 elsewhere. The probe reads the raw `timestamp` column — a sort-key prefix, so an index
 lookup rather than a scan — and widens the span by the extremes of any declared
@@ -264,8 +267,8 @@ UI offers that action rather than a "run anyway" that could only produce an empt
 Two properties are load-bearing and test-enforced:
 
 - **Nothing is ever locked.** A `not_applicable` method runs through
-  `GET .../analysis/findings` exactly as any other, returning what an unconditional sweep
-  would have returned.
+  `GET .../analysis/findings` exactly as any other, and can be configured through the
+  wizard exactly as any other — its card carries the arithmetic, not a disabled state.
 - **The gate never skips a method that works.** A wrong precondition fails silently, so
   `tests/test_demo_detector_coverage_clickhouse.py` — which already asserts every
   analysis tool finds something in the demo case — also asserts the gate offers every one
@@ -277,37 +280,49 @@ The numbers must come from the measurement they describe: `sampled` is the count
 tokens the numeric scan actually tested, not the merged inventory's length. The plan is
 fail-open — if it errors, the client marks every method applicable and runs everything.
 
-### Muting a method
+### Which detectors run: configured, never unprompted
 
-Some defects belong to the evidence rather than the behavior it records. A capture whose
-sources disagree about the clock makes `timestamp_order` fire on millions of rows: every
-finding true, none of them the investigation. Reading past that is not triage, so an
-analyst can take the method out of the sweep instead of dismissing findings one at a time.
+Opening a timeline runs nothing. `Timeline.detectors` is the list of methods an analyst
+configured through the detector wizard — `{method, params, frame, baseline_id, added_by,
+added_at}` per entry, one per method — and the rail runs exactly that list: one
+`GET …/analysis/findings` per entry, with the entry's own params and scope, through the
+same fingerprint cache as any ad hoc run. First open after configuring pays the scan;
+every later open, by anyone on the case, hits the cache.
 
-The mute is a list of method ids on `Timeline.muted_methods`, written through
-`PATCH …/muted-methods` (contribute access, unknown ids 422, audited as
-`timeline.update_muted_methods`). It is **shared, not per-browser**: "this source's clocks
-are a mess" is a conclusion the next analyst should inherit rather than rediscover.
+Written through `PUT …/timelines/{id}/detectors/{method}` (add or replace in place) and
+`DELETE …/detectors/{method}`, both contribute access, both audited
+(`timeline.set_detector`, `timeline.remove_detector`). `params` is validated with the same
+per-method models the findings endpoint uses (`validate_detector_entry` in
+`api/routers/analysis.py`), so nothing storable describes a run the runner would refuse; a
+baseline frame must name a definition on this timeline. **Shared, not per-browser**: which
+detectors an investigation ran is part of its record. The agent reads the list through
+`list_configured_detectors` and never writes it.
 
-A mute is a *reading* preference, held to the same "advice, never a lock" contract as the
-gate:
+Why this replaced the unprompted sweep: up to twelve heavy scans nobody asked for, over
+recommender-chosen fields, presented as one feed, read as noise — and beginners dismissed
+the subsystem with it. Three mechanisms existed only to subtract from that sweep — a
+shared mute list, a per-user field focus, preset filter pills — and none of them
+*configured* a detector. All three are gone (1.19). The one that stays is
+`Timeline.field_overrides` (next section): the wizard's "let Vestigo pick" choice consults
+it exactly as the sweep did.
 
-- **The plan does not consult it.** A muted method still reports its real status, because
-  a mute is not a claim that the method cannot produce a finding here — that would be the
-  gate's statement to make, and a false one.
-- **`GET .../analysis/findings` still runs it** when asked for by name, so "Run anyway"
-  works on a muted method exactly as on a gated one. Running a muted method does not
-  unmute it; they are different acts.
-- **The client is what skips it.** `useStreamingSweep` does not issue the query, which
-  removes the method from the findings feed, from the histogram and grid markers derived
-  from it, and from the sweep's progress denominator — one decision rather than three
-  that can drift.
+The wizard is three steps. *Choose* lists every method with a one-line "use this when",
+the plan's verdict for this timeline and its cost class; a `not_applicable` card is
+selectable, with the arithmetic beside it, because the gate is advice. *Configure* is the
+same knob form the sheet's method mode uses, with each knob's help text attached to the
+control, plus the frame — the four two-window methods offer only a baseline. *Confirm*
+reads back one sentence saying exactly what will be stored, then applies. In the rail, the
+strip above the feed names every configured detector with its scope and count, and carries
+edit and remove for contribute access.
 
-Because a mute makes the rail quieter, disclosure is not optional. The rail's top strip
-always names the count when anything is muted; the Tools accounting counts muted methods
-separately from both "ran" and "skipped" and shows no count for a muted row — its query
-never ran, so a `0` there would assert the "checked, clear" misread this surface exists
-to prevent — and every mute is reversible from either surface.
+Two things still run a method without storing anything, and both run under the panel scope
+rather than an entry's: the sheet's method mode with ad hoc knobs, and the Tools sheet's
+Retry on a configured detector that errored. Neither changes the list — that is a
+different act.
+
+The demo case ships five configured detectors on its "Full incident" timeline
+(`demo/metadata.py::DEMO_DETECTORS`), each asserted to find something in
+`tests/test_demo_detector_coverage_clickhouse.py`.
 
 ### Declaring which fields a method reads
 
@@ -322,14 +337,14 @@ the component's state and the next analyst never learned it had been made.
 `Timeline.field_overrides` makes that correction durable: `{method_id: {field_token:
 bool}}`, where `true` pins a field into a method's automatic selection and `false` takes
 it out. Written through `PATCH …/field-overrides` (contribute access, audited as
-`timeline.update_field_overrides`) and, like the mute list, **shared rather than
+`timeline.update_field_overrides`) and, like the configured list, **shared rather than
 per-browser**.
 
 It is **per method**, not per field, and that is the point: the same status code is
 meaningless to `numeric_range` and an excellent `value_novelty` field. A per-(method,
 field) blocklist of *findings* would record the symptom and have to be repeated for every
-numeric-ish detector added later; this records the decision at the one place both the
-unprompted sweep and the picker's auto default derive from.
+numeric-ish detector added later; this records the decision at the one place the wizard's
+auto default and the picker's auto preview derive from.
 
 A declaration that could never apply is rejected with 422 rather than stored: an empty
 field token, an unknown method id, and a *known* method that selects no fields of its own
@@ -338,7 +353,7 @@ reads no field, `log_template` clusters the message text —
 `FIELD_OVERRIDE_METHOD_IDS`). Stored, any of those would be audited and rendered under
 "Declared fields" as an effective decision while the detector scanned exactly as before.
 
-Same "advice, never a lock" contract as the gate and the mute:
+Same "advice, never a lock" contract as the gate:
 
 - **It applies only to automatic selection.** `apply_field_overrides` sits between a
   recommender's answer and the detector's scan list; an explicit `fields=[…]` never
@@ -379,42 +394,6 @@ pin/exclude button beside each chip in the Fields picker (the checkbox still sco
 single run — two questions, two controls); the picker's auto preview applies the
 declaration exactly as the backend does, and the Tools sheet's Methods tab summarizes and
 resets what a timeline declares.
-
-#### Declared fields vs. a personal focus
-
-A declaration answers "which fields should this method consider *for this case*". It does
-not answer "I am reading one field today and the rest is noise" — and answering the second
-question with the first would have one analyst rewriting what every colleague sees in order
-to tidy their own feed.
-
-So there is a second, deliberately smaller mechanism: a **focus** (#341). It is one
-analyst's narrowing of a single method to a chosen field set, stored in that user's own
-`preferences` blob under `analysis_method_focus` (`{timeline_id: {method_id: [field_token,
-…]}}`) and never shared. The sweep applies it by sending those fields as an explicit
-`fields`, which — per the contract above — bypasses `apply_field_overrides` entirely rather
-than competing with it. Nothing new happens on the server: a focused sweep is exactly the
-request an analyst could already make by hand, so the cache fingerprint (which covers
-`params`) separates focused from unfocused answers for free, and `DetectorRun` records the
-fields the run actually scanned, as it does for any explicit selection.
-
-The two are kept apart everywhere they surface, because confusing them is the expensive
-mistake:
-
-| | Declared fields | Focus |
-|---|---|---|
-| Scope | The case team | One analyst |
-| Stored on | `Timeline.field_overrides` | `User.preferences` |
-| Audited | Yes | No — it asserts nothing about the evidence |
-| Applies to | Automatic selection only | The sweep's request for one method |
-| Control | Pin/exclude beside each field chip | "Focus on this selection" in the sheet |
-
-A focus narrows what is **scanned**, not merely what is displayed: a focused method
-produces no findings for the fields it no longer reads. That is what the analyst asked for,
-and it is bounded — the focus is per method, so every *other* method still covers those
-fields. It obeys the same disclosure rule as the mute list and the rail floor: the rail
-carries a strip naming each focused method, the fields it is narrowed to, and a one-click
-way out. An empty field list is treated as no focus at all, since a scan over no fields
-returns an empty result set indistinguishable from "clean".
 
 ### The analysis cache
 

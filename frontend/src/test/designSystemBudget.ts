@@ -35,17 +35,26 @@ export const BUDGET: Record<string, FileBudget> = {
   // Mounted again by the method sheet's `fields` knob, which was a text box
   // between the rail-plus-overlay refactor and this fix.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
+  // The chip's edit/remove are icon glyphs inside a 20px pill; `Button`'s
+  // smallest size is 32px and would not fit the row it belongs to.
+  "../components/analysis/DetectorStrip.tsx": { rawButton: 2 },
+  // The wizard's method cards are selectable surfaces with a heading, a
+  // paragraph and a verdict line — a `Button` reads as a control, not a card.
+  "../components/analysis/DetectorWizard.tsx": { rawButton: 2 },
   "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
   // +1 each for the show-dismissed toggle, which is deliberately the same
   // pill as the preset filters it sits beside — a `Button` there would read as
   // a different kind of control than the row it belongs to.
-  "../components/analysis/InvestigateRail.tsx": { fontSize: 5, rawButton: 3 },
-  "../components/analysis/InvestigateSheet.tsx": { fontSize: 4 },
+  "../components/analysis/InvestigateRail.tsx": { fontSize: 4, rawButton: 2 },
+  "../components/analysis/InvestigateSheet.tsx": { fontSize: 2 },
+  // The knob label and input moved here verbatim from InvestigateSheet, whose
+  // budget dropped by the same two.
+  "../components/analysis/MethodKnobForm.tsx": { fontSize: 2 },
   // +1 button for the per-method mute toggle, which is the same dimmed-at-rest
   // icon affordance as the Settings2 one beside it — a `Button` there would be
   // visually heavier than the row it acts on, the same argument SigmaFindings
   // and FindingGroup carry.
-  "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 4 },
+  "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 3 },
   "../components/analysis/ScopeStrip.tsx": { fontSize: 1, rawButton: 1 },
   // +1 for the log-template blurb, matching the motif blurb above it.
   // +1 button for the section tab, which is a bottom-border tab rather than

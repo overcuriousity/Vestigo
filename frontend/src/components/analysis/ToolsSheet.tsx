@@ -193,7 +193,7 @@ export function ToolsSheet({
           >
             <Plus size={11} /> Add detector
           </Button>
-          <p className="mb-2 text-[11px] text-[var(--color-fg-muted)]">
+          <p className="mb-2 text-xs text-[var(--color-fg-muted)]">
             Only configured detectors run. A method the analysis gate marks not applicable can
             still be configured — the gate is advice.
           </p>

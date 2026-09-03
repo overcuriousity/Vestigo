@@ -20,9 +20,6 @@ the remaining 1.x work by payoff-per-effort:
 6. **D10** / **D16** — heaviest lifts, last of the detector line.
 7. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
    Hayabusa engine half lives in `overcuriousity/hayabusa-processor`.
-8. **Milestone 12** opt-in detectors — the detector wizard; designed 2026-09-03, first
-   UX item ahead of Milestone 3 because the unprompted sweep is what makes beginners
-   dismiss detection as noise.
 
 Milestones 2–3 are polish, picked up opportunistically. Milestone 9 is additive work on
 shipped subsystems. Milestones 6 (streaming ingest) and 7 (forensic examination) are future
@@ -98,9 +95,10 @@ burns its numbers out of that file**; the migration is done when the file is `{}
 - [ ] **Extract a `ui/Callout` primitive.** `EmbeddingStatusBanner`, `UploadDialog`'s
   duplicate warning and others hand-roll the same banner. Distinct from `Card` — a callout
   interrupts, a card contains; they should not collapse into one primitive.
-- [ ] **Just-in-time guidance restructure (Investigate panel).** Absorbed by Milestone 12
-  W3: the wizard's configure step attaches each knob's help text to the control itself.
-  Remaining after that lands: the Normal/Dismiss/Confirm copy in `lib/guidance.tsx`.
+- [ ] **Just-in-time guidance, remaining half.** The detector wizard (2026-09-03) attached
+  each knob's help text to its control. Still in the faintest text in a 320px panel: the
+  Normal/Dismiss/Confirm copy in `lib/guidance.tsx`, taught before anything on screen
+  demonstrates it. Proposed inversion unchanged: attach it to the verdict bar.
 - [ ] **Per-user guidance dismissal.** Collapse state lives in the `vestigo-ui` zustand
   store (`collapsedGuidance`, persisted to localStorage), so it is per-browser. The backend
   half is complete — `PUT /auth/me/preferences` exists with a whitelist and
@@ -528,114 +526,19 @@ Verified on 2026-09-02, and load-bearing for every item:
 exist in both engines, so the same rule can surface twice on an EVTX timeline until W5
 logsource scoping lands. A CLI path: enrichment runs through the web interface only.
 
-## Milestone 12 — opt-in detectors: the detector wizard replaces the unprompted sweep (designed 2026-09-03)
-
-**Diagnosis.** Opening a timeline today runs every applicable method over auto-selected
-fields: up to twelve heavy ClickHouse scans nobody asked for, chosen by a recommender with
-no reliable estimate of benefit, presented as one ranked feed. Beginners read the feed as
-noise and dismiss the subsystem; the three mechanisms built to tame it — the shared mute
-list, the per-user field focus, the preset pills — are three overlapping answers to "which
-detectors run", none of which is *configuring* one. The fix inverts the default: **no
-statistical detector runs unprompted, ever.** An analyst configures each detector through
-a wizard, the configuration is a shared property of the timeline, and the rail runs
-exactly what was configured. Sigma is already opt-in (the rail shows the latest completed
-run, started by hand from the Signatures tab) and is untouched.
-
-Verified on 2026-09-03, and load-bearing for the design:
-
-- **The sweep is entirely client-driven.** `useStreamingSweep` fetches the plan and fans
-  out one `GET …/analysis/findings?method=…` per applicable, unmuted method. There is no
-  server-side "run everything"; the backend has always run one named method with one
-  parameter set. Turning the sweep off is a frontend change plus one persisted list.
-- **The findings endpoint and its cache need no change.** The fingerprint already covers
-  `params`, `frame` and `baseline_id`, so a configured run is cached and shared across
-  members exactly as the sweep's runs are today: first open after configuring pays the
-  scan, every later open hits the cache.
-- **Per-method configuration forms already exist.** `method-registry.ts` describes all
-  twelve methods with their knobs; `InvestigateSheet`'s method mode renders them. The
-  wizard reuses that registry rather than describing a method a second time.
-- **Dispositions are keyed by method plus value or event, never by params**, so a verdict
-  survives reconfiguring the detector that produced it.
-- **Nothing persists "which detectors are on."** `Timeline.muted_methods` (0028) and
-  `User.preferences.analysis_method_focus` exist only to subtract from a sweep that no
-  longer happens. `Timeline.field_overrides` stays: the wizard's "let Vestigo pick" choice
-  consults it exactly as the sweep did.
-
-Decided, not open: one configuration per method per timeline (the column is list-shaped
-so that rule can be lifted later without a migration); the configuration is shared and
-audited, not per analyst; the run happens on open through the existing findings endpoint,
-not through a job; the demo timeline ships pre-configured.
-
-- [ ] **W1 — `Timeline.detectors`.** One JSONB column, a list of entries
-  `{method, params, frame, baseline_id, added_by, added_at}`; `params` is the same object
-  `/analysis/findings` accepts for that method and is validated with the same
-  `METHOD_MODELS` (`extra="forbid"`), so the wizard cannot store what the runner would
-  reject. `frame` and `baseline_id` live in the entry because they are part of what the
-  detector means, not a panel-wide setting; `_validate_scope_args` applies. Uniqueness on
-  `method` is enforced in validation, not in the shape. The same migration drops
-  `muted_methods` and its endpoint, and the focus key is removed from the preferences
-  whitelist. Serialized on the timeline object like `field_overrides`.
-- [ ] **W2 — Endpoints.** In `cases.py` beside field-overrides: `PUT
-  …/timelines/{id}/detectors/{method}` adds or replaces an entry (contribute access,
-  422 on unknown method or rejected params, audited `timeline.set_detector`), `DELETE
-  …/timelines/{id}/detectors/{method}` removes one (audited `timeline.remove_detector`).
-  The plan and findings endpoints are unchanged; the plan is still what the wizard's
-  cards read their verdicts from.
-- [ ] **W3 — The wizard.** A Dialog in `components/analysis/DetectorWizard/`, opened from
-  the rail's empty state, from an always-present "Add detector" in the rail header, and
-  in edit mode from a configured detector's group header. Three steps:
-  1. *Choose.* One card per registry method: a one-line "use this when…" (new registry
-     field), the existing `what` prose on expand, the plan's verdict as a badge (ready /
-     needs a baseline / cannot apply, with `reason_facts` prose) and the plan's cost
-     class so the analyst knows which cards mean a full scan. A `not_applicable` card is
-     still selectable — the gate stays advice. Configured methods show a check and open
-     in edit mode. A last "Signatures (Sigma)" card links to the Signatures tab.
-  2. *Configure.* The method's knob form extracted from `InvestigateSheet`'s `MethodBody`
-     into a shared component. `fields` defaults to "let Vestigo pick" and shows the
-     current auto-selection (declaration applied) so the choice is visible; pin/exclude
-     stays on the chips. Baseline-frame methods get the baseline picker with a link to
-     build one. Every knob carries its help text inline — this is the just-in-time
-     guidance inversion the Milestone 3 item asked for, and closes it.
-  3. *Confirm.* A plain-language summary ("Value novelty over `user` and `process`,
-     comparing to baseline *week before*. Full scan.") and Apply, which writes the entry,
-     closes, and lets the rail fetch it.
-- [ ] **W4 — The rail.** `useStreamingSweep` iterates `timeline.detectors` instead of the
-  plan, one findings query per entry with the stored params, frame and baseline. Cheap-
-  before-heavy ordering, progress denominator, evidence groups, sheet and dispositions
-  unchanged. Group headers name the detector and carry edit and remove. `DetectorMuteStrip`,
-  `MethodFocusStrip`, the preset pills and the "N methods not applicable — run anyway"
-  button go; the empty state becomes "No detectors configured" plus the wizard entry.
-  `ToolsSheet`'s Methods tab becomes the configured list with the same edit and remove;
-  "Run anyway" lives on the wizard's not-applicable cards. The sheet's method mode keeps
-  running a method with ad-hoc knobs without persisting it — that is a different act.
-- [ ] **W5 — Agent parity.** A read-only `list_configured_detectors` tool so the agent can
-  name what the team has set up; `run_anomaly_detector` keeps running ad hoc. MCP
-  exposure follows the existing tool list. `docs/AGENT.md` in the same commit.
-- [ ] **W6 — Demo seed.** `demo/metadata.py` configures four or five detectors on the demo
-  timeline, chosen to hit the scenario's planted anomalies, so first login shows findings
-  and a worked example of what the wizard produces. `test_demo_detector_coverage_clickhouse`
-  additionally asserts every seeded entry validates and produces a finding.
-- [ ] **W7 — Tests.** Migration round-trip on real PostgreSQL (`blank_pg_database`);
-  W2 rejects exactly what `/analysis/findings` rejects (shared fixture over
-  `METHOD_PARAMS`); the registry coverage test extended to the new "use this when" field;
-  vitest on the wizard's step state and the summary sentence; the rail issues no findings
-  query for a timeline with an empty list.
-- [ ] **W8 — Docs.** `ANOMALY_DETECTION.md`: replace "Muting a method" and "Declared
-  fields vs. a personal focus" with "Which detectors run", rewrite the gate section's
-  opening (the gate now advises the wizard, not the sweep), and update every "sweep"
-  reference. `CLAUDE.md` frontend layout paragraph. `CHANGELOG.md` entry naming the
-  removed mute and focus mechanisms as breaking for API clients.
-
-**Not planned here:** several instances of one method on a timeline (the list shape
-allows it; the rail, sheet and query keys would need an instance id threaded through);
-a background job for the initial run (the cache makes it a one-time cost per configuration
-and the sizing docs bound a single scan below the request timeout); any change to the
-legacy `/anomalies` endpoint, the CLI, or the Sigma runner.
-
 ## Standing decisions (with revisit triggers)
 
 Decisions, not work items — each stays as decided unless its trigger fires.
 
+- **Detectors are opt-in; nothing runs unprompted** (2026-09-03, Milestone 12, shipped).
+  One configuration per method per timeline (`Timeline.detectors` is list-shaped so that
+  rule can be lifted without a migration), shared and audited, run on open through the
+  findings cache rather than through a job; the mute list, the per-user focus and the
+  preset pills are gone rather than kept beside it. Trigger for instances: a request to
+  run one method twice with different fields on one timeline — then thread an instance id
+  through the rail, sheet and query keys. Trigger for a job: a single configured scan
+  exceeding the request timeout in the field. Not planned: any change to the legacy
+  `/anomalies` endpoint, the CLI, or the Sigma runner, which stays opt-in on its own tab.
 - **Engine output is enrichment, never a Source and never a detector of its own**
   (2026-09-02, Milestone 11). Timesketch's Hayabusa integration is a CSV profile uploaded
   as a timeline: rows that are verdicts, with no `content_hash`/`byte_offset` into

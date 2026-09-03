@@ -44,7 +44,7 @@ export function DetectorStrip({
           <span
             key={entry.method}
             data-testid={`detector-chip-${entry.method}`}
-            className="flex items-center gap-1 rounded-full border border-[var(--color-border)] px-2 py-0.5 text-[10px] text-[var(--color-fg-secondary)]"
+            className="flex items-center gap-1 rounded-full border border-[var(--color-border)] px-2 py-0.5 text-xs text-[var(--color-fg-secondary)]"
           >
             <meta.icon size={10} className="text-[var(--color-fg-muted)]" />
             {meta.label}

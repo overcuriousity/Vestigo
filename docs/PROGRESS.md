@@ -4,7 +4,31 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-02 (session 223 — the scan-budget divisor in the docs).
+Last updated: 2026-09-03 (session 224 — opt-in detectors, the detector wizard).
+
+## Session 224 — 2026-09-03: opt-in detectors — the wizard replaces the unprompted sweep
+
+Milestone 12, designed and shipped in one session. Opening a timeline used to fan out one
+findings request per applicable method over recommender-chosen fields: up to twelve heavy
+scans nobody asked for, read as noise, and the three mechanisms built to tame it (shared
+mute list, per-user focus, preset pills) none of which *configured* anything. Now nothing
+runs unprompted: `Timeline.detectors` (migration 0034, drops `muted_methods`) holds the
+analyst's configured entries, one per method, each with its own params, frame and
+baseline; `PUT`/`DELETE …/detectors/{method}` validate with the findings endpoint's own
+models and audit every change; `useStreamingSweep` iterates that list. The wizard is a
+three-step dialog reusing `method-registry.ts` (new `useWhen` line per method) and the knob
+form extracted from the sheet into `MethodKnobForm`, with each knob's help text attached
+to the control — which closes the just-in-time guidance item. The demo timeline ships five
+entries, each asserted to find something.
+
+One deviation from the roadmap text: per-detector edit and remove live in a
+`DetectorStrip` above the feed rather than on the evidence-class group headers — the
+groups interleave methods by rank, so a control per detector on a header would either
+split the feed or repeat. The scope-change dialog stopped promising re-runs: entries carry
+their own scope, so a panel scope change touches only ad hoc runs. The new agent tool took
+the tool-schema budget to 42,986 of 43,000; its docstring is one line for that reason.
+
+Verified with the backend and frontend suites (no browser run this session).
 
 ## Session 223 — 2026-09-02: the N trap, documented where it is set
 

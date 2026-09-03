@@ -40,14 +40,37 @@ vi.mock("@/api/analysis", () => ({
   },
 }));
 
+// Nothing runs unprompted: the sweep under test needs every method configured
+// on the timeline, in the shape the real `useTimelineDetectors` reads.
+vi.mock("@/api/timelines", () => ({
+  timelinesApi: {
+    get: async () => ({
+      id: "t1",
+      case_id: "c1",
+      detectors: METHODS.map((m) => ({
+        method: m.id,
+        params: {},
+        frame: "self",
+        baseline_id: null,
+        added_by: null,
+        added_at: "",
+      })),
+    }),
+  },
+}));
+vi.mock("@/api/cases", () => ({ casesApi: { get: async () => ({ id: "c1" }) } }));
+vi.mock("@/lib/caseAccess", () => ({ canContributeToCase: () => true }));
+
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
 describe("useStreamingSweep progress", () => {
-  it("counts every runnable method, not only the ones already dispatched", () => {
+  it("counts every configured method, not only the ones already dispatched", async () => {
     const { result } = renderHook(() => useStreamingSweep("c1", "t1"), { wrapper });
+    await waitFor(() => expect(result.current.total).toBe(METHODS.length));
+    // And still every one of them while the heavy set has not been dispatched.
     expect(result.current.total).toBe(METHODS.length);
   });
 

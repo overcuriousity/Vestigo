@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Detectors are opt-in.** Opening a timeline no longer runs every applicable statistical
+  detector. The Investigate rail runs only the detectors configured on the timeline through
+  the new detector wizard (choose → configure → confirm), stored as a shared, audited list
+  (`Timeline.detectors`, `PUT`/`DELETE …/timelines/{id}/detectors/{method}`, validated with
+  the findings endpoint's own models). Each entry carries its own frame and baseline; the
+  panel scope now applies only to ad hoc runs from the sheet and the Explore tab. The demo
+  case ships five pre-configured. Migration 0034.
+- The agent gains the read-only `list_configured_detectors` tool.
+
+### Removed
+
+- **Breaking for API clients:** `PATCH …/timelines/{id}/muted-methods` and the
+  `muted_methods` timeline field (migration 0034 drops the column); the
+  `analysis_method_focus` user preference; the Investigate rail's preset pills and the
+  "N methods not applicable — run anyway" summary. All of them only subtracted from the
+  unprompted sweep, which no longer exists.
+
 ## [1.18.3] — 2026-09-01
 
 ### Fixed
