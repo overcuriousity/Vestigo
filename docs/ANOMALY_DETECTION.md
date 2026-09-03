@@ -240,17 +240,57 @@ combinations, and a global top-50 could miss the 26th-rarest value of a field. `
 was never what bounded the scan: the `GROUP BY` over the corpus is the cost and
 `HEAVY_SCAN_SETTINGS` bounds it; `LIMIT` only trims what leaves ClickHouse.
 
-How the exact count is produced: `count() OVER ()` in the same statement
-(`count() OVER (PARTITION BY key)` under a `LIMIT n BY key`; `sum(hits) OVER ()` where a
-group fans out into one finding per suspect window). Window functions evaluate after
-`GROUP BY`/`HAVING` and before `ORDER BY`/`LIMIT`, so one scan yields both the page and
-the count — the pattern `list_log_templates` already uses. The rows it holds are the
-post-`HAVING` groups the `ORDER BY` materialises anyway, under the same
-`max_memory_usage` cap, so the failure mode is a loud query error, never a silently short
-number. Suppression is applied in the SQL (`NOT has({allow}, key)`, `NOT has({excl},
-evt_id)` in `HAVING`) so the count is post-suppression; a suppression set larger than
-`_SQL_SUPPRESSION_MAX` (1,000 entries) falls back to the Python-side filter on the page
-and marks the total inexact.
+How the exact count is produced: **a companion count scan beside the page**, not a window
+function. `StatisticalAnomalyService._page_and_total` takes one `core` — the whole grouped
+statement, SELECT list through `HAVING`, and nothing that pages it — and composes both
+statements from it: the page is `core + page_tail` (its `ORDER BY` and `LIMIT`), the total
+is `SELECT {total_select} FROM (core) AS scanned`. `total_select` is `count()`, or
+`sum(hits)` where a group fans out into one finding per suspect window, or `key, count()` /
+`key, sum(hits)` with a `GROUP BY key` tail under a `LIMIT n BY key` page. Composing both
+from one string is the point: a total describing a different filter than the page it
+annotates is worse than no total, and two hand-written statements drift on the first edit
+to a `HAVING`. The two run concurrently under the caller's one gate slot, declaring the
+fan-out (`db/_scan.py::scan_fanout`) so they split its memory cap rather than each taking
+it whole; wall clock stays roughly one scan's and the extra cost is ClickHouse-side.
+Sources are immutable, so both statements see the same data.
+
+**The rule this file carries going forward: a frameless window (`count() OVER ()`) is
+allowed only over a structurally bounded row set — otherwise the count is its own
+aggregate.** These five methods once got their totals from a frameless `OVER ()` in the
+paging statement, on the argument that the window holds only what the `ORDER BY`
+materialises anyway. That argument is wrong: a limit-aware sort keeps top-N, the window
+keeps *every* post-`GROUP BY` row, and window sorts cannot spill (`db/_scan.py`) where the
+`GROUP BY` beneath them can. Here it is worse than the general case — value novelty's
+`HAVING cnt <= rarity_floor` keeps the *rare* values, which on a field like `url` is nearly
+every distinct value in the corpus, and `queries.py::_field_terms_impl` records exactly
+this pattern dying at `max_memory_usage` on exactly the data the query existed for. The
+frameless windows still in `anomaly_stats.py` sit over candidate caps of 1,000–2,000 rows
+or the template set, which is what makes them fine.
+
+Suppression is applied in the SQL (`NOT has({allow}, key)`, `NOT has({excl}, evt_id)` in
+`HAVING`) so the count is post-suppression — and, because both statements come from one
+`core`, in the count as well as the page. A suppression set larger than
+`_SQL_SUPPRESSION_MAX` (1,000 entries) falls back to the Python-side filter on the page and
+marks the total inexact.
+
+Two further sources of inexactness, both disclosed rather than silent:
+
+- **Dismissed findings.** `_apply_dismissals` (`api/routers/events.py`) subtracts what it
+  dropped from `total_findings`, because a dismissal that shrinks the page but not the
+  count made the rail's "showing N of M" row fire for findings the analyst had already
+  dealt with. Only dismissals *on the page* are knowable — matching runs on serialized
+  findings — so the residue can leave the total slightly high, never low. Pushing
+  dismissals into the detector SQL would make it exact and is deliberately not done:
+  dismissal stays presentation-only and out of the reproducibility hash.
+- **Rows the Python loop discards after the scan.** Charset counts what its SQL returned;
+  its loop then drops rows the SQL's own filters make unreachable. It counts those drops
+  anyway, and a non-zero count appends an inexactness reason — so a reachable one says so
+  instead of stranding a permanent "showing N of M" row.
+
+The reason a total is inexact is served as `total_findings_note` alongside
+`total_findings_exact`, not only in `warnings`: runners append these reasons *after* every
+other caveat, so a client reading `warnings[0]` on a temporal run gets a window-size
+caveat instead. The rail reads the note.
 
 The one hard limit that remains is hydration: `get_events_by_ids` binds one parameter per
 id, so representative events are fetched in chunks of `_HYDRATE_CHUNK` (500). The display
@@ -453,9 +493,17 @@ resets what a timeline declares.
 ### The analysis cache
 
 `GET .../analysis/findings` is memoized in `analysis_cache`, keyed on a SHA-256 of
-everything that can change an answer: the timeline, the sorted set of source content
-hashes, the enrichment generation, the frame and baseline, the method, its canonical
-params, the row `limit`, and `dispositions_hash`.
+everything that can change an answer: `CACHE_VERSION`, the timeline, the sorted set of
+source content hashes, the enrichment generation, the frame and baseline, the method, its
+canonical params, the row `limit`, and `dispositions_hash`.
+
+`CACHE_VERSION` (`db/analysis_cache.py`) is the one input that is not about the data. It
+is bumped whenever the *meaning* of a stored payload changes rather than its inputs —
+because the key is otherwise a complete description of the question, a row cached under
+the old meaning stays a hit forever. Version 2 is what retired the rows cached before
+`total_findings` became an exact count: they carry a page-length total and no
+`total_findings_exact`, which clients default to `true`, so serving one would report a
+truncated count as exact. Bump it in the same commit as any such change.
 
 Five of those inputs are not request parameters, and each closes a way of being served a
 wrong answer as proof:

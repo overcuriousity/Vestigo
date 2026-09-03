@@ -4,8 +4,72 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 229 — exact finding totals: five detectors stopped
-reporting the page size as the count, and the rail says what it is not showing).
+Last updated: 2026-09-03 (session 230 — the exact total comes from a scan that can spill,
+plus seven smaller fixes from the PR #349 review).
+
+## Session 230 — 2026-09-03: an exact total that survives a big corpus
+
+`/code-review 349` found eight defects in the previous session's work. The one worth the
+session was how the exact count was produced. Session 229 read it off a frameless
+`count() OVER ()` in the paging statement, at ten sites, on the argument that the window
+holds only what the `ORDER BY` materialises anyway. That argument is wrong: a limit-aware
+sort keeps top-N, a frameless window keeps *every* post-`GROUP BY` row, and window sorts
+cannot spill where the `GROUP BY` beneath them can (`db/_scan.py`; `queries.py`'s
+`_field_terms_impl` records this exact pattern dying at `max_memory_usage`). Value
+novelty makes it worse rather than better — `HAVING cnt <= rarity_floor` keeps the *rare*
+values, which on a field like `url` is nearly every distinct value in the corpus. So the
+badge that was wrong at 50 would have become a query error at scale.
+
+Three options were weighed with the user: a companion count query per site (always exact,
+a second corpus scan), a bounded window reporting `total_findings_exact: false` above a
+50,000-row ceiling (one scan, exact in every realistic case), or keeping the window and
+retrying on `MEMORY_LIMIT_EXCEEDED`. **The user chose the companion query**, explicitly:
+accurate readings within available resources, extra SQL queries acceptable.
+
+The duplication hazard that made the companion query unattractive — ten hand-written
+statement *pairs* whose `WHERE`/`GROUP BY`/`HAVING` must agree forever — is solved in
+code rather than by discipline. `StatisticalAnomalyService._page_and_total` takes one
+`core` and composes both statements from it: the page is `core + page_tail`, the total is
+`SELECT {total_select} FROM (core) AS scanned`. They cannot drift. The two run
+concurrently under the caller's one gate slot, declaring `scan_fanout(2)` so they split
+its memory cap rather than each taking it whole, so wall clock stays roughly one scan's
+and the extra cost is ClickHouse-side. `ANOMALY_DETECTION.md` now describes that
+mechanism and carries the rule it implies: **a frameless window is allowed only over a
+structurally bounded row set; otherwise the count is its own aggregate.** The four
+`OVER ()` uses left in `anomaly_stats.py` sit over candidate caps of 1,000–2,000 rows or
+the template set, which is what makes them fine.
+
+The other seven, briefly. `analysis_cache` had no version, so every row cached before
+session 229 stayed a hit forever and served a page-length total with no
+`total_findings_exact` — which clients default to `true`; `CACHE_VERSION = 2` now folds
+into the fingerprint. Dismissals shrank the page but not the total, firing the rail's
+"showing N of M" row for findings the analyst had already dealt with — `_apply_dismissals`
+subtracts what it dropped, with the residue documented (only on-page dismissals are
+knowable, so the error can only leave the total slightly high). Charset counted rows its
+Python loop then discarded; the three `continue` paths increment a counter and a non-zero
+one appends an inexactness reason, so an unreachable path that becomes reachable says so
+instead of stranding a permanent truncation row. The inexactness tooltip showed
+`warnings[0]`, which on a temporal run is a window-size caveat — the reason now travels as
+its own `total_findings_note` through to `DetectorStrip`. The batched attribute pass
+double-counted a key reachable by two field tokens (`user` and `attr:user`); it returns a
+total per key and the caller sums once. A `row_ceiling_hit` warning said "ordered by
+novelty" for a scan ordered by score. And the frontend's page-size store was keyed by
+method alone, so "Show more" in the sheet re-ran the rail's separately-scoped detector; it
+is now keyed by `pageKeyOf(method, scope, params)`, the same identity the query uses.
+
+`tests/test_anomaly_stats.py`'s `FakeClient` was FIFO — one canned response per `query()`
+call, regardless of SQL. Two statements per scan broke 25 tests, and running them in two
+threads made the pop order non-deterministic besides. The fake now dispatches on content
+(the companion is recognisable by its `) AS scanned` alias), answers totals from their own
+seed, and takes a lock; page and totals statements are recorded separately so index-based
+assertions read as they did. The shape tests that asserted a `count() OVER ()` now assert
+the suppression reached **both** statements — the property `_page_and_total` exists to
+guarantee — and it has a unit test of its own.
+
+Verified: `tests/test_anomaly_stats.py` 231 passed; the ClickHouse totals suites
+(`test_value_combo_totals_clickhouse.py`, `test_novelty_batched_clickhouse.py`,
+`test_charset_group_field_clickhouse.py`) and `test_analysis_cache.py` 52 passed; frontend
+`tsc -b --noEmit` clean and 1275 vitest tests passing; `ruff check`/`format --check` clean.
 
 ## Session 229 — 2026-09-03: `total_findings` means what it says
 
