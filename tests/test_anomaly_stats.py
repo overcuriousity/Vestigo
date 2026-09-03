@@ -2362,8 +2362,8 @@ def test_range_self_baseline_iqr_flags_outliers():
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
-            result_rows=[(9000.0, 2, fs, "evt-hi")],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            result_rows=[(9000.0, 2, fs, "evt-hi", 1)],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2397,9 +2397,9 @@ def test_range_temporal_uses_baseline_minmax():
         # baseline min=10, max=500, n=300
         FakeQueryResult(result_rows=[(10.0, 500.0, 300)], column_names=["lo", "hi", "n"]),
         FakeQueryResult(
-            # val, cnt, first_seen, evt_id, win_idx
-            result_rows=[(9999.0, 1, fs, "evt-x", 0)],
-            column_names=["val", "cnt", "first_seen", "evt_id", "win_idx"],
+            # val, cnt, first_seen, evt_id, win_idx, n_total
+            result_rows=[(9999.0, 1, fs, "evt-x", 0, 1)],
+            column_names=["val", "cnt", "first_seen", "evt_id", "win_idx", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2421,10 +2421,10 @@ def test_range_excludes_normal_marked_events():
         FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
             result_rows=[
-                (9000.0, 1, fs, "evt-drop"),
-                (8000.0, 1, fs, "evt-keep"),
+                (9000.0, 1, fs, "evt-drop", 2),
+                (8000.0, 1, fs, "evt-keep", 2),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2432,6 +2432,63 @@ def test_range_excludes_normal_marked_events():
         "c1", ["s1"], fields=["attr:bytes"], exclude_event_ids={"evt-drop"}
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
+
+
+def test_range_total_is_the_sql_count_and_page_is_at_least_the_limit():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(9000.0 + i, 1, fs, f"e{i}", 640) for i in range(80)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_range_violations(
+        "c1",
+        ["s1"],
+        fields=["attr:bytes"],
+        limit=80,
+        allowlist={("attr:bytes", "9000.0")},
+        exclude_event_ids={"e5"},
+    )
+    assert len(result.results) == 78  # page-level pass drops the two the fake ignored
+    assert result.total_findings == 640
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    assert "count() OVER () AS n_total" in sql
+    # A float key: `str(9000.0)` and ClickHouse's `toString(9000.)` disagree, so
+    # the allowlist binds as numbers and compares as numbers.
+    assert "NOT has({allow:Array(Float64)}, val)" in sql
+    assert p["allow"] == [9000.0]
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+
+
+def test_range_total_sums_across_fields():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(9000.0, 1, fs, "e1", 30)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+            FakeQueryResult(result_rows=[(1.0, 2.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(50.0, 1, fs, "e2", 12)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes", "attr:ms"])
+    assert result.total_findings == 42
 
 
 def test_recommend_numeric_fields_filters_by_ratio():
@@ -2669,10 +2726,10 @@ def test_entropy_self_baseline_iqr_flags_both_directions():
         FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
             result_rows=[
-                ("kq3v9xz2m8w1", 5.5, 3, fs, "evt-dga"),
-                ("aaaaaaaaaaaa", 0.1, 7, fs, "evt-pad"),
+                ("kq3v9xz2m8w1", 5.5, 3, fs, "evt-dga", 2),
+                ("aaaaaaaaaaaa", 0.1, 7, fs, "evt-pad", 2),
             ],
-            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2712,9 +2769,9 @@ def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(result_rows=[(2.0, 2.5, 100)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
-            # val, ent, cnt, first_seen, evt_id, win_idx
-            result_rows=[("x9k2q8vz", 4.9, 1, fs, "evt-hi", 0)],
-            column_names=["val", "ent", "cnt", "first_seen", "evt_id", "win_idx"],
+            # val, ent, cnt, first_seen, evt_id, win_idx, n_total
+            result_rows=[("x9k2q8vz", 4.9, 1, fs, "evt-hi", 0, 1)],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id", "win_idx", "n_total"],
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
@@ -2743,10 +2800,10 @@ def test_entropy_excludes_normal_marked_events():
         FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
         FakeQueryResult(
             result_rows=[
-                ("zzzz11119999", 5.9, 1, fs, "evt-drop"),
-                ("q8m2x7c4v1n6", 5.5, 1, fs, "evt-keep"),
+                ("zzzz11119999", 5.9, 1, fs, "evt-drop", 2),
+                ("q8m2x7c4v1n6", 5.5, 1, fs, "evt-keep", 2),
             ],
-            column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "ent", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
@@ -2755,6 +2812,40 @@ def test_entropy_excludes_normal_marked_events():
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
     assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+def test_entropy_total_is_the_sql_count_and_suppression_is_bound():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(f"v{i:011d}", 5.5, 1, fs, f"e{i}", 900) for i in range(50)],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers(
+        "c1",
+        ["s1"],
+        fields=["attr:host"],
+        limit=80,
+        allowlist={("attr:host", "known-random")},
+        exclude_event_ids={"e-x"},
+    )
+    assert len(result.results) == 50
+    assert result.total_findings == 900
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    assert "count() OVER () AS n_total" in sql
+    assert "NOT has({allow:Array(String)}, val)" in sql
+    assert p["allow"] == ["known-random"]
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
 
 
 # ---------------------------------------------------------------------------

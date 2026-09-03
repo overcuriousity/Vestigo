@@ -1218,8 +1218,9 @@ def _sql_suppression(
     *,
     key_expr: str | None,
     evt_expr: str | None,
-    allow_keys: list[str],
+    allow_keys: list[Any],
     exclude_event_ids: set[str] | None,
+    allow_type: str = "String",
 ) -> tuple[str, list[str]]:
     """Bind suppression into a detector scan so its count is post-suppression.
 
@@ -1236,14 +1237,16 @@ def _sql_suppression(
     column each) passes ``evt_expr=None``: the ids are still bound as
     ``params["excl"]`` when they fit, and the caller writes its own per-window
     ``NOT has({excl:Array(String)}, w{i}_evt)`` — testing ``"excl" in params``
-    to know whether it may.
+    to know whether it may. *allow_type* is the ClickHouse type the allowlist
+    binds as: a numeric key must compare as a number, since ``str(9000.0)``
+    and ``toString(9000.)`` disagree.
     """
     clauses: list[str] = []
     reasons: list[str] = []
     if allow_keys and key_expr is not None:
         if len(allow_keys) <= _SQL_SUPPRESSION_MAX:
             params["allow"] = list(allow_keys)
-            clauses.append(f"NOT has({{allow:Array(String)}}, {key_expr})")
+            clauses.append(f"NOT has({{allow:Array({allow_type})}}, {key_expr})")
         else:
             reasons.append(
                 f"allowlist ({len(allow_keys):,} entries) exceeds the "
@@ -1771,6 +1774,8 @@ class StatisticalAnomalyService:
         allowlist: set[tuple[str, str]] | None = None,
         warnings: list[str] | None = None,
         windows: AnalysisWindows | None = None,
+        total_findings: int | None = None,
+        total_findings_exact: bool = True,
     ) -> StatAnomalyResult:
         """Rank, suppress, cap and hydrate a per-field detector's findings.
 
@@ -1780,6 +1785,12 @@ class StatisticalAnomalyService:
         dropped, findings are sorted by score descending, capped to
         ``limit``, and their representative events are hydrated in one batch
         before returning an ``ok`` result.
+
+        *total_findings* is the exact count a scan produced in SQL (see
+        docs/ANOMALY_DETECTION.md §"Totals and truncation"); when ``None``
+        the findings list is taken to be the whole scored pool — true for the
+        candidate-capped methods, whose caps warn on their own — and its
+        post-suppression length is the total.
         """
         windows_payload = windows.payload() if windows is not None else None
         if evaluated_fields == 0:
@@ -1807,7 +1818,8 @@ class StatisticalAnomalyService:
             results=results,
             warnings=warnings or [],
             windows=windows_payload,
-            total_findings=len(findings),
+            total_findings=len(findings) if total_findings is None else total_findings,
+            total_findings_exact=total_findings_exact,
         )
 
     def field_inventory(
@@ -3066,6 +3078,11 @@ class StatisticalAnomalyService:
 
         all_findings: list[RangeFinding] = []
         evaluated_fields = 0
+        # Per-field page is at least `limit` (a global top-N may be N values of
+        # one field); `n_total` sums each field's exact SQL count.
+        page = max(per_field_limit, limit)
+        n_total = 0
+        inexact: list[str] = []
 
         for field_token in scan_fields:
             # --- Learn the band from the baseline. ---
@@ -3123,7 +3140,24 @@ class StatisticalAnomalyService:
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
             viol_params["hi"] = upper
-            viol_params["plim"] = per_field_limit
+            viol_params["plim"] = page
+            # Allowlist values are `str(float)`; bind them back as numbers so
+            # the SQL compares what the finding compared.
+            allow_nums: list[float] = []
+            for raw in _sql_allow_keys(allowlist, field_token):
+                try:
+                    allow_nums.append(float(raw))
+                except ValueError:
+                    continue
+            suppress, field_inexact = _sql_suppression(
+                viol_params,
+                key_expr="val",
+                evt_expr="evt_id",
+                allow_keys=allow_nums,
+                exclude_event_ids=exclude_event_ids,
+                allow_type="Float64",
+            )
+            inexact += field_inexact
             win_idx_col = ""
             win_idx_group = ""
             detect_clause = ""
@@ -3137,12 +3171,15 @@ class StatisticalAnomalyService:
                 win_idx_col = f", {_suspect_multiif(viol_sps)} AS win_idx"
                 win_idx_group = ", win_idx"
                 detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+            # `n_total` counts every violating (value[, window]) after
+            # suppression — the exact finding count — in the same statement.
             viol_sql = f"""
                 SELECT
                     num AS val,
                     count() AS cnt,
                     min({eff}) AS first_seen,
-                    toString(argMin(event_id, {eff})) AS evt_id{win_idx_group}
+                    toString(argMin(event_id, {eff})) AS evt_id{win_idx_group},
+                    count() OVER () AS n_total
                 FROM (
                     SELECT toFloat64OrNull({vcol}) AS num, timestamp, event_id{off_src}{win_idx_col}
                     FROM {db}.events
@@ -3152,18 +3189,20 @@ class StatisticalAnomalyService:
                 )
                 WHERE num IS NOT NULL AND (num < {{lo:Float64}} OR num > {{hi:Float64}})
                 GROUP BY val{win_idx_group}
+                HAVING 1{suppress}
                 ORDER BY greatest({{lo:Float64}} - val, val - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
                 {heavy_scan_settings()}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            n_total += int(vrows[0][-1]) if vrows else 0
 
             for vrow in vrows:
                 if windows is None:
-                    val, cnt, first_seen, evt_id = vrow
+                    val, cnt, first_seen, evt_id = vrow[:4]
                     window: TimeWindow | None = None
                 else:
-                    val, cnt, first_seen, evt_id, win_idx = vrow
+                    val, cnt, first_seen, evt_id, win_idx = vrow[:5]
                     wi = int(win_idx)
                     window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 if val is None:
@@ -3225,24 +3264,21 @@ class StatisticalAnomalyService:
                 windows=windows.payload() if windows is not None else None,
             )
 
-        all_findings = _apply_allowlist(all_findings, allowlist)
-        if exclude_event_ids:
-            all_findings = [
-                f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
-            ]
-
-        all_findings.sort(key=lambda f: f.score, reverse=True)
-        results = all_findings[:limit]
-        self._hydrate_finding_events(case_id, source_ids, results)
-        return StatAnomalyResult(
-            status="ok",
+        return self._finalize_findings(
+            all_findings,
             detector="numeric_range",
             method=method,
-            baseline_size=total_events,
-            results=results,
-            warnings=override_notes,
-            windows=windows.payload() if windows is not None else None,
-            total_findings=len(all_findings),
+            total_events=total_events,
+            evaluated_fields=evaluated_fields,
+            allowlist=allowlist,
+            warnings=[*override_notes, *dict.fromkeys(inexact)],
+            windows=windows,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            total_findings=n_total,
+            total_findings_exact=not inexact,
         )
 
     # ------------------------------------------------------------------
@@ -4199,6 +4235,11 @@ class StatisticalAnomalyService:
         # (MEMORY_LIMIT_EXCEEDED in production). arrayReduce is linear in both.
         all_findings: list[EntropyFinding] = []
         evaluated_fields = 0
+        # Per-field page is at least `limit` (a global top-N may be N values of
+        # one field); `n_total` sums each field's exact SQL count.
+        page = max(per_field_limit, limit)
+        n_total = 0
+        inexact: list[str] = []
 
         for field_token in scan_fields:
             # --- Learn the entropy band from the baseline. ---
@@ -4246,7 +4287,15 @@ class StatisticalAnomalyService:
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
             viol_params["hi"] = upper
-            viol_params["plim"] = per_field_limit
+            viol_params["plim"] = page
+            suppress, field_inexact = _sql_suppression(
+                viol_params,
+                key_expr="val",
+                evt_expr="evt_id",
+                allow_keys=_sql_allow_keys(allowlist, field_token),
+                exclude_event_ids=exclude_event_ids,
+            )
+            inexact += field_inexact
             win_idx_sel = ""
             win_idx_group = ""
             detect_clause = ""
@@ -4258,8 +4307,11 @@ class StatisticalAnomalyService:
                 win_idx_sel = f", {_suspect_multiif(viol_sps)} AS win_idx"
                 win_idx_group = ", win_idx"
                 detect_clause = f" AND ({' OR '.join(viol_sps)}) AND {VESTIGO_NOT_SENTINEL_SQL}"
+            # `n_total`: every out-of-band (value[, window]) after suppression,
+            # counted in the same statement — the exact finding count.
             viol_sql = f"""
-                SELECT val, ent, cnt, first_seen, evt_id{win_idx_group}
+                SELECT val, ent, cnt, first_seen, evt_id{win_idx_group},
+                       count() OVER () AS n_total
                 FROM (
                     SELECT
                         val,
@@ -4279,19 +4331,20 @@ class StatisticalAnomalyService:
                         GROUP BY val{win_idx_group}
                     )
                 )
-                WHERE ent < {{lo:Float64}} OR ent > {{hi:Float64}}
+                WHERE (ent < {{lo:Float64}} OR ent > {{hi:Float64}}){suppress}
                 ORDER BY greatest({{lo:Float64}} - ent, ent - {{hi:Float64}}) DESC, first_seen ASC
                 LIMIT {{plim:UInt32}}
                 {heavy_scan_settings()}
             """
             vrows = self.ch.client.query(viol_sql, parameters=viol_params).result_rows
+            n_total += int(vrows[0][-1]) if vrows else 0
 
             for vrow in vrows:
                 if windows is None:
-                    val, ent, cnt, first_seen, evt_id = vrow
+                    val, ent, cnt, first_seen, evt_id = vrow[:5]
                     window: TimeWindow | None = None
                 else:
-                    val, ent, cnt, first_seen, evt_id, win_idx = vrow
+                    val, ent, cnt, first_seen, evt_id, win_idx = vrow[:6]
                     wi = int(win_idx)
                     window = windows.suspects[wi] if 0 <= wi < len(windows.suspects) else None
                 if not val or ent is None:
@@ -4354,12 +4407,14 @@ class StatisticalAnomalyService:
             total_events=total_events,
             evaluated_fields=evaluated_fields,
             allowlist=allowlist,
-            warnings=override_notes,
+            warnings=[*override_notes, *dict.fromkeys(inexact)],
             windows=windows,
             exclude_event_ids=exclude_event_ids,
             limit=limit,
             case_id=case_id,
             source_ids=source_ids,
+            total_findings=n_total,
+            total_findings_exact=not inexact,
         )
 
     # ------------------------------------------------------------------

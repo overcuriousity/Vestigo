@@ -1126,6 +1126,12 @@ distinct violating value.
   trust. If every scanned field is skipped, the status is `insufficient_data`.
 - Rare ≠ malicious, as everywhere: a legitimate large file transfer and an
   exfiltration both produce a large `bytes` value.
+- **Totals are exact and the page is the true top-N.** Each field's scan orders
+  by distance out of band (monotone in the score), pages at least `limit` rows,
+  and counts every violating value after suppression in the same statement
+  (`count() OVER ()`); the allowlist binds as numbers, since `str(9000.0)` and
+  ClickHouse's `toString(9000.)` disagree. See the
+  [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ---
 
@@ -1323,6 +1329,11 @@ baseline size in `details`.
   `insufficient_data`.
 - Rare ≠ malicious, as everywhere: a CDN hostname and a DGA domain can score
   identically. It ranks for triage.
+- **Totals are exact and the page is the true top-N.** Each field's scan orders
+  by distance out of band (monotone in the score), pages at least `limit` rows,
+  and counts every out-of-band value after suppression in the same statement
+  (`count() OVER ()`). See the
+  [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ---
 
