@@ -211,6 +211,101 @@ half — how to size the budget and read what resolved — is
   math on the raw column (a uniform per-source shift cancels within a source), and
   only the reported timestamps are shifted for display.
 
+### Totals and truncation: what `total_findings` promises
+
+Every findings response carries `results` (the page) and `total_findings` (the count).
+The contract, for every method:
+
+- **`total_findings` is the exact number of findings the method produced across the
+  full analysed scope, after allowlist and normal-event suppression, before the display
+  cap.** It is a fact about the data, not about the page. A method whose scan cannot
+  supply that number exactly sets `total_findings_exact: false` and attaches a warning
+  naming why; a client renders such a count as "N+", never as "N".
+- **`results` is the top-`limit` by score, and that ranking is the true top-`limit`.**
+  Every SQL that pages must order by an expression monotone in the score it reports, and
+  a per-field or per-group page budget is at least the global `limit` — a global top-50
+  may legitimately be 50 values from one field.
+- **The only truncation that is not a display cap is a candidate cap, and it warns.**
+  The candidate-enumerating methods (proportion shift, interval periodicity, distribution
+  drift, sequence novelty, sequence motif) bound how many candidates they score
+  (1,000–2,000 per field or source) because that enumeration *is* the scan; hitting the
+  cap attaches a warning, and `total_findings` is then exact relative to the disclosed
+  pool.
+
+Why this needs saying: before this contract landed, five methods (value novelty and its batched attribute
+pass, value combos, numeric range, charset, entropy) put a small `LIMIT` — the request
+limit, or 25 per field — into the aggregation itself and reported the size of what came
+back as the total. The count badge read "50" for a corpus with forty thousand rare
+combinations, and a global top-50 could miss the 26th-rarest value of a field. `LIMIT`
+was never what bounded the scan: the `GROUP BY` over the corpus is the cost and
+`HEAVY_SCAN_SETTINGS` bounds it; `LIMIT` only trims what leaves ClickHouse.
+
+How the exact count is produced: **a companion count scan beside the page**, not a window
+function. `StatisticalAnomalyService._page_and_total` takes one `core` — the whole grouped
+statement, SELECT list through `HAVING`, and nothing that pages it — and composes both
+statements from it: the page is `core + page_tail` (its `ORDER BY` and `LIMIT`), the total
+is `SELECT {total_select} FROM (core) AS scanned`. `total_select` is `count()`, or
+`sum(hits)` where a group fans out into one finding per suspect window, or `key, count()` /
+`key, sum(hits)` with a `GROUP BY key` tail under a `LIMIT n BY key` page. Composing both
+from one string is the point: a total describing a different filter than the page it
+annotates is worse than no total, and two hand-written statements drift on the first edit
+to a `HAVING`. The two run concurrently under the caller's one gate slot, declaring the
+fan-out (`db/_scan.py::scan_fanout`) so they split its memory cap rather than each taking
+it whole: each carries half the slot's `max_memory_usage`, spills at half the usual
+thresholds, and runs at half the slot's `max_threads` — the heavy width is `cores // N` so
+that a full gate exactly saturates the box, and two statements at it under one slot would
+make a full gate of paged detectors twice the machine (the chart lane is exempt from the
+thread half by the argument in `_scan.py::detect_foreground_max_threads`). The `GROUP BY`
+beneath both is the spillable path that makes the memory half hold.
+The declaration only divides a clause built while it is in effect, so the clause is built
+inside it — `tests/test_anomaly_stats.py` asserts the halved cap on the SQL that leaves
+the service, because a clause built one line earlier ships the full cap twice and nothing
+but an OOM would say so. Wall clock stays roughly one scan's and the extra cost is
+ClickHouse-side. Sources are immutable, so both statements see the same data.
+
+**The rule this file carries going forward: a frameless window (`count() OVER ()`) is
+allowed only over a structurally bounded row set — otherwise the count is its own
+aggregate.** These five methods once got their totals from a frameless `OVER ()` in the
+paging statement, on the argument that the window holds only what the `ORDER BY`
+materialises anyway. That argument is wrong: a limit-aware sort keeps top-N, the window
+keeps *every* post-`GROUP BY` row, and window sorts cannot spill (`db/_scan.py`) where the
+`GROUP BY` beneath them can. Here it is worse than the general case — value novelty's
+`HAVING cnt <= rarity_floor` keeps the *rare* values, which on a field like `url` is nearly
+every distinct value in the corpus, and `queries.py::_field_terms_impl` records exactly
+this pattern dying at `max_memory_usage` on exactly the data the query existed for. The
+frameless windows still in `anomaly_stats.py` sit over candidate caps of 1,000–2,000 rows
+or the template set, which is what makes them fine.
+
+Suppression is applied in the SQL (`NOT has({allow}, key)`, `NOT has({excl}, evt_id)` in
+`HAVING`) so the count is post-suppression — and, because both statements come from one
+`core`, in the count as well as the page. A suppression set larger than
+`_SQL_SUPPRESSION_MAX` (1,000 entries) falls back to the Python-side filter on the page and
+marks the total inexact.
+
+Two further sources of inexactness, both disclosed rather than silent:
+
+- **Dismissed findings.** `_apply_dismissals` (`api/routers/events.py`) subtracts what it
+  dropped from `total_findings`, because a dismissal that shrinks the page but not the
+  count made the rail's "showing N of M" row fire for findings the analyst had already
+  dealt with. Only dismissals *on the page* are knowable — matching runs on serialized
+  findings — so the residue can leave the total slightly high, never low. Pushing
+  dismissals into the detector SQL would make it exact and is deliberately not done:
+  dismissal stays presentation-only and out of the reproducibility hash.
+- **Rows the Python loop discards after the scan.** Charset counts what its SQL returned;
+  its loop then drops rows the SQL's own filters make unreachable. It counts those drops
+  anyway, and a non-zero count appends an inexactness reason — so a reachable one says so
+  instead of stranding a permanent "showing N of M" row.
+
+The reason a total is inexact is served as `total_findings_note` alongside
+`total_findings_exact`, not only in `warnings`: runners append these reasons *after* every
+other caveat, so a client reading `warnings[0]` on a temporal run gets a window-size
+caveat instead. The rail reads the note.
+
+The one hard limit that remains is hydration: `get_events_by_ids` binds one parameter per
+id, so representative events are fetched in chunks of `_HYDRATE_CHUNK` (500). The display
+cap (`limit`, 50 by default, 80 from the Investigate rail, 500 at the API) exists for
+triage and payload, not for the scan.
+
 ### The analysis gate: which methods are offered up front
 
 No statistical method runs unprompted. The Investigate rail runs exactly the detectors an
@@ -407,9 +502,17 @@ resets what a timeline declares.
 ### The analysis cache
 
 `GET .../analysis/findings` is memoized in `analysis_cache`, keyed on a SHA-256 of
-everything that can change an answer: the timeline, the sorted set of source content
-hashes, the enrichment generation, the frame and baseline, the method, its canonical
-params, the row `limit`, and `dispositions_hash`.
+everything that can change an answer: `CACHE_VERSION`, the timeline, the sorted set of
+source content hashes, the enrichment generation, the frame and baseline, the method, its
+canonical params, the row `limit`, and `dispositions_hash`.
+
+`CACHE_VERSION` (`db/analysis_cache.py`) is the one input that is not about the data. It
+is bumped whenever the *meaning* of a stored payload changes rather than its inputs —
+because the key is otherwise a complete description of the question, a row cached under
+the old meaning stays a hit forever. Version 2 is what retired the rows cached before
+`total_findings` became an exact count: they carry a page-length total and no
+`total_findings_exact`, which clients default to `true`, so serving one would report a
+truncated count as exact. Bump it in the same commit as any such change.
 
 Five of those inputs are not request parameters, and each closes a way of being served a
 wrong answer as proof:
@@ -748,6 +851,15 @@ columns and mapped canonical fields. The highest-coverage recommended fields
 win the cap; you can always override with an explicit field list via the
 Fields picker to scan something the auto-selector skipped.
 
+**Each field's page is at least the request `limit`** (`stat_per_field_limit`
+is a floor, not a cap): a global top-50 may legitimately be 50 values of one
+field, and the old 25-per-field budget silently dropped the 26th-rarest.
+`total_findings` sums every scanned field's exact post-suppression count, taken
+by a companion count statement over the same `core` as the page (`count()`
+grouped by key in the batched pass, one `count()` per residual field, `sum(hits)`
+in temporal mode) — never by a frameless window in the paging statement, per the
+[totals contract](#totals-and-truncation-what-total_findings-promises).
+
 **The ranking is a total order, deliberately.** Coverage ties are the normal
 case — every field of one source covers exactly that source's events — so
 recommended-then-coverage alone leaves the tie order to whatever the inventory
@@ -777,6 +889,16 @@ surprise score are computed per *combination*. Both modes carry over unchanged �
 self-baseline flags combinations appearing ≤ the rarity floor; temporal flags
 combinations absent from the baseline window but present after the split. The
 score is the same `−log(count / total events)`.
+
+**Totals and paging** follow the [contract above](#totals-and-truncation-what-total_findings-promises):
+`total_findings` is the exact number of rare combinations across the scope, counted
+by a companion statement over the same `core` as the page (`count()`; in temporal mode
+`sum(hits)`, one hit per suspect window a combination appears in) after the allowlist
+and normal-marked representatives have been bound into the `HAVING` both share. Temporal mode pages by each
+combination's *best* per-window score — the smallest `count / window total` over its
+hit windows — so the top-`limit` groups hold the true top-`limit` findings; ordering
+by the summed window counts, as it did before, could rank a combination hit twice in
+a large window above one hit once in a small one.
 
 **Field selection differs in one way:** you must give it at least two fields (the
 picker enforces 2–4). Auto mode does **not** enumerate every pair — with 15
@@ -1062,6 +1184,12 @@ distinct violating value.
   trust. If every scanned field is skipped, the status is `insufficient_data`.
 - Rare ≠ malicious, as everywhere: a legitimate large file transfer and an
   exfiltration both produce a large `bytes` value.
+- **Totals are exact and the page is the true top-N.** Each field's scan orders
+  by distance out of band (monotone in the score), pages at least `limit` rows,
+  and counts every violating value after suppression in a companion statement
+  over the same `core`; the allowlist binds as numbers, since `str(9000.0)` and
+  ClickHouse's `toString(9000.)` disagree. See the
+  [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ---
 
@@ -1117,6 +1245,16 @@ temporal mode a novel character was never seen at all, so each contributes the
 +1-smoothed maximum `log(distinct_values + 1)`. Findings carry the novel
 characters *and their unicode codepoints* (`U+0000`, …) in `details`, so
 invisible characters are visible in the report.
+
+The same sum is evaluated **in the SQL** — the rare characters and their
+distinct-value counts ride in as parallel array parameters (per group, plus the
+fallback's, in grouped runs) — and the scan orders by it, so the page is the true
+top-`limit` by the score each finding reports. It used to order by how many novel
+characters a value contained, which is only a proxy: one never-seen character can
+outscore two rare ones. Each field's page is at least `limit` (per group under
+`group_field`) and `total_findings` is the exact post-suppression count from a
+companion statement over the same `core`, per the
+[totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ### Caveats
 
@@ -1259,6 +1397,11 @@ baseline size in `details`.
   `insufficient_data`.
 - Rare ≠ malicious, as everywhere: a CDN hostname and a DGA domain can score
   identically. It ranks for triage.
+- **Totals are exact and the page is the true top-N.** Each field's scan orders
+  by distance out of band (monotone in the score), pages at least `limit` rows,
+  and counts every out-of-band value after suppression in a companion statement
+  over the same `core`. See the
+  [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ---
 

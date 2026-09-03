@@ -2919,6 +2919,12 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "warnings": list(getattr(result, "warnings", []) or []),
         "windows": getattr(result, "windows", None),
         "total_findings": getattr(result, "total_findings", 0),
+        # The totals contract (docs/ANOMALY_DETECTION.md): a count the runner
+        # could not make exact is flagged, and a client renders it as "N+"
+        # with the note as its reason. The note is in `warnings` too, but not
+        # findable there — the reasons are appended after every other caveat.
+        "total_findings_exact": bool(getattr(result, "total_findings_exact", True)),
+        "total_findings_note": getattr(result, "total_findings_note", None),
     }
 
 
@@ -2937,6 +2943,8 @@ def _apply_dismissals(
     in ``results`` flagged ``"dismissed": true`` instead of being dropped.
     Matching mirrors the value-allowlist key (``details.allowlist_field`` /
     ``allowlist_value``) plus the per-event fallback on ``event_id``.
+    ``total_findings`` is reduced by what was dropped, so "showing N of M"
+    describes the findings a client can actually reach — see the note below.
     """
     value_keys = {(d.field, d.value) for d in dismissed_rows if d.field is not None}
     event_ids = {d.event_id for d in dismissed_rows if d.event_id is not None}
@@ -2960,8 +2968,25 @@ def _apply_dismissals(
         payload["dismissed_count"] = count
         return payload
     kept = [f for f in results if not is_dismissed(f)]
-    payload["dismissed_count"] = len(results) - len(kept)
+    dropped = len(results) - len(kept)
+    payload["dismissed_count"] = dropped
     payload["results"] = kept
+    # `total_findings` counts what the detector produced, dismissals included —
+    # so a page with one dismissal reads "showing 11 of 12" and offers a "Show
+    # more" that can never close the gap. Subtract what was actually dropped,
+    # here rather than in each client, so every surface agrees.
+    #
+    # Only dismissals *on this page* are known: matching is done against
+    # serialized findings and the ones past the limit were never serialized.
+    # Pushing dismissals into the detector SQL would make it exact and is
+    # deliberately not done — the detectors never see dismissals, so dismissing
+    # stays presentation-only and out of the reproducibility hash. The residue
+    # is bounded by how many dismissals fall outside the page, and it can only
+    # leave the total slightly high, never low.
+    if dropped:
+        payload["total_findings"] = max(
+            int(payload.get("total_findings") or 0) - dropped, len(kept)
+        )
     return payload
 
 

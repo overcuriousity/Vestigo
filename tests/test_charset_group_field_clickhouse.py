@@ -282,18 +282,83 @@ def test_grouped_scan_survives_every_group_lacking_a_reference(svc):
         assert f.details["group_basis"] == "outside-suspect-windows"
 
 
-def test_per_group_finding_budget_is_preserved(svc):
-    """`LIMIT plim BY grp` means one noisy group cannot consume another's
-    budget — the syntax that enforces it only parses at execution time."""
-    result = svc.find_charset_novelty(
+def test_per_group_page_is_at_least_the_limit_and_the_total_is_exact(svc):
+    """`LIMIT plim BY grp` keeps one noisy group from consuming another's page
+    — the syntax only parses at execution time — but the page is never below
+    `limit`, and `total_findings` counts every flagged row whatever the page.
+    """
+    full = svc.find_charset_novelty(
+        CASE_ID,
+        [SOURCE_ID],
+        fields=["attr:user"],
+        windows=_windows(),
+        group_field="attr:host",
+        limit=1000,
+    )
+    assert full.total_findings == len(full.results) > 1
+    assert full.total_findings_exact is True
+
+    paged = svc.find_charset_novelty(
         CASE_ID,
         [SOURCE_ID],
         fields=["attr:user"],
         windows=_windows(),
         group_field="attr:host",
         per_field_limit=1,
-        limit=50,
+        limit=1,
     )
-    counts = {g: len(fs) for g, fs in _by_group(result).items()}
-    assert counts, "expected at least one finding"
-    assert all(n <= 1 for n in counts.values()), counts
+    assert len(paged.results) == 1
+    assert paged.total_findings == full.total_findings
+
+
+def test_grouped_sql_orders_by_the_reported_score(svc):
+    """A one-row page holds the best finding by the score the row reports, so
+    the ORDER BY in the SQL is the score and not a proxy for it."""
+    full = svc.find_charset_novelty(
+        CASE_ID,
+        [SOURCE_ID],
+        fields=["attr:user"],
+        windows=_windows(),
+        group_field="attr:host",
+        limit=1000,
+    )
+    top = svc.find_charset_novelty(
+        CASE_ID,
+        [SOURCE_ID],
+        fields=["attr:user"],
+        windows=_windows(),
+        group_field="attr:host",
+        limit=1,
+    )
+    assert top.results[0].score == max(f.score for f in full.results)
+
+
+def test_ungrouped_sql_orders_by_the_reported_score_and_counts(svc):
+    full = svc.find_charset_novelty(
+        CASE_ID, [SOURCE_ID], fields=["attr:user"], windows=_windows(), limit=1000
+    )
+    assert full.status == "ok"
+    assert full.total_findings == len(full.results) >= 1
+    top = svc.find_charset_novelty(
+        CASE_ID, [SOURCE_ID], fields=["attr:user"], windows=_windows(), limit=1
+    )
+    assert len(top.results) == 1
+    assert top.total_findings == full.total_findings
+    assert top.results[0].score == max(f.score for f in full.results)
+
+
+def test_self_baseline_ungrouped_total_and_suppression(svc):
+    full = svc.find_charset_novelty(CASE_ID, [SOURCE_ID], fields=["attr:user"], limit=1000)
+    if full.status != "ok" or not full.results:
+        pytest.skip("fixture has no rare-chars findings in self-baseline mode")
+    victim = full.results[0]
+    again = svc.find_charset_novelty(
+        CASE_ID,
+        [SOURCE_ID],
+        fields=["attr:user"],
+        limit=1000,
+        allowlist={("attr:user", victim.value)},
+    )
+    assert again.total_findings == full.total_findings - 1
+    assert again.total_findings_exact is True
+    assert victim.value not in {f.value for f in again.results}

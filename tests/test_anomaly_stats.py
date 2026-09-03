@@ -5,6 +5,7 @@ All tests use fakes/mocks for ClickHouse so they run without external services.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,11 +16,14 @@ import pytest
 from vestigo.db._offsets import OFFSET_SRC_PARAM, OFFSET_VAL_PARAM
 from vestigo.db.anomaly_stats import (
     _CHARSET_GROUP_PROBE_LIMIT,
+    _HYDRATE_CHUNK,
     _MAX_CHARSET_GROUPED_ROWS,
     _MAX_CHARSET_SIZE,
+    _SQL_SUPPRESSION_MAX,
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
+    StatAnomalyResult,
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
@@ -33,10 +37,27 @@ from vestigo.db.anomaly_stats import (
     _g_statistic_k,
     _greenwood_p,
     _poisson_rate_g,
+    _scalar_total,
+    _sql_suppression,
     _tvd,
     _window_preds,
     effective_ts_sql,
 )
+
+
+def _assert_paired(page_sql: str, total_sql: str, *fragments: str) -> None:
+    """Assert the page and its companion count carry the same filters.
+
+    ``_page_and_total`` composes both statements from one *core*, and this is
+    the property it exists for: a total describing a different filter than the
+    page it annotates is worse than no total. The old single-statement shape
+    asserted a ``count() OVER ()`` inside the page; there is no window any
+    more, so the pairing is what a shape test has to check.
+    """
+    assert " AS scanned" in total_sql, "no companion count statement ran"
+    for frag in fragments:
+        assert frag in page_sql, f"missing from page: {frag}"
+        assert frag in total_sql, f"missing from total: {frag}"
 
 
 def _one_suspect(
@@ -64,36 +85,89 @@ class FakeQueryResult:
     column_names: list[str]
 
 
-class FakeClient:
-    """Minimal ClickHouse client fake driven by a pre-seeded query→result map."""
+def _is_totals_sql(sql: str) -> bool:
+    """True for the companion count statement StatisticalAnomalyService runs.
 
-    def __init__(self, responses: list[FakeQueryResult]) -> None:
+    ``_page_and_total`` composes both statements from one *core*: the page is
+    ``core + page_tail``, the total is ``SELECT ... FROM (core) AS scanned``.
+    The alias is what tells them apart, and it has to: the two run in parallel
+    threads, so nothing about arrival order is stable.
+    """
+    return ") AS scanned" in sql
+
+
+class FakeClient:
+    """Minimal ClickHouse client fake driven by pre-seeded results.
+
+    Page and aggregate answers are consumed FIFO from *responses*. The
+    companion totals statement (see :func:`_is_totals_sql`) is answered from
+    its own *totals* seed — one entry per scan, in scan order — because it
+    neither arrives at a fixed position in the FIFO nor wants a row shape. An
+    entry is an int for the usual one-cell count, or a FakeQueryResult for a
+    grouped total (the batched attribute pass counts per key). A scan with no
+    totals seed left reports a total of 0.
+
+    ``_calls``/``_all_parameters``/``full_queries`` record the non-totals
+    queries only, so index-based assertions read the same as they did when a
+    scan was one statement; the totals statements are recorded separately in
+    ``total_queries``/``total_parameters``.
+    """
+
+    def __init__(
+        self,
+        responses: list[FakeQueryResult],
+        totals: list[int | FakeQueryResult] | None = None,
+    ) -> None:
         # Responses are consumed in order (FIFO) for each query call.
         self._responses: list[FakeQueryResult] = list(responses)
+        self._totals: list[int | FakeQueryResult] = list(totals or [])
         self._calls: list[str] = []
         self._all_parameters: list[dict] = []
+        self.total_queries: list[str] = []
+        self.total_parameters: list[dict] = []
+        # The page and its total run on two threads against this one client.
+        self._lock = threading.Lock()
 
     def query(self, sql: str, parameters: dict | None = None) -> FakeQueryResult:
-        self._calls.append(sql.strip().split("\n")[0].strip())
-        self._all_parameters.append(parameters or {})
-        if self._responses:
-            return self._responses.pop(0)
-        return FakeQueryResult(result_rows=[], column_names=[])
+        with self._lock:
+            if _is_totals_sql(sql):
+                self.total_queries.append(sql)
+                self.total_parameters.append(parameters or {})
+                if self._totals:
+                    seed = self._totals.pop(0)
+                    if isinstance(seed, FakeQueryResult):
+                        return seed
+                    return FakeQueryResult(result_rows=[(seed,)], column_names=["n_total"])
+                return FakeQueryResult(result_rows=[], column_names=[])
+            self._record(sql)
+            self._calls.append(sql.strip().split("\n")[0].strip())
+            self._all_parameters.append(parameters or {})
+            if self._responses:
+                return self._responses.pop(0)
+            return FakeQueryResult(result_rows=[], column_names=[])
+
+    def _record(self, sql: str) -> None:
+        """Hook for subclasses that keep the full SQL text."""
 
 
 class RecordingClient(FakeClient):
     """FakeClient that also captures the full SQL text of every query.
 
     Used by the temporal-mode tests to assert on the baseline/detect clauses.
+    ``full_queries`` holds the page statements; the companion totals go to
+    ``total_queries``, so a test can assert a filter reached *both*.
     """
 
-    def __init__(self, responses: list[FakeQueryResult]) -> None:
-        super().__init__(responses)
+    def __init__(
+        self,
+        responses: list[FakeQueryResult],
+        totals: list[int | FakeQueryResult] | None = None,
+    ) -> None:
+        super().__init__(responses, totals)
         self.full_queries: list[str] = []
 
-    def query(self, sql: str, parameters: dict | None = None) -> FakeQueryResult:
+    def _record(self, sql: str) -> None:
         self.full_queries.append(sql)
-        return super().query(sql, parameters)
 
 
 class FakeClickHouseStore:
@@ -122,11 +196,240 @@ class FakeClickHouseStore:
 # ---------------------------------------------------------------------------
 
 
-def _svc(responses: list[FakeQueryResult]) -> StatisticalAnomalyService:
-    """Build a service backed by a FakeClient with canned responses."""
+def _svc(
+    responses: list[FakeQueryResult], totals: list[int | FakeQueryResult] | None = None
+) -> StatisticalAnomalyService:
+    """Build a service backed by a FakeClient with canned responses.
+
+    *totals* seeds the companion count statements in scan order.
+    """
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
-    svc.ch = FakeClickHouseStore(FakeClient(responses))
+    svc.ch = FakeClickHouseStore(FakeClient(responses, totals))
     return svc
+
+
+# ---------------------------------------------------------------------------
+# Totals contract: exact counts, SQL-side suppression, chunked hydration
+# ---------------------------------------------------------------------------
+
+
+def test_result_total_is_exact_by_default():
+    r = StatAnomalyResult(
+        status="ok", detector="value_combo", method="self-baseline", baseline_size=0
+    )
+    assert r.total_findings_exact is True
+
+
+def test_page_and_total_compose_both_statements_from_one_core():
+    """The page and its exact total are built from the same *core*.
+
+    This is the whole reason `_page_and_total` exists: ten scan sites used to
+    need two hand-written statements each whose WHERE/GROUP BY/HAVING had to
+    agree forever. Composed from one string they cannot drift, and a total
+    over a wider set than its page is the failure this rules out.
+    """
+    svc = _svc([], totals=[42])
+    core = (
+        "SELECT val, count() AS cnt FROM db.events"
+        " WHERE case_id = {cid:String} AND NOT has({excl:Array(String)}, evt_id)"
+        " GROUP BY val HAVING cnt <= {floor:UInt32}"
+    )
+    params = {"cid": "c1", "excl": ["e1"], "floor": 3}
+    page, total = svc._page_and_total(
+        core,
+        params,
+        page_tail="ORDER BY cnt ASC\nLIMIT {lim:UInt32}",
+        total_select="count()",
+    )
+    assert _scalar_total(total) == 42
+    assert page == []
+
+    page_sql = svc.ch.client._calls  # first lines only; the full text is below
+    assert len(page_sql) == 1, "the page ran exactly once"
+    total_sql = svc.ch.client.total_queries[0]
+    assert total_sql.startswith("SELECT count() FROM (")
+    assert ") AS scanned" in total_sql
+    # Every filter of the page is inside the counted subquery, and the paging
+    # is not — a LIMIT in the count would make it the page length again.
+    assert "HAVING cnt <= {floor:UInt32}" in total_sql
+    assert "NOT has({excl:Array(String)}, evt_id)" in total_sql
+    assert "LIMIT" not in total_sql
+    # Both statements bind the same parameters.
+    assert svc.ch.client.total_parameters[0] == params
+    assert svc.ch.client._all_parameters[0] == params
+
+
+def _max_memory(sql: str) -> int:
+    """The ``max_memory_usage`` a statement carries, as an int."""
+    return int(sql.split("max_memory_usage = ")[1].split(",")[0].strip())
+
+
+def test_page_and_total_split_the_slot_budget_between_its_two_statements(monkeypatch):
+    """Both statements carry half the per-slot cap, not the full one.
+
+    A gate slot's cap is sized per *slot*; the page and its count run
+    concurrently under one slot, so each must carry half. `scan_fanout` only
+    divides a clause built while it is declared — building the clause first
+    and declaring the fan-out afterwards emits the full cap twice, which is
+    exactly the over-commit the declaration exists to prevent. This asserts
+    on the SQL that leaves the service, so a hoisted clause build fails here
+    rather than in a ClickHouse OOM.
+    """
+    from vestigo.db import _scan
+    from vestigo.db._scan import heavy_scan_settings, scan_fanout
+
+    budget = 1 << 30
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: budget)
+    solo_clause = heavy_scan_settings()
+    with scan_fanout(2):
+        halved_clause = heavy_scan_settings()
+    assert _max_memory(solo_clause) == budget, "fixture sanity"
+    assert _max_memory(halved_clause) == budget // 2, "fixture sanity"
+
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    svc._page_and_total(
+        "SELECT val, count() AS cnt FROM db.events WHERE case_id = {cid:String} GROUP BY val",
+        {"cid": "c1"},
+        page_tail="ORDER BY cnt ASC\nLIMIT 10",
+        total_select="count()",
+    )
+    page_sql = svc.ch.client.full_queries[0]
+    total_sql = svc.ch.client.total_queries[0]
+
+    for sql in (page_sql, total_sql):
+        assert _max_memory(sql) == budget // 2, sql[-160:]
+        # The whole clause, spill thresholds included, is the fan-out clause.
+        assert sql.rstrip().endswith(halved_clause), sql[-160:]
+        assert solo_clause not in sql
+
+
+def test_page_and_total_split_the_slot_threads_between_its_two_statements(monkeypatch):
+    """Both statements carry half the heavy thread width, not the full one.
+
+    The heavy width is `cores // N` so a full gate exactly saturates the box
+    (`detect_scan_max_threads`); two statements at that width under one slot
+    would make a full gate of paged detectors 2x the cores.
+    """
+    from vestigo.db import _scan
+
+    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 8)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    svc._page_and_total(
+        "SELECT val, count() AS cnt FROM db.events GROUP BY val",
+        {},
+        page_tail="LIMIT 10",
+        total_select="count()",
+    )
+    for sql in (svc.ch.client.full_queries[0], svc.ch.client.total_queries[0]):
+        assert "max_threads = 4," in sql, sql[-160:]
+
+
+def test_page_and_total_composes_with_an_outer_fan_out(monkeypatch):
+    """A caller already fanning out gets the product, not a reset to two.
+
+    `scan_fanout` multiplies, and the clause has to be built in the caller's
+    context for that to hold — a clause built anywhere else would lose the
+    outer declaration.
+    """
+    from vestigo.db import _scan
+    from vestigo.db._scan import scan_fanout
+
+    budget = 1 << 30
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: budget)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    with scan_fanout(2):
+        svc._page_and_total(
+            "SELECT val, count() AS cnt FROM db.events GROUP BY val",
+            {},
+            page_tail="LIMIT 10",
+            total_select="count()",
+        )
+    for sql in (svc.ch.client.full_queries[0], svc.ch.client.total_queries[0]):
+        assert _max_memory(sql) == budget // 4, sql[-160:]
+
+
+def test_scalar_total_reads_an_empty_or_null_count_as_zero():
+    """`count()` over an empty set returns no row; `sum(hits)` returns NULL."""
+    assert _scalar_total([]) == 0
+    assert _scalar_total([(None,)]) == 0
+    assert _scalar_total([(7,)]) == 7
+
+
+def test_sql_suppression_binds_both_sets_under_the_bound():
+    params: dict[str, Any] = {}
+    frag, reasons = _sql_suppression(
+        params,
+        key_expr="val",
+        evt_expr="evt_id",
+        allow_keys=["a", "b"],
+        exclude_event_ids={"e1"},
+    )
+    assert "NOT has({allow:Array(String)}, val)" in frag
+    assert "NOT has({excl:Array(String)}, evt_id)" in frag
+    assert params["allow"] == ["a", "b"]
+    assert params["excl"] == ["e1"]
+    assert reasons == []
+
+
+def test_sql_suppression_is_empty_without_sets():
+    params: dict[str, Any] = {}
+    frag, reasons = _sql_suppression(
+        params, key_expr="val", evt_expr="evt_id", allow_keys=[], exclude_event_ids=None
+    )
+    assert frag == ""
+    assert params == {}
+    assert reasons == []
+
+
+def test_sql_suppression_falls_back_when_a_set_is_too_large():
+    """A set past the bind bound is applied to the page instead — and says so."""
+    params: dict[str, Any] = {}
+    big = {f"e{i}" for i in range(_SQL_SUPPRESSION_MAX + 1)}
+    frag, reasons = _sql_suppression(
+        params, key_expr="val", evt_expr="evt_id", allow_keys=["a"], exclude_event_ids=big
+    )
+    # The allowlist still binds; only the oversized set falls back.
+    assert "NOT has({allow:Array(String)}, val)" in frag
+    assert "excl" not in frag
+    assert "excl" not in params
+    assert len(reasons) == 1
+    assert "page only" in reasons[0]
+    assert f"{_SQL_SUPPRESSION_MAX + 1:,}" in reasons[0]
+
+
+def test_sql_suppression_without_key_expr_skips_the_allowlist():
+    params: dict[str, Any] = {}
+    frag, _ = _sql_suppression(
+        params, key_expr=None, evt_expr="evt_id", allow_keys=["a"], exclude_event_ids={"e"}
+    )
+    assert "allow" not in frag and "allow" not in params
+    assert "excl" in frag
+
+
+def test_hydration_is_chunked():
+    """Hydration binds one parameter per id, so it must fetch in bounded batches."""
+    svc = _svc([])
+    n = _HYDRATE_CHUNK * 2 + 200
+    svc.ch.events_by_id = {f"e{i}": {"event_id": f"e{i}"} for i in range(n)}
+    findings = [
+        ValueFinding(
+            field="f",
+            value=str(i),
+            count=1,
+            score=1.0,
+            first_seen=None,
+            event_id=f"e{i}",
+            event=None,
+            details={},
+        )
+        for i in range(n)
+    ]
+    svc._hydrate_finding_events("c", ["s"], findings)
+    assert [len(c) for c in svc.ch.hydration_calls] == [_HYDRATE_CHUNK, _HYDRATE_CHUNK, 200]
+    assert findings[n - 1].event == {"event_id": f"e{n - 1}"}
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +596,8 @@ def test_value_novelty_self_baseline_limit_applied():
         [
             FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
             *per_field,
-        ]
+        ],
+        totals=[3, 3, 3],
     )
     result = svc.find_value_novelty(
         "c1",
@@ -366,6 +670,128 @@ def test_value_novelty_skips_empty_values():
     assert "real_value" in values
 
 
+def test_value_novelty_total_sums_exact_per_field_counts():
+    """Each field's scan counts its own findings; the total is their sum."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(f"a{i}", 1, datetime(2024, 1, 1), f"e{i}") for i in range(50)],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+            FakeQueryResult(
+                result_rows=[(f"b{i}", 1, datetime(2024, 1, 1), f"f{i}") for i in range(50)],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[300, 250],
+    )
+    result = svc.find_value_novelty("c1", ["s1"], fields=["artifact", "timestamp_desc"], limit=50)
+    assert len(result.results) == 50
+    assert result.total_findings == 550
+    assert result.total_findings_exact is True
+
+
+def test_value_novelty_per_field_budget_is_at_least_the_limit():
+    """A global top-50 may be 50 values of one field: the per-field page must allow it."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc.find_value_novelty("c1", ["s1"], fields=["artifact"], limit=80, per_field_limit=25)
+    assert svc.ch.client._all_parameters[1]["lim"] == 80
+
+
+def test_value_novelty_per_field_suppression_is_bound_into_the_sql():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=["artifact"],
+        allowlist={("artifact", "known"), ("other", "ignored")},
+        exclude_event_ids={"e1"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    # The suppression has to reach the count too, or the total describes a
+    # wider set than the page it annotates.
+    _assert_paired(
+        sql,
+        client.total_queries[-1],
+        "NOT has({allow:Array(String)}, val)",
+        "NOT has({excl:Array(String)}, evt_id)",
+    )
+    assert client.total_queries[-1].startswith("SELECT count() FROM (")
+    assert p["allow"] == ["known"]
+    assert p["excl"] == ["e1"]
+
+
+def test_value_novelty_batched_binds_per_key_allowlist():
+    """The batched pass carries one allowlist per attribute key, and counts per key."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user", "attr:host"],
+        allowlist={("attr:user", "svc"), ("attr:user", "root"), ("attr:host", "web-1")},
+        exclude_event_ids={"e1"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    # The batched pass counts per attribute key, so its companion is a grouped
+    # aggregate rather than a one-cell count.
+    total_sql = client.total_queries[-1]
+    assert total_sql.startswith("SELECT key, count() FROM (")
+    assert "GROUP BY key" in total_sql.rsplit(") AS scanned", 1)[1]
+    _assert_paired(sql, total_sql, "indexOf({allow_k:Array(String)}, key)")
+    assert p["allow_k"] == ["host", "user"]
+    assert p["allow_v"] == [["web-1"], ["root", "svc"]]
+    assert "indexOf({allow_k:Array(String)}, key)" in sql
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+
+
+def test_value_novelty_batched_temporal_counts_hits_per_key():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 4, tzinfo=UTC),
+    )
+    svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
+    sql = client.full_queries[-1]
+    # A group that hit two suspect windows is two findings: the total sums
+    # hits, per key.
+    assert client.total_queries[-1].startswith("SELECT key, sum(hits) FROM (")
+    assert "ORDER BY key ASC, best ASC, val ASC" in sql
+    assert "ORDER BY" not in client.total_queries[-1].rsplit(") AS scanned", 1)[1]
+    assert client._all_parameters[-1]["w0_total"] == 80.0
+
+
 # ---------------------------------------------------------------------------
 # find_value_novelty — temporal baseline
 # ---------------------------------------------------------------------------
@@ -389,9 +815,17 @@ def test_value_novelty_temporal_baseline_first_seen():
             # artifact field: val, baseline_cnt, w0_cnt, w0_first, w0_evt
             FakeQueryResult(
                 result_rows=[
-                    ("first_time_process.exe", 0, 3, datetime(2024, 1, 16), "evt-9"),
+                    ("first_time_process.exe", 0, 3, datetime(2024, 1, 16), "evt-9", 1, 0.025),
                 ],
-                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                column_names=[
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                ],
             ),
         ]
     )
@@ -430,7 +864,15 @@ def test_value_novelty_temporal_window_bounds_converted_to_utc_for_sql():
             FakeQueryResult(result_rows=[(300, 0)], column_names=["bl_total", "w0_total"]),
             FakeQueryResult(
                 result_rows=[],
-                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                column_names=[
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                ],
             ),
         ]
     )
@@ -472,6 +914,8 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
                         6,
                         datetime(2024, 1, 20),
                         "evt-b",
+                        2,
+                        0.03,
                     )
                 ],
                 column_names=[
@@ -484,6 +928,8 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
                     "w1_cnt",
                     "w1_first",
                     "w1_evt",
+                    "hits",
+                    "best",
                 ],
             ),
         ]
@@ -534,8 +980,17 @@ def test_value_novelty_small_window_warns():
             FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
             FakeQueryResult(result_rows=[(600, 5)], column_names=["bl", "w0"]),
             FakeQueryResult(
-                result_rows=[("user", "svc_x", 0, 3, datetime(2024, 1, 11), "evt-a")],
-                column_names=["key", "val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                result_rows=[("user", "svc_x", 0, 3, datetime(2024, 1, 11), "evt-a", 1, 0.6)],
+                column_names=[
+                    "key",
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                ],
             ),
         ]
     )
@@ -594,7 +1049,7 @@ def test_value_novelty_batched_sql_shape_temporal():
 
     batched_sql = client.full_queries[2]
     assert "ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val" in batched_sql
-    assert "HAVING baseline_cnt = 0 AND (w0_cnt) > 0" in batched_sql
+    assert "HAVING baseline_cnt = 0 AND hits > 0" in batched_sql
     assert "LIMIT {lim:UInt32} BY key" in batched_sql
     assert "timestamp !=" in batched_sql  # sentinel guard
     # Window bounds bound as parameters (forensic reproducibility).
@@ -1889,10 +2344,19 @@ def test_value_combo_temporal_flags_new_combos():
         FakeQueryResult(result_rows=[(300, 80)], column_names=["bl_total", "w0_total"]),
         FakeQueryResult(
             result_rows=[
-                # v0, v1, baseline_cnt, w0_cnt, w0_first, w0_evt
-                ("admin", "10.0.0.9", 0, 2, fs, "evt-x"),
+                # v0, v1, baseline_cnt, w0_cnt, w0_first, w0_evt, hits, best
+                ("admin", "10.0.0.9", 0, 2, fs, "evt-x", 1, 0.025),
             ],
-            column_names=["v0", "v1", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+            column_names=[
+                "v0",
+                "v1",
+                "baseline_cnt",
+                "w0_cnt",
+                "w0_first",
+                "w0_evt",
+                "hits",
+                "best",
+            ],
         ),
     ]
     svc = _svc(responses)
@@ -1951,6 +2415,147 @@ def test_value_combo_excludes_normal_marked_events():
         "c1", ["s1"], fields=["attr:x", "attr:y"], exclude_event_ids={"evt-drop"}
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
+
+
+def test_value_combo_total_is_the_sql_count_not_the_page():
+    """`total_findings` is what the scan counted, not how many rows came back."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    rows = [(f"a{i}", "b", 1, fs, f"e{i}") for i in range(50)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=rows,
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[4000],
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], limit=50)
+    assert len(result.results) == 50
+    assert result.total_findings == 4000
+    assert result.total_findings_exact is True
+
+
+def test_value_combo_suppression_is_bound_into_the_sql():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_value_combos(
+        "c1",
+        ["s1"],
+        fields=["attr:a", "attr:b"],
+        allowlist={("attr:a,attr:b", "x\x1fy")},
+        exclude_event_ids={"e9"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    _assert_paired(
+        sql,
+        client.total_queries[-1],
+        "NOT has({allow:Array(String)}, concat(v0, '\x1f', v1))",
+        "NOT has({excl:Array(String)}, evt_id)",
+    )
+    assert p["allow"] == ["x\x1fy"]
+    assert p["excl"] == ["e9"]
+    assert result.total_findings == 0
+    assert result.total_findings_exact is True
+
+
+def test_value_combo_oversized_exclusion_marks_the_total_inexact():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    big = {f"e{i}" for i in range(_SQL_SUPPRESSION_MAX + 1)}
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("a", "b", 1, fs, "e1"), ("c", "d", 1, fs, "zz")],
+                column_names=["v0", "v1", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[7],
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], exclude_event_ids=big)
+    # The page is still filtered; the count could not be.
+    assert [f.event_id for f in result.results] == ["zz"]
+    assert result.total_findings == 7
+    assert result.total_findings_exact is False
+    assert any("page only" in w for w in result.warnings)
+
+
+def test_value_combo_temporal_orders_by_best_window_score():
+    """The page is the true top-N by the score the finding reports."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80, 20)], column_names=["bl", "w0", "w1"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("s0", datetime(2024, 1, 3, tzinfo=UTC), datetime(2024, 1, 4, tzinfo=UTC)),
+            TimeWindow("s1", datetime(2024, 1, 5, tzinfo=UTC), datetime(2024, 1, 6, tzinfo=UTC)),
+        ),
+    )
+    svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], windows=windows)
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "ORDER BY best ASC" in sql
+    assert client.total_queries[-1].startswith("SELECT sum(hits) FROM (")
+    assert "(w0_cnt > 0) + (w1_cnt > 0) AS hits" in sql
+    assert p["w0_total"] == 80.0
+    assert p["w1_total"] == 20.0
+
+
+def test_value_combo_temporal_total_counts_window_hits_not_groups():
+    """One group hit in two suspect windows is two findings — the total says so."""
+    fs = datetime(2024, 1, 3, tzinfo=UTC)
+    windows = AnalysisWindows(
+        baseline=TimeWindow(
+            "baseline", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)
+        ),
+        suspects=(
+            TimeWindow("s0", datetime(2024, 1, 3, tzinfo=UTC), datetime(2024, 1, 4, tzinfo=UTC)),
+            TimeWindow("s1", datetime(2024, 1, 5, tzinfo=UTC), datetime(2024, 1, 6, tzinfo=UTC)),
+        ),
+    )
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80, 20)], column_names=["bl", "w0", "w1"]),
+            FakeQueryResult(
+                result_rows=[("a", "b", 0, 2, fs, "e0", 1, fs, "e1", 2, 0.025)],
+                column_names=[
+                    "v0",
+                    "v1",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "w1_cnt",
+                    "w1_first",
+                    "w1_evt",
+                    "hits",
+                    "best",
+                ],
+            ),
+        ],
+        totals=[9],
+    )
+    result = svc.find_value_combos("c1", ["s1"], fields=["attr:a", "attr:b"], windows=windows)
+    assert len(result.results) == 2
+    assert result.total_findings == 9
 
 
 # ---------------------------------------------------------------------------
@@ -2057,6 +2662,68 @@ def test_range_excludes_normal_marked_events():
     assert [f.event_id for f in result.results] == ["evt-keep"]
 
 
+def test_range_total_is_the_sql_count_and_page_is_at_least_the_limit():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(9000.0 + i, 1, fs, f"e{i}") for i in range(80)],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[640],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_range_violations(
+        "c1",
+        ["s1"],
+        fields=["attr:bytes"],
+        limit=80,
+        allowlist={("attr:bytes", "9000.0")},
+        exclude_event_ids={"e5"},
+    )
+    assert len(result.results) == 78  # page-level pass drops the two the fake ignored
+    assert result.total_findings == 640
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    # A float key: `str(9000.0)` and ClickHouse's `toString(9000.)` disagree, so
+    # the allowlist binds as numbers and compares as numbers.
+    _assert_paired(
+        sql,
+        client.total_queries[-1],
+        "NOT has({allow:Array(Float64)}, val)",
+        "NOT has({excl:Array(String)}, evt_id)",
+    )
+    assert p["allow"] == [9000.0]
+
+
+def test_range_total_sums_across_fields():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100.0, 200.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(9000.0, 1, fs, "e1")],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+            FakeQueryResult(result_rows=[(1.0, 2.0, 500)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(50.0, 1, fs, "e2")],
+                column_names=["val", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[30, 12],
+    )
+    result = svc.find_range_violations("c1", ["s1"], fields=["attr:bytes", "attr:ms"])
+    assert result.total_findings == 42
+
+
 def test_recommend_numeric_fields_filters_by_ratio():
     """Only fields whose values mostly parse as numbers are recommended."""
     # inventory: (token, distinct, non_empty_count); total passed explicitly.
@@ -2081,7 +2748,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     (external GROUP BY spill + per-query memory cap + thread cap) — a scan
     without it trusts the server-wide limit and can take the box down on a
     300M-row case."""
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import heavy_scan_settings, scan_fanout
 
     class _RecordingClient(FakeClient):
         def __init__(self) -> None:
@@ -2106,14 +2773,37 @@ def test_heavy_detector_scans_carry_memory_settings():
     svc.find_entropy_outliers("c1", ["s1"], fields=["artifact"])
     svc.field_inventory("c1", ["s1"], total=100)
 
+    def _is_total(q: str) -> bool:
+        return ") AS scanned" in q
+
+    def _is_count_probe(q: str) -> bool:
+        # The bare `SELECT count() FROM db.events ...` size probe — not a
+        # companion total, which also starts with `SELECT count()` but wraps
+        # the page's core as `(...) AS scanned`.
+        return q.strip().startswith("SELECT count()") and not _is_total(q)
+
     scans = [
         q
         for q in client.full_queries
-        if not q.strip().startswith("SELECT count()") and "min(timestamp), max(timestamp)" not in q
+        if not _is_count_probe(q) and "min(timestamp), max(timestamp)" not in q
     ]
     assert scans
+    solo = _max_memory(heavy_scan_settings())
+    with scan_fanout(2):
+        halved = _max_memory(heavy_scan_settings())
+    # The paged detectors issue a page and a companion count under one slot;
+    # both carry half the cap. Everything else runs alone and carries it whole.
+    totals = [q for q in scans if _is_total(q)]
+    assert totals, "no paged scan ran under this fake"
     for sql in scans:
-        assert heavy_scan_settings() in sql, sql[:120]
+        assert "max_bytes_before_external_group_by" in sql, sql[:120]
+        assert _max_memory(sql) in (solo, halved), sql[-160:]
+    for sql in totals:
+        assert _max_memory(sql) == halved, sql[-160:]
+    # Every total has its page beside it at the same halved cap — no page at
+    # the full cap next to a count at half, which is what the old assertion
+    # would have accepted.
+    assert sum(_max_memory(q) == halved for q in scans) == 2 * len(totals)
 
 
 # ---------------------------------------------------------------------------
@@ -2169,8 +2859,8 @@ def test_charset_self_baseline_flags_rare_char():
             column_names=["c", "n", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00ab", ["\x00"], 2, fs, "evt-nul", 0.0)],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     svc = _svc(responses)
@@ -2211,8 +2901,16 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
         FakeQueryResult(result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]),
         FakeQueryResult(
             # val, novel, cnt, first_seen, evt_id, win_idx
-            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0)],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0, 0.0)],
+            column_names=[
+                "val",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+            ],
         ),
     ]
     svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
@@ -2245,10 +2943,10 @@ def test_charset_excludes_normal_marked_events_and_limits():
         ),
         FakeQueryResult(
             result_rows=[
-                ("x$", ["$"], 1, fs, "evt-drop"),
-                ("y%", ["%"], 1, fs, "evt-keep"),
+                ("x$", ["$"], 1, fs, "evt-drop", 0.0),
+                ("y%", ["%"], 1, fs, "evt-keep", 0.0),
             ],
-            column_names=["val", "novel", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     svc = _svc(responses)
@@ -2258,6 +2956,94 @@ def test_charset_excludes_normal_marked_events_and_limits():
     assert [f.event_id for f in result.results] == ["evt-keep"]
     # Hydration happens once, on the surviving slice only.
     assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+def test_charset_orders_by_score_in_sql_and_counts_exactly():
+    """The page is the true top-N by the score the finding reports, not by how
+    many novel characters a value happens to contain."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("a", 90, 100), ("$", 2, 100), ("%", 1, 100)],
+                column_names=["c", "n", "n_vals"],
+            ),
+            FakeQueryResult(
+                result_rows=[(f"x{i}%", ["%"], 1, fs, f"e{i}", 4.6151) for i in range(50)],
+                column_names=["val", "novel", "cnt", "first_seen", "evt_id", "score"],
+            ),
+        ],
+        totals=[730],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_charset_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user"],
+        limit=80,
+        allowlist={("attr:user", "ok$")},
+        exclude_event_ids={"e-x"},
+    )
+    assert len(result.results) == 50
+    assert result.total_findings == 730
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    assert "ORDER BY score DESC, cnt ASC" in sql
+    assert client.total_queries[-1].startswith("SELECT count() FROM (")
+    # The rare characters and their counts ride in as parallel arrays so the
+    # SQL sums the same per-character surprise Python reports.
+    assert p["rc"] == ["$", "%"]
+    assert p["rn"] == [2.0, 1.0]
+    assert p["nv"] == 100.0
+    assert "log({nv:Float64} + 1)" in sql
+    _assert_paired(
+        sql,
+        client.total_queries[-1],
+        "NOT has({allow:Array(String)}, val)",
+        "NOT has({excl:Array(String)}, evt_id)",
+    )
+    assert p["allow"] == ["ok$"]
+
+
+def test_charset_grouped_binds_per_group_rarity_for_the_sql_score():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # per-group learn rows: grp, c, n, n_vals
+            FakeQueryResult(
+                result_rows=[
+                    ("h1", "a", 90, 100),
+                    ("h1", "$", 1, 100),
+                    ("h2", "a", 40, 50),
+                    ("h2", "%", 2, 50),
+                ],
+                column_names=["grp", "c", "n", "n_vals"],
+            ),
+            FakeQueryResult(result_rows=[], column_names=[]),  # probe
+            FakeQueryResult(result_rows=[], column_names=[]),  # violations
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_charset_novelty("c1", ["s1"], fields=["attr:user"], group_field="attr:host")
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "ORDER BY score DESC, cnt ASC" in sql
+    assert "LIMIT {plim:UInt32} BY grp" in sql
+    # The grouped page is paged per group; its total is still one number over
+    # the whole post-HAVING set.
+    total_sql = client.total_queries[-1]
+    assert total_sql.startswith("SELECT count() FROM (")
+    assert "LIMIT" not in total_sql.rsplit(") AS scanned", 1)[1]
+    assert p["grps"] == ["h1", "h2"]
+    assert p["rcs"] == [["$"], ["%"]]
+    assert p["rns"] == [[1.0], [2.0]]
+    assert p["nvs"] == [100.0, 50.0]
+    assert "{fb_rc:Array(String)}" in sql and "{fb_nv:Float64}" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -2378,6 +3164,44 @@ def test_entropy_excludes_normal_marked_events():
     )
     assert [f.event_id for f in result.results] == ["evt-keep"]
     assert svc.ch.hydration_calls == [["evt-keep"]]
+
+
+def test_entropy_total_is_the_sql_count_and_suppression_is_bound():
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[(f"v{i:011d}", 5.5, 1, fs, f"e{i}") for i in range(50)],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[900],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers(
+        "c1",
+        ["s1"],
+        fields=["attr:host"],
+        limit=80,
+        allowlist={("attr:host", "known-random")},
+        exclude_event_ids={"e-x"},
+    )
+    assert len(result.results) == 50
+    assert result.total_findings == 900
+    assert result.total_findings_exact is True
+    sql = client.full_queries[2]
+    p = client._all_parameters[2]
+    assert p["plim"] == 80
+    _assert_paired(
+        sql,
+        client.total_queries[-1],
+        "NOT has({allow:Array(String)}, val)",
+        "NOT has({excl:Array(String)}, evt_id)",
+    )
+    assert p["allow"] == ["known-random"]
 
 
 # ---------------------------------------------------------------------------
@@ -4797,8 +5621,8 @@ def test_charset_group_field_partitions_alphabets():
         # One violation scan for every group — host-b's row is the only one
         # whose value carries a character outside its own group's alphabet.
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-b", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-b", ["\x00"], 2, fs, "evt-nul", 0.0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     svc = _svc(responses)
@@ -4901,8 +5725,17 @@ def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
         ),
         # host-b was never in the baseline: scored by the fallback.
         FakeQueryResult(
-            result_rows=[("abа", "host-b", ["а"], 3, fs, "evt-hom", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("abа", "host-b", ["а"], 3, fs, "evt-hom", 0, 0.0)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+            ],
         ),
     ]
     # The probe runs before the fallback learn: host-a is known, host-b is not,
@@ -5048,8 +5881,17 @@ def test_charset_wide_group_is_dropped_not_scored_by_fallback():
         FakeQueryResult(result_rows=[("host-a",), ("host-prose",)], column_names=["grp"]),
         # Defensive: even if a host-prose row reached Python it is not scored.
         FakeQueryResult(
-            result_rows=[("文字", "host-prose", ["文"], 2, fs, "evt-cjk", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("文字", "host-prose", ["文"], 2, fs, "evt-cjk", 0, 0.0)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+            ],
         ),
     ]
     client = RecordingClient(responses)
@@ -5099,8 +5941,17 @@ def test_charset_thin_group_is_scored_by_fallback_not_dropped():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("abа", "host-new", ["а"], 3, fs, "evt-hom", 0)],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "win_idx"],
+            result_rows=[("abа", "host-new", ["а"], 3, fs, "evt-hom", 0, 0.0)],
+            column_names=[
+                "val",
+                "grp",
+                "novel",
+                "cnt",
+                "first_seen",
+                "evt_id",
+                "win_idx",
+                "score",
+            ],
         ),
     ]
     client = RecordingClient(responses)
@@ -5152,8 +6003,8 @@ def test_charset_self_baseline_thin_group_falls_back_to_merged_scope():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-tiny", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-tiny", ["\x00"], 2, fs, "evt-nul", 0.0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     client = RecordingClient(responses)
@@ -5247,9 +6098,10 @@ def test_charset_grouped_row_ceiling_is_reported_not_silent():
         # Exactly the ceiling: the query hit its LIMIT, so more rows existed.
         FakeQueryResult(
             result_rows=[
-                (f"ab\x00{i}", f"host-{i}", ["\x00"], 2, fs, f"evt-{i}") for i in range(ceiling)
+                (f"ab\x00{i}", f"host-{i}", ["\x00"], 2, fs, f"evt-{i}", 0.0)
+                for i in range(ceiling)
             ],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     svc = _svc(responses)
@@ -5271,8 +6123,8 @@ def test_charset_grouped_row_ceiling_is_quiet_below_it():
             column_names=["grp", "c", "n", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-a", ["\x00"], 2, fs, "evt-nul")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-a", ["\x00"], 2, fs, "evt-nul", 0.0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
     ]
     svc = _svc(responses)
@@ -5297,8 +6149,8 @@ def test_charset_fallback_warnings_name_the_field():
             column_names=["c", "n_vals_with_c", "n_vals"],
         ),
         FakeQueryResult(
-            result_rows=[("ab\x00", "host-x", ["\x00"], 2, fs, "evt-u")],
-            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id"],
+            result_rows=[("ab\x00", "host-x", ["\x00"], 2, fs, "evt-u", 0.0)],
+            column_names=["val", "grp", "novel", "cnt", "first_seen", "evt_id", "score"],
         ),
         # attr:path — every group is well-evidenced, so no fallback is needed.
         FakeQueryResult(

@@ -182,8 +182,15 @@ def test_self_baseline_equivalent_to_per_field_oracle(svc):
     assert batched == oracle
 
 
-def test_per_field_limit_matches_oracle(svc):
-    """per_field_limit=2 must keep the same survivors the per-field loop kept."""
+def test_per_field_budget_is_at_least_the_limit(svc):
+    """`per_field_limit` is a floor on each field's page, never a cap under `limit`.
+
+    The retired loop honoured per_field_limit=2 literally, so a global top-100
+    could never hold more than two values of one field. Under the totals
+    contract the per-field page is max(per_field_limit, limit): every rare
+    value of both fields is returned here, and `total_findings` is the exact
+    count the unlimited oracle produces.
+    """
     result = svc.find_value_novelty(
         CASE_ID,
         [SOURCE_ID],
@@ -196,11 +203,44 @@ def test_per_field_limit_matches_oracle(svc):
     oracle = sorted(
         (f"attr:{key}", str(val), int(cnt))
         for key in ("user", "host")
-        for val, cnt, _first, _evt in _oracle_rows(svc, key, floor=2, lim=2)
+        for val, cnt, _first, _evt in _oracle_rows(svc, key, floor=2, lim=10_000)
     )
     assert batched == oracle
-    # 2 survivors per field, not a global cap of 2.
-    assert len(batched) == 4
+    assert result.total_findings == len(oracle)
+    assert result.total_findings_exact is True
+
+
+def test_total_is_exact_when_the_page_is_smaller(svc):
+    """A limit below the finding count truncates the page, never the count."""
+    result = svc.find_value_novelty(
+        CASE_ID, [SOURCE_ID], fields=["attr:user", "attr:host"], rarity_floor=2, limit=3
+    )
+    unlimited = sum(len(_oracle_rows(svc, key, floor=2, lim=10_000)) for key in ("user", "host"))
+    assert len(result.results) == 3
+    assert result.total_findings == unlimited > 3
+    assert result.total_findings_exact is True
+
+
+def test_allowlist_and_normal_marks_are_counted_out(svc):
+    base = svc.find_value_novelty(
+        CASE_ID, [SOURCE_ID], fields=["attr:user", "attr:host"], rarity_floor=2, limit=100
+    )
+    drop_evt = next(f.event_id for f in base.results if f.value == "carol")
+    result = svc.find_value_novelty(
+        CASE_ID,
+        [SOURCE_ID],
+        fields=["attr:user", "attr:host"],
+        rarity_floor=2,
+        limit=100,
+        allowlist={("attr:user", "dave"), ("attr:host", "db-9")},
+        exclude_event_ids={drop_evt},
+    )
+    assert result.total_findings == base.total_findings - 3
+    assert result.total_findings_exact is True
+    values = {(f.field, f.value) for f in result.results}
+    assert ("attr:user", "dave") not in values
+    assert ("attr:host", "db-9") not in values
+    assert ("attr:user", "carol") not in values
 
 
 def test_temporal_matches_handcrafted_expectations(svc):

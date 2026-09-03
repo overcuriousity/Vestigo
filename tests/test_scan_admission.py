@@ -195,6 +195,40 @@ def test_the_heavy_class_splits_a_fan_out_the_same_way(monkeypatch):
         assert _max_memory(_scan.heavy_scan_settings()) == solo // 2
 
 
+def _max_threads(clause: str) -> int:
+    return int(clause.split("max_threads = ")[1].split(",")[0].strip())
+
+
+def test_a_heavy_fan_out_splits_its_slot_threads_too(monkeypatch):
+    """The heavy width is sized so a *full* gate exactly saturates the box.
+
+    One slot running two queries at that width is two slots' worth of cores;
+    a full gate of paged detectors is 2x the machine. Threads divide by the
+    fan-out the way the memory cap does, floored at 2 like the width itself.
+    """
+    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 8)
+    assert _max_threads(_scan.heavy_scan_settings()) == 8
+    with scan_fanout(2):
+        assert _max_threads(_scan.heavy_scan_settings()) == 4
+        with scan_fanout(2):
+            assert _max_threads(_scan.heavy_scan_settings()) == 2
+    with scan_fanout(1 << 40):
+        assert _max_threads(_scan.heavy_scan_settings()) == 2
+
+
+def test_a_foreground_fan_out_keeps_its_thread_width(monkeypatch):
+    """The chart lane is exempt on purpose — see detect_foreground_max_threads.
+
+    Its width is already half the heavy one, so a two-wave chart is one heavy
+    slot's threads and inside the allowance; dividing again would put the
+    ordinary chart at the floor.
+    """
+    monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 8 << 30)
+    solo = _max_threads(_scan.foreground_scan_settings())
+    with scan_fanout(2):
+        assert _max_threads(_scan.foreground_scan_settings()) == solo
+
+
 def test_a_fan_out_cap_never_reaches_zero(monkeypatch):
     monkeypatch.setattr(_scan, "detect_local_memory_total", lambda: 8 << 30)
     with scan_fanout(1 << 40):

@@ -60,7 +60,13 @@ export interface MethodFindings {
   method: MethodId;
   status: string;
   results: MethodResult[];
+  /** Exact count across the full scope, after suppression, before `limit`. */
   total_findings: number;
+  /** False when the runner could not count exactly — render as "N+", never "N". */
+  total_findings_exact: boolean;
+  /** Why the total is not exact, when it isn't. Also in `warnings`, but not
+   *  findable there: the reasons are appended after every other caveat. */
+  total_findings_note?: string | null;
   dismissed_count?: number;
   warnings: string[];
   scope: AnalysisScope;
@@ -76,7 +82,10 @@ export interface ScopeParams {
 export const analysisApi = {
   /** Gate verdicts for every method under *scope*. No events are scanned. */
   plan: (caseId: string, timelineId: string, scope: ScopeParams) =>
-    get<AnalysisPlan>(`/cases/${caseId}/timelines/${timelineId}/analysis/plan`, { ...scope }),
+    get<AnalysisPlan>(
+      `/cases/${caseId}/timelines/${timelineId}/analysis/plan`,
+      { ...scope },
+    ),
 
   /**
    * Run one method. A method the plan reported as not applicable runs here
@@ -93,11 +102,16 @@ export const analysisApi = {
     },
   ) => {
     const { params, ...rest } = opts;
-    return get<MethodFindings>(`/cases/${caseId}/timelines/${timelineId}/analysis/findings`, {
-      ...rest,
-      // Omitted entirely when empty so the cache key matches the server's
-      // "no params" case rather than an empty-object variant of it.
-      ...(params && Object.keys(params).length ? { params: JSON.stringify(params) } : {}),
-    });
+    return get<MethodFindings>(
+      `/cases/${caseId}/timelines/${timelineId}/analysis/findings`,
+      {
+        ...rest,
+        // Omitted entirely when empty so the cache key matches the server's
+        // "no params" case rather than an empty-object variant of it.
+        ...(params && Object.keys(params).length
+          ? { params: JSON.stringify(params) }
+          : {}),
+      },
+    );
   },
 };

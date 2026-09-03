@@ -10,12 +10,14 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
 import { METHODS_BY_ID } from "@/components/analysis/method-registry";
+import { fmtNum } from "@/lib/format";
 
 const sweep = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 const dismissed = vi.hoisted(() => ({
   current: { includeDismissed: false, setIncludeDismissed: (_: boolean) => {} },
 }));
 vi.mock("@/hooks/useMethodFindings", () => ({
+  useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
   useStreamingSweep: () => sweep.current,
   useMethodFindings: () => ({ data: undefined, isLoading: false }),
   useIncludeDismissed: () => dismissed.current,
@@ -52,7 +54,9 @@ vi.mock("@/hooks/useTimelineDetectors", () => ({
   scopeOf: () => ({ frame: "self" }),
 }));
 vi.mock("@/api/baselines", () => ({
-  baselinesApi: { list: async () => ({ baselines: [{ id: "bl-1", name: "Feb 24 – Mar 1" }] }) },
+  baselinesApi: {
+    list: async () => ({ baselines: [{ id: "bl-1", name: "Feb 24 – Mar 1" }] }),
+  },
 }));
 
 const sigma = vi.hoisted(() => ({ current: [] as unknown[] }));
@@ -108,9 +112,16 @@ function state(id: string, over: Record<string, unknown> = {}) {
     status: "applicable",
     findings: [],
     total: 0,
+    totalExact: true,
+    totalNote: null,
+    dismissedCount: 0,
+    limit: 50,
+    canRaise: true,
+    raise: () => {},
     isLoading: false,
     pending: false,
     error: false,
+    warnings: [],
     configured: true,
     entry: entryOf(id),
     ...over,
@@ -133,7 +144,10 @@ function renderRail(
   };
   // The configured list mirrors the sweep's `configured` states, as the real
   // hooks share one source.
-  const byMethod = sweep.current.byMethod as Record<string, { configured?: boolean; entry?: unknown }>;
+  const byMethod = sweep.current.byMethod as Record<
+    string,
+    { configured?: boolean; entry?: unknown }
+  >;
   detectors.entries = Object.values(byMethod)
     .filter((st) => st.configured && st.entry)
     .map((st) => st.entry as Record<string, unknown>);
@@ -186,9 +200,15 @@ describe("InvestigateRail", () => {
 
   it("shows the empty state with the wizard entry when nothing is configured", () => {
     const onAddDetector = vi.fn();
-    renderRail({ byMethod: {}, done: 0, total: 0 }, readiness.current, { onAddDetector });
-    expect(screen.getByTestId("no-detectors")).toHaveTextContent("No detectors configured");
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    renderRail({ byMethod: {}, done: 0, total: 0 }, readiness.current, {
+      onAddDetector,
+    });
+    expect(screen.getByTestId("no-detectors")).toHaveTextContent(
+      "No detectors configured",
+    );
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
     fireEvent.click(screen.getByTestId("add-detector"));
     expect(onAddDetector).toHaveBeenCalledWith();
   });
@@ -200,7 +220,9 @@ describe("InvestigateRail", () => {
     detectors.isLoaded = false;
     renderRail({ byMethod: {}, done: 0, total: 0 });
     expect(screen.queryByTestId("no-detectors")).toBeNull();
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
   });
 
   it("names each configured detector with its scope and count, editable and removable", async () => {
@@ -212,7 +234,10 @@ describe("InvestigateRail", () => {
           value_novelty: state("value_novelty", {
             findings: [finding()],
             total: 1,
-            entry: entryOf("value_novelty", { frame: "baseline", baseline_id: "bl-1" }),
+            entry: entryOf("value_novelty", {
+              frame: "baseline",
+              baseline_id: "bl-1",
+            }),
           }),
         },
       },
@@ -248,6 +273,99 @@ describe("InvestigateRail", () => {
     });
     expect(screen.queryByTestId("detector-chip-entropy")).toBeNull();
     expect(screen.getByTestId("no-detectors")).toBeInTheDocument();
+  });
+
+  it("says what it is not showing, per method, and offers the next page", () => {
+    const raise = vi.fn();
+    renderRail({
+      byMethod: {
+        value_combo: state("value_combo", {
+          findings: Array.from({ length: 50 }, (_, i) =>
+            finding({
+              type: "value_combo",
+              event_id: `e${i}`,
+              fields: ["a", "b"],
+              values: ["x", `y${i}`],
+            }),
+          ),
+          total: 4000,
+          raise,
+        }),
+      },
+    });
+    const row = screen.getByTestId("truncation-value_combo");
+    expect(row).toHaveTextContent(`showing 50 of ${fmtNum(4000)}`);
+    fireEvent.click(within(row).getByRole("button", { name: /show more/i }));
+    expect(raise).toHaveBeenCalledTimes(1);
+    // The group's count is what was found, not how many rows are drawn.
+    expect(screen.getByTestId("evidence-group")).toHaveTextContent(
+      fmtNum(4000),
+    );
+  });
+
+  it("stops offering more at the page ceiling but keeps saying it is a page", () => {
+    renderRail({
+      byMethod: {
+        value_combo: state("value_combo", {
+          findings: Array.from({ length: 80 }, (_, i) =>
+            finding({
+              type: "value_combo",
+              event_id: `e${i}`,
+              fields: ["a", "b"],
+              values: ["x", `y${i}`],
+            }),
+          ),
+          total: 4000,
+          limit: 80,
+          canRaise: false,
+        }),
+      },
+    });
+    const row = screen.getByTestId("truncation-value_combo");
+    expect(row).toHaveTextContent(`showing 80 of ${fmtNum(4000)}`);
+    expect(within(row).queryByRole("button")).toBeNull();
+  });
+
+  it("renders no truncation row when the page holds everything", () => {
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1,
+        }),
+      },
+    });
+    expect(screen.queryByTestId("truncation-value_novelty")).toBeNull();
+  });
+
+  it("marks a total the server could not make exact", () => {
+    renderRail({
+      byMethod: {
+        value_novelty: state("value_novelty", {
+          findings: [finding()],
+          total: 1204,
+          totalExact: false,
+          // The reason rides in its own field: runners append it *after* every
+          // other caveat, so reading `warnings[0]` explains the wrong thing.
+          totalNote:
+            "allowlist (1,203 entries) exceeds the 1,000-entry SQL bound",
+          warnings: [
+            "suspect window holds 3 events",
+            "allowlist (1,203 entries) exceeds the 1,000-entry SQL bound",
+          ],
+        }),
+      },
+    });
+    const chip = screen.getByTestId("detector-chip-value_novelty");
+    const shown = `${fmtNum(1204)}+`;
+    expect(chip).toHaveTextContent(shown);
+    expect(within(chip).getByText(shown)).toHaveAttribute(
+      "title",
+      expect.stringContaining("allowlist"),
+    );
+    expect(screen.getByTestId("truncation-value_novelty")).toHaveTextContent(
+      shown,
+    );
   });
 
   it("shows progress while methods are still settling", () => {
@@ -300,7 +418,9 @@ describe("InvestigateRail", () => {
     expect(
       screen.getByText("No events in this timeline yet."),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
     expect(
       screen.getByRole("link", { name: /case overview/i }),
     ).toHaveAttribute("href", "/cases/c1");
@@ -319,7 +439,9 @@ describe("InvestigateRail", () => {
       total: 1,
       byMethod: { entropy: state("entropy", { pending: true }) },
     });
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
   });
 
   it("says nothing-found only once every configured detector settled", () => {
@@ -356,7 +478,9 @@ describe("InvestigateRail", () => {
     const summary = screen.getByTestId("weak-summary");
     expect(summary).toHaveTextContent("1 weaker finding");
     // And it is not an all-clear: the group still counts what it holds.
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
 
     fireEvent.click(summary);
     expect(screen.getByText(/2212222122/)).toBeInTheDocument();
@@ -470,7 +594,9 @@ describe("named techniques", () => {
   it("counts a Sigma hit as a finding, so the rail does not claim it is clear", () => {
     sigma.current = [HIT];
     renderRail({ done: 0, total: 0 });
-    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(
+      screen.queryByText(/No findings from the configured detectors/i),
+    ).toBeNull();
     expect(screen.queryByTestId("no-detectors")).toBeNull();
   });
 

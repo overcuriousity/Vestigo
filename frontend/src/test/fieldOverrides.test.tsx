@@ -21,6 +21,7 @@ import { InvestigateSheet } from "@/components/analysis/InvestigateSheet";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 
 vi.mock("@/hooks/useMethodFindings", () => ({
+  useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
   useMethodFindings: () => ({ data: undefined, isLoading: false, isError: false }),
   METHOD_LIMIT: 50,
 }));
@@ -86,6 +87,7 @@ function renderMethod(methodId = "value_novelty") {
       methodId={methodId as never}
       onClose={() => {}}
       onRun={() => {}}
+      pageKey="test-page"
       query={{ data: undefined, isFetching: false, isError: false } as never}
     />,
     { wrapper },

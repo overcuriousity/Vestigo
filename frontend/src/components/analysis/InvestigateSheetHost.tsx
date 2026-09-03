@@ -13,7 +13,10 @@
 import { useEffect, useState } from "react";
 import { InvestigateSheet } from "./InvestigateSheet";
 import { ScopeChangeDialog } from "./ScopeChangeDialog";
-import { useMethodFindings } from "@/hooks/useMethodFindings";
+import {
+  useFindingsPageKey,
+  useMethodFindings,
+} from "@/hooks/useMethodFindings";
 import { useScopeChange } from "@/hooks/useScopeChange";
 import { scopeOf, useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import type { MethodId } from "./method-registry";
@@ -66,7 +69,9 @@ export function InvestigateSheetHost({
   // there showing prose without firing a request — opening a method's detail is
   // not the same act as running it — while `autorun` covers the one case where
   // it is: the Tools sheet's Run anyway / Retry.
-  const [runParams, setRunParams] = useState<Record<string, unknown> | null>(null);
+  const [runParams, setRunParams] = useState<Record<string, unknown> | null>(
+    null,
+  );
 
   // Set when the analyst submits the knobs from *finding* mode ("Run with
   // these"). The question they just asked is a method-wide one — "what does
@@ -102,13 +107,15 @@ export function InvestigateSheetHost({
     caseId,
     timelineId,
   );
-  const entry = sheet.kind === "finding" ? entries.get(sheet.method) : undefined;
+  const entry =
+    sheet.kind === "finding" ? entries.get(sheet.method) : undefined;
   // The rail stays interactive beside the sheet, so the detector whose finding
   // is open can be removed while it is open. Without this the query would fall
   // back to the panel scope with empty params and fire a *fresh* scan for a
   // detector that no longer exists — an unprompted heavy run, and a different
   // finding at that rank than the row that was clicked.
-  const entryGone = sheet.kind === "finding" && detectorsLoaded && entry === undefined;
+  const entryGone =
+    sheet.kind === "finding" && detectorsLoaded && entry === undefined;
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
     enabled:
       (sheet.kind === "finding" && entry !== undefined) ||
@@ -120,6 +127,12 @@ export function InvestigateSheetHost({
     // that question has no baseline to answer it with at all.
     scope: entry ? scopeOf(entry) : undefined,
   });
+  // The same identity the query above is keyed by, so "Show more" in the sheet
+  // raises this run's page and not the rail's run of the same method.
+  const pageKey = useFindingsPageKey(caseId, timelineId, methodOf(sheet), {
+    params: runParams ?? entry?.params ?? {},
+    scope: entry ? scopeOf(entry) : undefined,
+  });
 
   // Closing is the honest answer to "what you were reading is gone" — leaving
   // the overlay up would show a stale finding under a detector that is no
@@ -128,11 +141,15 @@ export function InvestigateSheetHost({
     if (entryGone) onClose();
   }, [entryGone, onClose]);
 
-  const finding = sheet.kind === "finding" ? findings.data?.results[sheet.rank] : undefined;
+  const finding =
+    sheet.kind === "finding" ? findings.data?.results[sheet.rank] : undefined;
 
   return (
     <>
-      {sheet.kind === "finding" && !ranFromFinding && finding && findings.data ? (
+      {sheet.kind === "finding" &&
+      !ranFromFinding &&
+      finding &&
+      findings.data ? (
         <InvestigateSheet
           caseId={caseId}
           timelineId={timelineId}
@@ -169,6 +186,7 @@ export function InvestigateSheetHost({
           initialParams={runParams ?? entry?.params}
           onRun={setRunParams}
           query={findings}
+          pageKey={pageKey}
         />
       ) : sheet.kind === "method" ? (
         <InvestigateSheet
@@ -180,6 +198,7 @@ export function InvestigateSheetHost({
           methodId={sheet.method}
           onRun={setRunParams}
           query={findings}
+          pageKey={pageKey}
         />
       ) : sheet.kind === "tools" ? (
         <InvestigateSheet

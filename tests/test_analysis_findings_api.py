@@ -43,6 +43,7 @@ def stub_detector(monkeypatch):
             warnings: list = []
             windows = None
             total_findings = len(findings)
+            total_findings_exact = calls.get("exact", True)
 
         return _Result(), {
             "baseline_id": kwargs.get("baseline_id"),
@@ -85,6 +86,7 @@ def stub_detector(monkeypatch):
             "warnings": result.warnings,
             "windows": result.windows,
             "total_findings": result.total_findings,
+            "total_findings_exact": result.total_findings_exact,
         }
 
     monkeypatch.setattr(analysis_router, "_run_stat_detector", _fake_detector)
@@ -125,6 +127,18 @@ def test_findings_returns_results_and_scope(client, seeded, stub_detector):
     assert body["method"] == "value_novelty"
     assert body["scope"]["frame"] == "self"
     assert body["cache"] == "miss"
+
+
+def test_findings_say_whether_the_total_is_exact(client, seeded, stub_detector):
+    """`total_findings_exact` reaches the client, so an inexact count renders as
+    "N+" rather than as a number nobody measured."""
+    case_id, timeline_id = seeded
+    body = client.get(_url(case_id, timeline_id, "value_novelty")).json()
+    assert body["total_findings_exact"] is True
+
+    stub_detector["exact"] = False
+    body = client.get(_url(case_id, timeline_id, "numeric_range")).json()
+    assert body["total_findings_exact"] is False
 
 
 def test_the_mode_the_detector_ran_in_survives_the_method_id(client, seeded, stub_detector):
@@ -618,6 +632,8 @@ def test_log_templates_report_the_total_before_the_limit(monkeypatch):
     )
     assert len(body["results"]) == 50
     assert body["total_findings"] == 400
+    # A template count is `count() OVER ()` before the LIMIT — always exact.
+    assert body["total_findings_exact"] is True
 
 
 def test_log_templates_do_not_re_resolve_the_timeline_scope(monkeypatch):

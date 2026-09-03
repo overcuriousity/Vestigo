@@ -16,6 +16,7 @@ import { AUTO_SCAN_MAX_FIELDS } from "@/components/analysis/detector-hooks";
 import { TooltipProvider } from "@/components/ui/Tooltip";
 
 vi.mock("@/hooks/useMethodFindings", () => ({
+  useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
   useMethodFindings: () => ({ data: undefined, isLoading: false, isError: false }),
   METHOD_LIMIT: 50,
 }));
@@ -85,7 +86,8 @@ describe("the charset picker's auto preview", () => {
         methodId={"charset" as never}
         onClose={() => {}}
         onRun={() => {}}
-        query={{ data: undefined, isFetching: false, isError: false } as never}
+        pageKey="test-page"
+      query={{ data: undefined, isFetching: false, isError: false } as never}
       />,
       { wrapper },
     );

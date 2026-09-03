@@ -4,8 +4,165 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 228 — review fixes on the story tools, and a nested-layer
-regression that closed the detector wizard).
+Last updated: 2026-09-03 (session 231 — exact finding totals shipped as 1.19.2; the fan-out
+that never divided, and the review findings on #349).
+
+## Session 231 — 2026-09-03: the fan-out that never divided
+
+Session 230 wrote that the page and its companion count "declare `scan_fanout(2)` so
+they split its memory cap rather than each taking it whole". They did not. `scan_fanout`
+is a ContextVar the clause builder reads at build time, and `_page_and_total` built its
+`SETTINGS` clause one line *before* declaring the fan-out — so both statements carried
+the full per-slot `max_memory_usage` and the undivided spill thresholds, and the
+`copy_context()` handed each worker a width nothing inside it ever read. Reproduced by
+capturing the SQL through a fake client: both statements at the full budget, half
+expected. Six call sites — value novelty, value combos, numeric range, charset, entropy —
+so every admitted heavy slot on a paged detector committed twice its reservation, the
+over-commit the declaration was introduced (#305) to prevent.
+
+The fix is the call order: the clause and both SQL strings are now built inside the
+`with scan_fanout(2)` block. Each statement runs at half the slot's cap and spills at
+half the thresholds, which the `GROUP BY` beneath both can do; that is the designed
+trade from session 230, now actually made. How it shipped: the only test over these
+scans asserted `heavy_scan_settings() in sql` — the *full* clause — on every statement,
+pinning the bug rather than the contract. It now bounds each statement to the solo or
+halved cap and requires every companion count to run halved beside its page, and two
+new tests assert `max_memory_usage == budget // 2` on the emitted SQL and `budget // 4`
+under an outer fan-out. `ANOMALY_DETECTION.md` now says where the clause must be built
+and why a test, not a docstring, is what holds it.
+
+Review of that fix found the other half: `scan_fanout` divided the memory cap and passed
+`max_threads` through untouched. The heavy width is `cores // N` precisely so that a full
+gate exactly saturates the box (`detect_scan_max_threads`, #301); two statements at that
+width under one slot made a full gate of paged detectors 2x the cores. The chart lane's
+exemption from the thread division is documented and deliberate (`detect_foreground_max_threads`:
+its width is already half the heavy one, so a two-wave chart is one heavy slot's threads)
+— but that argument is the chart lane's, and nothing carried it over to the heavy class.
+`_scan_settings_clause` now takes `split_threads`; the heavy clause divides threads by the
+fan-out (floored at 2 like the width itself), the foreground clause does not, and both
+are pinned: the heavy clause at 8 threads halves to 4 and quarters to 2 under nested
+fan-outs, the foreground width is unchanged under `scan_fanout(2)`, and the two statements
+`_page_and_total` emits carry `max_threads = 4` when the heavy width is 8.
+
+The same review's remaining findings, all fixed. The per-detector sections of
+`ANOMALY_DETECTION.md` (value novelty, value combos, numeric range, charset, entropy)
+still said the exact total came from `count() OVER ()` "in the same statement" — the
+design the contract section of the same file forbids, five hundred lines earlier, with
+the OOM incident as its reason; they now say what ships, a companion count statement over
+the page's own `core`. `findingsLimit.ts::pageKeyOf` keyed a page on method, frame,
+baseline and params but not case or timeline, while the query it mirrors keys on both:
+"Show more" on one timeline made an identically configured method on another open at the
+raised limit, the unprompted heavier scan the store exists to prevent — the key now
+carries both, with a store test. And three plan/handoff files under `.claude/plans/`
+(~3,000 lines) are removed from the branch: `CLAUDE.md` puts rationale in the subsystem
+doc, review findings in the PR thread, and history in git.
+
+## Session 230 — 2026-09-03: an exact total that survives a big corpus
+
+`/code-review 349` found eight defects in the previous session's work. The one worth the
+session was how the exact count was produced. Session 229 read it off a frameless
+`count() OVER ()` in the paging statement, at ten sites, on the argument that the window
+holds only what the `ORDER BY` materialises anyway. That argument is wrong: a limit-aware
+sort keeps top-N, a frameless window keeps *every* post-`GROUP BY` row, and window sorts
+cannot spill where the `GROUP BY` beneath them can (`db/_scan.py`; `queries.py`'s
+`_field_terms_impl` records this exact pattern dying at `max_memory_usage`). Value
+novelty makes it worse rather than better — `HAVING cnt <= rarity_floor` keeps the *rare*
+values, which on a field like `url` is nearly every distinct value in the corpus. So the
+badge that was wrong at 50 would have become a query error at scale.
+
+Three options were weighed with the user: a companion count query per site (always exact,
+a second corpus scan), a bounded window reporting `total_findings_exact: false` above a
+50,000-row ceiling (one scan, exact in every realistic case), or keeping the window and
+retrying on `MEMORY_LIMIT_EXCEEDED`. **The user chose the companion query**, explicitly:
+accurate readings within available resources, extra SQL queries acceptable.
+
+The duplication hazard that made the companion query unattractive — ten hand-written
+statement *pairs* whose `WHERE`/`GROUP BY`/`HAVING` must agree forever — is solved in
+code rather than by discipline. `StatisticalAnomalyService._page_and_total` takes one
+`core` and composes both statements from it: the page is `core + page_tail`, the total is
+`SELECT {total_select} FROM (core) AS scanned`. They cannot drift. The two run
+concurrently under the caller's one gate slot, declaring `scan_fanout(2)` so they split
+its memory cap rather than each taking it whole, so wall clock stays roughly one scan's
+and the extra cost is ClickHouse-side. `ANOMALY_DETECTION.md` now describes that
+mechanism and carries the rule it implies: **a frameless window is allowed only over a
+structurally bounded row set; otherwise the count is its own aggregate.** The four
+`OVER ()` uses left in `anomaly_stats.py` sit over candidate caps of 1,000–2,000 rows or
+the template set, which is what makes them fine.
+
+The other seven, briefly. `analysis_cache` had no version, so every row cached before
+session 229 stayed a hit forever and served a page-length total with no
+`total_findings_exact` — which clients default to `true`; `CACHE_VERSION = 2` now folds
+into the fingerprint. Dismissals shrank the page but not the total, firing the rail's
+"showing N of M" row for findings the analyst had already dealt with — `_apply_dismissals`
+subtracts what it dropped, with the residue documented (only on-page dismissals are
+knowable, so the error can only leave the total slightly high). Charset counted rows its
+Python loop then discarded; the three `continue` paths increment a counter and a non-zero
+one appends an inexactness reason, so an unreachable path that becomes reachable says so
+instead of stranding a permanent truncation row. The inexactness tooltip showed
+`warnings[0]`, which on a temporal run is a window-size caveat — the reason now travels as
+its own `total_findings_note` through to `DetectorStrip`. The batched attribute pass
+double-counted a key reachable by two field tokens (`user` and `attr:user`); it returns a
+total per key and the caller sums once. A `row_ceiling_hit` warning said "ordered by
+novelty" for a scan ordered by score. And the frontend's page-size store was keyed by
+method alone, so "Show more" in the sheet re-ran the rail's separately-scoped detector; it
+is now keyed by `pageKeyOf(method, scope, params)`, the same identity the query uses.
+
+`tests/test_anomaly_stats.py`'s `FakeClient` was FIFO — one canned response per `query()`
+call, regardless of SQL. Two statements per scan broke 25 tests, and running them in two
+threads made the pop order non-deterministic besides. The fake now dispatches on content
+(the companion is recognisable by its `) AS scanned` alias), answers totals from their own
+seed, and takes a lock; page and totals statements are recorded separately so index-based
+assertions read as they did. The shape tests that asserted a `count() OVER ()` now assert
+the suppression reached **both** statements — the property `_page_and_total` exists to
+guarantee — and it has a unit test of its own.
+
+Verified: `tests/test_anomaly_stats.py` 231 passed; the ClickHouse totals suites
+(`test_value_combo_totals_clickhouse.py`, `test_novelty_batched_clickhouse.py`,
+`test_charset_group_field_clickhouse.py`) and `test_analysis_cache.py` 52 passed; frontend
+`tsc -b --noEmit` clean and 1275 vitest tests passing; `ruff check`/`format --check` clean.
+
+## Session 229 — 2026-09-03: `total_findings` means what it says
+
+Live-testing value combos on a production case never showed more than 50 findings, and the
+strip badge read exactly 50. The cause was structural, not a bug in one place: five methods
+— value novelty (and its batched attribute pass), value combos, numeric range, charset,
+entropy — put a small `LIMIT` (the request limit, or 25 per field) into the aggregation
+itself and reported the size of what came back as `total_findings`. Value combos was the
+worst case: its SQL limit *was* the request limit, so the total could never exceed it. The
+other seven methods were already honest (timestamp order counts from per-source summaries,
+log templates use `count() OVER ()`, frequency builds its list in Python; the five
+candidate-capped methods warn when their 1,000–2,000-row caps trip).
+
+`LIMIT` was never what bounded the scan — the `GROUP BY` over the corpus is the cost and
+`HEAVY_SCAN_SETTINGS` bounds it — so the fix costs one window column per statement. The
+contract is now written down (`ANOMALY_DETECTION.md` §"Totals and truncation"): the count is
+exact across the full analysed scope, after suppression, before the display cap; the page is
+the true top-`limit` by the reported score; the only non-display truncation is a candidate
+cap, and it warns. Concretely: `count() OVER ()` (`PARTITION BY key` in the batched pass,
+`sum(hits)` where a group fans out per suspect window) in the same statement; allowlist and
+normal-marked events bound into the `HAVING` so the count is post-suppression (a set past
+1,000 entries falls back to the page filter and marks the total inexact, with a warning);
+per-field pages of `max(stat_per_field_limit, limit)` — the setting is now a floor, since a
+global top-50 may be 50 values of one field; temporal novelty/combos order by the best
+per-window score instead of summed window counts; charset evaluates its per-character
+surprise sum in SQL and orders by it instead of by `length(novel)`, which could rank two
+rare characters over one never-seen one. Hydration fetches in 500-id chunks, the one hard
+limit that remains. `StatAnomalyResult.total_findings_exact` and the API field of the same
+name carry the flag.
+
+On the rail: a per-method page size in a session-only store (50, then 80 — deliberately not
+persisted, since a lifted page from last week is the same undisclosed state the rail exists
+to avoid), "showing N of M <method> findings — Show more" under any method whose page is
+smaller than its total, group counts as the sum of exact totals, and "M+" with the reason as
+tooltip when the server could not count exactly. The sheet's method mode says the same.
+
+Verified against live ClickHouse: new `test_value_combo_totals_clickhouse.py`, the batched
+novelty and grouped charset suites extended with exact-total and ordering assertions (a
+`limit=1` page must hold the maximum score of an unlimited run), and the demo coverage test
+still finds something with every method.
+
+Not done, noted: `useTriageCoverage` → `useDetectorSweep` (the legacy `/anomalies` sweep at
+a fixed 50) has no callers at all and can go; `PatternsView` keeps its own 50→150→500 steps.
 
 ## Session 228 — 2026-09-03: what a confirm actually did, and one duplicated npm package
 

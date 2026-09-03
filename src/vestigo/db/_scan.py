@@ -793,7 +793,9 @@ def scan_fanout(width: int) -> Iterator[None]:
     fully admitted lane commits ``fanout x`` the budget that was reserved for
     it, which is exactly the over-commit the pair of gates exists to prevent.
     The factor is the fan-out width and nothing else, so no gate sizing can
-    absorb it.
+    absorb it. The heavy class divides its thread width by the same factor,
+    for the same reason (:func:`heavy_scan_settings`); the chart lane keeps
+    its width, by the argument in :func:`detect_foreground_max_threads`.
 
     Multiplies rather than replaces, so a nested fan-out (the violin chart's
     second wave under its first) divides by the product. contextvars are
@@ -836,13 +838,22 @@ def foreground_wait_seconds(bounded: float) -> float | None:
     return None if _foreground_unbounded_var.get() else bounded
 
 
-def _scan_settings_clause(budget: int, threads: int) -> str:
+def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> str:
     s = get_settings()
     # A gate slot's cap is per *slot*: a caller that fans out splits its own
     # share across the queries it has in flight, rather than issuing each at
     # the full cap. See `scan_fanout`. Never 0, for the same reason the caps
     # themselves never are.
-    budget = max(budget // max(_scan_fanout_var.get(), 1), 1)
+    fanout = max(_scan_fanout_var.get(), 1)
+    budget = max(budget // fanout, 1)
+    # The thread width is the other resource a slot commits, and the heavy
+    # width is sized so a *full* gate exactly saturates the box — two queries
+    # at it under one slot is a full gate at 2x the cores. The chart lane is
+    # exempt by argument (see `detect_foreground_max_threads`). Floored at 2
+    # like the width itself: a single-threaded whole-corpus GROUP BY is not a
+    # fallback to land on silently.
+    if split_threads:
+        threads = max(2, threads // fanout)
     # Spill must engage well before the cap kills the query — a configured
     # threshold at or above the per-query cap would never fire.
     group_by_spill = min(s.stat_scan_external_group_by_bytes, budget // 2)
@@ -868,8 +879,16 @@ def heavy_scan_settings() -> str:
     Built per call rather than frozen at import — see the module docstring.
     Cheap: a few f-string formats over cached inputs, against a query that is
     about to read the whole corpus.
+
+    Under :func:`scan_fanout` both the memory cap *and* the thread width
+    divide by the width: the heavy width is ``cores // N`` so that a full
+    gate exactly saturates the box (:func:`detect_scan_max_threads`), and a
+    slot running two queries at it would make a full gate of paged detectors
+    twice the machine.
     """
-    return _scan_settings_clause(detect_scan_memory_budget(), detect_scan_max_threads())
+    return _scan_settings_clause(
+        detect_scan_memory_budget(), detect_scan_max_threads(), split_threads=True
+    )
 
 
 def foreground_scan_settings() -> str:
@@ -882,7 +901,9 @@ def foreground_scan_settings() -> str:
     bound on top of it. See :func:`detect_foreground_max_threads` for why the
     width cannot simply be the heavy one, and why the asymmetry stands.
     """
-    return _scan_settings_clause(detect_foreground_memory_budget(), detect_foreground_max_threads())
+    return _scan_settings_clause(
+        detect_foreground_memory_budget(), detect_foreground_max_threads(), split_threads=False
+    )
 
 
 # Admission gate for heavy detector scans: at most VESTIGO_STAT_SCAN_CONCURRENCY

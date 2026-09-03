@@ -413,8 +413,8 @@ _SPECS: tuple[SettingSpec, ...] = (
     SettingSpec(
         "stat_per_field_limit",
         "detectors",
-        "Per-field result limit",
-        "Default cap on rare values reported per field.",
+        "Per-field result floor",
+        "Rare values fetched per field, at least; a request limit above it raises the per-field page to match.",
     ),
     SettingSpec(
         "stat_order_min_skew",

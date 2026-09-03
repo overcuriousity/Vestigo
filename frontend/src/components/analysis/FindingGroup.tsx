@@ -19,7 +19,7 @@ import type { EvidenceClass, MethodId, MethodMeta } from "./method-registry";
 import type { MethodState } from "@/hooks/useMethodFindings";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
-import { truncate } from "@/lib/format";
+import { fmtNum, truncate } from "@/lib/format";
 import { isTemplateRow, type LogTemplateRow } from "@/api/analysis";
 import type { AnomalyFinding, Event } from "@/api/types";
 
@@ -266,6 +266,19 @@ export function FindingGroup({
     isTemplateRow,
   );
 
+  // What each method found versus what its page holds. `total` is the exact
+  // count across the scope (docs/ANOMALY_DETECTION.md §"Totals and
+  // truncation"), so a page smaller than it is a display cap and nothing else
+  // — and a cap nobody can see is the one thing this rail must never have.
+  const truncated = methods
+    .map((meta) => byMethod[meta.id])
+    .filter(
+      (st): st is MethodState =>
+        st !== undefined && st.configured && st.findings.length < st.total,
+    );
+  const found = methods.reduce((n, meta) => n + (byMethod[meta.id]?.total ?? 0), 0);
+  const anyInexact = methods.some((meta) => byMethod[meta.id]?.totalExact === false);
+
   // A group whose every row is below the floor still renders: it holds
   // findings, and dropping the section would hide them without saying so.
   if (items.length === 0 && templateRows.length === 0 && extraCount === 0 && heldBack === 0) {
@@ -280,11 +293,13 @@ export function FindingGroup({
       >
         {evidenceClass.label}
         <span className="font-normal normal-case tracking-normal">— {evidenceClass.note}</span>
-        {/* What the group holds, including what the floor is holding back —
-            the count is about the findings, not about how many rows happen to
-            be drawn. The row below names the difference. */}
+        {/* What the group holds: every method's exact total, plus the rows
+            that come from elsewhere — the count is about the findings, not
+            about how many rows happen to be drawn. The rows below name the
+            difference (the display floor, the page). */}
         <span className="ml-auto font-mono text-[var(--color-fg-disabled)]">
-          {items.length + templateRows.length + extraCount + heldBack}
+          {fmtNum(found + extraCount)}
+          {anyInexact ? "+" : ""}
         </span>
       </h4>
       <div className="space-y-1.5">
@@ -310,6 +325,33 @@ export function FindingGroup({
             onSelect={(rank) => onSelectFinding(templates.id, rank)}
           />
         )}
+
+        {/* A page is not the whole answer either. One row per method whose
+            page is smaller than its total: what is shown, what was found, and
+            the one step that shows more — or, at the ceiling, no step and no
+            pretence that this is everything. */}
+        {truncated.map((st) => (
+          <div
+            key={st.meta.id}
+            data-testid={`truncation-${st.meta.id}`}
+            className="flex items-center justify-between gap-2 rounded border border-dashed border-[var(--color-border)] px-2 py-1.5 text-xs text-[var(--color-fg-muted)]"
+          >
+            <span>
+              showing {fmtNum(st.findings.length)} of {fmtNum(st.total)}
+              {st.totalExact ? "" : "+"} {st.meta.label.toLowerCase()} findings
+            </span>
+            {st.canRaise && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={st.raise}
+                className="h-auto px-1.5 py-0.5 font-normal text-[var(--color-fg-secondary)]"
+              >
+                Show more
+              </Button>
+            )}
+          </div>
+        ))}
 
         {/* Held back is not the same as not found, and the difference has to be
             on screen: this rail's whole contract is that nothing it hides is
