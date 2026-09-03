@@ -1,5 +1,11 @@
 /**
- * How many findings each method's page holds on the Investigate surface.
+ * How many findings each findings *query* holds on the Investigate surface.
+ *
+ * Keyed by the query's own identity — method, scope and parameters — not by
+ * method alone. The rail's configured detector and the sheet's method mode ask
+ * different questions of the same method, and a page shared between them means
+ * "Show more" on one silently re-runs the other: a heavy scan nobody asked for,
+ * answering something the analyst was not reading.
  *
  * Session state, deliberately not persisted (the UI store persists everything
  * it holds): a page raised last week and still raised today would be the same
@@ -16,24 +22,43 @@ import type { MethodId } from "@/components/analysis/method-registry";
 export const DEFAULT_FINDINGS_LIMIT = 50;
 export const FINDINGS_LIMIT_STEPS: readonly number[] = [50, 80];
 
+/** A findings query's page identity. Mirrors `findingsQueryOptions`' key. */
+export type FindingsPageKey = string;
+
+export function pageKeyOf(
+  method: MethodId,
+  scope: { frame: string; baseline_id?: string | null },
+  params: Record<string, unknown>,
+): FindingsPageKey {
+  return [
+    method,
+    scope.frame,
+    scope.baseline_id ?? "none",
+    JSON.stringify(params),
+  ].join("|");
+}
+
 interface FindingsLimitState {
-  byMethod: Partial<Record<MethodId, number>>;
-  raise: (method: MethodId) => void;
+  byKey: Partial<Record<FindingsPageKey, number>>;
+  raise: (key: FindingsPageKey) => void;
 }
 
 export const useFindingsLimitStore = create<FindingsLimitState>()((set) => ({
-  byMethod: {},
-  raise: (method) =>
+  byKey: {},
+  raise: (key) =>
     set((s) => {
-      const current = s.byMethod[method] ?? DEFAULT_FINDINGS_LIMIT;
+      const current = s.byKey[key] ?? DEFAULT_FINDINGS_LIMIT;
       const next = FINDINGS_LIMIT_STEPS.find((step) => step > current);
       if (next === undefined) return s;
-      return { byMethod: { ...s.byMethod, [method]: next } };
+      return { byKey: { ...s.byKey, [key]: next } };
     }),
 }));
 
-export function limitOf(byMethod: Partial<Record<MethodId, number>>, method: MethodId): number {
-  return byMethod[method] ?? DEFAULT_FINDINGS_LIMIT;
+export function limitOf(
+  byKey: Partial<Record<FindingsPageKey, number>>,
+  key: FindingsPageKey,
+): number {
+  return byKey[key] ?? DEFAULT_FINDINGS_LIMIT;
 }
 
 export function canRaise(limit: number): boolean {

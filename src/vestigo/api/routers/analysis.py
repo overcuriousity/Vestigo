@@ -510,8 +510,10 @@ async def _run_log_templates(
         # with 400 distinct templates would report 50 and the rail's "showing N
         # of M" would claim nothing was cut.
         "total_findings": payload.get("total_templates", len(templates)),
-        # `count() OVER ()` before the LIMIT — always exact.
+        # `count() OVER ()` over the bounded template set, before the LIMIT —
+        # always exact, so there is no reason to report.
         "total_findings_exact": True,
+        "total_findings_note": None,
         "warnings": payload.get("warnings", []),
     }
 

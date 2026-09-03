@@ -20,6 +20,7 @@ const calls = vi.hoisted(() => ({ current: [] as Record<string, unknown>[] }));
 
 vi.mock("@/hooks/useMethodFindings", () => ({
   useFindingsPage: () => ({ limit: 50, canRaise: true, raise: () => {} }),
+  useFindingsPageKey: (method: string) => `${method}|page`,
   useMethodFindings: (
     _c: string,
     _t: string,

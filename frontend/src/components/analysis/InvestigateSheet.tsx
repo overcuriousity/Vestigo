@@ -41,14 +41,21 @@ import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
 import { Button } from "@/components/ui/Button";
 import { useFindingsPage } from "@/hooks/useMethodFindings";
+import type { FindingsPageKey } from "@/stores/findingsLimit";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
-import type { AnalysisScope, MethodFindings, MethodResult } from "@/api/analysis";
+import type {
+  AnalysisScope,
+  MethodFindings,
+  MethodResult,
+} from "@/api/analysis";
 import type { AnomalyFinding, Event } from "@/api/types";
 import { isTemplateRow } from "@/api/analysis";
 
 /** See FindingGroup: method ids are API keys, detector-registry uses UI slugs. */
-const DETECTOR_BY_API_KEY = Object.fromEntries(DETECTORS.map((d) => [d.detector, d]));
+const DETECTOR_BY_API_KEY = Object.fromEntries(
+  DETECTORS.map((d) => [d.detector, d]),
+);
 
 export type SheetMode =
   | {
@@ -75,6 +82,8 @@ export type SheetMode =
       /** Runs the method with the knob values as typed. */
       onRun: (params: Record<string, unknown>) => void;
       query: UseQueryResult<MethodFindings>;
+      /** Pages this run's own results — not the rail's run of the same method. */
+      pageKey: FindingsPageKey;
     }
   | { mode: "tools"; section?: "methods" | "signatures" | "explore" | "scope" };
 
@@ -141,17 +150,24 @@ function MethodBody({
   running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
-  const [params, setParams] = useState<Record<string, unknown>>(initialParams ?? {});
+  const [params, setParams] = useState<Record<string, unknown>>(
+    initialParams ?? {},
+  );
   const [blocker, setBlocker] = useState<string | null>(null);
-  const onFormChange = useCallback((p: Record<string, unknown>, b: string | null) => {
-    setParams(p);
-    setBlocker(b);
-  }, []);
+  const onFormChange = useCallback(
+    (p: Record<string, unknown>, b: string | null) => {
+      setParams(p);
+      setBlocker(b);
+    },
+    [],
+  );
 
   return (
     <>
       <Subhead>How this method works</Subhead>
-      <p className="text-xs leading-relaxed text-[var(--color-fg-secondary)]">{meta.what}</p>
+      <p className="text-xs leading-relaxed text-[var(--color-fg-secondary)]">
+        {meta.what}
+      </p>
 
       <Subhead>Parameters</Subhead>
       {/* An ad hoc run: nothing here is stored. Configuring a detector so the
@@ -174,14 +190,22 @@ function MethodBody({
           onChange={onFormChange}
         />
         {onRun && (
-          <Button type="submit" variant="outline" size="sm" disabled={running || blocker !== null}>
+          <Button
+            type="submit"
+            variant="outline"
+            size="sm"
+            disabled={running || blocker !== null}
+          >
             <Play size={11} />
             {running ? "Running…" : runLabel}
           </Button>
         )}
       </form>
       {onRun && blocker && (
-        <p data-testid="method-knob-blocker" className="mt-1.5 text-xs text-[var(--color-warning)]">
+        <p
+          data-testid="method-knob-blocker"
+          className="mt-1.5 text-xs text-[var(--color-warning)]"
+        >
           {blocker}
         </p>
       )}
@@ -191,8 +215,9 @@ function MethodBody({
         {meta.querySketch}
       </pre>
       <p className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
-        The structure of the statement this method runs. Fields, windows and thresholds are bound
-        from the parameters above — this is not a transcript of the executed query.
+        The structure of the statement this method runs. Fields, windows and
+        thresholds are bound from the parameters above — this is not a
+        transcript of the executed query.
       </p>
     </>
   );
@@ -211,17 +236,22 @@ function MethodResults({
   timelineId,
   methodId,
   query,
+  pageKey,
 }: {
   caseId: string;
   timelineId: string;
   methodId: MethodId;
   query: UseQueryResult<MethodFindings>;
+  pageKey: FindingsPageKey;
 }) {
   const detectorMeta = DETECTOR_BY_API_KEY[methodId];
   const results = query.data?.results ?? [];
   const scored = results.filter((f): f is AnomalyFinding => !isTemplateRow(f));
   const templates = results.filter(isTemplateRow);
-  const page = useFindingsPage(methodId);
+  const page = useFindingsPage(pageKey);
+  // `total_findings` already excludes what dismissal removed from `results`
+  // (the API subtracts it), so a page shorter than the total is a display cap
+  // and nothing else — which is what makes "Show more" an honest offer.
   const total = query.data?.total_findings ?? 0;
   const totalExact = query.data?.total_findings_exact ?? true;
 
@@ -250,7 +280,9 @@ function MethodResults({
         </p>
       ) : (
         <div className="space-y-1">
-          {templates.length > 0 && <TemplateRows rows={templates} onSelect={() => {}} />}
+          {templates.length > 0 && (
+            <TemplateRows rows={templates} onSelect={() => {}} />
+          )}
           {detectorMeta &&
             scored.map((f, rank) => (
               <ScoredRow
@@ -309,7 +341,6 @@ function when(finding: MethodResult): string {
   const ts = rawTs(finding);
   return ts ? fmtTs(ts) : "—";
 }
-
 
 function FindingBody({
   caseId,
@@ -383,20 +414,32 @@ function FindingBody({
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
         <dt className="text-[var(--color-fg-muted)]">Score</dt>
-        <dd data-testid="finding-score" className="m-0 font-mono text-[var(--color-fg-primary)]">
-          {template ? `×${finding.count}` : finding.score.toFixed(2)} {meta.scoreUnit}
+        <dd
+          data-testid="finding-score"
+          className="m-0 font-mono text-[var(--color-fg-primary)]"
+        >
+          {template ? `×${finding.count}` : finding.score.toFixed(2)}{" "}
+          {meta.scoreUnit}
         </dd>
 
         <dt className="text-[var(--color-fg-muted)]">When</dt>
-        <dd className="m-0 font-mono text-[var(--color-fg-secondary)]">{when(finding)}</dd>
+        <dd className="m-0 font-mono text-[var(--color-fg-secondary)]">
+          {when(finding)}
+        </dd>
 
         <dt className="text-[var(--color-fg-muted)]">Claim</dt>
-        <dd data-testid="finding-class" className="m-0 text-[var(--color-fg-secondary)]">
+        <dd
+          data-testid="finding-class"
+          className="m-0 text-[var(--color-fg-secondary)]"
+        >
           {evidence?.label} — {evidence?.note}
         </dd>
 
         <dt className="text-[var(--color-fg-muted)]">Scope</dt>
-        <dd data-testid="finding-scope" className="m-0 text-[var(--color-fg-secondary)]">
+        <dd
+          data-testid="finding-scope"
+          className="m-0 text-[var(--color-fg-secondary)]"
+        >
           {scope.frame === "baseline" && scope.baseline_name
             ? `Compared against ${scope.baseline_name}`
             : "All events scanned — no baseline comparison"}
@@ -462,7 +505,11 @@ function FindingActions({
             ts={rawTs(finding)}
             eventId={"event_id" in finding ? finding.event_id : null}
             field={finding.type === "value_novelty" ? finding.field : undefined}
-            value={finding.type === "value_novelty" ? String(finding.value) : undefined}
+            value={
+              finding.type === "value_novelty"
+                ? String(finding.value)
+                : undefined
+            }
             onDrillField={onDrillField}
             onJumpToTime={onJumpToTime}
             disposition={{
@@ -539,8 +586,15 @@ export function InvestigateSheet({
         }}
       >
         <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2.5">
-          <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">{title}</h3>
-          <Button variant="ghost" size="icon" onClick={onClose} title="Close (Esc)">
+          <h3 className="flex-1 text-sm font-semibold text-[var(--color-fg-primary)]">
+            {title}
+          </h3>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            title="Close (Esc)"
+          >
             <X size={14} />
           </Button>
         </div>
@@ -573,6 +627,7 @@ export function InvestigateSheet({
                 timelineId={timelineId}
                 methodId={rest.methodId}
                 query={rest.query}
+                pageKey={rest.pageKey}
               />
             </>
           )}

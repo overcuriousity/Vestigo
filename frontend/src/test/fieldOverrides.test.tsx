@@ -87,6 +87,7 @@ function renderMethod(methodId = "value_novelty") {
       methodId={methodId as never}
       onClose={() => {}}
       onRun={() => {}}
+      pageKey="test-page"
       query={{ data: undefined, isFetching: false, isError: false } as never}
     />,
     { wrapper },

@@ -3,10 +3,13 @@
 The key is a hash of every input that can change an answer: which timeline,
 which sources (by their content hash), which enrichment generation, which
 scope, which method, which parameters, and which detection-affecting analyst
-verdicts. Sources are immutable after ingestion, so identical inputs cannot
-describe different data — a hit is therefore provably the same answer, and
-there is no staleness heuristic anywhere in the system. Deliberately no TTL:
-a TTL would answer "is this recent?", which is not the question.
+verdicts, and which :data:`CACHE_VERSION` produced it. Sources are immutable
+after ingestion, so identical inputs cannot describe different data — a hit is
+therefore provably the same answer, and there is no staleness heuristic
+anywhere in the system. Deliberately no TTL: a TTL would answer "is this
+recent?", which is not the question. What a TTL *would* have covered by
+accident — the runner itself learning to answer differently — is what
+:data:`CACHE_VERSION` covers on purpose.
 
 ``dispositions_hash`` is in the key because ``kind="normal"`` verdicts are
 detection-affecting (see :class:`FindingDisposition`): marking a value normal
@@ -30,6 +33,19 @@ from vestigo.db.postgres import AnalysisCache, SourceEnrichment, SourceFieldStat
 
 if TYPE_CHECKING:
     from vestigo.db.postgres import PostgresStore
+
+
+#: Bumped whenever a runner changes what it puts in a payload for inputs it
+#: already answered — a new field, a different ranking, a corrected count.
+#: Nothing else invalidates such a row: the key covers the *inputs*, sources
+#: are immutable, and there is no TTL, so without this every cache written
+#: before the change stays a hit forever and the new code never runs.
+#:
+#: 2 — the exact-`total_findings` contract (docs/ANOMALY_DETECTION.md
+#: §"Totals and truncation"). Rows written before it carry a total that was
+#: the page length and no `total_findings_exact`, which a client reads as an
+#: exact count; they also carry the superseded page ordering.
+CACHE_VERSION = 2
 
 
 def fingerprint(
@@ -59,6 +75,9 @@ def fingerprint(
     computed at 50 rows is not the answer to a request for 500, and serving it
     as a hit would assert a completeness it does not have.
 
+    ``version`` is :data:`CACHE_VERSION`, and it is what makes a payload-shape
+    change deployable: see that constant.
+
     Five inputs are here for the same reason and are easy to forget, because
     none of them is a request parameter:
 
@@ -79,6 +98,7 @@ def fingerprint(
     """
     material = json.dumps(
         {
+            "version": CACHE_VERSION,
             "timeline_id": timeline_id,
             "source_hashes": sorted(source_hashes),
             "enrichment_generation": enrichment_generation,

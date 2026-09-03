@@ -32,7 +32,11 @@ import {
   type MethodPlanEntry,
   type ScopeParams,
 } from "@/api/analysis";
-import { METHODS, type MethodId, type MethodMeta } from "@/components/analysis/method-registry";
+import {
+  METHODS,
+  type MethodId,
+  type MethodMeta,
+} from "@/components/analysis/method-registry";
 import {
   HIDE_DISMISSED_KEY,
   SHOW_DISMISSED_KEY,
@@ -42,10 +46,16 @@ import {
   DEFAULT_FINDINGS_LIMIT,
   canRaise,
   limitOf,
+  pageKeyOf,
   useFindingsLimitStore,
+  type FindingsPageKey,
 } from "@/stores/findingsLimit";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
-import { scopeOf, useTimelineDetectors, type KnownDetectorEntry } from "./useTimelineDetectors";
+import {
+  scopeOf,
+  useTimelineDetectors,
+  type KnownDetectorEntry,
+} from "./useTimelineDetectors";
 
 /**
  * The page size a method starts at. The live value is per method in
@@ -117,12 +127,18 @@ export function useMethodFindings(
   caseId: string,
   timelineId: string,
   method: MethodId,
-  opts: { enabled: boolean; params?: Record<string, unknown>; scope?: ScopeParams },
+  opts: {
+    enabled: boolean;
+    params?: Record<string, unknown>;
+    scope?: ScopeParams;
+  },
 ) {
   const globalScope = useScopeParams();
   const scopeParams = opts.scope ?? globalScope;
   const { includeDismissed } = useIncludeDismissed();
-  const limit = useFindingsLimitStore((s) => limitOf(s.byMethod, method));
+  const limit = useFindingsLimitStore((s) =>
+    limitOf(s.byKey, pageKeyOf(method, scopeParams, opts.params ?? {})),
+  );
   return useQuery<MethodFindings>(
     findingsQueryOptions(
       caseId,
@@ -137,11 +153,26 @@ export function useMethodFindings(
   );
 }
 
-/** The page a method is on, and the one step it can take from there. */
-export function useFindingsPage(method: MethodId) {
-  const limit = useFindingsLimitStore((s) => limitOf(s.byMethod, method));
+/**
+ * The page one findings *query* is on, and the one step it can take.
+ *
+ * Addressed by :func:`pageKeyOf`'s key, not by method: the rail's configured
+ * detector and the sheet's own-knob run are two questions, and raising one
+ * must not re-run the other.
+ */
+export function useFindingsPage(key: FindingsPageKey) {
+  const limit = useFindingsLimitStore((s) => limitOf(s.byKey, key));
   const raise = useFindingsLimitStore((s) => s.raise);
-  return { limit, canRaise: canRaise(limit), raise: () => raise(method) };
+  return { limit, canRaise: canRaise(limit), raise: () => raise(key) };
+}
+
+/** The key `useMethodFindings` pages under, for a caller that needs to raise it. */
+export function useFindingsPageKey(
+  method: MethodId,
+  opts: { params?: Record<string, unknown>; scope?: ScopeParams } = {},
+): FindingsPageKey {
+  const globalScope = useScopeParams();
+  return pageKeyOf(method, opts.scope ?? globalScope, opts.params ?? {});
 }
 
 export interface MethodState {
@@ -153,6 +184,10 @@ export interface MethodState {
   total: number;
   /** False when the server could not count exactly; render the total as "N+". */
   totalExact: boolean;
+  /** Why it is not exact — the tooltip on that "N+". */
+  totalNote: string | null;
+  /** Findings hidden from `findings` by a dismissal, on this page. */
+  dismissedCount: number;
   /** The page this method's findings are capped at, and whether it can grow. */
   limit: number;
   canRaise: boolean;
@@ -200,23 +235,56 @@ export interface MethodState {
   planApplies: boolean;
 }
 
-const CHEAP_IDS = METHODS.filter((m) => m.costClass === "cheap").map((m) => m.id);
-const HEAVY_IDS = METHODS.filter((m) => m.costClass === "heavy").map((m) => m.id);
+const CHEAP_IDS = METHODS.filter((m) => m.costClass === "cheap").map(
+  (m) => m.id,
+);
+const HEAVY_IDS = METHODS.filter((m) => m.costClass === "heavy").map(
+  (m) => m.id,
+);
 
 /** Run every configured detector, cheapest-first, reporting them as they settle. */
 export function useStreamingSweep(caseId: string, timelineId: string) {
-  const { planById, scope, isLoading: planLoading } = useAnalysisPlan(caseId, timelineId);
+  const {
+    planById,
+    scope,
+    isLoading: planLoading,
+  } = useAnalysisPlan(caseId, timelineId);
   const scopeParams = useScopeParams();
   const { includeDismissed } = useIncludeDismissed();
 
   // A configured entry is the whole decision: not the plan (advice, never a
   // lock — a not_applicable method an analyst configured anyway still runs),
   // not a mute, not a per-user focus. One list, shared, audited.
-  const { entries, byMethod: entryByMethod } = useTimelineDetectors(caseId, timelineId);
-  const runnable = useCallback((id: MethodId) => entryByMethod.has(id), [entryByMethod]);
-  const limitByMethod = useFindingsLimitStore((s) => s.byMethod);
+  const { entries, byMethod: entryByMethod } = useTimelineDetectors(
+    caseId,
+    timelineId,
+  );
+  const runnable = useCallback(
+    (id: MethodId) => entryByMethod.has(id),
+    [entryByMethod],
+  );
+  const limitByKey = useFindingsLimitStore((s) => s.byKey);
   const raiseLimit = useFindingsLimitStore((s) => s.raise);
-
+  // The rail runs each method under its configured entry, so that entry is
+  // what its page is keyed by — the same identity the query is keyed by.
+  // Built from the panel frame's primitives, not from `scopeParams` itself,
+  // for the reason `queryDeps` gives: that object is fresh every render, and
+  // a `byMethod` that churns with it is a render loop.
+  const pageKeyFor = useCallback(
+    (id: MethodId) => {
+      const entry = entryByMethod.get(id);
+      const scope = entry
+        ? scopeOf(entry)
+        : {
+            frame: scopeParams.frame,
+            baseline_id: scopeParams.baseline_id ?? null,
+          };
+      return pageKeyOf(id, scope, entry?.params ?? {});
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the frame's two
+    // primitives, not the per-render object they come out of.
+    [entryByMethod, scopeParams.frame, scopeParams.baseline_id],
+  );
   const optionsFor = (id: MethodId, enabled: boolean) => {
     const entry = entryByMethod.get(id);
     return findingsQueryOptions(
@@ -227,11 +295,13 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
       entry?.params ?? {},
       enabled && entry !== undefined,
       includeDismissed,
-      limitOf(limitByMethod, id),
+      limitOf(limitByKey, pageKeyFor(id)),
     );
   };
 
-  const cheapResults = useQueries({ queries: CHEAP_IDS.map((id) => optionsFor(id, true)) });
+  const cheapResults = useQueries({
+    queries: CHEAP_IDS.map((id) => optionsFor(id, true)),
+  });
   // Settled, not "not loading": a disabled query is neither, and asking
   // `isFetched` says what this actually means without depending on how
   // react-query happens to derive `isLoading` from pending/fetching.
@@ -288,9 +358,11 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         findings: data?.results ?? [],
         total: data?.total_findings ?? 0,
         totalExact: data?.total_findings_exact ?? true,
-        limit: limitOf(limitByMethod, meta.id),
-        canRaise: canRaise(limitOf(limitByMethod, meta.id)),
-        raise: () => raiseLimit(meta.id),
+        totalNote: data?.total_findings_note ?? null,
+        dismissedCount: data?.dismissed_count ?? 0,
+        limit: limitOf(limitByKey, pageKeyFor(meta.id)),
+        canRaise: canRaise(limitOf(limitByKey, pageKeyFor(meta.id))),
+        raise: () => raiseLimit(pageKeyFor(meta.id)),
         isLoading: Boolean(query?.isFetching),
         // A method the plan says to run is pending until its query has
         // actually produced something — including while it is still disabled
@@ -309,7 +381,17 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see queryDeps above
-  }, [...queryDeps, planById, runnable, entryByMethod, panelFrame, panelBaseline, limitByMethod, raiseLimit]);
+  }, [
+    ...queryDeps,
+    planById,
+    runnable,
+    entryByMethod,
+    panelFrame,
+    panelBaseline,
+    limitByKey,
+    pageKeyFor,
+    raiseLimit,
+  ]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
   const settled = expected.filter((m) => !byMethod[m.id].pending).length;

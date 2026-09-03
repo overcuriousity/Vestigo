@@ -86,7 +86,8 @@ describe("the charset picker's auto preview", () => {
         methodId={"charset" as never}
         onClose={() => {}}
         onRun={() => {}}
-        query={{ data: undefined, isFetching: false, isError: false } as never}
+        pageKey="test-page"
+      query={{ data: undefined, isFetching: false, isError: false } as never}
       />,
       { wrapper },
     );

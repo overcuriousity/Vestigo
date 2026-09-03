@@ -60,7 +60,8 @@ export function DetectorStrip({
                 state?.error
                   ? "Failed to run"
                   : state && !state.totalExact
-                    ? (state.warnings[0] ?? "The total could not be counted exactly")
+                    ? (state.totalNote ??
+                      "The total could not be counted exactly")
                     : undefined
               }
             >
