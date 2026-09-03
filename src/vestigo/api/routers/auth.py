@@ -64,43 +64,6 @@ def _check_bool_value(key: str, value: Any) -> None:
         raise ValueError(f"Preference {key} values must be booleans")
 
 
-def _check_method_focus_value(key: str, value: Any) -> None:
-    """One timeline's focus: ``{method_id: [field_token, ...]}``.
-
-    Nested one level deeper than the other preferences, so it validates one
-    level deeper too — the blob stays a whitelist rather than becoming the
-    free-form store the top-level check exists to prevent.
-
-    That includes the size bounds. ``_MAX_PREFERENCE_ENTRIES`` and
-    ``_MAX_PREFERENCE_KEY_LENGTH`` only reach the *top-level* keys (timeline
-    ids); without a cap in here, a scripted client can hold 500 timelines each
-    carrying thousands of methods and thousands of field tokens, and the row
-    grows without bound anyway. Refused rather than evicted, unlike the
-    top-level limit: a focus is a filter an analyst can always re-apply, so
-    there is no consent record to lose by saying no.
-    """
-    if not isinstance(value, dict):
-        raise ValueError(f"Preference {key} values must be objects of method -> fields")
-    if len(value) > _MAX_FOCUS_METHODS:
-        raise ValueError(f"Preference {key} may focus at most {_MAX_FOCUS_METHODS} methods")
-    for method, fields in value.items():
-        if not isinstance(method, str) or not method:
-            raise ValueError(f"Preference {key} method ids must be non-empty strings")
-        if len(method) > _MAX_PREFERENCE_KEY_LENGTH:
-            raise ValueError(
-                f"Preference {key} method ids must be at most "
-                f"{_MAX_PREFERENCE_KEY_LENGTH} characters"
-            )
-        if not isinstance(fields, list) or not all(
-            isinstance(f, str) and f and len(f) <= _MAX_PREFERENCE_KEY_LENGTH for f in fields
-        ):
-            raise ValueError(f"Preference {key} fields must be a list of field tokens")
-        if len(fields) > _MAX_FOCUS_FIELDS:
-            raise ValueError(
-                f"Preference {key} may focus a method on at most {_MAX_FOCUS_FIELDS} fields"
-            )
-
-
 #: Keys the current user may set in their own ``preferences`` blob, with the
 #: type each must have and how its entries are checked one level down. A
 #: whitelist rather than a free-form merge: the blob is read by feature code
@@ -114,13 +77,6 @@ _ALLOWED_PREFERENCE_KEYS: dict[str, tuple[type, Callable[[str, Any], None] | Non
     # endpoint, the model and what the request carries. The opt-in is per
     # timeline because that is the granularity at which evidence is sent.
     "column_advisor_optin": (dict, _check_bool_value),
-    # `{timeline_id: {method_id: [field_token, ...]}}` — this analyst's own
-    # narrowing of which fields one method scans (#341). Per user and never
-    # shared: `Timeline.field_overrides` is the *team's* audited declaration,
-    # and one analyst focusing their own feed must not rewrite a colleague's.
-    # Applied by sending an explicit `fields` to /analysis/findings, which
-    # bypasses the overrides layer by contract rather than competing with it.
-    "analysis_method_focus": (dict, _check_method_focus_value),
 }
 
 #: Ceiling on entries in a dict-valued preference. High enough that no real
@@ -142,13 +98,6 @@ _MAX_PREFERENCE_ENTRIES = 500
 #: (a timeline id is 32 characters); this only has to stop a megabyte of
 #: string from being stored as a key.
 _MAX_PREFERENCE_KEY_LENGTH = 128
-
-#: Ceilings inside one timeline's `analysis_method_focus` entry (see
-#: :func:`_check_method_focus_value`). There are twelve methods and a focus
-#: over more fields than a timeline has is not a narrowing at all, so both are
-#: far above any real selection and only bound what a scripted client can store.
-_MAX_FOCUS_METHODS = 64
-_MAX_FOCUS_FIELDS = 256
 
 
 class UpdatePreferencesRequest(BaseModel):

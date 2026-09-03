@@ -3381,6 +3381,72 @@ class PostgresStore:
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
 
+    async def set_timeline_detector(
+        self,
+        case_id: str,
+        timeline_id: str,
+        entry: dict[str, Any],
+    ) -> Timeline | None:
+        """Add or replace the configured detector for ``entry["method"]``.
+
+        One entry per method: an existing entry is replaced *in place*, so the
+        rail's order — the order analysts added things — survives an edit.
+        ``added_by``/``added_at`` are the caller's; validation of the entry
+        against the runner's models happens at the API layer.
+
+        Returns the updated timeline with sources eagerly loaded, or None.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            current = list(timeline.detectors or [])
+            index = next(
+                (i for i, e in enumerate(current) if e.get("method") == entry["method"]), None
+            )
+            if index is None:
+                current.append(entry)
+            else:
+                current[index] = entry
+            timeline.detectors = current
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
+    async def remove_timeline_detector(
+        self,
+        case_id: str,
+        timeline_id: str,
+        method: str,
+    ) -> Timeline | None:
+        """Remove the configured detector for ``method`` (no-op if absent).
+
+        An emptied list is stored as None so "nothing configured" has one
+        representation. Returns the updated timeline, or None if it does not
+        exist.
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline).where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return None
+            remaining = [e for e in (timeline.detectors or []) if e.get("method") != method]
+            timeline.detectors = remaining or None
+            await session.commit()
+            await session.refresh(timeline)
+            await session.refresh(timeline, attribute_names=["sources"])
+            return timeline
+
     async def update_timeline_field_overrides(
         self,
         case_id: str,

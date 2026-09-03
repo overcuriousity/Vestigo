@@ -43,6 +43,7 @@ from vestigo.db._offsets import offset_raw_bounds
 from vestigo.db.analysis_cache import cache_get, cache_put, enrichment_generation, fingerprint
 from vestigo.db.analysis_cache import detector_settings as detector_settings_material
 from vestigo.db.analysis_plan import (
+    METHOD_IDS,
     PlanInputs,
     build_plan,
     numeric_tokens_from_stats,
@@ -403,6 +404,43 @@ def _adapt_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
             ),
         ) from exc
     return model.runner_kwargs()
+
+
+class DetectorEntryIn(BaseModel):
+    """What the wizard stores for one configured detector.
+
+    ``params`` is *exactly* the object ``GET …/analysis/findings`` takes for the
+    method, kept in the client's own shape (a ``fields`` list stays a list) so
+    the rail can hand it back verbatim; it is validated here with the same
+    per-method model, so nothing storable describes a run the runner refuses.
+    ``frame`` and ``baseline_id`` live in the entry rather than on the panel
+    because they are part of what the detector *means*.
+    """
+
+    params: dict[str, Any] = Field(default_factory=dict)
+    frame: Literal["self", "baseline"] = "self"
+    baseline_id: str | None = None
+
+
+def validate_detector_entry(method: str, entry: DetectorEntryIn) -> dict[str, Any]:
+    """Reject what the findings endpoint would reject; return the storable entry.
+
+    Three checks, each a 422 with the same wording the request it stands in
+    for would have produced: the method must be one the plan knows, the
+    frame/baseline pair must describe one question (``_validate_scope_args``),
+    and the params must pass the method's own model (``_adapt_params``).
+    Baseline *existence* is the caller's check — it needs the store.
+    """
+    if method not in METHOD_IDS:
+        raise HTTPException(status_code=422, detail=f"Unknown analysis method: {method}")
+    _validate_scope_args(entry.frame, entry.baseline_id)
+    _adapt_params(method, entry.params)
+    return {
+        "method": method,
+        "params": entry.params,
+        "frame": entry.frame,
+        "baseline_id": entry.baseline_id,
+    }
 
 
 async def _run_log_templates(
