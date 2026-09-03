@@ -35,11 +35,6 @@ export const BUDGET: Record<string, FileBudget> = {
   // Mounted again by the method sheet's `fields` knob, which was a text box
   // between the rail-plus-overlay refactor and this fix.
   "../components/analysis/AnomalyFieldPicker.tsx": { fontSize: 1, rawButton: 4 },
-  // The mute chips are the same pill as InvestigateRail's preset filters they
-  // sit directly above, for the reason recorded there: a `Button` reads as a
-  // different kind of control than the row it belongs to. The disclosure line
-  // and the collapsed summary carry the remaining sizes.
-  "../components/analysis/DetectorMuteStrip.tsx": { fontSize: 4, rawButton: 3 },
   "../components/analysis/FindingGroup.tsx": { fontSize: 3, rawButton: 1 },
   // +1 each for the show-dismissed toggle, which is deliberately the same
   // pill as the preset filters it sits beside — a `Button` there would read as

@@ -1,5 +1,6 @@
-import { del, get, patch, post } from "./client";
+import { del, get, patch, post, put } from "./client";
 import type {
+  DetectorEntry,
   EmbeddingFieldsResponse,
   EmbeddingFieldConfig,
   FieldCoverageResponse,
@@ -48,15 +49,23 @@ export const timelinesApi = {
     ).then((r) => r.timeline),
 
   /**
-   * Replace the analysis methods muted for this timeline (empty clears them).
-   *
-   * Shared state, not a browser preference: the next analyst on the case
-   * inherits the mute, and every change lands in the audit trail.
+   * Configure one detector on this timeline (replaces an existing entry for
+   * the method). Shared, audited state: it is the list the rail runs.
    */
-  patchMutedMethods: (caseId: string, timelineId: string, mutedMethods: string[]) =>
-    patch<{ timeline: Timeline }>(
-      `/cases/${caseId}/timelines/${timelineId}/muted-methods`,
-      { muted_methods: mutedMethods },
+  putDetector: (
+    caseId: string,
+    timelineId: string,
+    method: string,
+    body: Pick<DetectorEntry, "params" | "frame" | "baseline_id">,
+  ) =>
+    put<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/detectors/${method}`,
+      body,
+    ).then((r) => r.timeline),
+
+  deleteDetector: (caseId: string, timelineId: string, method: string) =>
+    del<{ timeline: Timeline }>(
+      `/cases/${caseId}/timelines/${timelineId}/detectors/${method}`,
     ).then((r) => r.timeline),
 
   /**
