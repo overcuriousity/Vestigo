@@ -794,6 +794,14 @@ columns and mapped canonical fields. The highest-coverage recommended fields
 win the cap; you can always override with an explicit field list via the
 Fields picker to scan something the auto-selector skipped.
 
+**Each field's page is at least the request `limit`** (`stat_per_field_limit`
+is a floor, not a cap): a global top-50 may legitimately be 50 values of one
+field, and the old 25-per-field budget silently dropped the 26th-rarest.
+`total_findings` sums every scanned field's exact post-suppression count —
+`count() OVER (PARTITION BY key)` in the batched pass, `count() OVER ()` per
+residual field, `sum(hits)` in temporal mode — per the
+[totals contract](#totals-and-truncation-what-total_findings-promises).
+
 **The ranking is a total order, deliberately.** Coverage ties are the normal
 case — every field of one source covers exactly that source's events — so
 recommended-then-coverage alone leaves the tie order to whatever the inventory

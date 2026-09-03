@@ -111,7 +111,8 @@ class Settings(BaseSettings):
     stat_z_threshold: float = 2.5
     # Number of time buckets for frequency analysis (same math as histogram).
     stat_frequency_buckets: int = 60
-    # Default per-field limit when scanning for rare values.
+    # Floor on the per-field page when scanning for rare values; the effective
+    # page is max(this, request limit) so a global top-N is the true top-N.
     stat_per_field_limit: int = 25
     # Minimum backwards jump (seconds) before the timestamp-order detector
     # flags a record — suppresses sub-second logger jitter. 0 = AMiner-strict.

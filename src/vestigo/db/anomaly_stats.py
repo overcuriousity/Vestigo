@@ -1264,6 +1264,37 @@ def _sql_suppression(
     return ("".join(f" AND {c}" for c in clauses), reasons)
 
 
+def _window_hit_sql(
+    params: dict[str, Any], suspect_totals: list[int], *, evt_prefix: str = "w"
+) -> tuple[str, str]:
+    """``(hits, best)`` expressions for a temporal scan with per-window blocks.
+
+    A temporal group yields one finding per suspect window it appears in, so
+    *hits* — ``(w0_cnt > 0) + (w1_cnt > 0) + …`` — is how many findings the
+    group is, and ``sum(hits) OVER ()`` the exact total. A hit whose
+    representative event was marked normal is not one: when ``params["excl"]``
+    is bound (see :func:`_sql_suppression`) each term also tests its window's
+    ``w{i}_evt``. *best* is the group's smallest ``count / window total`` over
+    its hit windows — the score ``-log(count / total)`` is monotone in it, so
+    ``ORDER BY best ASC LIMIT n`` pages the true top-``n`` findings. Binds
+    ``params["w{i}_total"]`` (floored at 1 so an empty window cannot divide by
+    zero; such a window has no hits anyway).
+    """
+    excl = "excl" in params
+    hits = [
+        f"({evt_prefix}{i}_cnt > 0 AND NOT has({{excl:Array(String)}}, {evt_prefix}{i}_evt))"
+        if excl
+        else f"({evt_prefix}{i}_cnt > 0)"
+        for i in range(len(suspect_totals))
+    ]
+    for i, total in enumerate(suspect_totals):
+        params[f"w{i}_total"] = float(max(total, 1))
+    shares = ", ".join(
+        f"if({hit}, {evt_prefix}{i}_cnt / {{w{i}_total:Float64}}, 0)" for i, hit in enumerate(hits)
+    )
+    return " + ".join(hits), f"arrayMin(arrayFilter(x -> x > 0, [{shares}]))"
+
+
 def _freq_finding(
     series_field: str,
     series_value: Any,
@@ -2096,12 +2127,20 @@ class StatisticalAnomalyService:
         (``-log(w_cnt / window_total)``); events outside every window are
         ignored. *allowlist* suppresses findings whose (field, value) an
         analyst declared never-anomalous.
+
+        *per_field_limit* is a floor on each field's page, not a cap on it:
+        the effective per-field budget is ``max(per_field_limit, limit)``,
+        because a global top-``limit`` may legitimately be ``limit`` values of
+        one field and a smaller per-field page would silently miss them.
+        ``total_findings`` sums each field's exact post-suppression count
+        (docs/ANOMALY_DETECTION.md §"Totals and truncation").
         """
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
         method = "self-baseline" if windows is None else "temporal"
         eff = effective_ts_sql(source_offsets)
+        page = max(per_field_limit, limit)
 
         # Total event count for surprise score denominator.
         total_events = self._count_events(case_id, source_ids)
@@ -2154,6 +2193,8 @@ class StatisticalAnomalyService:
             run_warnings += _window_size_warnings(windows, suspect_totals)
 
         all_findings: list[ValueFinding] = []
+        n_total = 0
+        inexact: list[str] = []
 
         # M23(b): all plain-attribute fields share ONE ARRAY JOIN pass over the
         # attributes map — that column dominates scan cost, and the former
@@ -2166,20 +2207,31 @@ class StatisticalAnomalyService:
         attr_key_by_token = _split_novelty_fields(scan_fields, field_mappings)
         rows_by_key: dict[str, list[tuple[Any, ...]]] = {}
         if attr_key_by_token:
-            rows_by_key = self._batched_attr_novelty_rows(
+            # The allowlist per attribute key, for the keys this pass scans.
+            allow_by_key: dict[str, list[str]] = {}
+            for token, key in attr_key_by_token.items():
+                vals = _sql_allow_keys(allowlist, token)
+                if vals:
+                    allow_by_key.setdefault(key, []).extend(vals)
+            rows_by_key, batched_inexact = self._batched_attr_novelty_rows(
                 base_params,
                 sorted(set(attr_key_by_token.values())),
                 rarity_floor=rarity_floor,
-                per_field_limit=per_field_limit,
+                per_field_limit=page,
                 windows=windows,
                 source_offsets=source_offsets,
+                suspect_totals=suspect_totals,
+                allow_by_key={k: sorted(set(v)) for k, v in allow_by_key.items()},
+                exclude_event_ids=exclude_event_ids,
             )
+            inexact += batched_inexact
 
         for field_token in scan_fields:
             if field_token in attr_key_by_token:
                 # Duplicate tokens naming the same key share the rows — the
                 # old loop ran the identical query twice for identical rows.
                 rows = rows_by_key.get(attr_key_by_token[field_token], [])
+                n_total += int(rows[0][-1]) if rows else 0
                 all_findings.extend(
                     self._novelty_rows_to_findings(
                         case_id,
@@ -2198,22 +2250,31 @@ class StatisticalAnomalyService:
             bind_offset_params(source_offsets, params)
             col = _col_expr(field_token, params, field_mappings)
 
+            params["lim"] = page
+            allow_keys = _sql_allow_keys(allowlist, field_token)
             if windows is None:
                 # Self-baseline: flag values with count ≤ rarity_floor.
                 params["floor"] = rarity_floor
-                params["lim"] = per_field_limit
+                suppress, field_inexact = _sql_suppression(
+                    params,
+                    key_expr="val",
+                    evt_expr="evt_id",
+                    allow_keys=allow_keys,
+                    exclude_event_ids=exclude_event_ids,
+                )
                 sql = f"""
                     SELECT
                         {col} AS val,
                         count() AS cnt,
                         min({eff}) AS first_seen,
-                        toString(argMin(event_id, {eff})) AS evt_id
+                        toString(argMin(event_id, {eff})) AS evt_id,
+                        count() OVER () AS n_total
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
                       AND {col} != ''
                     GROUP BY val
-                    HAVING cnt <= {{floor:UInt32}}
+                    HAVING cnt <= {{floor:UInt32}}{suppress}
                     ORDER BY cnt ASC, first_seen ASC
                     LIMIT {{lim:UInt32}}
                     {heavy_scan_settings()}
@@ -2226,20 +2287,29 @@ class StatisticalAnomalyService:
                 # scan to the windows (events between/outside windows are
                 # ignored by construction).
                 bp, sps = _window_preds(windows, params, source_offsets)
-                params["lim"] = per_field_limit
+                suppress, field_inexact = _sql_suppression(
+                    params,
+                    key_expr="val",
+                    evt_expr=None,
+                    allow_keys=allow_keys,
+                    exclude_event_ids=exclude_event_ids,
+                )
                 w_blocks = ",\n                        ".join(
                     f"countIf({sp}) AS w{i}_cnt,"
                     f" minIf({eff}, {sp}) AS w{i}_first,"
                     f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                     for i, sp in enumerate(sps)
                 )
-                w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+                hits_expr, best_expr = _window_hit_sql(params, suspect_totals)
                 union_pred = " OR ".join([bp, *sps])
                 sql = f"""
                     SELECT
                         {col} AS val,
                         countIf({bp}) AS baseline_cnt,
-                        {w_blocks}
+                        {w_blocks},
+                        {hits_expr} AS hits,
+                        {best_expr} AS best,
+                        sum(hits) OVER () AS n_total
                     FROM {db}.events
                     WHERE case_id = {{cid:String}}
                       AND has({{src:Array(String)}}, source_id)
@@ -2247,13 +2317,15 @@ class StatisticalAnomalyService:
                       AND {VESTIGO_NOT_SENTINEL_SQL}
                       AND ({union_pred})
                     GROUP BY val
-                    HAVING baseline_cnt = 0 AND ({w_sum}) > 0
-                    ORDER BY ({w_sum}) ASC
+                    HAVING baseline_cnt = 0 AND hits > 0{suppress}
+                    ORDER BY best ASC, val ASC
                     LIMIT {{lim:UInt32}}
                     {heavy_scan_settings()}
                 """
 
             rows = self.ch.client.query(sql, parameters=params).result_rows
+            n_total += int(rows[0][-1]) if rows else 0
+            inexact += field_inexact
             all_findings.extend(
                 self._novelty_rows_to_findings(
                     case_id,
@@ -2267,12 +2339,15 @@ class StatisticalAnomalyService:
                 )
             )
 
-        # Value-level allowlist first, then the legacy per-event suppression.
+        # The page is filtered again here — a no-op when the SQL bound the
+        # sets, and the whole suppression when one was too large to bind.
         all_findings = _apply_allowlist(all_findings, allowlist)
         if exclude_event_ids:
             all_findings = [
                 f for f in all_findings if not f.event_id or f.event_id not in exclude_event_ids
             ]
+        # A reason repeats once per scanned field; the analyst needs it once.
+        run_warnings += list(dict.fromkeys(inexact))
 
         # Sort by surprise descending (rarest first), apply global limit,
         # then hydrate only the surviving findings' representative events.
@@ -2287,7 +2362,8 @@ class StatisticalAnomalyService:
             results=results,
             warnings=run_warnings,
             windows=windows.payload() if windows is not None else None,
-            total_findings=len(all_findings),
+            total_findings=n_total,
+            total_findings_exact=not inexact,
         )
 
     def _batched_attr_novelty_rows(
@@ -2299,11 +2375,20 @@ class StatisticalAnomalyService:
         per_field_limit: int,
         windows: AnalysisWindows | None,
         source_offsets: dict[str, int] | None,
-    ) -> dict[str, list[tuple[Any, ...]]]:
+        suspect_totals: list[int] | None = None,
+        allow_by_key: dict[str, list[str]] | None = None,
+        exclude_event_ids: set[str] | None = None,
+    ) -> tuple[dict[str, list[tuple[Any, ...]]], list[str]]:
         """One ARRAY JOIN pass over ``attributes`` for all plain-attribute fields.
 
-        Returns rows keyed by raw attribute key, each row in the exact shape
-        the old per-field query produced (leading ``key`` column stripped).
+        Returns ``(rows_by_key, inexact_reasons)``: rows keyed by raw
+        attribute key, each row in the exact shape the per-field query
+        produces (leading ``key`` column stripped, trailing ``n_total`` — the
+        key's exact post-suppression finding count, ``count() OVER (PARTITION
+        BY key)`` — kept), and the reasons a suppression set could not be
+        bound (see :func:`_sql_suppression`). *allow_by_key* rides as two
+        parallel arrays (``allow_k`` keys, ``allow_v`` value lists) picked by
+        ``indexOf``; the bound applies to the total number of entries.
         The paired mapKeys/mapValues ARRAY JOIN follows field_inventory's
         memory-safety pattern (no per-row map re-materialization), the
         ``has(nkeys, key)`` filter shrinks the expansion before GROUP BY, and
@@ -2319,6 +2404,34 @@ class StatisticalAnomalyService:
         params: dict[str, Any] = {**base_params, "nkeys": attr_keys, "lim": per_field_limit}
         bind_offset_params(source_offsets, params)
 
+        # The exclusion binds through the shared helper; the allowlist is
+        # per key, so it is bound here as parallel arrays instead.
+        suppress, inexact = _sql_suppression(
+            params,
+            key_expr=None,
+            evt_expr="evt_id" if windows is None else None,
+            allow_keys=[],
+            exclude_event_ids=exclude_event_ids,
+        )
+        allow_by_key = allow_by_key or {}
+        n_allow = sum(len(v) for v in allow_by_key.values())
+        if 0 < n_allow <= _SQL_SUPPRESSION_MAX:
+            params["allow_k"] = sorted(allow_by_key)
+            params["allow_v"] = [allow_by_key[k] for k in params["allow_k"]]
+            # `greatest(idx, 1)` because ClickHouse evaluates both branches and
+            # rejects array index 0; the OR short-circuits the meaning.
+            suppress += (
+                " AND (indexOf({allow_k:Array(String)}, key) = 0"
+                " OR NOT has({allow_v:Array(Array(String))}"
+                "[greatest(indexOf({allow_k:Array(String)}, key), 1)], val))"
+            )
+        elif n_allow:
+            inexact.append(
+                f"allowlist ({n_allow:,} entries) exceeds the {_SQL_SUPPRESSION_MAX:,}-entry "
+                "SQL bound; suppression applied to the page only, so the total may include "
+                "allowlisted findings"
+            )
+
         if windows is None:
             params["floor"] = rarity_floor
             sql = f"""
@@ -2327,7 +2440,8 @@ class StatisticalAnomalyService:
                     val,
                     count() AS cnt,
                     min({eff}) AS first_seen,
-                    toString(argMin(event_id, {eff})) AS evt_id
+                    toString(argMin(event_id, {eff})) AS evt_id,
+                    count() OVER (PARTITION BY key) AS n_total
                 FROM {db}.events
                 ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val
                 WHERE case_id = {{cid:String}}
@@ -2335,7 +2449,7 @@ class StatisticalAnomalyService:
                   AND has({{nkeys:Array(String)}}, key)
                   AND val != ''
                 GROUP BY key, val
-                HAVING cnt <= {{floor:UInt32}}
+                HAVING cnt <= {{floor:UInt32}}{suppress}
                 ORDER BY key ASC, cnt ASC, first_seen ASC
                 LIMIT {{lim:UInt32}} BY key
                 {heavy_scan_settings()}
@@ -2348,14 +2462,17 @@ class StatisticalAnomalyService:
                 f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                 for i, sp in enumerate(sps)
             )
-            w_sum = " + ".join(f"w{i}_cnt" for i in range(len(sps)))
+            hits_expr, best_expr = _window_hit_sql(params, suspect_totals or [0] * len(sps))
             union_pred = " OR ".join([bp, *sps])
             sql = f"""
                 SELECT
                     key,
                     val,
                     countIf({bp}) AS baseline_cnt,
-                    {w_blocks}
+                    {w_blocks},
+                    {hits_expr} AS hits,
+                    {best_expr} AS best,
+                    sum(hits) OVER (PARTITION BY key) AS n_total
                 FROM {db}.events
                 ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val
                 WHERE case_id = {{cid:String}}
@@ -2365,8 +2482,8 @@ class StatisticalAnomalyService:
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({union_pred})
                 GROUP BY key, val
-                HAVING baseline_cnt = 0 AND ({w_sum}) > 0
-                ORDER BY key ASC, ({w_sum}) ASC
+                HAVING baseline_cnt = 0 AND hits > 0{suppress}
+                ORDER BY key ASC, best ASC, val ASC
                 LIMIT {{lim:UInt32}} BY key
                 {heavy_scan_settings()}
             """
@@ -2374,7 +2491,7 @@ class StatisticalAnomalyService:
         rows_by_key: dict[str, list[tuple[Any, ...]]] = {}
         for row in self.ch.client.query(sql, parameters=params).result_rows:
             rows_by_key.setdefault(str(row[0]), []).append(tuple(row[1:]))
-        return rows_by_key
+        return rows_by_key, inexact
 
     def _novelty_rows_to_findings(
         self,
@@ -2396,7 +2513,8 @@ class StatisticalAnomalyService:
         findings: list[ValueFinding] = []
         for row in rows:
             if windows is None:
-                val, cnt, first_seen, evt_id = row
+                # Trailing columns (`n_total`) are the scan's, not the finding's.
+                val, cnt, first_seen, evt_id = row[:4]
                 if not val:
                     continue
                 findings.append(
@@ -2652,30 +2770,17 @@ class StatisticalAnomalyService:
                 f" toString(argMinIf(event_id, {eff}, {sp})) AS w{i}_evt"
                 for i, sp in enumerate(sps)
             )
-            # One finding per (group, suspect window with a hit): `hits` is how
-            # many findings the group yields, and a hit whose representative
-            # event was marked normal is not one. `best` is the group's best
-            # per-window score, monotone in the smallest window share, so the
-            # top-`lim` groups by it hold the true top-`lim` findings.
-            w_hits = [
-                f"(w{i}_cnt > 0 AND NOT has({{excl:Array(String)}}, w{i}_evt))"
-                if "excl" in params
-                else f"(w{i}_cnt > 0)"
-                for i in range(len(sps))
-            ]
-            for i, total in enumerate(suspect_totals):
-                params[f"w{i}_total"] = float(max(total, 1))
-            shares = ", ".join(
-                f"if({hit}, w{i}_cnt / {{w{i}_total:Float64}}, 0)" for i, hit in enumerate(w_hits)
-            )
+            # One finding per (group, suspect window with a hit) — see
+            # _window_hit_sql for why `hits` is the count and `best` the order.
+            hits_expr, best_expr = _window_hit_sql(params, suspect_totals)
             union_pred = " OR ".join([bp, *sps])
             sql = f"""
                 SELECT
                     {val_cols},
                     countIf({bp}) AS baseline_cnt,
                     {w_blocks},
-                    {" + ".join(w_hits)} AS hits,
-                    arrayMin(arrayFilter(x -> x > 0, [{shares}])) AS best,
+                    {hits_expr} AS hits,
+                    {best_expr} AS best,
                     sum(hits) OVER () AS n_total
                 FROM {db}.events
                 WHERE case_id = {{cid:String}}

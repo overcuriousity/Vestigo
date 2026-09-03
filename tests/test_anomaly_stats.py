@@ -314,17 +314,17 @@ def test_value_novelty_self_baseline_returns_rare_values():
             result_rows=[
                 # Naive datetimes — matches clickhouse-connect's real return type
                 # for a DateTime column with no explicit timezone.
-                ("suspicious.exe", 1, datetime(2024, 1, 2), "evt-1"),
-                ("unusual_tool", 2, datetime(2024, 1, 1), "evt-2"),
+                ("suspicious.exe", 1, datetime(2024, 1, 2), "evt-1", 2),
+                ("unusual_tool", 2, datetime(2024, 1, 1), "evt-2", 2),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         ),
         # timestamp_desc field: one rare value
         FakeQueryResult(
             result_rows=[
-                ("Malware execution", 1, datetime(2024, 1, 2, 1), "evt-3"),
+                ("Malware execution", 1, datetime(2024, 1, 2, 1), "evt-3", 1),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         ),
         # display_name field: no rare values
         FakeQueryResult(result_rows=[], column_names=[]),
@@ -373,9 +373,9 @@ def test_value_novelty_self_baseline_limit_applied():
     per_field = [
         FakeQueryResult(
             result_rows=[
-                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j * 3 + i}") for i in range(3)
+                (f"val_{i}", 1, datetime(2024, 1, 1), f"evt-{j * 3 + i}", 3) for i in range(3)
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         )
         for j in range(3)
     ]
@@ -404,8 +404,8 @@ def test_value_novelty_event_id_populated():
         [
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
             FakeQueryResult(
-                result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc")],
-                column_names=["val", "cnt", "first_seen", "evt_id"],
+                result_rows=[("backdoor.exe", 1, datetime(2024, 1, 1), "evt-abc", 1)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
             ),
         ]
     )
@@ -442,10 +442,10 @@ def test_value_novelty_skips_empty_values():
             FakeQueryResult(result_rows=[(100,)], column_names=["count()"]),
             FakeQueryResult(
                 result_rows=[
-                    ("", 1, datetime(2024, 1, 1), "evt-1"),
-                    ("real_value", 2, datetime(2024, 1, 1), "evt-2"),
+                    ("", 1, datetime(2024, 1, 1), "evt-1", 2),
+                    ("real_value", 2, datetime(2024, 1, 1), "evt-2", 2),
                 ],
-                column_names=["val", "cnt", "first_seen", "evt_id"],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
             ),
         ]
     )
@@ -454,6 +454,113 @@ def test_value_novelty_skips_empty_values():
     values = [r.value for r in result.results]
     assert "" not in values
     assert "real_value" in values
+
+
+def test_value_novelty_total_sums_exact_per_field_counts():
+    """Each field's scan counts its own findings; the total is their sum."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(f"a{i}", 1, datetime(2024, 1, 1), f"e{i}", 300) for i in range(50)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+            FakeQueryResult(
+                result_rows=[(f"b{i}", 1, datetime(2024, 1, 1), f"f{i}", 250) for i in range(50)],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
+            ),
+        ]
+    )
+    result = svc.find_value_novelty("c1", ["s1"], fields=["artifact", "timestamp_desc"], limit=50)
+    assert len(result.results) == 50
+    assert result.total_findings == 550
+    assert result.total_findings_exact is True
+
+
+def test_value_novelty_per_field_budget_is_at_least_the_limit():
+    """A global top-50 may be 50 values of one field: the per-field page must allow it."""
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc.find_value_novelty("c1", ["s1"], fields=["artifact"], limit=80, per_field_limit=25)
+    assert svc.ch.client._all_parameters[1]["lim"] == 80
+
+
+def test_value_novelty_per_field_suppression_is_bound_into_the_sql():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=["artifact"],
+        allowlist={("artifact", "known"), ("other", "ignored")},
+        exclude_event_ids={"e1"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "count() OVER () AS n_total" in sql
+    assert "NOT has({allow:Array(String)}, val)" in sql
+    assert p["allow"] == ["known"]
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+    assert p["excl"] == ["e1"]
+
+
+def test_value_novelty_batched_binds_per_key_allowlist():
+    """The batched pass carries one allowlist per attribute key, and counts per key."""
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(10,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_novelty(
+        "c1",
+        ["s1"],
+        fields=["attr:user", "attr:host"],
+        allowlist={("attr:user", "svc"), ("attr:user", "root"), ("attr:host", "web-1")},
+        exclude_event_ids={"e1"},
+    )
+    sql = client.full_queries[-1]
+    p = client._all_parameters[-1]
+    assert "count() OVER (PARTITION BY key) AS n_total" in sql
+    assert p["allow_k"] == ["host", "user"]
+    assert p["allow_v"] == [["web-1"], ["root", "svc"]]
+    assert "indexOf({allow_k:Array(String)}, key)" in sql
+    assert "NOT has({excl:Array(String)}, evt_id)" in sql
+
+
+def test_value_novelty_batched_temporal_counts_hits_per_key():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(500,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(300, 80)], column_names=["bl", "w0"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ]
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    windows = _one_suspect(
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 2, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+        datetime(2024, 1, 4, tzinfo=UTC),
+    )
+    svc.find_value_novelty("c1", ["s1"], fields=["attr:user"], windows=windows)
+    sql = client.full_queries[-1]
+    assert "sum(hits) OVER (PARTITION BY key) AS n_total" in sql
+    assert "ORDER BY key ASC, best ASC, val ASC" in sql
+    assert client._all_parameters[-1]["w0_total"] == 80.0
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +586,18 @@ def test_value_novelty_temporal_baseline_first_seen():
             # artifact field: val, baseline_cnt, w0_cnt, w0_first, w0_evt
             FakeQueryResult(
                 result_rows=[
-                    ("first_time_process.exe", 0, 3, datetime(2024, 1, 16), "evt-9"),
+                    ("first_time_process.exe", 0, 3, datetime(2024, 1, 16), "evt-9", 1, 0.025, 1),
                 ],
-                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                column_names=[
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                    "n_total",
+                ],
             ),
         ]
     )
@@ -520,7 +636,16 @@ def test_value_novelty_temporal_window_bounds_converted_to_utc_for_sql():
             FakeQueryResult(result_rows=[(300, 0)], column_names=["bl_total", "w0_total"]),
             FakeQueryResult(
                 result_rows=[],
-                column_names=["val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                column_names=[
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                    "n_total",
+                ],
             ),
         ]
     )
@@ -562,6 +687,9 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
                         6,
                         datetime(2024, 1, 20),
                         "evt-b",
+                        2,
+                        0.03,
+                        2,
                     )
                 ],
                 column_names=[
@@ -574,6 +702,9 @@ def test_value_novelty_two_suspect_windows_attributed_separately():
                     "w1_cnt",
                     "w1_first",
                     "w1_evt",
+                    "hits",
+                    "best",
+                    "n_total",
                 ],
             ),
         ]
@@ -594,10 +725,10 @@ def test_value_novelty_allowlist_suppresses_value_everywhere():
             FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
             FakeQueryResult(
                 result_rows=[
-                    ("keep_me", 1, datetime(2024, 1, 1), "evt-1"),
-                    ("known_good", 1, datetime(2024, 1, 1), "evt-2"),
+                    ("keep_me", 1, datetime(2024, 1, 1), "evt-1", 2),
+                    ("known_good", 1, datetime(2024, 1, 1), "evt-2", 2),
                 ],
-                column_names=["val", "cnt", "first_seen", "evt_id"],
+                column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
             ),
         ]
     )
@@ -624,8 +755,18 @@ def test_value_novelty_small_window_warns():
             FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
             FakeQueryResult(result_rows=[(600, 5)], column_names=["bl", "w0"]),
             FakeQueryResult(
-                result_rows=[("user", "svc_x", 0, 3, datetime(2024, 1, 11), "evt-a")],
-                column_names=["key", "val", "baseline_cnt", "w0_cnt", "w0_first", "w0_evt"],
+                result_rows=[("user", "svc_x", 0, 3, datetime(2024, 1, 11), "evt-a", 1, 0.6, 1)],
+                column_names=[
+                    "key",
+                    "val",
+                    "baseline_cnt",
+                    "w0_cnt",
+                    "w0_first",
+                    "w0_evt",
+                    "hits",
+                    "best",
+                    "n_total",
+                ],
             ),
         ]
     )
@@ -684,7 +825,7 @@ def test_value_novelty_batched_sql_shape_temporal():
 
     batched_sql = client.full_queries[2]
     assert "ARRAY JOIN mapKeys(attributes) AS key, mapValues(attributes) AS val" in batched_sql
-    assert "HAVING baseline_cnt = 0 AND (w0_cnt) > 0" in batched_sql
+    assert "HAVING baseline_cnt = 0 AND hits > 0" in batched_sql
     assert "LIMIT {lim:UInt32} BY key" in batched_sql
     assert "timestamp !=" in batched_sql  # sentinel guard
     # Window bounds bound as parameters (forensic reproducibility).
@@ -1536,8 +1677,8 @@ def test_value_novelty_smart_default_calls_recommender():
         # find_value_novelty scans (recommended fields = artifact + attr:status_code):
         # the batched attribute pass runs first, then the per-field top-level scan.
         FakeQueryResult(
-            result_rows=[("status_code", "404", 2, datetime(2024, 1, 1), "evt-1")],
-            column_names=["key", "val", "cnt", "first_seen", "evt_id"],
+            result_rows=[("status_code", "404", 2, datetime(2024, 1, 1), "evt-1", 1)],
+            column_names=["key", "val", "cnt", "first_seen", "evt_id", "n_total"],
         ),  # batched attr scan (attr:status_code)
         FakeQueryResult(
             result_rows=[],
@@ -1597,10 +1738,10 @@ def test_value_novelty_exclude_event_ids():
         FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
         FakeQueryResult(
             result_rows=[
-                ("malware.exe", 1, datetime(2024, 1, 1), "evt-bad"),
-                ("tool.exe", 2, datetime(2024, 1, 1), "evt-ok"),
+                ("malware.exe", 1, datetime(2024, 1, 1), "evt-bad", 2),
+                ("tool.exe", 2, datetime(2024, 1, 1), "evt-ok", 2),
             ],
-            column_names=["val", "cnt", "first_seen", "evt_id"],
+            column_names=["val", "cnt", "first_seen", "evt_id", "n_total"],
         ),
     ]
     svc = _svc(responses)
