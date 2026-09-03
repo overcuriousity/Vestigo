@@ -1796,10 +1796,13 @@ class StatisticalAnomalyService:
         whole (:func:`~vestigo.db._scan.scan_fanout`). The declaration only
         divides a SETTINGS clause built while it is in effect, so the clause
         is built inside the ``with`` — built before it, both statements would
-        carry the full cap. Each therefore runs at half the slot's cap and
-        spills at half the usual thresholds; the ``GROUP BY`` under both is
-        the spillable path, which is what makes that survivable. Wall clock is
-        roughly one scan's, and the extra cost is ClickHouse-side. Threads run
+        carry the full cap. Each therefore runs at half the slot's cap,
+        spills at half the usual thresholds and gets half the slot's thread
+        width; the ``GROUP BY`` under both is the spillable path, which is
+        what makes the memory half survivable, and the thread half is what
+        keeps a full gate of paged detectors at the core count rather than
+        twice it. Wall clock is roughly one scan's on a saturated box, and
+        the extra cost is ClickHouse-side. Threads run
         under a copy of the calling context so the scan tag reaches both and a
         disconnect can KILL both (#300).
 

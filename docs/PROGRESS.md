@@ -31,6 +31,19 @@ new tests assert `max_memory_usage == budget // 2` on the emitted SQL and `budge
 under an outer fan-out. `ANOMALY_DETECTION.md` now says where the clause must be built
 and why a test, not a docstring, is what holds it.
 
+Review of that fix found the other half: `scan_fanout` divided the memory cap and passed
+`max_threads` through untouched. The heavy width is `cores // N` precisely so that a full
+gate exactly saturates the box (`detect_scan_max_threads`, #301); two statements at that
+width under one slot made a full gate of paged detectors 2x the cores. The chart lane's
+exemption from the thread division is documented and deliberate (`detect_foreground_max_threads`:
+its width is already half the heavy one, so a two-wave chart is one heavy slot's threads)
+— but that argument is the chart lane's, and nothing carried it over to the heavy class.
+`_scan_settings_clause` now takes `split_threads`; the heavy clause divides threads by the
+fan-out (floored at 2 like the width itself), the foreground clause does not, and both
+are pinned: the heavy clause at 8 threads halves to 4 and quarters to 2 under nested
+fan-outs, the foreground width is unchanged under `scan_fanout(2)`, and the two statements
+`_page_and_total` emits carry `max_threads = 4` when the heavy width is 8.
+
 ## Session 230 — 2026-09-03: an exact total that survives a big corpus
 
 `/code-review 349` found eight defects in the previous session's work. The one worth the

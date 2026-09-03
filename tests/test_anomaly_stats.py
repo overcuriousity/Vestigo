@@ -304,6 +304,28 @@ def test_page_and_total_split_the_slot_budget_between_its_two_statements(monkeyp
         assert solo_clause not in sql
 
 
+def test_page_and_total_split_the_slot_threads_between_its_two_statements(monkeypatch):
+    """Both statements carry half the heavy thread width, not the full one.
+
+    The heavy width is `cores // N` so a full gate exactly saturates the box
+    (`detect_scan_max_threads`); two statements at that width under one slot
+    would make a full gate of paged detectors 2x the cores.
+    """
+    from vestigo.db import _scan
+
+    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 8)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    svc._page_and_total(
+        "SELECT val, count() AS cnt FROM db.events GROUP BY val",
+        {},
+        page_tail="LIMIT 10",
+        total_select="count()",
+    )
+    for sql in (svc.ch.client.full_queries[0], svc.ch.client.total_queries[0]):
+        assert "max_threads = 4," in sql, sql[-160:]
+
+
 def test_page_and_total_composes_with_an_outer_fan_out(monkeypatch):
     """A caller already fanning out gets the product, not a reset to two.
 

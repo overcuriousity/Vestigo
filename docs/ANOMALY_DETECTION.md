@@ -251,8 +251,12 @@ from one string is the point: a total describing a different filter than the pag
 annotates is worse than no total, and two hand-written statements drift on the first edit
 to a `HAVING`. The two run concurrently under the caller's one gate slot, declaring the
 fan-out (`db/_scan.py::scan_fanout`) so they split its memory cap rather than each taking
-it whole: each carries half the slot's `max_memory_usage` and spills at half the usual
-thresholds, and the `GROUP BY` beneath both is the spillable path that makes that hold.
+it whole: each carries half the slot's `max_memory_usage`, spills at half the usual
+thresholds, and runs at half the slot's `max_threads` — the heavy width is `cores // N` so
+that a full gate exactly saturates the box, and two statements at it under one slot would
+make a full gate of paged detectors twice the machine (the chart lane is exempt from the
+thread half by the argument in `_scan.py::detect_foreground_max_threads`). The `GROUP BY`
+beneath both is the spillable path that makes the memory half hold.
 The declaration only divides a clause built while it is in effect, so the clause is built
 inside it — `tests/test_anomaly_stats.py` asserts the halved cap on the SQL that leaves
 the service, because a clause built one line earlier ships the full cap twice and nothing
