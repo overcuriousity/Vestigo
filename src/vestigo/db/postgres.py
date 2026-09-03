@@ -373,22 +373,23 @@ class Timeline(Base):
     # ``vestigo/columns/`` for the payload shape and how it is produced.
     recommended_columns: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    # Analysis methods the analysts on this case have muted for this timeline:
-    # a list of ``db/analysis_plan.py::METHOD_IDS`` entries. Shared rather than
-    # per-browser, because "this source's clocks are a mess, stop surfacing it"
-    # is a finding about the *data* that the next analyst inherits.
+    # The detectors an analyst has configured for this timeline — the only
+    # thing the Investigate rail runs. Entries are
+    # ``{method, params, frame, baseline_id, added_by, added_at}``; ``params``
+    # is the same object ``/analysis/findings`` accepts for that method and is
+    # validated with the same models before it is stored, so nothing here can
+    # describe a run the runner would refuse. At most one entry per method:
+    # the shape is a list so that rule can be lifted later without a migration.
     #
-    # A reading preference, never a gate: the plan endpoint does not consult
-    # this (a mute is not a claim that the method *cannot* produce a finding),
-    # and ``/analysis/findings`` still runs a muted method when asked for it
-    # directly. All it does is keep the method out of the unprompted sweep, and
-    # the rail is required to disclose the count it is holding back.
-    muted_methods: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Shared, not per-browser, and audited on every change: which detectors an
+    # investigation runs is a decision the next analyst inherits. Nothing runs
+    # unprompted — an empty list is an empty rail, never a sweep.
+    detectors: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Per-method field decisions the analysts on this case have declared for
     # this timeline: ``{method_id: {field_token: bool}}``, where True pins a
     # field into that detector's *automatic* field selection and False takes it
-    # out. Shared for the same reason ``muted_methods`` is — "an HTTP status
+    # out. Shared because "an HTTP status
     # code is not a range field" is a finding about the data, not a browser
     # preference, and the recommenders type fields syntactically so they cannot
     # discover it themselves.
@@ -426,7 +427,7 @@ class Timeline(Base):
             "source_ids": [s.id for s in self.sources],
             "field_mappings": self.field_mappings,
             "recommended_columns": self.recommended_columns,
-            "muted_methods": self.muted_methods or [],
+            "detectors": self.detectors or [],
             "field_overrides": self.field_overrides or {},
             "is_embedded": is_embedded,
             "is_stale": is_stale,
@@ -3375,40 +3376,6 @@ class PostgresStore:
             if timeline is None:
                 return None
             timeline.field_mappings = field_mappings or None
-            await session.commit()
-            await session.refresh(timeline)
-            await session.refresh(timeline, attribute_names=["sources"])
-            return timeline
-
-    async def update_timeline_muted_methods(
-        self,
-        case_id: str,
-        timeline_id: str,
-        muted_methods: list[str] | None,
-    ) -> Timeline | None:
-        """Replace a timeline's muted analysis methods (None/empty clears them).
-
-        Stored sorted and de-duplicated so the audit trail's before/after is a
-        comparison of sets rather than of insertion orders. Validation of the
-        ids against ``METHOD_IDS`` happens at the API layer, where an unknown id
-        can be reported as a 422 rather than silently persisted.
-
-        Returns the updated timeline with sources eagerly loaded, or None if it
-        doesn't exist.
-        """
-        from sqlalchemy import select
-
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(Timeline).where(
-                    Timeline.case_id == case_id,
-                    Timeline.id == timeline_id,
-                )
-            )
-            timeline = result.scalar_one_or_none()
-            if timeline is None:
-                return None
-            timeline.muted_methods = sorted(set(muted_methods)) if muted_methods else None
             await session.commit()
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])
