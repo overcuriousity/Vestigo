@@ -2919,6 +2919,9 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "warnings": list(getattr(result, "warnings", []) or []),
         "windows": getattr(result, "windows", None),
         "total_findings": getattr(result, "total_findings", 0),
+        # The totals contract (docs/ANOMALY_DETECTION.md): a count the runner
+        # could not make exact is flagged, and a client renders it as "N+".
+        "total_findings_exact": bool(getattr(result, "total_findings_exact", True)),
     }
 
 
