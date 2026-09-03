@@ -25,12 +25,21 @@ export const FINDINGS_LIMIT_STEPS: readonly number[] = [50, 80];
 /** A findings query's page identity. Mirrors `findingsQueryOptions`' key. */
 export type FindingsPageKey = string;
 
+/**
+ * Every input `findingsQueryOptions` keys on, including the case and timeline:
+ * a method configured identically on two timelines is two queries, and a page
+ * raised on one must not make the other's first open the heavier scan.
+ */
 export function pageKeyOf(
+  caseId: string,
+  timelineId: string,
   method: MethodId,
   scope: { frame: string; baseline_id?: string | null },
   params: Record<string, unknown>,
 ): FindingsPageKey {
   return [
+    caseId,
+    timelineId,
     method,
     scope.frame,
     scope.baseline_id ?? "none",

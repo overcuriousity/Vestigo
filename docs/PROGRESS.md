@@ -44,6 +44,19 @@ are pinned: the heavy clause at 8 threads halves to 4 and quarters to 2 under ne
 fan-outs, the foreground width is unchanged under `scan_fanout(2)`, and the two statements
 `_page_and_total` emits carry `max_threads = 4` when the heavy width is 8.
 
+The same review's remaining findings, all fixed. The per-detector sections of
+`ANOMALY_DETECTION.md` (value novelty, value combos, numeric range, charset, entropy)
+still said the exact total came from `count() OVER ()` "in the same statement" — the
+design the contract section of the same file forbids, five hundred lines earlier, with
+the OOM incident as its reason; they now say what ships, a companion count statement over
+the page's own `core`. `findingsLimit.ts::pageKeyOf` keyed a page on method, frame,
+baseline and params but not case or timeline, while the query it mirrors keys on both:
+"Show more" on one timeline made an identically configured method on another open at the
+raised limit, the unprompted heavier scan the store exists to prevent — the key now
+carries both, with a store test. And three plan/handoff files under `.claude/plans/`
+(~3,000 lines) are removed from the branch: `CLAUDE.md` puts rationale in the subsystem
+doc, review findings in the PR thread, and history in git.
+
 ## Session 230 — 2026-09-03: an exact total that survives a big corpus
 
 `/code-review 349` found eight defects in the previous session's work. The one worth the

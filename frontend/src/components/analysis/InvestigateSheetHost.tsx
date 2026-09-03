@@ -129,7 +129,7 @@ export function InvestigateSheetHost({
   });
   // The same identity the query above is keyed by, so "Show more" in the sheet
   // raises this run's page and not the rail's run of the same method.
-  const pageKey = useFindingsPageKey(methodOf(sheet), {
+  const pageKey = useFindingsPageKey(caseId, timelineId, methodOf(sheet), {
     params: runParams ?? entry?.params ?? {},
     scope: entry ? scopeOf(entry) : undefined,
   });

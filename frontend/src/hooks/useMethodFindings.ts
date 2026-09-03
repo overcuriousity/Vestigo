@@ -137,7 +137,7 @@ export function useMethodFindings(
   const scopeParams = opts.scope ?? globalScope;
   const { includeDismissed } = useIncludeDismissed();
   const limit = useFindingsLimitStore((s) =>
-    limitOf(s.byKey, pageKeyOf(method, scopeParams, opts.params ?? {})),
+    limitOf(s.byKey, pageKeyOf(caseId, timelineId, method, scopeParams, opts.params ?? {})),
   );
   return useQuery<MethodFindings>(
     findingsQueryOptions(
@@ -168,11 +168,13 @@ export function useFindingsPage(key: FindingsPageKey) {
 
 /** The key `useMethodFindings` pages under, for a caller that needs to raise it. */
 export function useFindingsPageKey(
+  caseId: string,
+  timelineId: string,
   method: MethodId,
   opts: { params?: Record<string, unknown>; scope?: ScopeParams } = {},
 ): FindingsPageKey {
   const globalScope = useScopeParams();
-  return pageKeyOf(method, opts.scope ?? globalScope, opts.params ?? {});
+  return pageKeyOf(caseId, timelineId, method, opts.scope ?? globalScope, opts.params ?? {});
 }
 
 export interface MethodState {
@@ -279,11 +281,11 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
             frame: scopeParams.frame,
             baseline_id: scopeParams.baseline_id ?? null,
           };
-      return pageKeyOf(id, scope, entry?.params ?? {});
+      return pageKeyOf(caseId, timelineId, id, scope, entry?.params ?? {});
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the frame's two
     // primitives, not the per-render object they come out of.
-    [entryByMethod, scopeParams.frame, scopeParams.baseline_id],
+    [caseId, timelineId, entryByMethod, scopeParams.frame, scopeParams.baseline_id],
   );
   const optionsFor = (id: MethodId, enabled: boolean) => {
     const entry = entryByMethod.get(id);

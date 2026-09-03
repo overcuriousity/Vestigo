@@ -854,9 +854,10 @@ Fields picker to scan something the auto-selector skipped.
 **Each field's page is at least the request `limit`** (`stat_per_field_limit`
 is a floor, not a cap): a global top-50 may legitimately be 50 values of one
 field, and the old 25-per-field budget silently dropped the 26th-rarest.
-`total_findings` sums every scanned field's exact post-suppression count —
-`count() OVER (PARTITION BY key)` in the batched pass, `count() OVER ()` per
-residual field, `sum(hits)` in temporal mode — per the
+`total_findings` sums every scanned field's exact post-suppression count, taken
+by a companion count statement over the same `core` as the page (`count()`
+grouped by key in the batched pass, one `count()` per residual field, `sum(hits)`
+in temporal mode) — never by a frameless window in the paging statement, per the
 [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 **The ranking is a total order, deliberately.** Coverage ties are the normal
@@ -891,9 +892,9 @@ score is the same `−log(count / total events)`.
 
 **Totals and paging** follow the [contract above](#totals-and-truncation-what-total_findings-promises):
 `total_findings` is the exact number of rare combinations across the scope, counted
-in the same statement (`count() OVER ()`; in temporal mode `sum(hits) OVER ()`, one
-hit per suspect window a combination appears in) after the allowlist and normal-marked
-representatives have been bound into the `HAVING`. Temporal mode pages by each
+by a companion statement over the same `core` as the page (`count()`; in temporal mode
+`sum(hits)`, one hit per suspect window a combination appears in) after the allowlist
+and normal-marked representatives have been bound into the `HAVING` both share. Temporal mode pages by each
 combination's *best* per-window score — the smallest `count / window total` over its
 hit windows — so the top-`limit` groups hold the true top-`limit` findings; ordering
 by the summed window counts, as it did before, could rank a combination hit twice in
@@ -1185,8 +1186,8 @@ distinct violating value.
   exfiltration both produce a large `bytes` value.
 - **Totals are exact and the page is the true top-N.** Each field's scan orders
   by distance out of band (monotone in the score), pages at least `limit` rows,
-  and counts every violating value after suppression in the same statement
-  (`count() OVER ()`); the allowlist binds as numbers, since `str(9000.0)` and
+  and counts every violating value after suppression in a companion statement
+  over the same `core`; the allowlist binds as numbers, since `str(9000.0)` and
   ClickHouse's `toString(9000.)` disagree. See the
   [totals contract](#totals-and-truncation-what-total_findings-promises).
 
@@ -1251,8 +1252,8 @@ fallback's, in grouped runs) — and the scan orders by it, so the page is the t
 top-`limit` by the score each finding reports. It used to order by how many novel
 characters a value contained, which is only a proxy: one never-seen character can
 outscore two rare ones. Each field's page is at least `limit` (per group under
-`group_field`) and `total_findings` is the exact post-suppression count
-(`count() OVER ()`), per the
+`group_field`) and `total_findings` is the exact post-suppression count from a
+companion statement over the same `core`, per the
 [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ### Caveats
@@ -1398,8 +1399,8 @@ baseline size in `details`.
   identically. It ranks for triage.
 - **Totals are exact and the page is the true top-N.** Each field's scan orders
   by distance out of band (monotone in the score), pages at least `limit` rows,
-  and counts every out-of-band value after suppression in the same statement
-  (`count() OVER ()`). See the
+  and counts every out-of-band value after suppression in a companion statement
+  over the same `core`. See the
   [totals contract](#totals-and-truncation-what-total_findings-promises).
 
 ---
