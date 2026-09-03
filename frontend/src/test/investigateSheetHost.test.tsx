@@ -45,7 +45,6 @@ vi.mock("@/hooks/useScopeChange", () => ({
   useScopeChange: () => ({
     pending: null,
     currentScope: { frame: "self", baseline_id: null, baseline_name: null },
-    methodsToRerun: 0,
     affectedVerdicts: 0,
     request: () => {},
     cancel: () => {},

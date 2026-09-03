@@ -21,7 +21,6 @@ function renderDialog(props: Record<string, unknown> = {}) {
       open
       current={CURRENT}
       next={NEXT}
-      methodsToRerun={9}
       affectedVerdicts={4}
       onConfirm={() => {}}
       onCancel={() => {}}
@@ -34,7 +33,6 @@ describe("ScopeChangeDialog", () => {
   it("names the consequence before anything changes", () => {
     renderDialog();
     const dialog = screen.getByRole("dialog");
-    expect(dialog).toHaveTextContent("9");
     expect(dialog).toHaveTextContent("4");
   });
 

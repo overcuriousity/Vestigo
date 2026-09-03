@@ -169,7 +169,6 @@ export function InvestigateSheetHost({
         open={scopeChange.pending !== null}
         current={scopeChange.currentScope}
         next={scopeChange.pending ?? { frame: "self" }}
-        methodsToRerun={scopeChange.methodsToRerun}
         affectedVerdicts={scopeChange.affectedVerdicts}
         onConfirm={scopeChange.confirm}
         onCancel={scopeChange.cancel}

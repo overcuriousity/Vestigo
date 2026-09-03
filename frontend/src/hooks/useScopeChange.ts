@@ -5,15 +5,15 @@
  * until confirmation, so cancelling genuinely leaves the findings on screen
  * untouched rather than reverting a change that already ran.
  *
- * The counts the dialog quotes are computed here: how many methods will re-run
- * (every applicable one — the fingerprint moves for all of them at once) and
- * how many verdicts were recorded under the scope being left behind.
+ * The count the dialog quotes is computed here: how many verdicts were
+ * recorded under the scope being left behind. Configured detectors carry
+ * their own scope and are untouched by this change; it applies to ad hoc
+ * runs from the sheet and to the Explore tab.
  */
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { dispositionsApi } from "@/api/dispositions";
 import { useBaselineStore } from "@/stores/baseline";
-import { METHODS } from "@/components/analysis/method-registry";
 import { useAnalysisPlan } from "./useAnalysisPlan";
 
 export interface PendingScope {
@@ -24,7 +24,7 @@ export interface PendingScope {
 
 export function useScopeChange(caseId: string, timelineId: string) {
   const [pending, setPending] = useState<PendingScope | null>(null);
-  const { planById, scope } = useAnalysisPlan(caseId, timelineId);
+  const { scope } = useAnalysisPlan(caseId, timelineId);
   const setFrame = useBaselineStore((s) => s.setFrame);
   const setActiveBaselineId = useBaselineStore((s) => s.setActiveBaselineId);
 
@@ -55,8 +55,6 @@ export function useScopeChange(caseId: string, timelineId: string) {
     }).length;
   }, [dispositions, scope]);
 
-  const methodsToRerun = METHODS.filter((m) => planById[m.id]?.status === "applicable").length;
-
   return {
     pending,
     // A baseline frame with no definition is not a scope change — the store
@@ -84,7 +82,6 @@ export function useScopeChange(caseId: string, timelineId: string) {
       }
       setPending(null);
     },
-    methodsToRerun,
     affectedVerdicts,
     currentScope: scope,
   };

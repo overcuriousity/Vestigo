@@ -1,10 +1,14 @@
 /**
- * useMethodFindings / useStreamingSweep — one query per method.
+ * useMethodFindings / useStreamingSweep — one query per configured detector.
  *
- * The old sweep issued eleven requests inside a single query, so the panel
- * could not render until the slowest returned. One query per method means each
- * result paints the moment it lands, and the rail's progress line is simply how
- * many have settled.
+ * Nothing runs unprompted. The sweep runs exactly the entries on
+ * `Timeline.detectors` (see `useTimelineDetectors`), each with its own stored
+ * params and its own scope, through the same findings endpoint and server
+ * cache as any ad hoc run. The analysis plan is fetched only to advise — the
+ * wizard's cards and the Tools accounting read it; it never decides what runs.
+ *
+ * One query per entry means each result paints the moment it lands, and the
+ * rail's progress line is simply how many have settled.
  *
  * Cheap methods are enabled immediately; heavy ones wait until the cheap set
  * settles, so the first paint is never queued behind a HEAVY_SCAN_GATE slot on
@@ -35,8 +39,7 @@ import {
 } from "@/components/analysis/detector-hooks";
 import { useUiStore } from "@/stores/ui";
 import { useAnalysisPlan, useScopeParams } from "./useAnalysisPlan";
-import { useMethodFocus } from "./useMethodFocus";
-import { useMutedMethods } from "./useMutedMethods";
+import { scopeOf, useTimelineDetectors, type KnownDetectorEntry } from "./useTimelineDetectors";
 
 /** Per-method fetch cap, mirrored in the rail's coverage copy. */
 export const METHOD_LIMIT = 50;
@@ -92,14 +95,20 @@ function findingsQueryOptions(
   };
 }
 
-/** One method on its own — the "run anyway" path, and the sheet's rerun. */
+/**
+ * One method on its own — the sheet's ad hoc run, or a finding addressed by
+ * the rail. `scope` overrides the panel scope: a finding the rail fetched under
+ * a configured entry must be opened under that entry's scope, or the sheet
+ * reads a different list than the row that was clicked.
+ */
 export function useMethodFindings(
   caseId: string,
   timelineId: string,
   method: MethodId,
-  opts: { enabled: boolean; params?: Record<string, unknown> },
+  opts: { enabled: boolean; params?: Record<string, unknown>; scope?: ScopeParams },
 ) {
-  const scopeParams = useScopeParams();
+  const globalScope = useScopeParams();
+  const scopeParams = opts.scope ?? globalScope;
   const { includeDismissed } = useIncludeDismissed();
   return useQuery<MethodFindings>(
     findingsQueryOptions(
@@ -139,55 +148,40 @@ export interface MethodState {
   dataStatus?: string;
   /** Caveats the runner attached to an answer it did produce. */
   warnings: string[];
+  /** The stored entry this method runs under; absent when not configured. */
+  entry?: KnownDetectorEntry;
+  configured: boolean;
 }
 
 const CHEAP_IDS = METHODS.filter((m) => m.costClass === "cheap").map((m) => m.id);
 const HEAVY_IDS = METHODS.filter((m) => m.costClass === "heavy").map((m) => m.id);
 
-/** Run every applicable method, cheapest-first, reporting them as they settle. */
+/** Run every configured detector, cheapest-first, reporting them as they settle. */
 export function useStreamingSweep(caseId: string, timelineId: string) {
   const { planById, scope, isLoading: planLoading } = useAnalysisPlan(caseId, timelineId);
   const scopeParams = useScopeParams();
   const { includeDismissed } = useIncludeDismissed();
 
-  // Muted methods are excluded here rather than filtered out downstream, so
-  // "no findings, no histogram marks, no place in the progress denominator"
-  // all follow from one decision instead of from three that can drift. The
-  // *plan* is untouched: `status` stays the structural claim about the data,
-  // and the sheet's run-anyway path still reaches a muted method by name.
-  const { muted } = useMutedMethods(caseId, timelineId);
-  const runnable = useCallback(
-    (id: MethodId) => !planLoading && !muted.has(id) && planById[id]?.status === "applicable",
-    [planById, planLoading, muted],
-  );
+  // A configured entry is the whole decision: not the plan (advice, never a
+  // lock — a not_applicable method an analyst configured anyway still runs),
+  // not a mute, not a per-user focus. One list, shared, audited.
+  const { entries, byMethod: entryByMethod } = useTimelineDetectors(caseId, timelineId);
+  const runnable = useCallback((id: MethodId) => entryByMethod.has(id), [entryByMethod]);
 
-  // A focused method scans only the fields this analyst chose (#341), sent as
-  // an explicit `fields` — which bypasses the shared `field_overrides` layer
-  // by contract, so one analyst's focus never rewrites what a colleague sees.
-  // `params` is already part of both the server fingerprint and this query's
-  // key, so a focused and an unfocused answer cache separately for free.
-  const { fieldsFor } = useMethodFocus(timelineId);
-  const paramsFor = useCallback(
-    (id: MethodId): Record<string, unknown> => {
-      const fields = fieldsFor(id);
-      return fields ? { fields } : {};
-    },
-    [fieldsFor],
-  );
+  const optionsFor = (id: MethodId, enabled: boolean) => {
+    const entry = entryByMethod.get(id);
+    return findingsQueryOptions(
+      caseId,
+      timelineId,
+      id,
+      entry ? scopeOf(entry) : scopeParams,
+      entry?.params ?? {},
+      enabled && entry !== undefined,
+      includeDismissed,
+    );
+  };
 
-  const cheapResults = useQueries({
-    queries: CHEAP_IDS.map((id) =>
-      findingsQueryOptions(
-        caseId,
-        timelineId,
-        id,
-        scopeParams,
-        paramsFor(id),
-        runnable(id),
-        includeDismissed,
-      ),
-    ),
-  });
+  const cheapResults = useQueries({ queries: CHEAP_IDS.map((id) => optionsFor(id, true)) });
   // Settled, not "not loading": a disabled query is neither, and asking
   // `isFetched` says what this actually means without depending on how
   // react-query happens to derive `isLoading` from pending/fetching.
@@ -196,17 +190,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
   );
 
   const heavyResults = useQueries({
-    queries: HEAVY_IDS.map((id) =>
-      findingsQueryOptions(
-        caseId,
-        timelineId,
-        id,
-        scopeParams,
-        paramsFor(id),
-        runnable(id) && cheapSettled,
-        includeDismissed,
-      ),
-    ),
+    queries: HEAVY_IDS.map((id) => optionsFor(id, cheapSettled)),
   });
 
   // `useQueries` returns a fresh array (and fresh result objects) on every
@@ -251,14 +235,24 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         cache: data?.cache,
         dataStatus: data?.status,
         warnings: data?.warnings ?? [],
+        entry: entryByMethod.get(meta.id),
+        configured: entryByMethod.has(meta.id),
       };
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps -- see queryDeps above
-  }, [...queryDeps, planById, runnable]);
+  }, [...queryDeps, planById, runnable, entryByMethod]);
 
   const expected = METHODS.filter((m) => runnable(m.id));
   const settled = expected.filter((m) => !byMethod[m.id].pending).length;
 
-  return { byMethod, scope, done: settled, total: expected.length, planLoading };
+  return {
+    byMethod,
+    scope,
+    done: settled,
+    total: expected.length,
+    planLoading,
+    planById,
+    configured: entries,
+  };
 }

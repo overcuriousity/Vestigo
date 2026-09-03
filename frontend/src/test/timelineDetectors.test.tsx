@@ -9,6 +9,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useTimelineDetectors, scopeOf } from "@/hooks/useTimelineDetectors";
+import { useStreamingSweep } from "@/hooks/useMethodFindings";
 
 const server = vi.hoisted(() => ({
   detectors: [] as Record<string, unknown>[],
@@ -41,6 +42,51 @@ vi.mock("@/api/cases", () => ({
   casesApi: { get: async () => ({ id: "c1", access: "contribute" }) },
 }));
 vi.mock("@/lib/caseAccess", () => ({ canContributeToCase: () => true }));
+
+const asked = vi.hoisted(() => ({ calls: [] as Record<string, unknown>[] }));
+const plan = vi.hoisted(() => ({ status: "applicable" as string }));
+
+vi.mock("@/api/analysis", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/analysis")>();
+  const { METHODS } = await import("@/components/analysis/method-registry");
+  return {
+    ...actual,
+    analysisApi: {
+      plan: async (_c: string, _t: string, scope: { frame: string; baseline_id?: string }) => ({
+        methods: METHODS.map((m) => ({
+          method: m.id,
+          status: plan.status,
+          reason: "",
+          reason_facts: {},
+          cost_class: m.costClass,
+        })),
+        scope: { frame: scope.frame, baseline_id: scope.baseline_id ?? null, baseline_name: null },
+        events_total: 1,
+      }),
+      findings: async (
+        _c: string,
+        _t: string,
+        args: { method: string; frame: string; baseline_id?: string; params?: unknown },
+      ) => {
+        asked.calls.push({
+          method: args.method,
+          frame: args.frame,
+          baseline_id: args.baseline_id,
+          params: args.params,
+        });
+        return {
+          method: args.method,
+          results: [],
+          total_findings: 0,
+          dismissed_count: 0,
+          warnings: [],
+          scope: { frame: args.frame, baseline_id: args.baseline_id ?? null, baseline_name: null },
+          cache: "miss",
+        };
+      },
+    },
+  };
+});
 
 function wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -93,5 +139,62 @@ describe("useTimelineDetectors", () => {
       frame: "baseline",
       baseline_id: "b1",
     });
+  });
+});
+
+describe("useStreamingSweep", () => {
+  beforeEach(() => {
+    server.detectors = [];
+    asked.calls = [];
+    plan.status = "applicable";
+  });
+
+  it("issues no findings query when nothing is configured", async () => {
+    const { result } = renderHook(() => useStreamingSweep("c1", "t1"), { wrapper });
+    await waitFor(() => expect(result.current.planLoading).toBe(false));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(asked.calls).toEqual([]);
+    expect(result.current.total).toBe(0);
+  });
+
+  it("runs exactly the configured entries with their own params and scope", async () => {
+    server.detectors = [
+      { method: "value_novelty", params: { fields: ["user"] }, frame: "self", baseline_id: null },
+      {
+        method: "frequency",
+        params: { series_field: "artifact" },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    const { result } = renderHook(() => useStreamingSweep("c1", "t1"), { wrapper });
+    await waitFor(() => expect(result.current.done).toBe(2));
+    expect(asked.calls).toEqual(
+      expect.arrayContaining([
+        {
+          method: "value_novelty",
+          frame: "self",
+          baseline_id: undefined,
+          params: { fields: ["user"] },
+        },
+        {
+          method: "frequency",
+          frame: "baseline",
+          baseline_id: "b1",
+          params: { series_field: "artifact" },
+        },
+      ]),
+    );
+    expect(asked.calls).toHaveLength(2);
+    expect(result.current.byMethod.entropy.configured).toBe(false);
+    expect(result.current.byMethod.frequency.entry?.baseline_id).toBe("b1");
+  });
+
+  it("runs a configured method even when the plan calls it not_applicable", async () => {
+    plan.status = "not_applicable";
+    server.detectors = [{ method: "charset", params: {}, frame: "self", baseline_id: null }];
+    const { result } = renderHook(() => useStreamingSweep("c1", "t1"), { wrapper });
+    await waitFor(() => expect(result.current.done).toBe(1));
+    expect(asked.calls.map((c) => c.method)).toEqual(["charset"]);
   });
 });
