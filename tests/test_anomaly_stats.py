@@ -259,6 +259,76 @@ def test_page_and_total_compose_both_statements_from_one_core():
     assert svc.ch.client._all_parameters[0] == params
 
 
+def _max_memory(sql: str) -> int:
+    """The ``max_memory_usage`` a statement carries, as an int."""
+    return int(sql.split("max_memory_usage = ")[1].split(",")[0].strip())
+
+
+def test_page_and_total_split_the_slot_budget_between_its_two_statements(monkeypatch):
+    """Both statements carry half the per-slot cap, not the full one.
+
+    A gate slot's cap is sized per *slot*; the page and its count run
+    concurrently under one slot, so each must carry half. `scan_fanout` only
+    divides a clause built while it is declared — building the clause first
+    and declaring the fan-out afterwards emits the full cap twice, which is
+    exactly the over-commit the declaration exists to prevent. This asserts
+    on the SQL that leaves the service, so a hoisted clause build fails here
+    rather than in a ClickHouse OOM.
+    """
+    from vestigo.db import _scan
+    from vestigo.db._scan import heavy_scan_settings, scan_fanout
+
+    budget = 1 << 30
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: budget)
+    solo_clause = heavy_scan_settings()
+    with scan_fanout(2):
+        halved_clause = heavy_scan_settings()
+    assert _max_memory(solo_clause) == budget, "fixture sanity"
+    assert _max_memory(halved_clause) == budget // 2, "fixture sanity"
+
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    svc._page_and_total(
+        "SELECT val, count() AS cnt FROM db.events WHERE case_id = {cid:String} GROUP BY val",
+        {"cid": "c1"},
+        page_tail="ORDER BY cnt ASC\nLIMIT 10",
+        total_select="count()",
+    )
+    page_sql = svc.ch.client.full_queries[0]
+    total_sql = svc.ch.client.total_queries[0]
+
+    for sql in (page_sql, total_sql):
+        assert _max_memory(sql) == budget // 2, sql[-160:]
+        # The whole clause, spill thresholds included, is the fan-out clause.
+        assert sql.rstrip().endswith(halved_clause), sql[-160:]
+        assert solo_clause not in sql
+
+
+def test_page_and_total_composes_with_an_outer_fan_out(monkeypatch):
+    """A caller already fanning out gets the product, not a reset to two.
+
+    `scan_fanout` multiplies, and the clause has to be built in the caller's
+    context for that to hold — a clause built anywhere else would lose the
+    outer declaration.
+    """
+    from vestigo.db import _scan
+    from vestigo.db._scan import scan_fanout
+
+    budget = 1 << 30
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: budget)
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(RecordingClient([], totals=[0]))
+    with scan_fanout(2):
+        svc._page_and_total(
+            "SELECT val, count() AS cnt FROM db.events GROUP BY val",
+            {},
+            page_tail="LIMIT 10",
+            total_select="count()",
+        )
+    for sql in (svc.ch.client.full_queries[0], svc.ch.client.total_queries[0]):
+        assert _max_memory(sql) == budget // 4, sql[-160:]
+
+
 def test_scalar_total_reads_an_empty_or_null_count_as_zero():
     """`count()` over an empty set returns no row; `sum(hits)` returns NULL."""
     assert _scalar_total([]) == 0
@@ -2656,7 +2726,7 @@ def test_heavy_detector_scans_carry_memory_settings():
     (external GROUP BY spill + per-query memory cap + thread cap) — a scan
     without it trusts the server-wide limit and can take the box down on a
     300M-row case."""
-    from vestigo.db._scan import heavy_scan_settings
+    from vestigo.db._scan import heavy_scan_settings, scan_fanout
 
     class _RecordingClient(FakeClient):
         def __init__(self) -> None:
@@ -2681,14 +2751,37 @@ def test_heavy_detector_scans_carry_memory_settings():
     svc.find_entropy_outliers("c1", ["s1"], fields=["artifact"])
     svc.field_inventory("c1", ["s1"], total=100)
 
+    def _is_total(q: str) -> bool:
+        return ") AS scanned" in q
+
+    def _is_count_probe(q: str) -> bool:
+        # The bare `SELECT count() FROM db.events ...` size probe — not a
+        # companion total, which also starts with `SELECT count()` but wraps
+        # the page's core as `(...) AS scanned`.
+        return q.strip().startswith("SELECT count()") and not _is_total(q)
+
     scans = [
         q
         for q in client.full_queries
-        if not q.strip().startswith("SELECT count()") and "min(timestamp), max(timestamp)" not in q
+        if not _is_count_probe(q) and "min(timestamp), max(timestamp)" not in q
     ]
     assert scans
+    solo = _max_memory(heavy_scan_settings())
+    with scan_fanout(2):
+        halved = _max_memory(heavy_scan_settings())
+    # The paged detectors issue a page and a companion count under one slot;
+    # both carry half the cap. Everything else runs alone and carries it whole.
+    totals = [q for q in scans if _is_total(q)]
+    assert totals, "no paged scan ran under this fake"
     for sql in scans:
-        assert heavy_scan_settings() in sql, sql[:120]
+        assert "max_bytes_before_external_group_by" in sql, sql[:120]
+        assert _max_memory(sql) in (solo, halved), sql[-160:]
+    for sql in totals:
+        assert _max_memory(sql) == halved, sql[-160:]
+    # Every total has its page beside it at the same halved cap — no page at
+    # the full cap next to a count at half, which is what the old assertion
+    # would have accepted.
+    assert sum(_max_memory(q) == halved for q in scans) == 2 * len(totals)
 
 
 # ---------------------------------------------------------------------------

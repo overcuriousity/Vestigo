@@ -1793,7 +1793,12 @@ class StatisticalAnomalyService:
 
         The two run concurrently under the caller's one gate slot, declaring
         the fan-out so they split its memory cap rather than each taking it
-        whole (:func:`~vestigo.db._scan.scan_fanout`). Wall clock is therefore
+        whole (:func:`~vestigo.db._scan.scan_fanout`). The declaration only
+        divides a SETTINGS clause built while it is in effect, so the clause
+        is built inside the ``with`` — built before it, both statements would
+        carry the full cap. Each therefore runs at half the slot's cap and
+        spills at half the usual thresholds; the ``GROUP BY`` under both is
+        the spillable path, which is what makes that survivable. Wall clock is
         roughly one scan's, and the extra cost is ClickHouse-side. Threads run
         under a copy of the calling context so the scan tag reaches both and a
         disconnect can KILL both (#300).
@@ -1801,14 +1806,20 @@ class StatisticalAnomalyService:
         Sources are immutable, so the two statements see the same data and the
         total is a fact about the page's own scope, not an approximation of it.
         """
-        settings = heavy_scan_settings()
-        page_sql = f"{core}\n{page_tail}\n{settings}"
-        total_sql = f"SELECT {total_select} FROM (\n{core}\n) AS scanned\n{total_tail}\n{settings}"
 
         def _run(sql: str) -> list[tuple[Any, ...]]:
             return self.ch.client.query(sql, parameters=params).result_rows
 
+        # The clause is built *inside* the declaration: `scan_fanout` is a
+        # ContextVar the clause builder reads, not a limiter, so a clause
+        # built before it embeds the full per-slot cap — twice. Pinned by
+        # test_page_and_total_split_the_slot_budget_between_its_two_statements.
         with scan_fanout(2), ThreadPoolExecutor(max_workers=2) as pool:
+            settings = heavy_scan_settings()
+            page_sql = f"{core}\n{page_tail}\n{settings}"
+            total_sql = (
+                f"SELECT {total_select} FROM (\n{core}\n) AS scanned\n{total_tail}\n{settings}"
+            )
             page = pool.submit(copy_context().run, _run, page_sql)
             total = pool.submit(copy_context().run, _run, total_sql)
             return page.result(), total.result()
