@@ -211,6 +211,52 @@ half — how to size the budget and read what resolved — is
   math on the raw column (a uniform per-source shift cancels within a source), and
   only the reported timestamps are shifted for display.
 
+### Totals and truncation: what `total_findings` promises
+
+Every findings response carries `results` (the page) and `total_findings` (the count).
+The contract, for every method:
+
+- **`total_findings` is the exact number of findings the method produced across the
+  full analysed scope, after allowlist and normal-event suppression, before the display
+  cap.** It is a fact about the data, not about the page. A method whose scan cannot
+  supply that number exactly sets `total_findings_exact: false` and attaches a warning
+  naming why; a client renders such a count as "N+", never as "N".
+- **`results` is the top-`limit` by score, and that ranking is the true top-`limit`.**
+  Every SQL that pages must order by an expression monotone in the score it reports, and
+  a per-field or per-group page budget is at least the global `limit` — a global top-50
+  may legitimately be 50 values from one field.
+- **The only truncation that is not a display cap is a candidate cap, and it warns.**
+  The candidate-enumerating methods (proportion shift, interval periodicity, distribution
+  drift, sequence novelty, sequence motif) bound how many candidates they score
+  (1,000–2,000 per field or source) because that enumeration *is* the scan; hitting the
+  cap attaches a warning, and `total_findings` is then exact relative to the disclosed
+  pool.
+
+Why this needs saying: until 1.20 five methods (value novelty and its batched attribute
+pass, value combos, numeric range, charset, entropy) put a small `LIMIT` — the request
+limit, or 25 per field — into the aggregation itself and reported the size of what came
+back as the total. The count badge read "50" for a corpus with forty thousand rare
+combinations, and a global top-50 could miss the 26th-rarest value of a field. `LIMIT`
+was never what bounded the scan: the `GROUP BY` over the corpus is the cost and
+`HEAVY_SCAN_SETTINGS` bounds it; `LIMIT` only trims what leaves ClickHouse.
+
+How the exact count is produced: `count() OVER ()` in the same statement
+(`count() OVER (PARTITION BY key)` under a `LIMIT n BY key`; `sum(hits) OVER ()` where a
+group fans out into one finding per suspect window). Window functions evaluate after
+`GROUP BY`/`HAVING` and before `ORDER BY`/`LIMIT`, so one scan yields both the page and
+the count — the pattern `list_log_templates` already uses. The rows it holds are the
+post-`HAVING` groups the `ORDER BY` materialises anyway, under the same
+`max_memory_usage` cap, so the failure mode is a loud query error, never a silently short
+number. Suppression is applied in the SQL (`NOT has({allow}, key)`, `NOT has({excl},
+evt_id)` in `HAVING`) so the count is post-suppression; a suppression set larger than
+`_SQL_SUPPRESSION_MAX` (1,000 entries) falls back to the Python-side filter on the page
+and marks the total inexact.
+
+The one hard limit that remains is hydration: `get_events_by_ids` binds one parameter per
+id, so representative events are fetched in chunks of `_HYDRATE_CHUNK` (500). The display
+cap (`limit`, 50 by default, 80 from the Investigate rail, 500 at the API) exists for
+triage and payload, not for the scan.
+
 ### The analysis gate: which methods are offered up front
 
 No statistical method runs unprompted. The Investigate rail runs exactly the detectors an
