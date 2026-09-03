@@ -38,8 +38,14 @@ export const baselinesApi = {
       body,
     ),
 
+  /**
+   * Delete a definition. Detectors framed on it are unconfigured with it —
+   * a configured entry pointing at a baseline that no longer exists is a
+   * question nobody can answer — and `unconfigured_detectors` names the
+   * methods that went, so the caller can say so.
+   */
   remove: (caseId: string, timelineId: string, baselineId: string) =>
-    del<{ deleted: boolean; baseline_id: string }>(
+    del<{ deleted: boolean; baseline_id: string; unconfigured_detectors: string[] }>(
       `/cases/${caseId}/timelines/${timelineId}/baselines/${baselineId}`,
     ),
 };

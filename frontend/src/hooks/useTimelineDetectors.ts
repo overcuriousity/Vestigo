@@ -32,6 +32,8 @@ export interface TimelineDetectors {
   /** Stored order, filtered to methods this client knows about. */
   entries: KnownDetectorEntry[];
   byMethod: Map<MethodId, KnownDetectorEntry>;
+  /** The timeline has been fetched — an empty `entries` means "none", not "not yet". */
+  isLoaded: boolean;
   set: (method: MethodId, body: DetectorBody) => Promise<Timeline>;
   remove: (method: MethodId) => Promise<Timeline>;
   canEdit: boolean;
@@ -50,7 +52,7 @@ export function useTimelineDetectors(caseId: string, timelineId: string): Timeli
   const queryClient = useQueryClient();
   const timelineKey = ["timeline", caseId, timelineId];
 
-  const { data: timeline } = useQuery({
+  const { data: timeline, isSuccess: isLoaded } = useQuery({
     queryKey: timelineKey,
     queryFn: () => timelinesApi.get(caseId, timelineId),
     enabled: Boolean(caseId && timelineId),
@@ -102,6 +104,7 @@ export function useTimelineDetectors(caseId: string, timelineId: string): Timeli
   return {
     entries,
     byMethod,
+    isLoaded,
     set,
     remove,
     canEdit,

@@ -565,6 +565,19 @@ async def import_case(
                             embedded_timelines += 1
                         for colname in _TIMELINE_EMBEDDING_COLUMNS:
                             setattr(obj, colname, None)
+                        # `detectors` is a JSON column, so `_revive` already
+                        # rewrote the baseline ids embedded in it. `added_by`
+                        # holds a *user* id, which the entity map does not
+                        # cover — left verbatim, every configured detector on
+                        # a restored case would credit an account that exists
+                        # nowhere on this instance.
+                        if isinstance(obj.detectors, list):
+                            obj.detectors = [
+                                {**e, "added_by": _local_user(e["added_by"])}
+                                if isinstance(e, dict) and isinstance(e.get("added_by"), str)
+                                else e
+                                for e in obj.detectors
+                            ]
                     elif isinstance(obj, AgentConversation):
                         obj.user_id = _local_user(row.get("user_id"))
                     elif isinstance(obj, AuditLog):

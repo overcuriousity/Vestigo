@@ -3394,13 +3394,20 @@ class PostgresStore:
         ``added_by``/``added_at`` are the caller's; validation of the entry
         against the runner's models happens at the API layer.
 
+        The whole list is one JSON column, so this is a read-modify-write and
+        the row is locked for the duration: two analysts configuring *different*
+        methods concurrently would otherwise each write the list they read, one
+        entry silently lost while both audit rows claim success.
+
         Returns the updated timeline with sources eagerly loaded, or None.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Timeline).where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
             )
             timeline = result.scalar_one_or_none()
             if timeline is None:
@@ -3428,14 +3435,16 @@ class PostgresStore:
         """Remove the configured detector for ``method`` (no-op if absent).
 
         An emptied list is stored as None so "nothing configured" has one
-        representation. Returns the updated timeline, or None if it does not
-        exist.
+        representation. Locked like ``set_timeline_detector``, and for the same
+        reason. Returns the updated timeline, or None if it does not exist.
         """
         from sqlalchemy import select
 
         async with self.session_factory() as session:
             result = await session.execute(
-                select(Timeline).where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
             )
             timeline = result.scalar_one_or_none()
             if timeline is None:
@@ -3446,6 +3455,44 @@ class PostgresStore:
             await session.refresh(timeline)
             await session.refresh(timeline, attribute_names=["sources"])
             return timeline
+
+    async def remove_timeline_detectors_for_baseline(
+        self,
+        case_id: str,
+        timeline_id: str,
+        baseline_id: str,
+    ) -> list[dict[str, Any]]:
+        """Drop every configured detector framed on ``baseline_id``.
+
+        Called when that baseline definition is deleted. A baseline-framed
+        entry whose definition is gone is not a detector any more: the rail's
+        request 404s, the chip degrades to a bare "vs baseline", and the wizard
+        seeds an id its own picker cannot show — a dead end that never says so.
+        Removing the entries with the definition keeps "what is configured" a
+        list of questions that can actually be asked; the caller audits each
+        removal, so nothing disappears off the record.
+
+        Returns the entries that were removed, in stored order (empty when none
+        referenced it, or the timeline does not exist).
+        """
+        from sqlalchemy import select
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Timeline)
+                .where(Timeline.case_id == case_id, Timeline.id == timeline_id)
+                .with_for_update()
+            )
+            timeline = result.scalar_one_or_none()
+            if timeline is None:
+                return []
+            current = list(timeline.detectors or [])
+            removed = [e for e in current if e.get("baseline_id") == baseline_id]
+            if not removed:
+                return []
+            timeline.detectors = [e for e in current if e.get("baseline_id") != baseline_id] or None
+            await session.commit()
+            return removed
 
     async def update_timeline_field_overrides(
         self,

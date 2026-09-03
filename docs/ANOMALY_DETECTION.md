@@ -315,10 +315,19 @@ reads back one sentence saying exactly what will be stored, then applies. In the
 strip above the feed names every configured detector with its scope and count, and carries
 edit and remove for contribute access.
 
-Two things still run a method without storing anything, and both run under the panel scope
-rather than an entry's: the sheet's method mode with ad hoc knobs, and the Tools sheet's
-Retry on a configured detector that errored. Neither changes the list — that is a
-different act.
+One thing still runs a method without storing anything: the sheet's method mode with ad hoc
+knobs, under the panel scope rather than an entry's. It does not change the list — that is
+a different act. The Tools sheet's Retry is *not* that: it re-runs the configured entry's
+own query, params and scope included, because a Retry that asked a different question could
+report success while the rail's chip still showed the failure it was supposed to clear.
+
+Deleting a baseline definition unconfigures every detector framed on it. An entry whose
+definition is gone is a question nobody can ask — the findings request 404s on every rail
+open, the chip degrades to a bare "vs baseline", and the wizard seeds an id its own picker
+cannot show. Each removal is audited as its own `timeline.remove_detector` row (with the
+deleting baseline named in `reason`), the `baseline.delete` row lists the methods, and the
+DELETE response returns them so the Scope tab can say what went. Past `DetectorRun`s are
+unaffected: they snapshot the windows they used, so they stay replayable either way.
 
 The demo case ships five configured detectors on its "Full incident" timeline
 (`demo/metadata.py::DEMO_DETECTORS`), each asserted to find something in

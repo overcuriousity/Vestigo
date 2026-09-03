@@ -87,6 +87,7 @@ function state(id: string, over: Record<string, unknown> = {}) {
     isLoading: false,
     error: false,
     pending: false,
+    refetch: () => {},
     configured: true,
     entry: { method: id, params: {}, frame: "self", baseline_id: null, added_by: null, added_at: "" },
     ...over,
@@ -191,6 +192,23 @@ describe("ToolsSheet", () => {
       .getByRole("button", { name: /run anyway/i })
       .click();
     expect(onRunMethod).toHaveBeenCalledWith("numeric_range");
+  });
+
+  it("retries the query that failed, not an ad hoc run of the same method", () => {
+    // Routing Retry through `onRunMethod` ran the method with empty params
+    // under the panel scope — a different question than the configured entry's
+    // failing one, which could report success while the rail's chip still
+    // showed the failure.
+    const onRunMethod = vi.fn();
+    const refetch = vi.fn();
+    renderTools({ onRunMethod }, {}, {
+      entropy: state("entropy", { error: true, refetch }),
+    });
+    within(screen.getByTestId("method-row-entropy"))
+      .getByRole("button", { name: /retry/i })
+      .click();
+    expect(refetch).toHaveBeenCalled();
+    expect(onRunMethod).not.toHaveBeenCalled();
   });
 
   it("lists only configured detectors and offers the wizard for the rest", () => {

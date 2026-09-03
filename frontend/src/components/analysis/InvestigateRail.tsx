@@ -265,7 +265,10 @@ export function InvestigateRail({
         baselineNames={baselineNames}
         canEdit={detectors.canEdit}
         onEdit={(m) => onAddDetector(m)}
-        onRemove={(m) => void detectors.remove(m)}
+        // The rejection is already rendered as `saveError` below; swallowing
+        // it here only keeps a failed DELETE from surfacing as an unhandled
+        // promise rejection.
+        onRemove={(m) => void detectors.remove(m).catch(() => {})}
       />
       {detectors.saveError && (
         <p data-testid="detector-save-error" className="text-xs text-[var(--color-danger)]">

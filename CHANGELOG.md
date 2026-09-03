@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panel scope now applies only to ad hoc runs from the sheet and the Explore tab. The demo
   case ships five pre-configured. Migration 0034.
 - The agent gains the read-only `list_configured_detectors` tool.
+- Deleting a baseline definition now unconfigures the detectors framed on it, rather than
+  leaving entries whose findings request 404s. Each removal is audited separately and the
+  DELETE response names the methods that went. Past detector runs are unaffected — they
+  snapshot the windows they used.
+- Case export now carries the `added_by` of each configured detector through the archive's
+  username map, so a restored case credits the analyst who configured it rather than the
+  importer.
 
 ### Removed
 

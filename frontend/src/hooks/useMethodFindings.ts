@@ -148,6 +148,14 @@ export interface MethodState {
   dataStatus?: string;
   /** Caveats the runner attached to an answer it did produce. */
   warnings: string[];
+  /**
+   * Re-run *this* query — the configured entry's params under its own scope.
+   * The Tools sheet's Retry needs it: routing that button through an ad hoc
+   * run would ask a different question (empty params, the panel scope) than
+   * the one that failed, and could report success while the rail's chip still
+   * showed the failure.
+   */
+  refetch: () => void;
   /** The stored entry this method runs under; absent when not configured. */
   entry?: KnownDetectorEntry;
   configured: boolean;
@@ -235,6 +243,7 @@ export function useStreamingSweep(caseId: string, timelineId: string) {
         cache: data?.cache,
         dataStatus: data?.status,
         warnings: data?.warnings ?? [],
+        refetch: () => void query?.refetch(),
         entry: entryByMethod.get(meta.id),
         configured: entryByMethod.has(meta.id),
       };

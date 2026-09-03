@@ -141,8 +141,15 @@ export function MethodRow({
           Set a baseline
         </button>
       ) : status === "not_applicable" || state.error ? (
+        // Two acts behind one affordance. "Run anyway" is an ad hoc run of a
+        // gated method; "Retry" re-runs *the query that failed* — the
+        // configured entry's own params under its own scope. Routing Retry
+        // through the ad hoc run asked a different question (empty params, the
+        // panel scope), could report success while the rail's chip still
+        // showed the failure, and never retried the failing request at all.
         <button
-          onClick={() => onRun(meta.id)}
+          data-testid={`method-run-${meta.id}`}
+          onClick={() => (state.error ? state.refetch() : onRun(meta.id))}
           className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] hover:border-[var(--color-accent)]"
         >
           <Play size={9} />

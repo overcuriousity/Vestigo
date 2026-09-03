@@ -164,6 +164,32 @@ describe("DetectorWizard", () => {
     );
   });
 
+  it("drops a stored baseline id the timeline no longer has", async () => {
+    // The definition was deleted after this detector was configured. Seeding
+    // the dead id back left the picker blank while the wizard still held it:
+    // Next enabled, the confirm sentence reading `baseline "(unnamed)"`, and
+    // the PUT 422ing at the end.
+    detectors.entries = [
+      {
+        method: "proportion_shift",
+        params: {},
+        frame: "baseline",
+        baseline_id: "gone",
+        added_by: null,
+        added_at: "",
+      },
+    ];
+    renderWizard({ initialMethod: "proportion_shift" });
+    await waitFor(() =>
+      expect(screen.getByTestId("wizard-baseline")).toHaveTextContent("week before"),
+    );
+    expect(screen.getByTestId("wizard-baseline")).toHaveValue("");
+    expect(screen.getByTestId("wizard-next")).toBeDisabled();
+
+    fireEvent.change(screen.getByTestId("wizard-baseline"), { target: { value: "b1" } });
+    expect(screen.getByTestId("wizard-next")).not.toBeDisabled();
+  });
+
   it("opens in edit mode on a configured method", () => {
     detectors.entries = [
       {

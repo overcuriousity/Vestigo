@@ -55,7 +55,6 @@ export const BUDGET: Record<string, FileBudget> = {
   // visually heavier than the row it acts on, the same argument SigmaFindings
   // and FindingGroup carry.
   "../components/analysis/MethodRow.tsx": { fontSize: 3, rawButton: 3 },
-  "../components/analysis/ScopeStrip.tsx": { fontSize: 1, rawButton: 1 },
   // +1 for the log-template blurb, matching the motif blurb above it.
   // +1 button for the section tab, which is a bottom-border tab rather than
   // anything `Button` has a variant for.

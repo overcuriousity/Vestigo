@@ -236,6 +236,14 @@ async def _snapshot_postgres(store: PostgresStore, case_id: str) -> dict[str, An
         # not user ids (system origins) simply resolve to no row below.
         for rows in stems.values():
             user_ids |= {r["created_by"] for r in rows if r.get("created_by")}
+        # `added_by` on a configured detector is a user id inside a JSON column,
+        # so the `created_by` sweep above cannot see it. Without it the
+        # importer has no username to resolve and every configured detector on
+        # the restored case is credited to whoever imported it.
+        for row in stems["timelines"]:
+            for entry in row.get("detectors") or []:
+                if isinstance(entry, dict) and entry.get("added_by"):
+                    user_ids.add(entry["added_by"])
         users: dict[str, str] = {}
         if user_ids:
             pairs = (

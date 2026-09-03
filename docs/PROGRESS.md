@@ -4,7 +4,34 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 224 — opt-in detectors, the detector wizard).
+Last updated: 2026-09-03 (session 225 — review fixes on the detector wizard branch).
+
+## Session 225 — 2026-09-03: review fixes on the detector wizard branch
+
+Six findings from the PR review, all real, none of them the one the review led with — the
+importer already remaps a detector's `baseline_id`, because `Timeline.detectors` is a JSON
+column and `_revive` runs every JSON column through `_remap_json_ids`. What it did *not*
+carry was `added_by`: a user id, which the entity map does not cover, and which the
+exporter's `created_by` sweep could not see inside a JSON column either. Both ends now
+handle it, so a restored case credits the analyst who configured the detector.
+
+The rest: deleting a baseline definition left every detector framed on it pointing at
+nothing — a 404 per rail open, a chip reading "vs baseline", and a wizard that seeded the
+dead id, enabled Apply and 422'd on it. The definition now takes those entries with it,
+audited one row each, with the methods named in the response and in the Scope tab; the
+wizard also drops a `baselineId` the fetched list does not contain, so a stale id can never
+re-enable Next. Removing a detector while its finding sheet was open flipped the sheet's
+query to the panel scope with empty params and fired a *fresh* scan for the detector just
+deleted — the one thing this milestone exists to prevent; the query is now disabled and the
+sheet closes. Tools' "Retry" ran a different question than the one that failed (empty
+params, panel scope) and so could report success while the chip still showed `!`; it
+refetches the entry's own query. Plus a swallowed rejection on the strip's remove, and
+`SELECT … FOR UPDATE` on the detector list's read-modify-write, which two analysts
+configuring different methods could otherwise silently narrow to one.
+
+`ScopeStrip` went with the mute strip it outlived. The agent schema ledger in
+`test_agent_schema.py` now records 42,986/43,000 — the 14 chars are deliberate, as
+`docs/AGENT.md` already said, and the comment no longer stops at 42,285.
 
 ## Session 224 — 2026-09-03: opt-in detectors — the wizard replaces the unprompted sweep
 

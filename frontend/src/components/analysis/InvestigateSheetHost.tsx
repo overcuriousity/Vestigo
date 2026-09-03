@@ -98,13 +98,31 @@ export function InvestigateSheetHost({
   // under the *configured* entry's params and scope — so the sheet must read
   // the same query, or it renders a different list than the row clicked.
   // Method mode with the analyst's own knobs runs under the panel scope.
-  const { byMethod: entries } = useTimelineDetectors(caseId, timelineId);
+  const { byMethod: entries, isLoaded: detectorsLoaded } = useTimelineDetectors(
+    caseId,
+    timelineId,
+  );
   const entry = sheet.kind === "finding" ? entries.get(sheet.method) : undefined;
+  // The rail stays interactive beside the sheet, so the detector whose finding
+  // is open can be removed while it is open. Without this the query would fall
+  // back to the panel scope with empty params and fire a *fresh* scan for a
+  // detector that no longer exists — an unprompted heavy run, and a different
+  // finding at that rank than the row that was clicked.
+  const entryGone = sheet.kind === "finding" && detectorsLoaded && entry === undefined;
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
-    enabled: sheet.kind === "finding" || (sheet.kind === "method" && runParams !== null),
+    enabled:
+      (sheet.kind === "finding" && entry !== undefined) ||
+      (sheet.kind === "method" && runParams !== null),
     params: runParams ?? entry?.params ?? {},
     scope: runParams === null && entry ? scopeOf(entry) : undefined,
   });
+
+  // Closing is the honest answer to "what you were reading is gone" — leaving
+  // the overlay up would show a stale finding under a detector that is no
+  // longer configured.
+  useEffect(() => {
+    if (entryGone) onClose();
+  }, [entryGone, onClose]);
 
   const finding = sheet.kind === "finding" ? findings.data?.results[sheet.rank] : undefined;
 

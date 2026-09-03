@@ -104,7 +104,21 @@ export function DetectorWizard({
     () => baselines?.baselines.find((b) => b.id === baselineId)?.name ?? null,
     [baselines, baselineId],
   );
-  const scopeOk = frame === "self" || baselineId !== null;
+
+  // A stored entry can name a baseline that has since been deleted. Seeding it
+  // back would leave the picker blank while the wizard still held the id: Next
+  // and Apply enabled, the confirm sentence reading `baseline "(unnamed)"`, and
+  // the PUT 422ing at the end. Drop it once the list has actually loaded, so
+  // the analyst is asked for a baseline that exists instead.
+  const staleBaseline =
+    baselineId !== null &&
+    baselines !== undefined &&
+    !baselines.baselines.some((b) => b.id === baselineId);
+  useEffect(() => {
+    if (staleBaseline) setBaselineId(null);
+  }, [staleBaseline]);
+
+  const scopeOk = frame === "self" || (baselineId !== null && !staleBaseline);
   const canProceed = method !== null && blocker === null && scopeOk;
   const meta = method ? METHODS_BY_ID[method] : null;
 

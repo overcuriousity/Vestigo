@@ -46,6 +46,7 @@ vi.mock("@/hooks/useTimelineDetectors", () => ({
   useTimelineDetectors: () => ({
     entries: configured.entries,
     byMethod: new Map(configured.entries.map((e) => [e.method, e])),
+    isLoaded: true,
     set: async () => ({}),
     remove: async () => ({}),
     canEdit: true,
@@ -124,11 +125,43 @@ describe("InvestigateSheetHost configured entries", () => {
     });
     configured.entries = [];
   });
+
+  it("stops querying and closes when the detector is removed while its finding is open", () => {
+    // The rail stays interactive beside the sheet. With the entry gone the
+    // query used to fall back to the panel scope with empty params — a fresh,
+    // unprompted scan for a detector that was just deleted, answering a
+    // different question than the row that was clicked.
+    calls.current = [];
+    configured.entries = [
+      { method: "value_novelty", params: { fields: ["user"] }, frame: "self", baseline_id: null },
+    ];
+    const onClose = vi.fn();
+    const sheet: SheetRequest = { kind: "finding", method: "value_novelty", rank: 0 };
+    const props = {
+      caseId: "c1",
+      timelineId: "t1",
+      railWidth: 320,
+      sheet,
+      onClose,
+      onOpenMethod: () => {},
+      onRunMethod: () => {},
+      onAddDetector: () => {},
+    };
+    const { rerender } = render(<InvestigateSheetHost {...props} />, { wrapper });
+    expect(calls.current.at(-1)).toMatchObject({ enabled: true });
+
+    configured.entries = [];
+    rerender(<InvestigateSheetHost {...props} />);
+
+    expect(calls.current.at(-1)).toMatchObject({ enabled: false });
+    expect(onClose).toHaveBeenCalled();
+  });
 });
 
 describe("InvestigateSheetHost run parameters", () => {
   it("drops a custom run when the same method's finding is opened", () => {
     calls.current = [];
+    configured.entries = [{ method: "value_novelty", params: {}, frame: "self", baseline_id: null }];
     const { rerender, getByTestId } = renderHost({ kind: "method", method: "value_novelty" });
 
     // Run it with knobs the analyst typed.
@@ -162,6 +195,7 @@ describe("InvestigateSheetHost run parameters", () => {
 
   it("drops a custom run when a different rank of the same method is opened", () => {
     calls.current = [];
+    configured.entries = [{ method: "value_novelty", params: {}, frame: "self", baseline_id: null }];
     const sheetAt = (rank: number): SheetRequest => ({
       kind: "finding",
       method: "value_novelty",

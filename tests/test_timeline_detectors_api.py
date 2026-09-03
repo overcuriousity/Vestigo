@@ -189,3 +189,66 @@ def test_read_only_member_cannot_configure(client, admin_bootstrap):
     assert (
         client.delete(f"/api/cases/{case_id}/timelines/{tid}/detectors/entropy").status_code == 403
     )
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_baseline_unconfigures_the_detectors_framed_on_it(
+    client, admin_bootstrap, store
+):
+    """A configured entry whose baseline is gone is a question nobody can ask.
+
+    Left behind, it 404s `/analysis/findings` on every rail open, renders as a
+    bare "vs baseline" chip and seeds the wizard with an id its own picker
+    cannot show. So the definition takes them with it — audited one by one, and
+    named in the response so the UI can say what went.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id, tid = _case_and_timeline(client)
+    baseline_id = _baseline(client, case_id, tid)
+    other_id = _baseline(client, case_id, tid)
+
+    assert (
+        _put(
+            client, case_id, tid, "frequency", {"frame": "baseline", "baseline_id": baseline_id}
+        ).status_code
+        == 200
+    )
+    assert (
+        _put(
+            client, case_id, tid, "value_novelty", {"frame": "baseline", "baseline_id": other_id}
+        ).status_code
+        == 200
+    )
+    assert _put(client, case_id, tid, "entropy", {"params": {}}).status_code == 200
+
+    resp = client.delete(f"/api/cases/{case_id}/timelines/{tid}/baselines/{baseline_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["unconfigured_detectors"] == ["frequency"]
+
+    # The other baseline's entry and the self-framed one are untouched.
+    assert sorted(e["method"] for e in _get(client, case_id, tid)["detectors"]) == [
+        "entropy",
+        "value_novelty",
+    ]
+
+    entries = await store.query_audit(case_id=case_id)
+    rm_row = next(
+        e
+        for e in entries
+        if e.action == "timeline.remove_detector" and e.detail["method"] == "frequency"
+    )
+    assert rm_row.detail["reason"] == f"baseline {baseline_id} deleted"
+    delete_row = next(e for e in entries if e.action == "baseline.delete")
+    assert delete_row.detail["unconfigured_detectors"] == ["frequency"]
+
+
+def test_deleting_an_unused_baseline_leaves_the_detectors_alone(client, admin_bootstrap):
+    as_admin(client, admin_bootstrap)
+    case_id, tid = _case_and_timeline(client)
+    baseline_id = _baseline(client, case_id, tid)
+    assert _put(client, case_id, tid, "entropy", {"params": {}}).status_code == 200
+
+    resp = client.delete(f"/api/cases/{case_id}/timelines/{tid}/baselines/{baseline_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["unconfigured_detectors"] == []
+    assert [e["method"] for e in _get(client, case_id, tid)["detectors"]] == ["entropy"]
