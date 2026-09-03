@@ -1,11 +1,11 @@
 /**
- * The rail's contract: group findings by what kind of claim they are, never
- * present a gated-off method as an all-clear, and say what scope you are
- * looking at.
+ * The rail's contract: run only what is configured, group findings by what
+ * kind of claim they are, never present an unconfigured or still-pending
+ * detector as an all-clear, and name each configured detector's scope.
  */
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InvestigateRail } from "@/components/analysis/InvestigateRail";
@@ -27,6 +27,30 @@ const readiness = vi.hoisted(() => ({
 }));
 vi.mock("@/hooks/useTimelineReadiness", () => ({
   useTimelineReadiness: () => readiness.current,
+}));
+
+const detectors = vi.hoisted(() => ({
+  entries: [] as Record<string, unknown>[],
+  removed: [] as string[],
+  canEdit: true,
+}));
+vi.mock("@/hooks/useTimelineDetectors", () => ({
+  useTimelineDetectors: () => ({
+    entries: detectors.entries,
+    byMethod: new Map(detectors.entries.map((e) => [e.method, e])),
+    set: async () => ({}),
+    remove: async (m: string) => {
+      detectors.removed.push(m);
+      return {};
+    },
+    canEdit: detectors.canEdit,
+    isSaving: false,
+    saveError: null,
+  }),
+  scopeOf: () => ({ frame: "self" }),
+}));
+vi.mock("@/api/baselines", () => ({
+  baselinesApi: { list: async () => ({ baselines: [{ id: "bl-1", name: "Feb 24 – Mar 1" }] }) },
 }));
 
 const sigma = vi.hoisted(() => ({ current: [] as unknown[] }));
@@ -59,6 +83,16 @@ const finding = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+const entryOf = (id: string, over: Record<string, unknown> = {}) => ({
+  method: id,
+  params: {},
+  frame: "self",
+  baseline_id: null,
+  added_by: null,
+  added_at: "",
+  ...over,
+});
+
 function state(id: string, over: Record<string, unknown> = {}) {
   return {
     meta: METHODS_BY_ID[id as keyof typeof METHODS_BY_ID],
@@ -73,7 +107,10 @@ function state(id: string, over: Record<string, unknown> = {}) {
     findings: [],
     total: 0,
     isLoading: false,
+    pending: false,
     error: false,
+    configured: true,
+    entry: entryOf(id),
     ...over,
   };
 }
@@ -92,12 +129,19 @@ function renderRail(
     byMethod: {},
     ...overrides,
   };
+  // The configured list mirrors the sweep's `configured` states, as the real
+  // hooks share one source.
+  const byMethod = sweep.current.byMethod as Record<string, { configured?: boolean; entry?: unknown }>;
+  detectors.entries = Object.values(byMethod)
+    .filter((st) => st.configured && st.entry)
+    .map((st) => st.entry as Record<string, unknown>);
   return render(
     <InvestigateRail
       caseId="c1"
       timelineId="t1"
       onSelectFinding={() => {}}
       onOpenTools={() => {}}
+      onAddDetector={() => {}}
       onSelectEvent={() => {}}
       {...props}
     />,
@@ -136,36 +180,60 @@ describe("InvestigateRail", () => {
     expect(headings[1]).toContain("Exploration");
   });
 
-  it("states the scope it is showing findings under", () => {
-    renderRail({
-      scope: {
-        frame: "baseline",
-        baseline_id: "bl-1",
-        baseline_name: "Feb 24 – Mar 1",
-      },
-    });
-    expect(screen.getByTestId("scope-strip")).toHaveTextContent(
-      "Feb 24 – Mar 1",
-    );
+  it("shows the empty state with the wizard entry when nothing is configured", () => {
+    const onAddDetector = vi.fn();
+    renderRail({ byMethod: {}, done: 0, total: 0 }, readiness.current, { onAddDetector });
+    expect(screen.getByTestId("no-detectors")).toHaveTextContent("No detectors configured");
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    fireEvent.click(screen.getByTestId("add-detector"));
+    expect(onAddDetector).toHaveBeenCalledWith();
   });
 
-  it("never renders a gated method as an all-clear", () => {
+  it("names each configured detector with its scope and count, editable and removable", async () => {
+    const onAddDetector = vi.fn();
+    detectors.removed = [];
+    renderRail(
+      {
+        byMethod: {
+          value_novelty: state("value_novelty", {
+            findings: [finding()],
+            total: 1,
+            entry: entryOf("value_novelty", { frame: "baseline", baseline_id: "bl-1" }),
+          }),
+        },
+      },
+      readiness.current,
+      { onAddDetector },
+    );
+    const chip = screen.getByTestId("detector-chip-value_novelty");
+    expect(chip).toHaveTextContent("Rare values");
+    expect(chip).toHaveTextContent("1");
+    await screen.findByText(/Feb 24 – Mar 1/);
+    fireEvent.click(within(chip).getByTitle("Edit"));
+    expect(onAddDetector).toHaveBeenCalledWith("value_novelty");
+    fireEvent.click(within(chip).getByTitle("Remove"));
+    expect(detectors.removed).toEqual(["value_novelty"]);
+  });
+
+  it("hides edit and remove from read-only members", () => {
+    detectors.canEdit = false;
+    renderRail({ byMethod: { value_novelty: state("value_novelty") } });
+    const chip = screen.getByTestId("detector-chip-value_novelty");
+    expect(within(chip).queryByTitle("Remove")).toBeNull();
+    expect(screen.queryByTestId("add-detector")).toBeNull();
+    detectors.canEdit = true;
+  });
+
+  it("never renders a group for an unconfigured method", () => {
     renderRail({
       byMethod: {
-        numeric_range: state("numeric_range", {
-          status: "not_applicable",
-          plan: {
-            method: "numeric_range",
-            status: "not_applicable",
-            reason: "no field parses as numeric",
-            reason_facts: { numeric_fields: 0, sampled: 19 },
-            cost_class: "heavy",
-          },
-        }),
+        entropy: state("entropy", { configured: false, entry: undefined }),
       },
+      done: 0,
+      total: 0,
     });
-    expect(screen.queryByText(/0 findings/i)).toBeNull();
-    expect(screen.getByTestId("skipped-summary")).toHaveTextContent("1");
+    expect(screen.queryByTestId("detector-chip-entropy")).toBeNull();
+    expect(screen.getByTestId("no-detectors")).toBeInTheDocument();
   });
 
   it("shows progress while methods are still settling", () => {
@@ -202,6 +270,7 @@ describe("InvestigateRail", () => {
         timelineId="t1"
         onSelectFinding={onSelectFinding}
         onOpenTools={() => {}}
+        onAddDetector={() => {}}
         onSelectEvent={() => {}}
       />,
       { wrapper },
@@ -217,7 +286,7 @@ describe("InvestigateRail", () => {
     expect(
       screen.getByText("No events in this timeline yet."),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
     expect(
       screen.getByRole("link", { name: /case overview/i }),
     ).toHaveAttribute("href", "/cases/c1");
@@ -230,65 +299,19 @@ describe("InvestigateRail", () => {
     ).toBeInTheDocument();
   });
 
-  it("makes no all-clear claim while the plan is still resolving", () => {
-    // Nothing is runnable during plan load, so `done === total` is vacuously
-    // true — the empty state must not read that as "everything checked, clear".
-    renderRail({ done: 0, total: 0, planLoading: true });
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
-    expect(screen.queryByText(/No method applies/i)).toBeNull();
-  });
-
-  it("distinguishes nothing-found from nothing-ran", () => {
-    renderRail({ done: 0, total: 0, planLoading: false });
-    expect(
-      screen.getByText(/No method applies to this data yet/i),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
-  });
-
-  it("makes the all-clear claim only about the preset on screen", () => {
-    // The sweep's global done/total say nothing about what this preset shows.
-    // Reading them here let "Changed vs. baseline" — whose comparison methods
-    // are gated off without a baseline — inherit an all-clear from methods it
-    // hides, asserting a clean sweep for two methods that never ran.
+  it("makes no all-clear claim while a configured detector is still pending", () => {
     renderRail({
-      done: 2,
-      total: 2,
-      byMethod: {
-        value_novelty: state("value_novelty", {
-          findings: [finding()],
-          total: 1,
-        }),
-        frequency: state("frequency", {
-          status: "not_applicable",
-          plan: {
-            method: "frequency",
-            status: "not_applicable",
-            reason: "no baseline is set",
-            reason_facts: {},
-            cost_class: "cheap",
-          },
-        }),
-      },
-    });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Changed vs. baseline" }),
-    );
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
-    expect(
-      screen.getByText(/No method applies to this data yet/i),
-    ).toBeInTheDocument();
-  });
-
-  it("still says nothing-found when this preset's methods did all run", () => {
-    renderRail({
-      done: 1,
+      done: 0,
       total: 1,
-      byMethod: { value_novelty: state("value_novelty") },
+      byMethod: { entropy: state("entropy", { pending: true }) },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+  });
+
+  it("says nothing-found only once every configured detector settled", () => {
+    renderRail({ done: 1, total: 1, byMethod: { entropy: state("entropy") } });
     expect(
-      screen.getByText(/No findings under this scope/i),
+      screen.getByText(/No findings from the configured detectors/i),
     ).toBeInTheDocument();
   });
 
@@ -319,7 +342,7 @@ describe("InvestigateRail", () => {
     const summary = screen.getByTestId("weak-summary");
     expect(summary).toHaveTextContent("1 weaker finding");
     // And it is not an all-clear: the group still counts what it holds.
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
 
     fireEvent.click(summary);
     expect(screen.getByText(/2212222122/)).toBeInTheDocument();
@@ -432,8 +455,9 @@ describe("named techniques", () => {
 
   it("counts a Sigma hit as a finding, so the rail does not claim it is clear", () => {
     sigma.current = [HIT];
-    renderRail({ done: 2, total: 2 });
-    expect(screen.queryByText(/No findings under this scope/i)).toBeNull();
+    renderRail({ done: 0, total: 0 });
+    expect(screen.queryByText(/No findings from the configured detectors/i)).toBeNull();
+    expect(screen.queryByTestId("no-detectors")).toBeNull();
   });
 
   it("drills a rule's hits into the grid with the tag the Tools sheet uses", () => {
@@ -442,45 +466,5 @@ describe("named techniques", () => {
     renderRail({}, readiness.current, { onTagFilter });
     fireEvent.click(screen.getByTestId("sigma-drill"));
     expect(onTagFilter).toHaveBeenCalledWith("sigma: psexec service install");
-  });
-
-  it("filters to Sigma alone under Known-bad, and away from it under the rest", () => {
-    sigma.current = [HIT];
-    renderRail({
-      byMethod: {
-        value_novelty: state("value_novelty", {
-          findings: [finding()],
-          total: 1,
-        }),
-      },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Known-bad" }));
-    expect(screen.getByText("psexec service install")).toBeInTheDocument();
-    expect(screen.queryByText(/curl\/7\.68\.0/)).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Unusual values" }));
-    expect(screen.queryByText("psexec service install")).toBeNull();
-    expect(screen.getByText(/curl\/7\.68\.0/)).toBeInTheDocument();
-  });
-
-  it("does not disclaim the hits it is showing under Known-bad", () => {
-    // Known-bad is `methods: []`, so it has no runnable method *by
-    // construction* — which used to print "No method applies to this data yet"
-    // directly underneath the rule rows it had just listed.
-    sigma.current = [HIT];
-    renderRail({
-      byMethod: {
-        value_novelty: state("value_novelty", {
-          findings: [finding()],
-          total: 1,
-        }),
-      },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Known-bad" }));
-    expect(screen.getByText("psexec service install")).toBeInTheDocument();
-    expect(screen.queryByText(/no method applies to this data/i)).toBeNull();
-    expect(
-      screen.queryByText(/every detector for this view is muted/i),
-    ).toBeNull();
   });
 });

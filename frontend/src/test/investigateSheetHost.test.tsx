@@ -41,6 +41,23 @@ vi.mock("@/hooks/useMethodFindings", () => ({
   METHOD_LIMIT: 50,
 }));
 
+const configured = vi.hoisted(() => ({ entries: [] as Record<string, unknown>[] }));
+vi.mock("@/hooks/useTimelineDetectors", () => ({
+  useTimelineDetectors: () => ({
+    entries: configured.entries,
+    byMethod: new Map(configured.entries.map((e) => [e.method, e])),
+    set: async () => ({}),
+    remove: async () => ({}),
+    canEdit: true,
+    isSaving: false,
+    saveError: null,
+  }),
+  scopeOf: (e: { frame: string; baseline_id: string | null }) =>
+    e.frame === "baseline" && e.baseline_id
+      ? { frame: "baseline", baseline_id: e.baseline_id }
+      : { frame: "self" },
+}));
+
 vi.mock("@/hooks/useScopeChange", () => ({
   useScopeChange: () => ({
     pending: null,
@@ -81,10 +98,33 @@ function renderHost(sheet: SheetRequest) {
       onClose={() => {}}
       onOpenMethod={() => {}}
       onRunMethod={() => {}}
+      onAddDetector={() => {}}
     />,
     { wrapper },
   );
 }
+
+describe("InvestigateSheetHost configured entries", () => {
+  it("opens a finding under the configured entry's params and scope, so it matches the rail", () => {
+    calls.current = [];
+    configured.entries = [
+      {
+        method: "value_novelty",
+        params: { fields: ["user"] },
+        frame: "baseline",
+        baseline_id: "b1",
+      },
+    ];
+    renderHost({ kind: "finding", method: "value_novelty", rank: 0 });
+    expect(calls.current.at(-1)).toMatchObject({
+      method: "value_novelty",
+      enabled: true,
+      params: { fields: ["user"] },
+      scope: { frame: "baseline", baseline_id: "b1" },
+    });
+    configured.entries = [];
+  });
+});
 
 describe("InvestigateSheetHost run parameters", () => {
   it("drops a custom run when the same method's finding is opened", () => {
@@ -110,6 +150,7 @@ describe("InvestigateSheetHost run parameters", () => {
         onClose={() => {}}
         onOpenMethod={() => {}}
         onRunMethod={() => {}}
+        onAddDetector={() => {}}
       />,
     );
     // `toMatchObject` treats `{}` as "any object", so the params are compared
@@ -146,6 +187,7 @@ describe("InvestigateSheetHost run parameters", () => {
         onClose={() => {}}
         onOpenMethod={() => {}}
         onRunMethod={() => {}}
+        onAddDetector={() => {}}
       />,
     );
     expect(calls.current.at(-1)!.params).toEqual({});

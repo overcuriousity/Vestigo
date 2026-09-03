@@ -15,6 +15,7 @@ import { InvestigateSheet } from "./InvestigateSheet";
 import { ScopeChangeDialog } from "./ScopeChangeDialog";
 import { useMethodFindings } from "@/hooks/useMethodFindings";
 import { useScopeChange } from "@/hooks/useScopeChange";
+import { scopeOf, useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import type { MethodId } from "./method-registry";
 import type { Event } from "@/api/types";
 
@@ -32,6 +33,7 @@ export function InvestigateSheetHost({
   onClose,
   onOpenMethod,
   onRunMethod,
+  onAddDetector,
   onTagFilter,
   onDrillField,
   onJumpToTime,
@@ -47,6 +49,8 @@ export function InvestigateSheetHost({
   onOpenMethod: (method: MethodId) => void;
   /** Open the method's sheet already running it. */
   onRunMethod: (method: MethodId) => void;
+  /** Open the detector wizard, optionally on one method. */
+  onAddDetector: (method?: MethodId) => void;
   onTagFilter?: (tag: string) => void;
   /** Drill into the grid's filters — a template in Tools, a value in finding mode. */
   onDrillField?: (field: string, value: string) => void;
@@ -90,9 +94,16 @@ export function InvestigateSheetHost({
     setRanFromFinding(false);
   }, [sheet.kind, methodKey, rankKey, autorun]);
 
+  // Finding mode addresses a row of the rail's list, which the rail fetched
+  // under the *configured* entry's params and scope — so the sheet must read
+  // the same query, or it renders a different list than the row clicked.
+  // Method mode with the analyst's own knobs runs under the panel scope.
+  const { byMethod: entries } = useTimelineDetectors(caseId, timelineId);
+  const entry = sheet.kind === "finding" ? entries.get(sheet.method) : undefined;
   const findings = useMethodFindings(caseId, timelineId, methodOf(sheet), {
     enabled: sheet.kind === "finding" || (sheet.kind === "method" && runParams !== null),
-    params: runParams ?? {},
+    params: runParams ?? entry?.params ?? {},
+    scope: runParams === null && entry ? scopeOf(entry) : undefined,
   });
 
   const finding = sheet.kind === "finding" ? findings.data?.results[sheet.rank] : undefined;
@@ -156,6 +167,7 @@ export function InvestigateSheetHost({
           // prose panel is what made the gate a lock in practice, whatever the
           // endpoint allowed.
           onRunMethod={onRunMethod}
+          onAddDetector={onAddDetector}
           onRequestScopeChange={(next) => scopeChange.request(next)}
           onTagFilter={onTagFilter}
           onDrillField={onDrillField}
