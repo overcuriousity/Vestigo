@@ -104,6 +104,11 @@ export interface MethodMeta {
   id: MethodId;
   label: string;
   hint: string;
+  /**
+   * When to configure it, in one sentence for the wizard's card. Starts with
+   * "Use this when" — a test enforces it — so the twelve cards read as one list.
+   */
+  useWhen: string;
   icon: React.ElementType;
   evidenceClass: EvidenceClass;
   costClass: "cheap" | "heavy";
@@ -190,6 +195,8 @@ export const METHODS: MethodMeta[] = [
     id: "value_novelty",
     label: "Rare values",
     hint: "Rare or first-seen field values",
+    useWhen:
+      "Use this when you want the rarest values in a field surfaced first — a user, host or process that almost never appears. Works with no baseline.",
     icon: Hash,
     evidenceClass: "statistical",
     costClass: "cheap",
@@ -202,6 +209,8 @@ export const METHODS: MethodMeta[] = [
     id: "value_combo",
     label: "Value combos",
     hint: "Rare combinations of fields",
+    useWhen:
+      "Use this when two fields are each ordinary on their own but their pairing might not be — an account on a host it never logs into.",
     icon: Layers,
     evidenceClass: "statistical",
     costClass: "cheap",
@@ -215,6 +224,8 @@ export const METHODS: MethodMeta[] = [
     id: "numeric_range",
     label: "Numeric range",
     hint: "Values outside a learned band",
+    useWhen:
+      "Use this when a numeric field has a normal band and you want values far outside it — bytes transferred, durations, ports.",
     icon: Ruler,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -228,6 +239,8 @@ export const METHODS: MethodMeta[] = [
     id: "charset",
     label: "Charset novelty",
     hint: "Never-seen characters",
+    useWhen:
+      "Use this when a field should only ever contain a fixed alphabet and a stray script or injected byte would matter — usernames, hostnames, paths.",
     icon: Type,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -252,6 +265,8 @@ export const METHODS: MethodMeta[] = [
     id: "entropy",
     label: "Entropy outliers",
     hint: "Random or degenerate strings",
+    useWhen:
+      "Use this when random-looking strings would be a lead — encoded payloads, generated domains, packed command lines.",
     icon: Shuffle,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -265,6 +280,8 @@ export const METHODS: MethodMeta[] = [
     id: "frequency",
     label: "Frequency",
     hint: "Count spikes and silences",
+    useWhen:
+      "Use this when a change in volume over time is the question — a burst, a silence, a series that spiked in one window. Best with a baseline.",
     icon: Activity,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -280,6 +297,8 @@ export const METHODS: MethodMeta[] = [
     id: "proportion_shift",
     label: "Proportion shift",
     hint: "Value shares that change between windows",
+    useWhen:
+      "Use this when you have a baseline and want the values whose share of events changed most in the suspect window. Needs a baseline.",
     icon: Percent,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -292,6 +311,8 @@ export const METHODS: MethodMeta[] = [
     id: "value_distribution_drift",
     label: "Distribution drift",
     hint: "Whole-field value-mix changes",
+    useWhen:
+      "Use this when whole fields, not single values, may have changed shape between the baseline and the suspect window. Needs a baseline.",
     icon: Replace,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -304,6 +325,8 @@ export const METHODS: MethodMeta[] = [
     id: "interval_periodicity",
     label: "Interval cadence",
     hint: "Broken heartbeats and new beaconing",
+    useWhen:
+      "Use this when beaconing or a missed heartbeat is the question — a value that arrives on a new rhythm, or stopped arriving on its old one. Needs a baseline.",
     icon: Timer,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -316,6 +339,8 @@ export const METHODS: MethodMeta[] = [
     id: "timestamp_order",
     label: "Timestamp order",
     hint: "Timestamps running backwards",
+    useWhen:
+      "Use this when you need to know whether the records themselves are sound — timestamps running backwards inside a source. No baseline, cheap.",
     icon: Rewind,
     evidenceClass: "statistical",
     costClass: "cheap",
@@ -328,6 +353,8 @@ export const METHODS: MethodMeta[] = [
     id: "sequence_novelty",
     label: "Event sequences",
     hint: "Never-seen event orderings",
+    useWhen:
+      "Use this when the order things happened in matters — a host sequence, a command chain — and you want orderings never seen in the baseline. Needs a baseline.",
     icon: ListOrdered,
     evidenceClass: "statistical",
     costClass: "heavy",
@@ -344,6 +371,8 @@ export const METHODS: MethodMeta[] = [
     id: "log_template",
     label: "Log templates",
     hint: "New kinds of log line",
+    useWhen:
+      "Use this when the logs are unstructured and you want to see their shapes first — rare line structures surface without naming a field.",
     icon: FileText,
     evidenceClass: "exploration",
     costClass: "heavy",

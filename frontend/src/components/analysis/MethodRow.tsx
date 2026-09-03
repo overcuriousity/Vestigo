@@ -1,5 +1,5 @@
 /**
- * MethodRow — one method's line in the Tools sheet's accounting.
+ * MethodRow — one configured detector's line in the Tools sheet's accounting.
  *
  * Three shapes, because three situations are genuinely different:
  *
@@ -21,9 +21,8 @@
  * "checked, clear" misread this whole surface exists to prevent, so it renders
  * as a dash with the runner's own words rather than a count.
  */
-import { AlertTriangle, Bell, BellOff, Play, Settings2 } from "lucide-react";
+import { AlertTriangle, Play, Settings2 } from "lucide-react";
 import type { MethodState } from "@/hooks/useMethodFindings";
-import type { MutedMethods } from "@/hooks/useMutedMethods";
 import type { MethodId } from "./method-registry";
 import { cn } from "@/lib/cn";
 
@@ -47,18 +46,14 @@ export function MethodRow({
   onRun,
   onOpen,
   onSetupBaseline,
-  mute,
 }: {
   state: MethodState;
   onRun: (method: MethodId) => void;
   onOpen: (method: MethodId) => void;
   onSetupBaseline: () => void;
-  /** Omitted where a mute makes no sense; present, this row can toggle one. */
-  mute?: MutedMethods;
 }) {
   const { meta, plan, status } = state;
   const gated = status !== "applicable";
-  const muted = mute?.isMuted(meta.id) ?? false;
   const detail = gated ? facts(plan?.reason_facts) : null;
   // The runner's own verdict about the data, only meaningful once it has run.
   const unscored =
@@ -70,11 +65,9 @@ export function MethodRow({
       data-testid={`method-row-${meta.id}`}
       className={cn(
         "flex items-center gap-2 rounded border px-2 py-1.5 text-xs",
-        muted
-          ? "border-dashed border-[var(--color-warning)] bg-transparent"
-          : gated
-            ? "border-dashed border-[var(--color-border)]"
-            : "border-[var(--color-border)] bg-[var(--color-bg-elevated)]",
+        gated
+          ? "border-dashed border-[var(--color-border)]"
+          : "border-[var(--color-border)] bg-[var(--color-bg-elevated)]",
       )}
     >
       <meta.icon size={12} className="shrink-0 text-[var(--color-fg-muted)]" />
@@ -84,12 +77,7 @@ export function MethodRow({
           data-testid={`method-detail-${meta.id}`}
           className="not-italic text-[11px] text-[var(--color-fg-muted)]"
         >
-          {muted ? (
-            // Deliberately not the gate's reason: the gate may well consider
-            // this method applicable, and it was left out because somebody
-            // said so. Naming that keeps the two apart.
-            "muted — kept out of the sweep by an analyst on this case"
-          ) : gated ? (
+          {gated ? (
             <>
               {plan?.reason}
               {detail && <span className="font-mono"> ({detail})</span>}
@@ -113,14 +101,11 @@ export function MethodRow({
         </em>
       </div>
 
-      {!muted && (state.error || unscored) && (
+      {(state.error || unscored) && (
         <AlertTriangle size={12} className="shrink-0 text-[var(--color-warning)]" />
       )}
 
-      {/* No count for a muted method, and emphatically not a zero: its query
-          never ran, so `total === 0` here means "not asked", not "asked and
-          clear". */}
-      {!muted && !gated && !state.error && (
+      {!gated && !state.error && (
         <span
           data-testid={`method-count-${meta.id}`}
           className={cn(
@@ -148,33 +133,6 @@ export function MethodRow({
         </span>
       )}
 
-      {/* Offered on every row, muted or not: a mute is reversible from the same
-          place it is applied, and Tools is the surface that has to be able to
-          list and undo one (the rule the template mute already follows). */}
-      {mute && (
-        <button
-          data-testid={`method-mute-${meta.id}`}
-          onClick={() => mute.toggle(meta.id)}
-          disabled={!mute.canEdit || mute.isSaving}
-          aria-pressed={muted}
-          title={
-            !mute.canEdit
-              ? "Read-only access — muting changes shared case state"
-              : muted
-                ? "Unmute: put this method back in the sweep"
-                : "Mute: keep this method's findings out of the feed and the histogram. It still runs from here."
-          }
-          className={cn(
-            "shrink-0 rounded border border-transparent px-1 py-0.5 transition-base hover:border-[var(--color-border)] disabled:opacity-40",
-            muted
-              ? "text-[var(--color-warning)]"
-              : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg-secondary)]",
-          )}
-        >
-          {muted ? <BellOff size={11} /> : <Bell size={11} />}
-        </button>
-      )}
-
       {status === "needs_setup" ? (
         <button
           onClick={onSetupBaseline}
@@ -182,10 +140,7 @@ export function MethodRow({
         >
           Set a baseline
         </button>
-      ) : muted || status === "not_applicable" || state.error ? (
-        // A muted method reuses the gate's affordance because it is the same
-        // promise: this was left out of the sweep, and you can still run it.
-        // Running it does not unmute it — the two are different acts.
+      ) : status === "not_applicable" || state.error ? (
         <button
           onClick={() => onRun(meta.id)}
           className="flex shrink-0 items-center gap-1 rounded border border-[var(--color-border)] px-1.5 py-0.5 text-[11px] text-[var(--color-accent)] hover:border-[var(--color-accent)]"

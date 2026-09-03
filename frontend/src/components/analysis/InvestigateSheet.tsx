@@ -24,13 +24,12 @@
  * asked while looking at one of a method's findings.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Crosshair, Play, X } from "lucide-react";
+import { Play, X } from "lucide-react";
 import type { UseQueryResult } from "@tanstack/react-query";
-import { METHODS_BY_ID, type MethodId, type MethodMeta } from "./method-registry";
+import { METHODS_BY_ID, type MethodId } from "./method-registry";
 import { EVIDENCE_CLASSES } from "./method-registry";
 import { ToolsSheet } from "./ToolsSheet";
-import { AnomalyFieldPicker } from "./AnomalyFieldPicker";
-import { MethodFieldSelect } from "./MethodFieldSelect";
+import { MethodKnobForm } from "./MethodKnobForm";
 import { ScoredRow, TemplateRows } from "./FindingGroup";
 import { FindingRowActions, FindingRowState } from "./detector-shared";
 import { DETECTORS } from "./detector-registry";
@@ -39,8 +38,6 @@ import { normalizeFinding } from "@/lib/finding-normalize";
 import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
 import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
-import { useFieldOverrides } from "@/hooks/useFieldOverrides";
-import { useMethodFocus } from "@/hooks/useMethodFocus";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
@@ -80,6 +77,8 @@ interface Props {
   onRunMethod?: (method: MethodId) => void;
   /** Tools mode: open a method's own detail. */
   onOpenMethod?: (method: MethodId) => void;
+  /** Tools mode: open the detector wizard, optionally on one method. */
+  onAddDetector?: (method?: MethodId) => void;
   /** Tools mode: hand a scope change to the host's confirm gate. */
   onRequestScopeChange?: (next: {
     frame: "self" | "baseline";
@@ -106,68 +105,6 @@ function Subhead({ children }: { children: React.ReactNode }) {
   );
 }
 
-/**
- * Turn the knob inputs into the params object the findings endpoint takes.
- *
- * Blanks are omitted rather than sent as empty strings: an untouched knob means
- * "use the method's default", and sending "" would either 422 or, worse, be
- * coerced into a different question under a cache key claiming otherwise.
- * Numbers are coerced here because the endpoint's per-method models are typed,
- * and a numeric knob arriving as a string is the analyst's typing, not intent.
- *
- * A `fields` selection is sent as a list, which `_FieldsParams._join_fields`
- * accepts alongside the comma-joined string. `null` there is the picker's "auto"
- * — the same untouched-knob case, so it is omitted for the same reason. An
- * empty list never reaches here: `knobBlocker` refuses the run, because a scan
- * over no fields comes back as an empty result set and reads as "clean".
- */
-function buildParams(
-  meta: MethodMeta,
-  raw: Record<string, string>,
-  fields: Record<string, string[] | null>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const knob of meta.knobs) {
-    if (knob.kind === "fields") {
-      const selected = fields[knob.param];
-      if (selected) out[knob.param] = selected;
-      continue;
-    }
-    const value = (raw[knob.param] ?? "").trim();
-    if (!value) continue;
-    out[knob.param] = knob.kind === "number" ? Number(value) : value;
-  }
-  return out;
-}
-
-/**
- * Why the knobs as they stand cannot be run, or `null` if they can.
- *
- * `AnomalyFieldPicker` lets a selection fall below its own floor on purpose —
- * unchecking down to one chip on the way to a different pair is a normal thing
- * to do — and only warns; disabling the run is the caller's half of that pair,
- * and without it `value_combo` sends one field and comes back as a 422 the
- * sheet can only render as "this method failed to run".
- *
- * The floor is at least one field even where the method declares none: an
- * explicit empty selection is "scan nothing", which returns an empty result set
- * indistinguishable from "the data is clean". `null` — the picker's auto — is
- * always runnable, since the method chooses its own fields there.
- */
-function knobBlocker(meta: MethodMeta, fields: Record<string, string[] | null>): string | null {
-  for (const knob of meta.knobs) {
-    if (knob.kind !== "fields") continue;
-    const selected = fields[knob.param];
-    if (!selected) continue;
-    const floor = Math.max(1, knob.picker?.minSelected ?? 1);
-    if (selected.length >= floor) continue;
-    return floor > 1
-      ? `Pick at least ${floor} fields to combine, or reset to auto.`
-      : "Pick at least one field to scan, or reset to auto.";
-  }
-  return null;
-}
-
 function MethodBody({
   caseId,
   timelineId,
@@ -190,58 +127,12 @@ function MethodBody({
   running?: boolean;
 }) {
   const meta = METHODS_BY_ID[methodId];
-  // The knob a focus is stored against. Read from the method's own knobs
-  // rather than assumed to be `"fields"`, so a second field knob could not
-  // silently have its selection focused as if it were this one.
-  const fieldsParam = meta.knobs.find((k) => k.kind === "fields")?.param ?? null;
-
-  // This analyst's own narrowing of the same method (#341) — per user, never
-  // shared, and applied by sending these fields explicitly on every sweep.
-  const { fieldsFor, setFocus, clearFocus } = useMethodFocus(timelineId);
-  const focusedFields = fieldsFor(methodId);
-  const isFocused = focusedFields !== undefined;
-
-  // The picker opens on the focus already in force, not on "auto". A focused
-  // method whose picker reads "auto" describes a sweep that is not happening —
-  // and since the focus controls only appear beside a selection, an unseeded
-  // picker also leaves "Clear focus" unreachable from the sheet that set it.
-  const seededFields = useCallback(
-    (): Record<string, string[] | null> =>
-      fieldsParam && focusedFields ? { [fieldsParam]: focusedFields } : {},
-    [fieldsParam, focusedFields],
-  );
-
-  const [values, setValues] = useState<Record<string, string>>({});
-  // Field selections are kept apart from the typed knobs: `null` is a real
-  // value here ("let the method choose"), which an empty string cannot express.
-  const [fields, setFields] = useState<Record<string, string[] | null>>(seededFields);
-
-  // Switching methods must not carry the previous method's typing across —
-  // the knobs look the same and the params would silently be the old ones.
-  // Guarded on the method actually changing: re-seeding whenever the focus
-  // changes identity would throw away the analyst's next edit of the picker,
-  // including the edit they are making in order to change the focus.
-  const seededFor = useRef(methodId);
-  useEffect(() => {
-    if (seededFor.current === methodId) return;
-    seededFor.current = methodId;
-    setValues({});
-    setFields(seededFields());
-  }, [methodId, seededFields]);
-
-  const blocker = knobBlocker(meta, fields);
-  // The durable half of the same decision: which fields this method reads at
-  // all, declared once for the case. Read-only members see the state and not
-  // the control (`canEdit` false → no `onDeclare`), the way muting does.
-  const { forMethod, declare, canEdit, saveError } = useFieldOverrides(caseId, timelineId);
-  const overrides = forMethod(methodId);
-
-  // Only an explicit selection can be focused: "let the method choose" is the
-  // absence of a field set, so there is nothing to keep.
-  const selectedFocusFields = useMemo(() => {
-    const picked = fieldsParam ? fields[fieldsParam] : null;
-    return picked && picked.length > 0 ? picked : null;
-  }, [fields, fieldsParam]);
+  const [params, setParams] = useState<Record<string, unknown>>({});
+  const [blocker, setBlocker] = useState<string | null>(null);
+  const onFormChange = useCallback((p: Record<string, unknown>, b: string | null) => {
+    setParams(p);
+    setBlocker(b);
+  }, []);
 
   return (
     <>
@@ -249,6 +140,8 @@ function MethodBody({
       <p className="text-xs leading-relaxed text-[var(--color-fg-secondary)]">{meta.what}</p>
 
       <Subhead>Parameters</Subhead>
+      {/* An ad hoc run: nothing here is stored. Configuring a detector so the
+          rail runs it every time is the wizard's act, not this form's. */}
       <form
         className="flex flex-wrap items-center gap-2"
         onSubmit={(e) => {
@@ -256,123 +149,25 @@ function MethodBody({
           // Guarded here too, not only on the button: implicit submission from a
           // knob input is a second way into the same run.
           if (blocker) return;
-          onRun?.(buildParams(meta, values, fields));
+          onRun?.(params);
         }}
       >
-        {meta.knobs.map((knob) =>
-          // Which fields to scan is a choice among this timeline's own columns,
-          // ranked by cardinality — the picker is the control for it, and a
-          // text box asking the analyst to recall `attr:` token spellings is
-          // not a smaller version of the same thing.
-          knob.kind === "fields" ? (
-            <AnomalyFieldPicker
-              key={knob.param}
-              caseId={caseId}
-              timelineId={timelineId}
-              selected={fields[knob.param] ?? null}
-              onChange={(tokens) => setFields((f) => ({ ...f, [knob.param]: tokens }))}
-              minSelected={knob.picker?.minSelected}
-              maxSelected={knob.picker?.maxSelected}
-              autoCount={knob.picker?.autoCount}
-              autoIncludesIdentifiers={knob.picker?.autoIncludesIdentifiers}
-              autoLabel={knob.picker?.autoLabel}
-              numeric={knob.picker?.numeric}
-              overrides={overrides}
-              onDeclare={
-                canEdit ? (token, state) => declare(methodId, token, state) : undefined
-              }
-            />
-          ) : (
-            <label
-              key={knob.param}
-              data-testid="method-knob"
-              className="flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-2 py-1 text-[11px] text-[var(--color-fg-secondary)]"
-            >
-              {knob.label}
-              {/* A field name comes from the timeline's own inventory; anything
-                  else is the analyst's own number or string. */}
-              {knob.kind === "field" ? (
-                <MethodFieldSelect
-                  caseId={caseId}
-                  timelineId={timelineId}
-                  knob={knob}
-                  value={values[knob.param] ?? ""}
-                  onChange={(next) => setValues((v) => ({ ...v, [knob.param]: next }))}
-                />
-              ) : (
-                <input
-                  aria-label={knob.label}
-                  data-testid={`method-knob-${knob.param}`}
-                  type={knob.kind === "number" ? "number" : "text"}
-                  value={values[knob.param] ?? ""}
-                  onChange={(e) => setValues((v) => ({ ...v, [knob.param]: e.target.value }))}
-                  placeholder={knob.placeholder}
-                  className="w-16 bg-transparent font-mono text-[11px] text-[var(--color-fg-primary)] outline-none placeholder:text-[var(--color-fg-disabled)]"
-                />
-              )}
-            </label>
-          ),
-        )}
+        <MethodKnobForm
+          caseId={caseId}
+          timelineId={timelineId}
+          methodId={methodId}
+          onChange={onFormChange}
+        />
         {onRun && (
           <Button type="submit" variant="outline" size="sm" disabled={running || blocker !== null}>
             <Play size={11} />
             {running ? "Running…" : runLabel}
           </Button>
         )}
-        {/* The run above answers "what does this method say about these
-            fields?" once. Keeping that answer is a separate ask (#341):
-            without it, closing the sheet puts every field back and the ranked
-            feed fills with the fields the analyst just ruled out. Distinct
-            from the per-field Pin/Ban chips in the picker, which declare the
-            *case team's* shared, audited field set — this one is only ever
-            this analyst's, which is why the copy says so. */}
-        {onRun && selectedFocusFields !== null && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            // A selection the Run button refuses must not be persisted into
-            // *every* sweep instead: below `picker.minSelected` the endpoint
-            // 422s, and a stored one-field `value_combo` focus would do that on
-            // every load of the rail until the strip cleared it. Clearing stays
-            // available regardless — the way out of a bad focus cannot itself
-            // be gated on the picker being valid.
-            disabled={running || (!isFocused && blocker !== null)}
-            title={
-              isFocused
-                ? "Stop narrowing this method to these fields"
-                : "Keep scanning only these fields for this method — only you see this"
-            }
-            onClick={() =>
-              void (isFocused
-                ? clearFocus(methodId)
-                : setFocus(methodId, selectedFocusFields))
-            }
-          >
-            <Crosshair size={11} />
-            {isFocused ? "Clear focus" : "Focus on this selection"}
-          </Button>
-        )}
       </form>
-      {onRun && isFocused && (
-        <p data-testid="method-focus-note" className="mt-1.5 text-xs text-[var(--color-fg-muted)]">
-          Only you see this. Every sweep now scans just {focusedFields!.join(", ")} for this
-          method, so it reports nothing about the fields it no longer reads. Declared fields
-          (the pins above) stay the case team's shared answer.
-        </p>
-      )}
       {onRun && blocker && (
         <p data-testid="method-knob-blocker" className="mt-1.5 text-xs text-[var(--color-warning)]">
           {blocker}
-        </p>
-      )}
-      {/* The chip snaps back to the server's answer on the next render, which
-          on its own reads as "nothing happened". A declaration the analyst
-          believes the whole case now inherits has to say when it was not
-          stored. */}
-      {saveError && (
-        <p data-testid="field-declare-error" className="mt-1.5 text-xs text-[var(--color-danger)]">
-          Field declaration not saved: {saveError}
         </p>
       )}
 
@@ -648,6 +443,7 @@ export function InvestigateSheet({
   onClose,
   onRunMethod,
   onOpenMethod,
+  onAddDetector,
   onRequestScopeChange,
   onTagFilter,
   onDrillField,
@@ -738,6 +534,7 @@ export function InvestigateSheet({
               section={rest.section}
               onRunMethod={onRunMethod ?? (() => {})}
               onOpenMethod={onOpenMethod ?? (() => {})}
+              onAddDetector={onAddDetector ?? (() => {})}
               onRequestScopeChange={onRequestScopeChange ?? (() => {})}
               onTagFilter={onTagFilter}
               onDrillField={onDrillField}
