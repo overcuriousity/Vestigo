@@ -2389,6 +2389,187 @@ def test_interrupted_turn_still_persists_window_row(
 
 
 # ---------------------------------------------------------------------------
+# Proposals: story kind (the report document itself)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_story_proposal(store, case_id, timeline_id, user_id, payload):
+    conv = await store.create_agent_conversation(case_id, timeline_id, user_id, model_id="m")
+    proposal = await store.create_agent_proposal(
+        case_id=case_id,
+        timeline_id=timeline_id,
+        conversation_id=conv.id,
+        rationale="the case has no report yet",
+        kind="story",
+        payload=payload,
+    )
+    return conv, proposal
+
+
+def test_confirm_story_creates_an_empty_story(client, admin_bootstrap, agent_on, store):
+    """The analyst's click is the write, and it creates the container only.
+
+    Blocks are proposed and confirmed separately — a story that arrived
+    pre-filled would skip the per-block sign-off the subsystem is built on.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {"title": "Verifikation der Ergebnisse", "description": "Abschlussbericht"},
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is True
+    assert body["story"]["title"] == "Verifikation der Ergebnisse"
+    assert body["story"]["description"] == "Abschlussbericht"
+
+    stories = asyncio.run(store.list_stories(case_id))
+    assert [s.title for s in stories] == ["Verifikation der Ergebnisse"]
+    assert asyncio.run(store.list_story_blocks(stories[0].id)) == []
+
+    # Same idempotency backbone as every other kind.
+    again = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert again.status_code == 409
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    confirm = next(a for a in audit_rows if a.action == "agent.story_confirm")
+    assert confirm.detail["applied"] is True
+    assert confirm.detail["story_id"] == stories[0].id
+
+
+def test_confirm_story_reports_a_title_taken_since_propose_time(
+    client, admin_bootstrap, agent_on, store
+):
+    """A decided proposal reports honestly rather than making a duplicate.
+
+    Two stories under one name is worse than an unapplied confirm: the title
+    is the handle the agent and the analyst both use to find the document.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_proposal(
+            store, case_id, timeline_id, owner["id"], {"title": "Report", "description": None}
+        )
+    )
+    asyncio.run(store.create_story(case_id, "taken", "report", None, user="alice"))
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied"] is False
+    assert "already exists" in body["reason"]
+    assert body["proposal"]["status"] == "confirmed"
+    assert len(asyncio.run(store.list_stories(case_id))) == 1
+
+    # The outcome is persisted on the proposal, not only in this response: the
+    # card re-renders from the stored transcript, where `confirmed` alone
+    # would read as "created" and link to the story that took the name.
+    assert body["proposal"]["result"] == {
+        "applied": False,
+        "story_id": None,
+        "reason": body["reason"],
+    }
+    listed = client.get(f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals").json()[
+        "proposals"
+    ]
+    assert listed[0]["result"]["applied"] is False
+
+
+def test_confirm_story_persists_the_created_story_id(client, admin_bootstrap, agent_on, store):
+    """An applied confirm records which story it made.
+
+    That id is the handle the transcript links by — resolving the title
+    instead pointed at whatever story carried the name later, and survived a
+    rename no better.
+    """
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_proposal(
+            store, case_id, timeline_id, owner["id"], {"title": "Report", "description": None}
+        )
+    )
+    body = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    ).json()
+
+    assert body["proposal"]["result"] == {
+        "applied": True,
+        "story_id": body["story"]["id"],
+        "reason": None,
+    }
+
+
+def test_confirm_story_block_persists_its_outcome(client, admin_bootstrap, agent_on, store):
+    """A block confirm that adds nothing says so durably, like the story kind."""
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_block_proposal(
+            store,
+            case_id,
+            timeline_id,
+            owner["id"],
+            {
+                "story_id": "s1",
+                "block_kind": "markdown",
+                "content": {"text": "## Findings"},
+                "after_block_id": None,
+            },
+        )
+    )
+    asyncio.run(store.delete_story(case_id, "s1"))
+
+    body = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/confirm"
+    ).json()
+    assert body["applied"] is False
+    assert body["proposal"]["result"]["applied"] is False
+    assert body["proposal"]["result"]["block_id"] is None
+    assert body["proposal"]["result"]["reason"] == body["reason"]
+
+
+def test_reject_story_records_its_own_audit_action(client, admin_bootstrap, agent_on, store):
+    owner = as_admin(client, admin_bootstrap)
+    case_id, timeline_id = _make_case_and_timeline(client)
+
+    conv, proposal = asyncio.run(
+        _seed_story_proposal(
+            store, case_id, timeline_id, owner["id"], {"title": "Report", "description": None}
+        )
+    )
+
+    resp = client.post(
+        f"/api/cases/{case_id}/agent/conversations/{conv.id}/proposals/{proposal.id}/reject"
+    )
+    assert resp.status_code == 200, resp.text
+    assert asyncio.run(store.list_stories(case_id)) == []
+
+    audit_rows = asyncio.run(store.query_audit(case_id=case_id))
+    assert any(a.action == "agent.story_reject" for a in audit_rows)
+    assert not any(a.action == "agent.annotation_reject" for a in audit_rows)
+
+
+# ---------------------------------------------------------------------------
 # Proposals: story_block kind (W7 agent parity)
 # ---------------------------------------------------------------------------
 

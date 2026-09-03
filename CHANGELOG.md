@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.1] — 2026-09-03
+
+### Added
+
+- The agent can propose a story. `propose_story` records a proposal the analyst confirms;
+  confirming creates an **empty** document, and its blocks are proposed and signed off one at
+  a time. A case with no stories was previously a dead end — the agent could be asked for a
+  report and had no way to make the document to put it in.
+- `propose_story_block` documents its `content` per block kind and parses a stringified
+  object itself, so a malformed argument is answered with the JSON defect *and* the expected
+  shape. `read_story` reports this conversation's pending proposals, so the agent no longer
+  reads its own confirmed work as a no-op.
+
+### Fixed
+
+- Clicking a field in the detector wizard's "Fields to scan" list closed the whole wizard.
+  `package-lock.json` carried a duplicated `@radix-ui/react-dismissable-layer`, which gave
+  the dialog and the popover separate layer registries — so every click inside the popover
+  read as a click outside the dialog. Any popover inside a modal was affected.
+- Renaming a story to an over-long title returned a 500 (a driver truncation error) instead
+  of a 422. The `STORY_TITLE_MAX_CHARS` cap now covers all three write paths.
+- A confirmed story proposal that created nothing — because the title was taken between
+  propose and confirm — still claimed "created by <analyst>" in the transcript, and its
+  *Open story* link resolved by title to the unrelated document that took the name. What a
+  confirm did is now persisted on the proposal (`AgentProposal.result`, migration 0035) and
+  the card reads it; the same fix covers a block proposal whose story was deleted.
+- Two analysts confirming the same proposed story title at once could both pass the
+  duplicate check. The check and the create now share one transaction, serialized per case
+  and title.
+
 ## [1.19.0] — 2026-09-03
 
 ### Changed

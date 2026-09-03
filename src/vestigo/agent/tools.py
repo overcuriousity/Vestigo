@@ -192,6 +192,12 @@ TOOL_REGISTRY: tuple[ToolInfo, ...] = (
         tier="core",
     ),
     ToolInfo(
+        "propose_story",
+        "Propose creating a story (a report document) — the analyst must confirm.",
+        requires_conversation=True,
+        tier="core",
+    ),
+    ToolInfo(
         "propose_story_block",
         "Propose adding a block to a story — the analyst must confirm.",
         requires_conversation=True,
@@ -2179,43 +2185,137 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             }
 
         @server.tool()
+        async def propose_story(
+            title: str, description: str | None = None, rationale: str = ""
+        ) -> dict[str, Any]:
+            """Propose creating a story — a report document — for this case.
+
+            Use when the analyst wants a report and `list_stories` is empty.
+            The story has no id until the analyst confirms, so this does not
+            chain into `propose_story_block`: propose, say what you would
+            write into it, and wait. Never invent a story_id.
+            """
+            from vestigo.api.deps import get_store
+            from vestigo.stories.schemas import STORY_TITLE_MAX_CHARS
+
+            title = (title or "").strip()
+            if not title:
+                return {"error": "title is required — name the report document"}
+            if len(title) > STORY_TITLE_MAX_CHARS:
+                return {"error": f"title exceeds {STORY_TITLE_MAX_CHARS} characters"}
+            store = get_store()
+            # A case rarely wants two reports under one name, and a model
+            # that cannot see the confirmation queue (a proposal is not a
+            # story) will otherwise re-propose the same document on the next
+            # turn. Both the confirmed and the still-pending case are named,
+            # because "it already exists" and "you already asked" call for
+            # different next moves.
+            existing = await store.list_stories(scope.case_id)
+            clash = next((st for st in existing if st.title.strip().lower() == title.lower()), None)
+            if clash is not None:
+                return {
+                    "error": f"story {clash.title!r} already exists (id {clash.id}) — "
+                    "propose blocks against it instead of creating a second one"
+                }
+            pending = [
+                p
+                for p in await store.list_agent_proposals(scope.conversation_id)
+                if p.kind == "story"
+                and p.status == "proposed"
+                and (p.payload or {}).get("title", "").strip().lower() == title.lower()
+            ]
+            if pending:
+                return {
+                    "error": f"you already proposed a story titled {title!r} "
+                    f"(proposal {pending[0].id}); it is waiting on the analyst"
+                }
+            proposal = await store.create_agent_proposal(
+                case_id=scope.case_id,
+                timeline_id=scope.timeline_id,
+                conversation_id=scope.conversation_id,
+                rationale=rationale,
+                kind="story",
+                payload={"title": title, "description": (description or "").strip() or None},
+            )
+            return {
+                "proposal_id": proposal.id,
+                "status": "proposed",
+                "note": "no story exists until the analyst confirms — do not propose blocks "
+                "against it yet; it will appear in list_stories with an id once confirmed",
+            }
+
+        @server.tool()
         async def propose_story_block(
             story_id: str,
             block_kind: str,
-            content: dict[str, Any],
+            content: dict[str, Any] | str,
             after_block_id: str | None = None,
             rationale: str = "",
         ) -> dict[str, Any]:
             """Propose adding one block to a story — the analyst must confirm.
 
-            Nothing is written until the analyst confirms the proposal card.
-            block_kind is one of markdown | view_ref | chart_ref | event_ref.
-            view_ref/event_ref must reference existing persisted objects.
-            chart_ref may instead carry {"chart_spec": {...}, "name": "..."} —
-            a spec exactly as propose_chart takes, validated by executing it;
-            confirming then saves the chart and embeds it in one step.
+            Nothing is written until then; `read_story` lists what is pending.
+            `content` by block_kind (referents must already exist):
+              markdown  {"text": "..."}
+              view_ref  {"view_id": "..", "timeline_id": "..", "display": {"limit": 200}}
+              chart_ref {"chart_id": "..", "timeline_id": ".."}
+              event_ref {"event_id": "..", "source_id": "..", "caption": ".."}
+            A chart_ref may instead carry {"chart_spec": {...}, "name": "..."}
+            — a spec as propose_chart takes; confirming saves the chart and
+            embeds it in one step.
             """
             from vestigo.api.deps import get_store
             from vestigo.stories.export import spec_to_stored_chart_config
             from vestigo.stories.refs import validate_block_scope
-            from vestigo.stories.schemas import validate_block_content
+            from vestigo.stories.schemas import (
+                CONTENT_SHAPE_HINT,
+                CONTENT_SHAPES,
+                validate_block_content,
+            )
 
             store = get_store()
             story = await store.get_story(scope.case_id, story_id)
             if story is None:
+                # An empty case is a dead end unless the error says so: the
+                # agent cannot create the document it was asked to write, and
+                # "not found — list_stories" points at a list it already knows
+                # is empty.
+                if not await store.list_stories(scope.case_id):
+                    return {
+                        "error": "this case has no stories yet — propose_story creates one, "
+                        "and blocks can be proposed against it once the analyst confirms"
+                    }
                 return {"error": f"story {story_id!r} not found in this case — list_stories"}
             if after_block_id is not None:
                 blocks = await store.list_story_blocks(story_id)
                 if after_block_id not in {b.id for b in blocks}:
                     return {"error": f"after_block_id {after_block_id!r} not in this story"}
-            # `content` is a *top-level* argument, so it arrives parsed even
-            # from a provider that stringifies it: pydantic-ai parses the top
-            # level, and the MCP SDK's `pre_parse_json` parses any non-`str`
-            # parameter again. The guard is stated anyway because the failure
-            # it would prevent is silent rather than loud — `in` on a string
-            # is a *substring* match, which passes and then fails on `.get`.
+            # A stringified `content` is normally parsed before the tool runs
+            # — pydantic-ai parses the top level of a tool call's arguments,
+            # and the MCP SDK's `pre_parse_json` parses any non-`str`
+            # parameter again. Both give up on a string that is not valid
+            # JSON, which is exactly what a small model emits when it closes
+            # an object with `")` instead of `"}` (observed on a real turn,
+            # 2026-09-03). Declaring the parameter `| str` puts that case
+            # inside the tool, where the error can name the defect and the
+            # expected shape instead of surfacing pydantic's
+            # "Input should be a valid dictionary" — which taught the model
+            # nothing and cost it six retries. The `isinstance` narrowing is
+            # also what keeps the `"chart_spec" in content` test below an
+            # object-key check rather than a silent substring match.
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except ValueError as exc:
+                    return {
+                        "error": f"content is not valid JSON ({exc}) — pass a JSON object, "
+                        f"not text: {CONTENT_SHAPES.get(block_kind, CONTENT_SHAPE_HINT)}"
+                    }
             if not isinstance(content, dict):
-                return {"error": "content must be a JSON object keyed for the block kind"}
+                return {
+                    "error": "content must be a JSON object: "
+                    + CONTENT_SHAPES.get(block_kind, CONTENT_SHAPE_HINT)
+                }
             inline_chart = block_kind == "chart_ref" and "chart_spec" in content
             try:
                 if inline_chart:
@@ -2242,7 +2342,16 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
                         "resolved": executed["resolved"],
                     }
                 else:
-                    content = validate_block_content(block_kind, content)
+                    try:
+                        content = validate_block_content(block_kind, content)
+                    except ValueError as exc:
+                        # Only a *shape* failure earns the shape hint. A
+                        # referent error ("view not in this case") arrives on
+                        # a well-formed payload, and echoing the shape at it
+                        # would point the model at the one thing that was
+                        # already right.
+                        hint = CONTENT_SHAPES.get(block_kind)
+                        return {"error": f"{exc}\nexpected: {hint}" if hint else str(exc)}
                     # Checked here so a wrong id is an error the model can
                     # correct, rather than a proposal card the analyst
                     # confirms into a block that resolves to an error.
@@ -2406,6 +2515,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         `text_length`. Treat such a block as unread rather than summarizing
         it: the tail is not retrievable here, and the analyst's own document
         is the authority on what it says.
+
+        `pending_proposals` lists what this conversation proposed and the
+        analyst has not decided: not blocks, not counted in `block_count`.
         """
         from vestigo.api.deps import get_store
 
@@ -2457,6 +2569,29 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         }
         if truncated_blocks:
             result["truncated_blocks"] = truncated_blocks
+        # Without this, a proposal is invisible from every tool the model has:
+        # `block_count` does not move until the analyst confirms, and a model
+        # that reads its own proposal as a no-op re-proposes — or probes the
+        # API with a throwaway "test" block, which lands in the analyst's
+        # confirmation queue as junk they have to decline (observed on a real
+        # turn, 2026-09-03). Scoped to this conversation because that is what
+        # `list_agent_proposals` addresses and what the model is accountable
+        # for; another analyst's pending edits are not this turn's business.
+        if scope.conversation_id:
+            pending = [
+                {
+                    "proposal_id": p.id,
+                    "block_kind": p.payload.get("block_kind"),
+                    "after_block_id": p.payload.get("after_block_id"),
+                    "rationale": p.rationale,
+                }
+                for p in await store.list_agent_proposals(scope.conversation_id)
+                if p.kind == "story_block"
+                and p.status == "proposed"
+                and p.payload.get("story_id") == story_id
+            ]
+            if pending:
+                result["pending_proposals"] = pending
         return result
 
     @server.tool()

@@ -1110,6 +1110,94 @@ async def list_proposals(
     return {"proposals": [p.to_dict() for p in rows]}
 
 
+#: Audit action per proposal kind on reject. "annotation" is the default
+#: because every pre-W7 row carries it via the column's server default.
+_REJECT_ACTIONS: dict[str, str] = {
+    "annotation": "agent.annotation_reject",
+    "story": "agent.story_reject",
+    "story_block": "agent.story_block_reject",
+}
+
+
+async def _apply_story_proposal(
+    store, decided, case_id: str, conversation_id: str, user
+) -> dict[str, Any]:
+    """Apply a confirmed ``story`` proposal — create the report document.
+
+    The agent can propose the container it was asked to write into; the
+    analyst's click is still the write, exactly as for a block. ``Story`` has
+    no ``origin`` column (blocks carry theirs), so what records the agent's
+    hand here is the ``agent.story_confirm`` audit row plus the `origin:
+    agent` on every block the agent then proposes into it — the document is
+    a container, its content is what carries provenance.
+
+    A title that collided since propose time is reported honestly rather than
+    raised: the proposal is decided either way, and two stories under one name
+    is a worse outcome than an unapplied confirm the analyst can redo. The
+    collision check and the insert are serialized per (case, title) inside
+    ``create_story_if_title_free``, so two confirms racing on one title cannot
+    both pass it.
+
+    The outcome is persisted on the proposal (``result``), because the card
+    that renders this proposal outlives the confirm response and must not
+    claim a story it did not create.
+    """
+    import uuid as _uuid
+
+    from vestigo.stories.schemas import STORY_TITLE_MAX_CHARS
+
+    payload = decided.payload or {}
+    title = (payload.get("title") or "").strip()
+    applied = False
+    story_dict = None
+    reason = None
+    if not title:
+        reason = "the proposal carries no title"
+    elif len(title) > STORY_TITLE_MAX_CHARS:
+        reason = f"title exceeds {STORY_TITLE_MAX_CHARS} characters"
+    else:
+        story = await store.create_story_if_title_free(
+            case_id,
+            _uuid.uuid4().hex,
+            title,
+            payload.get("description"),
+            user=user.username,
+        )
+        if story is None:
+            reason = f"a story titled {title!r} already exists"
+        else:
+            applied = True
+            story_dict = story.to_dict()
+    recorded = await store.set_agent_proposal_result(
+        decided.id,
+        {
+            "applied": applied,
+            "story_id": story_dict["id"] if story_dict else None,
+            "reason": reason,
+        },
+    )
+    await store.record_audit(
+        action="agent.story_confirm",
+        actor=user,
+        case_id=case_id,
+        target_type="agent_proposal",
+        target_id=decided.id,
+        detail={
+            "conversation_id": conversation_id,
+            "applied": applied,
+            "story_id": story_dict["id"] if story_dict else None,
+            "title": title,
+            "reason": reason,
+        },
+    )
+    return {
+        "proposal": (recorded or decided).to_dict(),
+        "applied": applied,
+        "story": story_dict,
+        "reason": reason,
+    }
+
+
 async def _apply_story_block_proposal(
     store, decided, case_id: str, conversation_id: str, user
 ) -> dict[str, Any]:
@@ -1208,6 +1296,18 @@ async def _apply_story_block_proposal(
                 block_dict = block.to_dict()
         except ValueError as exc:
             reason = str(exc)
+    # Persisted for the same reason as on the story proposal: the card renders
+    # from the stored transcript long after the confirm response is gone, and
+    # a confirmed-but-unapplied block must not read as written.
+    recorded = await store.set_agent_proposal_result(
+        decided.id,
+        {
+            "applied": applied,
+            "story_id": payload.get("story_id"),
+            "block_id": block_dict["id"] if block_dict else None,
+            "reason": reason,
+        },
+    )
     await store.record_audit(
         action="agent.story_block_confirm",
         actor=user,
@@ -1222,7 +1322,7 @@ async def _apply_story_block_proposal(
         },
     )
     return {
-        "proposal": decided.to_dict(),
+        "proposal": (recorded or decided).to_dict(),
         "applied": applied,
         "block": block_dict,
         "reason": reason,
@@ -1255,6 +1355,8 @@ async def confirm_proposal(
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
 
+    if decided.kind == "story":
+        return await _apply_story_proposal(store, decided, case_id, conversation_id, user)
     if decided.kind == "story_block":
         return await _apply_story_block_proposal(store, decided, case_id, conversation_id, user)
 
@@ -1316,11 +1418,7 @@ async def reject_proposal(
     if decided is None:
         raise HTTPException(status_code=409, detail=f"Proposal already {proposal.status}")
     await store.record_audit(
-        action=(
-            "agent.story_block_reject"
-            if decided.kind == "story_block"
-            else "agent.annotation_reject"
-        ),
+        action=_REJECT_ACTIONS.get(decided.kind, "agent.annotation_reject"),
         actor=user,
         case_id=case_id,
         target_type="agent_proposal",

@@ -4,7 +4,85 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 226 — second review pass on the detector wizard branch).
+Last updated: 2026-09-03 (session 228 — review fixes on the story tools, and a nested-layer
+regression that closed the detector wizard).
+
+## Session 228 — 2026-09-03: what a confirm actually did, and one duplicated npm package
+
+Review of PR #348 turned up three defects, all fixed here, plus one the user hit live.
+
+`POST /stories` and `propose_story` both capped the title at `STORY_TITLE_MAX_CHARS`; the
+rename on `PATCH /stories/{id}` did not, so the path an analyst is likeliest to paste into
+still reached `String(255)` as an asyncpg truncation error — a 500 on a typo, the exact
+failure the cap exists to prevent.
+
+The bigger one was a claim the transcript could not back. A confirmed `story` proposal whose
+title had been taken since propose time reports `applied: false`, but the card rendered the
+success state anyway: "created by <analyst>" plus an *Open story* button that resolved the
+story **by title** — i.e. the unrelated document that took the name. The toast saying
+otherwise is gone by the next page load; the false provenance claim is permanent. The
+outcome is now persisted on the proposal itself (`AgentProposal.result`, migration 0035) for
+both story kinds, and the card reads it: the link goes by id, an unapplied confirm says so,
+and rows decided before 0035 keep the old inference behind a null. `story_block` had the
+same latent defect (a story deleted since propose time) and gets the same treatment.
+
+`_apply_story_proposal`'s duplicate-title check was read-then-insert, so two analysts
+confirming the same proposed title concurrently both passed it — which is what the docstring
+promised would not happen. `create_story_if_title_free` now does the check and the insert in
+one transaction serialized per `(case, title)` by a Postgres advisory lock. Deliberately not
+a unique index: an analyst naming two documents alike by hand is their call, and this is only
+the agent path's promise not to duplicate a name behind their back.
+
+Separately, and reported mid-session: clicking a field in the detector wizard's "Fields to
+scan" popover closed the whole wizard. Nothing in `DetectorWizard` or `AnomalyFieldPicker` was
+at fault — `package-lock.json` carried a second copy of `@radix-ui/react-dismissable-layer`
+(same version) nested under `react-dialog`, so Dialog and Popover held *separate* layer
+registries, the popover's layer never joined the dialog's, and every click inside the portalled
+popover read as a click outside the dialog. `npm dedupe` collapses the duplicated subtree (369
+lockfile lines); `src/test/dialogPopoverNesting.test.tsx` is the regression test and fails
+again if the tree grows a second copy.
+
+## Session 227 — 2026-09-03: the story tools stop costing a turn
+
+Read an exported agent conversation in which a small model was asked, in German, to write a
+verification story's conclusion. It took 48 messages and twelve `propose_story_block` calls
+to produce three blocks, and none of the loss was investigative — it was all our tool
+contract.
+
+`content` is an opaque object in the schema, and the docstring documented the keys for
+`chart_ref` only. The model guessed its way up the ladder — bare markdown string,
+`{"markdown": …}`, then `{"text": …}` — and, because every error was a raw pydantic message,
+repeated the whole ladder for the next block. Three of the calls sent `content` as a
+stringified object that ended `")` instead of `"}`; neither pydantic-ai's `args_as_dict` nor
+the MCP SDK's `pre_parse_json` can parse that, so what came back was "Input should be a
+valid dictionary" on an argument the model could see it had sent as a dict. The tool now
+declares `content: dict | str`, parses a string itself, and names both the JSON defect and
+the expected shape; `schemas.CONTENT_SHAPES` is that shape, pinned against the models by a
+test and advertised in the docstring. A test that asserted the old `isinstance` guard was
+unreachable was asserting something true only of well-formed strings — corrected rather than
+deleted.
+
+`read_story` could not see the agent's own pending proposals, so `block_count` never moved
+and the model read its confirmed work as a no-op. It responded by probing the API with two
+throwaway "test" blocks, which are now sitting in a real analyst's confirmation queue as
+junk to decline. `read_story` returns `pending_proposals` for this conversation.
+
+The dead end underneath all of it: there was no way for the agent to create a story. A case
+with no stories could not be given a report, and `propose_story_block` answered "not found —
+list_stories" pointing at a list already known to be empty. `propose_story` closes it on the
+existing propose→confirm backbone (`AgentProposal.kind="story"`, `agent.story_confirm` /
+`agent.story_reject`, a card in the panel). It deliberately does not chain — confirming
+creates an empty story and blocks are signed off one at a time, which is the point of the
+subsystem — and it refuses a title already taken or already pending, because a proposal is
+invisible to a model that would otherwise re-propose the same document every turn.
+`STORY_TITLE_MAX_CHARS` now guards both write paths; the column is `String(255)` and an
+over-long title used to surface as a 500 on the analyst's click.
+
+The schema budget guard fired at 43,858 over 35 tools. The trimming rule was applied first —
+the three story docstrings rewritten compact, −970 chars — before the ceiling moved to
+44,000. The argument for the remaining 872 is in `docs/AGENT.md`: a retry is a whole model
+request carrying the entire tool list again, so one prevented retry pays it back about fifty
+times, and this turn spent six.
 
 ## Session 226 — 2026-09-03: the panel scope stops speaking for a configured detector
 

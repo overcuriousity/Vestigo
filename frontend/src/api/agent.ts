@@ -13,6 +13,7 @@ import { BASE, get, post, put, patch, del, fetchBlobGet, ApiError } from "./clie
 import type {
   EventFilters,
   FieldMatchMode,
+  Story,
   StoryBlock,
   StoryBlockKind,
 } from "./types";
@@ -373,6 +374,19 @@ export interface StoryBlockProposalPayload {
   after_block_id: string | null;
 }
 
+/** `propose_story` payload — the document, before it has an id. */
+export interface StoryProposalPayload {
+  title: string;
+  description: string | null;
+}
+
+export interface ProposalResult {
+  applied: boolean;
+  story_id: string | null;
+  block_id?: string | null;
+  reason: string | null;
+}
+
 export interface AgentProposal {
   id: string;
   conversation_id: string;
@@ -380,9 +394,14 @@ export interface AgentProposal {
   timeline_id: string;
   status: "proposed" | "confirmed" | "rejected";
   /** What the proposal proposes; "annotation" for every pre-W7 row. */
-  kind: "annotation" | "story_block";
-  /** Kind-specific body — the story-block target and content, else null. */
-  payload: StoryBlockProposalPayload | null;
+  kind: "annotation" | "story" | "story_block";
+  /** Kind-specific body — the story or story-block target, else null. */
+  payload: StoryBlockProposalPayload | StoryProposalPayload | null;
+  /** What confirming actually did. Null on annotation proposals, on anything
+   * still `proposed`, and on rows decided before the outcome was persisted —
+   * a confirm can legitimately apply nothing (title taken, story deleted),
+   * and `status` alone cannot say which. */
+  result: ProposalResult | null;
   tag: string | null;
   comment: string | null;
   rationale: string;
@@ -623,9 +642,10 @@ export const agentApi = {
       // Annotation proposals report what they wrote…
       written?: number;
       skipped_event_ids?: string[];
-      // …story-block proposals report whether the block landed.
+      // …story and story-block proposals report whether the write landed.
       applied?: boolean;
       block?: StoryBlock | null;
+      story?: Story | null;
       reason?: string | null;
     }>(
       `/cases/${caseId}/agent/conversations/${conversationId}/proposals/${proposalId}/confirm`,

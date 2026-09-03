@@ -332,3 +332,69 @@ async def test_at_top_and_after_block_id_are_mutually_exclusive(store):
             after_block_id="b1",
             at_top=True,
         )
+
+
+def test_content_shape_hints_match_the_models():
+    """Every hint names its kind's required fields, and only real kinds.
+
+    The hints are what `propose_story_block` advertises and echoes back on an
+    error; a hint that has drifted from its model teaches the wrong shape,
+    which is worse than the bare pydantic message it replaced.
+    """
+    import json
+
+    from vestigo.stories.schemas import (
+        _CONTENT_MODELS,
+        BLOCK_KINDS,
+        CONTENT_SHAPE_HINT,
+        CONTENT_SHAPES,
+    )
+
+    assert set(CONTENT_SHAPES) == set(BLOCK_KINDS)
+    for kind, hint in CONTENT_SHAPES.items():
+        example = json.loads(hint)
+        required = {
+            name for name, f in _CONTENT_MODELS[kind].model_fields.items() if f.is_required()
+        }
+        assert required <= set(example), f"{kind} hint omits {required - set(example)}"
+        assert set(example) <= set(_CONTENT_MODELS[kind].model_fields), (
+            f"{kind} hint names a field the model does not have"
+        )
+    for kind in BLOCK_KINDS:
+        assert kind in CONTENT_SHAPE_HINT
+
+
+async def test_create_story_if_title_free_refuses_a_taken_title(store):
+    """The agent's create path will not add a second document under one name.
+
+    Case and surrounding whitespace do not make a title free — the analyst
+    reads them as the same name, and so does the agent looking the story up.
+    """
+    await _story(store)
+    case_id = (await store.list_cases())[0].id
+
+    assert await store.create_story_if_title_free(case_id, "s2", "  t  ", None, "bob") is None
+    assert await store.create_story_if_title_free(case_id, "s3", "T", None, "bob") is None
+    made = await store.create_story_if_title_free(case_id, "s4", "Second report", None, "bob")
+    assert made is not None and made.id == "s4"
+    assert len(await store.list_stories(case_id)) == 2
+
+
+async def test_create_story_if_title_free_serializes_concurrent_creates(store):
+    """Two confirms racing on one title: exactly one story, one None.
+
+    The check and the insert share an advisory-locked transaction, so the
+    second caller reads the first caller's row rather than passing a check
+    that was true a moment ago.
+    """
+    await _story(store)
+    case_id = (await store.list_cases())[0].id
+
+    results = await asyncio.gather(
+        *[
+            store.create_story_if_title_free(case_id, f"r{i}", "Abschlussbericht", None, "bob")
+            for i in range(4)
+        ]
+    )
+    assert sum(r is not None for r in results) == 1
+    assert [s.title for s in await store.list_stories(case_id)].count("Abschlussbericht") == 1

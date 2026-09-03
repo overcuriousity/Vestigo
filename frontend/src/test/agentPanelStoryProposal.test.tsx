@@ -56,12 +56,19 @@ vi.mock("@/api/agent", async () => {
 /** One testid per ChatItem kind, so a card rendered for the wrong kind fails. */
 const CARD_TESTID: Record<ProposalItemKind, string> = {
   proposal: "annotation-proposal-card",
+  newStoryProposal: "new-story-proposal-card",
   storyProposal: "story-proposal-card",
 };
 
 vi.mock("@/components/agent/StoryBlockProposalCard", () => ({
   StoryBlockProposalCard: (props: { proposal: AgentProposal }) => (
     <div data-testid="story-proposal-card">{props.proposal.id}</div>
+  ),
+}));
+
+vi.mock("@/components/agent/StoryProposalCard", () => ({
+  StoryProposalCard: (props: { proposal: AgentProposal }) => (
+    <div data-testid="new-story-proposal-card">{props.proposal.id}</div>
   ),
 }));
 
@@ -101,29 +108,45 @@ function conversation(): AgentConversation {
 
 /** A proposal of the kind the given ChatItem kind resolves against. */
 function proposal(itemKind: ProposalItemKind): AgentProposal {
-  const storyBlock = itemKind === "storyProposal";
+  const body: Pick<AgentProposal, "kind" | "payload" | "tag" | "comment"> =
+    itemKind === "storyProposal"
+      ? {
+          kind: "story_block",
+          payload: {
+            story_id: "story1",
+            block_kind: "markdown",
+            content: { text: "Source IP country analysis" },
+            after_block_id: null,
+          },
+          tag: null,
+          comment: null,
+        }
+      : itemKind === "newStoryProposal"
+        ? {
+            kind: "story",
+            payload: { title: "Country spread", description: null },
+            tag: null,
+            comment: null,
+          }
+        : {
+            kind: "annotation",
+            payload: null,
+            tag: "suspicious",
+            comment: "unusual country spread",
+          };
   return {
     id: PROPOSAL_ID,
     conversation_id: CONV_ID,
     case_id: CASE,
     timeline_id: TL,
     status: "proposed",
-    kind: storyBlock ? "story_block" : "annotation",
-    payload: storyBlock
-      ? {
-          story_id: "story1",
-          block_kind: "markdown",
-          content: { text: "Source IP country analysis" },
-          after_block_id: null,
-        }
-      : null,
-    tag: storyBlock ? null : "suspicious",
-    comment: storyBlock ? null : "unusual country spread",
+    ...body,
     rationale: "key findings",
     events: [],
     created_at: null,
     decided_by: null,
     decided_at: null,
+    result: null,
   };
 }
 

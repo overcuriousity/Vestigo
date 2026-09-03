@@ -24,6 +24,7 @@
 export const CARD_TOOLS = {
   propose_finding: "finding",
   propose_annotation: "annotation",
+  propose_story: "story",
   propose_story_block: "story block",
   propose_chart: "chart",
 } as const;
@@ -40,6 +41,7 @@ export const CARD_TOOLS = {
  */
 export const PROPOSAL_TOOLS = {
   propose_annotation: "proposal",
+  propose_story: "newStoryProposal",
   propose_story_block: "storyProposal",
   // `satisfies` rather than a type annotation: it keeps the literal kinds
   // while proving every proposal tool is also a card tool, so a tool added
@@ -75,5 +77,6 @@ export function cardToolName(tool: string | null | undefined): string | null {
  */
 export const PROPOSAL_KIND_BY_ITEM: Record<ProposalItemKind, string> = {
   proposal: "annotation",
+  newStoryProposal: "story",
   storyProposal: "story_block",
 };

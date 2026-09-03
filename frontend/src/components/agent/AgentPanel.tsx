@@ -45,6 +45,7 @@ import { FindingCard } from "./FindingCard";
 import { ChartProposalCard } from "./ChartProposalCard";
 import { ProposalCard } from "./ProposalCard";
 import { StoryBlockProposalCard } from "./StoryBlockProposalCard";
+import { StoryProposalCard } from "./StoryProposalCard";
 import { ToolSelectorPopover } from "./ToolSelector";
 import { AgentFiltersBar } from "./AgentFiltersBar";
 import { FilterChips } from "@/components/explorer/FilterChips";
@@ -126,6 +127,7 @@ type ChatItem =
     }
   | { kind: "chart"; id?: string | null; title: string; description: string; spec: AgentChartSpec }
   | { kind: "proposal"; proposalId: string }
+  | { kind: "newStoryProposal"; proposalId: string }
   | { kind: "storyProposal"; proposalId: string }
   | { kind: "error"; detail: string }
   /** Something happened that isn't a failure — a turn the analyst stopped. */
@@ -1186,6 +1188,20 @@ export function AgentPanel({ caseId, timelineId, currentFilters, onApplyFilters,
                 conversationId={activeId}
                 proposal={proposal}
                 onApply={onApplyFilters}
+              />
+            );
+          }
+          if (item.kind === "newStoryProposal") {
+            const proposal = proposalOfKind(proposalsById[item.proposalId], item.kind);
+            if (!proposal || !activeId) {
+              return <ToolRow key={i} tool="propose_story" />;
+            }
+            return (
+              <StoryProposalCard
+                key={i}
+                caseId={caseId}
+                conversationId={activeId}
+                proposal={proposal}
               />
             );
           }

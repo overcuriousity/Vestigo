@@ -56,6 +56,33 @@ def test_story_create_requires_title(client, admin_bootstrap, store):
     assert client.post(f"/api/cases/{case_id}/stories", json={"title": "  "}).status_code == 422
 
 
+def test_story_title_length_is_capped_on_create_and_rename(client, admin_bootstrap, store):
+    """Both write paths reject an over-long title, rather than the driver.
+
+    ``Story.title`` is ``String(255)``; a longer one reaches asyncpg as a
+    truncation error and surfaces as a 500. The rename path is the one an
+    analyst is likeliest to hit by pasting.
+    """
+    as_admin(client, admin_bootstrap)
+    case_id = _setup_case(client)
+    too_long = "x" * 300
+
+    assert client.post(f"/api/cases/{case_id}/stories", json={"title": too_long}).status_code == 422
+
+    story = _create_story(client, case_id, "Intrusion 42")
+    resp = client.patch(f"/api/cases/{case_id}/stories/{story['id']}", json={"title": too_long})
+    assert resp.status_code == 422
+    assert "255" in resp.json()["detail"]
+    # Nothing was written: the story keeps the title it had.
+    assert (
+        client.get(f"/api/cases/{case_id}/stories/{story['id']}").json()["story"]["title"]
+        == "Intrusion 42"
+    )
+
+    ok = client.patch(f"/api/cases/{case_id}/stories/{story['id']}", json={"title": "x" * 255})
+    assert ok.status_code == 200
+
+
 def test_block_create_validates_content(client, admin_bootstrap, store):
     as_admin(client, admin_bootstrap)
     case_id = _setup_case(client)
