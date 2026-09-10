@@ -37,6 +37,9 @@ export interface TimelineEnricherInfo {
   key: string;
   display_name: string;
   description: string;
+  /** Names this enricher appends to a matched field, per the
+   * `<attr_key>:<output_field>` contract in `enrichers/base.py`. */
+  output_fields: string[];
   eligible: boolean;
   sample_checked: number;
   sample_matched: number;

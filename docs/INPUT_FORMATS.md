@@ -350,8 +350,10 @@ What is specific to it:
   the row to say so is the one outcome the rule exists to prevent.
   The rule also covers collisions between Windows' vocabulary and Vestigo's. The converter
   derives `host`, `user`, `src_ip`, `src_port`, `MapDescription` and the `Map*` properties
-  under its own spellings, and those have to win the plain key because the platform reads
-  them by name (the GeoIP enricher wants `src_ip`) — so here it is the *native* value that
+  under its own spellings, and those have to win the plain key because analysts, saved views
+  and detector configs address them by name across every source in a timeline (the enrichers
+  do not — GeoIP and ASN match attribute *values* against a pattern and are indifferent to
+  the key they find them under) — so here it is the *native* value that
   steps aside to `host_2`, `user_2`, … rather than being overwritten. Same for the
   `EventData_`-prefixed form a field colliding with a `<System>` name gets: a record
   carrying a literal `EventData_Channel` alongside an `EventData` `Channel` keeps both.

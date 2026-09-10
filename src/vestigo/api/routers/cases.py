@@ -1037,19 +1037,48 @@ async def download_source(source_id: str, case: Case = Depends(require_case_read
 @router.delete("/{case_id}/sources/{source_id}")
 async def delete_source(
     source_id: str,
+    force: bool = False,
     case: Case = Depends(require_case_manage),
     user: User = Depends(require_password_current),
 ) -> dict[str, Any]:
     """Delete a source and cascade-remove its events and vectors.
 
     The source is removed from all timelines automatically by the foreign-key
-    cascade on ``timeline_sources``.
+    cascade on ``timeline_sources``. For the default "All sources" timeline
+    that is the definition — it tracks the case. For an analyst-created
+    timeline it silently rewrites a *named grouping someone else may be
+    working in*: its saved views, baseline windows and detector findings were
+    all declared over a source set that no longer holds. So a source that any
+    named timeline still lists refuses to delete with 409 unless ``force`` is
+    set, and the refusal names the timelines rather than making the analyst
+    go find them. The default timeline never counts — it cannot be edited to
+    exclude a source, so requiring confirmation for it would make *every*
+    delete a two-step.
     """
     store = get_store()
     case_id = case.id
     source = await store.get_source(case_id, source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
+
+    named_timelines = [
+        t
+        for t in await store.list_timelines_for_source(case_id, source_id)
+        if not t.is_default
+    ]
+    if named_timelines and not force:
+        names = ", ".join(f"“{t.name}”" for t in sorted(named_timelines, key=lambda t: t.name))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This source is part of {len(named_timelines)} "
+                f"{'timeline' if len(named_timelines) == 1 else 'timelines'}: {names}. "
+                "Deleting it removes the source from "
+                f"{'that grouping' if len(named_timelines) == 1 else 'those groupings'} "
+                "and from every saved view, baseline window and finding declared over it. "
+                "Confirm to delete anyway."
+            ),
+        )
 
     qdrant = QdrantStore()
     ch = ClickHouseStore()
@@ -1082,8 +1111,19 @@ async def delete_source(
         case_id=case_id,
         target_type="source",
         target_id=source_id,
+        # Which named groupings this delete rewrote. The join rows are gone by
+        # the time anyone reads the trail, so the audit row is the only place
+        # left that records what the timelines used to contain.
+        detail={
+            "removed_from_timelines": [{"id": t.id, "name": t.name} for t in named_timelines],
+            "forced": force,
+        },
     )
-    return {"deleted": True, "source_id": source_id}
+    return {
+        "deleted": True,
+        "source_id": source_id,
+        "removed_from_timelines": [t.id for t in named_timelines],
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2102,6 +2142,10 @@ async def list_timeline_enrichers(
                 "key": enricher.key,
                 "display_name": enricher.display_name,
                 "description": enricher.description,
+                # The dialog states the derived-key naming contract
+                # ("<field>:geo_country") in the row, so it needs the names
+                # rather than hardcoding one enricher's.
+                "output_fields": list(enricher.output_fields),
                 "eligible": False if failed else eligibility.eligible,
                 "sample_checked": 0 if failed else eligibility.sample_checked,
                 "sample_matched": 0 if failed else eligibility.sample_matched,
