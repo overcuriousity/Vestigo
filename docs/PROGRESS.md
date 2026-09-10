@@ -4,7 +4,7 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-10 (session 232 — three field reports triaged: the converter suite's
+Last updated: 2026-09-10 (1.19.3; session 232 — three field reports triaged: the converter suite's
 empty `src_ip`, a source delete that rewrote named timelines in silence, and the enricher
 "field picker" that never existed).
 

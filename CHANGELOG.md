@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.3] — 2026-09-10
+
+### Fixed
+
+- **Deleting a source no longer rewrites a named timeline in silence.**
+  `DELETE /cases/{id}/sources/{id}` had no guard and the trash button had no confirmation at
+  all: one click cascaded `timeline_sources` and dropped the source out of every
+  analyst-created grouping that listed it, along with the saved views, baseline windows and
+  findings declared over that source set. It now refuses with 409 unless `force=true`, and
+  the refusal names the timelines. The default "All sources" timeline never counts — it
+  tracks the case by definition and cannot be edited to exclude a source. The success audit
+  row records `removed_from_timelines`, since the join rows are gone by the time anyone
+  reads the trail.
+- The enrichers dialog explains itself. "Manual" is a *trigger* setting (do not auto-run
+  after an ingest), not a scope, and the dropdown is disabled until the row's switch is on —
+  neither of which anything said, so it read as a broken control. The row now states the
+  scan scope and the `<field>:<output>` naming contract, and the explanatory title sits on a
+  wrapper rather than the disabled button, which fires no pointer events.
+- `docs/INPUT_FORMATS.md` claimed the GeoIP enricher reads `src_ip` by name. It does not:
+  GeoIP and ASN match attribute *values* against a pattern and are indifferent to the key.
+
+### Known issues
+
+- The vendored `apache2timesketch` / `nginx2timesketch` converters leave `src_ip` empty when
+  `%h` holds a hostname (`HostnameLookups On`) or a vhost, and drop the row outright for a
+  comma-joined `X-Forwarded-For` in that slot. The fix is upstream in
+  `overcuriousity/2timesketch` and lands here on the next re-vendor; tracked in
+  `docs/ROADMAP.md`. Nothing keys on the field *name* — the enrichers scan values — so the
+  effect is an empty field, not a broken enrichment run.
+
 ## [1.19.2] — 2026-09-03
 
 ### Fixed
