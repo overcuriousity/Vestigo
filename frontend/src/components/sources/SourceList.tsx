@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileText, Database, Cpu, Download, Trash2, Clock } from "lucide-react";
 import { sourcesApi } from "@/api/sources";
+import { timelinesApi } from "@/api/timelines";
 import { fmtRelative } from "@/lib/time";
 import { fmtNum, fmtBytes, fmtParserName, truncateHash } from "@/lib/format";
 import { Badge } from "@/components/ui/Badge";
@@ -13,6 +14,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/Popover";
+import { Dialog, DialogContent, DialogClose } from "@/components/ui/Dialog";
 import { UploadDialog } from "@/components/timelines/UploadDialog";
 import type { Source } from "@/api/types";
 
@@ -217,26 +219,108 @@ function ClockOffsetControl({
   );
 }
 
+/**
+ * Delete a source, behind a confirmation that names what the delete rewrites.
+ *
+ * A source belongs to the default "All sources" timeline by definition, so
+ * that one is never worth mentioning. An analyst-*created* timeline is a
+ * different thing: it is a named grouping someone declared, and dropping a
+ * source out of it silently invalidates the saved views, baseline windows and
+ * findings built on that source set. The server refuses such a delete with 409
+ * unless `force` is set (it is the enforcement — this dialog is not), so the
+ * confirmation lists those timelines by name and the confirm button is what
+ * sends `force`. The timelines query is already cached by the sidebar, so
+ * naming them costs no extra request.
+ */
 function DeleteSourceButton({ caseId, source }: { caseId: string; source: Source }) {
+  const [open, setOpen] = useState(false);
   const qc = useQueryClient();
-  const { mutate, isPending } = useMutation({
-    mutationFn: () => sourcesApi.delete(caseId, source.id),
+
+  // Until this resolves we cannot honestly say which groupings the delete
+  // rewrites, so the confirm button waits for it rather than sending a
+  // `force` computed from an empty list (the server would 409 — correctly —
+  // and the analyst would have to click twice for no reason).
+  const { data: timelines, isPending: timelinesLoading } = useQuery({
+    queryKey: ["timelines", caseId],
+    queryFn: () => timelinesApi.list(caseId),
+    enabled: open,
+  });
+  const affected = (timelines ?? []).filter(
+    (t) => !t.is_default && t.source_ids.includes(source.id),
+  );
+
+  const { mutate, isPending, error, reset } = useMutation({
+    // `force` is only ever true once the analyst has read the list above; a
+    // first click on a source no timeline names never needs it.
+    mutationFn: () => sourcesApi.delete(caseId, source.id, affected.length > 0),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["sources", caseId] });
       qc.invalidateQueries({ queryKey: ["timelines", caseId] });
+      setOpen(false);
     },
   });
 
   return (
-    <Button
-      variant="ghost"
-      size="icon"
-      title="Delete source"
-      disabled={isPending}
-      onClick={() => mutate()}
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) reset();
+      }}
     >
-      <Trash2 size={14} className="text-[var(--color-danger)]" />
-    </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        title="Delete source"
+        onClick={() => setOpen(true)}
+      >
+        <Trash2 size={14} className="text-[var(--color-danger)]" />
+      </Button>
+      <DialogContent
+        title={`Delete source "${source.name}"?`}
+        description="Removes the source and every event and vector derived from it. The original uploaded file is not recoverable from Vestigo afterwards."
+      >
+        <div className="space-y-4">
+          {affected.length > 0 && (
+            <div className="rounded border border-[var(--color-danger)]/30 bg-[var(--color-danger-dim)] px-3 py-2 text-xs text-[var(--color-danger)] space-y-1">
+              <p>
+                This source is part of {affected.length}{" "}
+                {affected.length === 1 ? "timeline" : "timelines"}. Deleting it
+                removes the source from{" "}
+                {affected.length === 1 ? "that grouping" : "those groupings"} and
+                from every saved view, baseline window and finding declared over
+                it:
+              </p>
+              <ul className="list-disc pl-4">
+                {affected.map((t) => (
+                  <li key={t.id} className="font-medium">
+                    {t.name}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {error && (
+            <p className="text-xs text-[var(--color-danger)]">{(error as Error).message}</p>
+          )}
+          <div className="flex justify-end gap-2">
+            <DialogClose asChild>
+              <Button variant="ghost" size="sm">
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={isPending || timelinesLoading}
+              onClick={() => mutate()}
+            >
+              {isPending ? "Deleting…" : "Delete Source"}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

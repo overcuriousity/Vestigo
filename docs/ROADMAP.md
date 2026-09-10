@@ -51,6 +51,27 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   with `MEMORY_LIMIT_EXCEEDED` (session-223). Needs a floor to compare against (the rewrite
   is the binding query, not a detector GROUP BY) and copy naming the ceiling, not N, as the
   remedy. Documented in `docs/DEPLOYMENT.md` "The N trap" until then.
+- [ ] **Vendored converters: a non-IP `%h` silently empties `src_ip`.** Upstream
+  (`overcuriousity/2timesketch`, vendored at `bb4d69f`) — `apache`/`nginx` assign
+  `normalize_ip(token)` straight into `src_ip` and drop the token when it is not an address,
+  so `HostnameLookups On`, or a `%v %h %u` LogFormat where the combined-format regex matches
+  with the *vhost* in the address slot (the vhost-strip fallback never runs, because the
+  first parse "succeeded"), both yield a populated table with an empty `src_ip`, the real
+  client in `remote_ident`, and nothing in the unparseable count. A comma-joined
+  `X-Forwarded-For` in `%h` drops the whole row instead — counted in the converter's summary,
+  invisible once the CSV is ingested. The fix belongs
+  upstream (`normalize_ip(x) or x` — the pattern `haproxy`/`w3c`/`exchange`/`conntrackd`
+  already use, or cloudtrail's keep-the-native-key-beside-it), then re-run
+  `scripts/vendor_converters.py`. Nothing in Vestigo keys on the name — the GeoIP/ASN
+  enrichers match attribute *values* — so the damage is a field the analyst filters and
+  pivots on being empty, and derived keys landing as `remote_ident:geo_country`.
+- [ ] **Per-timeline field scope for enrichers.** Analysts open the enrichers dialog
+  expecting to choose which field gets enriched; there is no such control, and the dialog now
+  says so. A real scope (an optional allow-list of attribute keys on `TimelineEnricher`)
+  is worth having for wide timelines, but it has to be recorded in provenance — a source
+  enriched under a narrow scope must not read as "already enriched" when the scope widens,
+  and `SourceEnrichment` only carries the enricher's `config_hash` today. Do it **on top of
+  Milestone 11 P4's `SourceEnrichment.detail` column**, not before, or it gets built twice.
 - [ ] **Per-source progress on a resumed enrichment run.** `run_resume_job` reports status
   only. Minimal shape: an optional `on_source_done` callback on `_apply_staged_rows`, with
   the route seeding `total` from the staged-source count it already computes.

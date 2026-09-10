@@ -461,9 +461,112 @@ async def test_source_delete_succeeds_and_audits(
 
     response = await cases.delete_source(source_id="s_ok", case=case_obj, user=_fake_user())
 
-    assert response == {"deleted": True, "source_id": "s_ok"}
+    assert response == {
+        "deleted": True,
+        "source_id": "s_ok",
+        "removed_from_timelines": [],
+    }
     assert await store.get_source(case, "s_ok") is None
     assert await store.query_audit(case_id=case, action="source.delete") != []
+
+
+@pytest.mark.asyncio
+async def test_source_delete_refuses_while_a_named_timeline_lists_it(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source an analyst-created timeline still names does not delete silently.
+
+    The FK cascade on ``timeline_sources`` rewrites that grouping — and every
+    saved view, baseline window and finding declared over its source set —
+    without saying so. The 409 is what makes that visible; it names the
+    timelines so the analyst does not have to go find them.
+    """
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_named", "victim", file_hash="hn", size_bytes=1)
+    await store.create_timeline(case, "tl_named", "Web servers", source_ids=["s_named"])
+    case_obj = await store.get_case(case)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cases.delete_source(source_id="s_named", case=case_obj, user=_fake_user())
+
+    assert exc_info.value.status_code == 409
+    assert "Web servers" in exc_info.value.detail
+    # Refused means refused: the evidence, the join row and the audit trail are
+    # all untouched.
+    assert await store.get_source(case, "s_named") is not None
+    assert await store.query_audit(case_id=case, action="source.delete") == []
+
+
+@pytest.mark.asyncio
+async def test_forced_source_delete_records_the_timelines_it_rewrote(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``force=True`` goes through, and the audit row keeps what was rewritten.
+
+    The join rows are gone by the time anyone reads the trail, so this audit
+    detail is the only remaining record of which named groupings lost a source.
+    """
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_forced", "victim", file_hash="hf", size_bytes=1)
+    await store.create_timeline(case, "tl_forced", "Web servers", source_ids=["s_forced"])
+    case_obj = await store.get_case(case)
+
+    response = await cases.delete_source(
+        source_id="s_forced", case=case_obj, force=True, user=_fake_user()
+    )
+
+    assert response["removed_from_timelines"] == ["tl_forced"]
+    assert await store.get_source(case, "s_forced") is None
+    rows = await store.query_audit(case_id=case, action="source.delete")
+    assert rows[0].detail["forced"] is True
+    assert rows[0].detail["removed_from_timelines"] == [
+        {"id": "tl_forced", "name": "Web servers"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_delete_ignores_the_default_timeline(
+    store: PostgresStore,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Membership of the default "All sources" timeline never triggers the refusal.
+
+    It tracks the case by definition and cannot be edited to exclude a source,
+    so counting it would make every single delete a two-step for no information.
+    """
+    monkeypatch.setattr(cases, "QdrantStore", _FakeQdrant)
+    monkeypatch.setattr(
+        cases,
+        "ClickHouseStore",
+        lambda: type("CH", (), {"delete_source_events": staticmethod(lambda *a: None)})(),
+    )
+    await store.create_source(case, "s_default", "victim", file_hash="hdf", size_bytes=1)
+    default = await store.get_default_timeline(case)
+    assert default is not None
+    await store.add_source_to_timeline(case, default.id, "s_default")
+    case_obj = await store.get_case(case)
+
+    response = await cases.delete_source(
+        source_id="s_default", case=case_obj, user=_fake_user()
+    )
+
+    assert response["removed_from_timelines"] == []
+    assert await store.get_source(case, "s_default") is None
 
 
 class _ThreadRecordingQdrant:

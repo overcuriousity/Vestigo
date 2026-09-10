@@ -21,8 +21,18 @@ export const sourcesApi = {
       (r) => r.source,
     ),
 
-  delete: (caseId: string, sourceId: string) =>
-    del<{ deleted: boolean }>(`/cases/${caseId}/sources/${sourceId}`),
+  /** Delete a source and its events/vectors.
+   *
+   * Refuses with 409 when any analyst-created timeline still lists the source
+   * — deleting it would silently rewrite that grouping and everything declared
+   * over it. `force` is the analyst's confirmation of exactly that, so the
+   * dialog sends it only after showing which timelines are affected. The
+   * default "All sources" timeline never triggers the refusal. */
+  delete: (caseId: string, sourceId: string, force = false) =>
+    del<{ deleted: boolean; removed_from_timelines: string[] }>(
+      `/cases/${caseId}/sources/${sourceId}`,
+      force ? { force: true } : undefined,
+    ),
 
   /** Set a source's query-time clock-skew correction (W2), in seconds. */
   update: (caseId: string, sourceId: string, timeOffsetSeconds: number) =>

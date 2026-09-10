@@ -224,6 +224,18 @@ function EnricherRow({
             {enricher.display_name}
           </p>
           <p className="text-xs text-[var(--color-fg-muted)]">{enricher.description}</p>
+          {/* The one thing analysts consistently expect to configure here and
+              cannot: which field is enriched. Say it up front rather than
+              leaving them hunting for a picker that does not exist. */}
+          <p className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Runs over every attribute of every event — each value is matched
+            against this enricher's own pattern, so there is no field to choose.
+            Results land beside the field they came from, as{" "}
+            <span className="font-mono">
+              &lt;field&gt;:{enricher.output_fields?.[0] ?? "derived"}
+            </span>
+            .
+          </p>
         </div>
         <Switch checked={enricher.enabled} onCheckedChange={onToggle} />
       </div>
@@ -277,19 +289,33 @@ function EnricherRow({
               : "No matching field values found in this timeline's sources"}
         </span>
         <div className="flex items-center gap-2 shrink-0">
-          <Select
-            value={enricher.mode}
-            onValueChange={(v) => onModeChange(v as "automatic" | "manual")}
-            disabled={!enricher.enabled}
+          {/* Trigger mode, not scope: "Manual" only means this enricher will not
+              start itself after an ingest — the field it reads is not a choice
+              (see the scan-scope line above the switch). The title sits on the
+              wrapper rather than the trigger because a disabled button fires no
+              pointer events, so the one state that most needs an explanation is
+              exactly the one where a title on the control never appears. */}
+          <span
+            title={
+              enricher.enabled
+                ? "When this enricher runs: automatically after each source finishes ingesting, or only when you press Run now"
+                : "Turn this enricher on first — a disabled enricher has no trigger mode"
+            }
           >
-            <SelectTrigger className="h-7 w-28 text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="automatic">Automatic</SelectItem>
-              <SelectItem value="manual">Manual</SelectItem>
-            </SelectContent>
-          </Select>
+            <Select
+              value={enricher.mode}
+              onValueChange={(v) => onModeChange(v as "automatic" | "manual")}
+              disabled={!enricher.enabled}
+            >
+              <SelectTrigger className="h-7 w-28 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="automatic">Automatic</SelectItem>
+                <SelectItem value="manual">Manual</SelectItem>
+              </SelectContent>
+            </Select>
+          </span>
           {/* Force re-run is a standing affordance, not a state that only
               appears after a skipped run in this dialog session — it is the
               documented recovery path when provenance disagrees with the

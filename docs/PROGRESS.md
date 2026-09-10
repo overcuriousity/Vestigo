@@ -4,8 +4,60 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-03 (session 231 — exact finding totals shipped as 1.19.2; the fan-out
-that never divided, and the review findings on #349).
+Last updated: 2026-09-10 (session 232 — three field reports triaged: the converter suite's
+empty `src_ip`, a source delete that rewrote named timelines in silence, and the enricher
+"field picker" that never existed).
+
+## Session 232 — 2026-09-10: three bug reports, three different answers
+
+**1. `apache2timesketch` emits an empty `src_ip`.** Not what the report said — the column is
+in every header and populated for combined, CLF, vhost-prefixed and 2.4/2.2 error logs, so
+this was reproduced by variant rather than accepted. What empties it is the token: `%h` is
+`\S+` to the parser and `normalize_ip` returns `""` for anything that is not an address,
+which covers `HostnameLookups On` and — the quiet one — a `%v %h %u` LogFormat, where the
+combined-format regex matches with the *vhost* in the address position, the real client
+lands in `remote_ident`, and the vhost-stripping fallback never runs because the first parse
+"succeeded". Neither shows up in the unparseable count. A comma-joined `X-Forwarded-For` in
+`%h` fails every arm and drops the row outright — counted in the converter's own summary,
+invisible once the CSV is ingested.
+
+Blast radius, surveyed across all 28 vendored converters: the split is between
+`normalize_ip(x) or x` (haproxy, w3c, exchange, conntrackd — keeps the raw value) and bare
+`normalize_ip(x)` (apache, nginx, and the JSON/regex readers whose token is already an
+address). Only apache and nginx take a token that can legitimately be a hostname, so only
+they lose data; cloudtrail has the best shape of all, keeping `sourceIPAddress` natively and
+setting `src_ip` only when it validates. Nothing in Vestigo keys on the *name*: the GeoIP and
+ASN enrichers `ARRAY JOIN mapValues(attributes)` and match values against a regex, so the
+consequence is an empty field analysts filter and pivot on, plus derived keys landing as
+`remote_ident:geo_country`. Fix belongs upstream in `overcuriousity/2timesketch` (the
+vendored files carry a do-not-edit header and a manifest sha256); filed in `ROADMAP.md`.
+`INPUT_FORMATS.md` claimed "the GeoIP enricher wants `src_ip`" — corrected, since that
+belief is what the evtx converter's own comment repeats.
+
+**2. A source deleted out from under a named timeline.** `DELETE /sources/{id}` had no guard
+and the trash button had no confirmation at all: one click cascaded `timeline_sources` and
+silently rewrote every analyst-created grouping that listed the source, along with the saved
+views, baseline windows and findings declared over that source set. It now refuses with 409
+unless `force=true`, and the refusal names the timelines. The default "All sources" timeline
+never counts — it tracks the case by definition and cannot be edited to exclude a source, so
+counting it would make every delete a two-step for no information. The success audit row
+gained `removed_from_timelines`, because the join rows are gone by the time anyone reads the
+trail. The dialog lists the same timelines from the already-cached timelines query and waits
+for it before enabling the confirm, so `force` is never computed from a list that has not
+loaded.
+
+**3. The enricher "Manual" mode does not let you select anything.** Correct, and not a bug:
+"Manual" is a *trigger* setting (do not auto-run after ingest), the dropdown is disabled
+until the row's switch is on, and there has never been a field picker — an enricher matches
+attribute values against its own pattern across every field. The gap is that nothing said
+so, which makes a greyed dropdown read like a failure. The row now states the scan scope and
+the `<field>:<output>` naming contract up front (`output_fields` added to the timeline
+listing so it names the real output rather than hardcoding GeoIP's), and both the enabled and
+disabled dropdown carry a title explaining what the setting is and why it is unavailable. A
+genuine per-timeline field scope is filed in `ROADMAP.md` behind Milestone 11 P4 —
+`SourceEnrichment` records only the enricher's `config_hash`, so a source enriched under a
+narrow scope would read as "already enriched" when the scope widens, and P4 is already
+adding the `detail` column that fixes it. Building it first means building it twice.
 
 ## Session 231 — 2026-09-03: the fan-out that never divided
 
