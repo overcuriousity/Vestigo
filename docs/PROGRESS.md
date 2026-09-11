@@ -4,8 +4,95 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-11 (1.19.5; session 233 — sorts never spilled on ClickHouse ≥ 25.1: the ratio
-setting that made `interval_periodicity` die at its cap on an airgapped 26.6 deployment).
+Last updated: 2026-09-11 (1.19.6; session 234 — the enrichment join that never bucketed, the
+scans whose memory grew with cardinality, and a sizing calculator rebuilt on measurement).
+
+## Session 234 — 2026-09-11: what the 1.19.5 production stack was still failing on
+
+**The report.** A diagnostics bundle from the same airgapped 26.6 stack, now on 1.19.5, still
+full of code 241. Two misconfigurations sat underneath everything:
+- ClickHouse's container had 64 GiB, but `memory.xml` still pinned the reference 9.5 GiB — the
+  trap `DEPLOYMENT.md` already describes.
+- `VESTIGO_STAT_SCAN_CONCURRENCY=4` then cut that into 819 MiB per query.
+
+The bundle's two post-upgrade failures were not config alone, though:
+- One `interval_periodicity` scan spilled 48 files and died merging them back at that cap.
+- Every enrichment apply died in `FillingRightJoinSide`.
+
+**The enrichment rewrite never spilled.** Reproduced on the pinned binary:
+- The `grace_hash` join splits into buckets only past `max_bytes_in_join`, which was unset (0 =
+  never), and `query_plan_join_swap_table = auto` put the full-width `events` rows on the
+  in-memory side (EXPLAIN: `Type: RIGHT`, events as the right table).
+- Memory grew with the source: 2M events failed at 1, 2 and 4 GiB; 4M failed at 4 GiB.
+- `max_bytes_ratio_before_external_join` was a red herring — setting it changed nothing; it only
+  converts hash joins to grace.
+- Fix, via `_scan.heavy_join_bucket_bytes()`: bucket at a quarter of the cap, swap off, so the
+  narrow staged maps are the build side. ~800 MiB at a 1 GiB cap on 2M and 4M events alike,
+  output verified row for row.
+- Swap-off is not what makes it pass (the bucket limit alone passed). It is what keeps a
+  billion-event source inside `grace_hash_join_max_buckets` (1024).
+
+**Blast radius.** A survey of every ClickHouse query for memory that escapes the per-query spill,
+each finding checked against the code and the server before acting on it:
+- **Charset novelty** learned every alphabet through `SELECT DISTINCT` (a set that cannot spill)
+  under a frameless `count() OVER ()` (buffers every distinct value). Three million distinct
+  values failed in every mode.
+  - Now a `GROUP BY`, with the distinct total counted off an empty-string marker (`extractAll`
+    never yields an empty match); column shape unchanged, so the Python loop and mock tests are
+    untouched.
+  - Verified identical per-character counts and totals against the old SQL.
+- **`count_routine_collapsed`** — no settings clause, runs on every collapsed Explorer page —
+  held `uniqExact` over every muted event's id: 1 GiB for 20M ids, charged to the server's
+  ceiling. Now inclusion–exclusion (`|T| + |M| − |T∩M|`), exact because `event_id` is one row's
+  provenance hash.
+- **`ensure_source_field_stats`** gathered every cache miss with no gate slot, each a set of
+  full-cap scans. `compute_source_field_stats` now holds a heavy slot; no caller holds one, so it
+  cannot self-deadlock.
+- **Not bugs, on measurement:**
+  - The top-level `uniqExact` inventory columns are LowCardinality.
+  - Window scans with explicit frames spill (already tested).
+  - The grouped charset violation scan needs ~450 MiB at four threads over 3M rows with 20
+    groups *and* with 2000 — not the group-count scaling its per-row constant arrays suggested.
+
+**The sizing calculator was sized on a guess.** Its scan requirement was 12 MiB per million
+events. Measured instead — smallest cap each corpus completed under, heavy clause, five threads:
+
+| Events | window-sort peak (passing cap) | high-cardinality GROUP BY peak (passing cap) |
+|---|---|---|
+| 2M | 0.97 GiB (1 GiB) | 401 MiB (512 MiB) |
+| 4M | 1.21 GiB (2 GiB) | 718 MiB (1 GiB) |
+| 8M | 1.39 GiB (2 GiB) | 714 MiB (1 GiB) |
+| 16M | 1.97 GiB (2 GiB) | 991 MiB (1 GiB) |
+| 32M | 2.36 GiB (4 GiB) | 1.24 GiB (2 GiB) |
+
+10 and 20 threads at 16M needed a cap one step higher than 5 threads did.
+
+Memory follows log2(events), because the sort spills; spill disk and runtime follow events
+(11.8 GiB and 45 s per field at 32M). The calculator now:
+- Uses a least-squares log model of that table: `scanNeed()` in the page, `scan_memory_model`
+  in the generator, with provenance.
+- Walks N down from the core bound until a slot fits the corpus's need at the width N leaves.
+  It used to divide by a fixed 2 GiB floor, which recommended ten 3.4 GiB slots for a
+  5 GiB-per-scan timeline.
+- Has an events slider reaching 10B.
+- No longer tells a split-host deployment to pin the budget (the app's probe asks ClickHouse
+  over its own connection).
+
+`tests/test_sizing_calculator_behavior.py` runs the page's JavaScript under Node and asserts its
+recommendations against the measurements.
+
+**Every fix went red first** on the committed code:
+- `test_enrichment_apply_memory_clickhouse` (1 GiB, 2M events)
+- `test_charset_memory_clickhouse` (256/512 MiB, 3M distinct values; red against a stash of the
+  old SQL)
+- `test_routine_collapse_memory_clickhouse` (32 MiB, 3M muted events)
+- `test_field_stats_admission_clickhouse` (peak in-flight 2 → 1)
+- the calculator tests
+
+**Left for a decision, not done:**
+- Per-attribute-key `uniqExact` in the field-stats cache still grows with a key's distinct
+  values. Switching to `uniq` would change a displayed count from exact to approximate.
+- The calculator sizes no spill disk, which at a billion events is the next thing to run out.
 
 ## Session 233 — 2026-09-11: the spill that was asked for and never fired
 

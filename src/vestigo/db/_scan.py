@@ -900,6 +900,29 @@ def heavy_scan_settings() -> str:
     )
 
 
+def heavy_join_bucket_bytes() -> int:
+    """``max_bytes_in_join`` for a ``grace_hash`` join under the heavy cap.
+
+    Grace hash splits into another bucket only when one outgrows this, and at
+    ClickHouse's default of 0 it never does: the join holds its whole build
+    side in memory, so a partition rewrite's footprint grew with the source's
+    event count and died at the cap however large the cap was (the airgapped
+    26.6 stack, 819 MiB; a 4 GiB cap still failed on 4M events). The
+    ``max_bytes_ratio_before_external_join`` default does not help — it only
+    converts a plain hash join to grace hash, a conversion this join has
+    already made.
+
+    A quarter of the cap: the bucket shares one ``max_memory_usage`` with the
+    GROUP BY feeding it (which spills at half) and with the read streams, and a
+    quarter is what measured green — 2M events at a 1 GiB cap peak around
+    750 MiB with it and fail with 241 without it. Divided by the fan-out
+    width exactly as :func:`_scan_settings_clause` divides the cap, so the two
+    never disagree about which cap the bucket is a quarter of.
+    """
+    budget = max(detect_scan_memory_budget() // max(_scan_fanout_var.get(), 1), 1)
+    return max(budget // 4, 1)
+
+
 def foreground_scan_settings() -> str:
     """The SETTINGS clause for an interactive chart aggregation.
 

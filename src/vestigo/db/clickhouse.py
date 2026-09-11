@@ -36,7 +36,12 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
-from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
+from vestigo.db._scan import (
+    HEAVY_SCAN_GATE,
+    acquire_scan_slot,
+    heavy_join_bucket_bytes,
+    heavy_scan_settings,
+)
 from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
@@ -609,32 +614,48 @@ class ClickHouseStore:
         would double-count an event that is both a motif-occurrence member
         *and* carries a muted template — the grid excludes it on either
         predicate matching (an OR at the set level), so the reported count
-        must be the union's cardinality, not the sum. One UNION ALL query
-        (deduped by ``uniqExact``) over both sources is the union count.
+        must be the union's cardinality, not the sum.
+
+        Taken by inclusion–exclusion rather than as ``uniqExact`` over both
+        branches' ids: ``|T| + |M| − |T ∩ M|``. The muted side ``T`` is a plain
+        count over ``events`` (one row per event — ``event_id`` is derived from
+        the row's provenance), so the only set held in memory is the
+        motif-occurrence membership ``M``, a side table bounded per disposition.
+        The id set this replaced held one entry per *muted* event: a muted
+        heartbeat on a billion-event case, on every Explorer page with collapse
+        on, in a query that carries no per-query cap and so spends the server's
+        ceiling instead.
         """
         if not motif_disposition_ids and not template_hashes:
             return 0
         self.init_schema()
         params: dict[str, Any] = {"cid": case_id, "sids": source_ids}
-        branches = []
-        if template_hashes:
-            params["ths"] = template_hashes
-            branches.append(
-                # `IN`, not `has(...)` — see count_template_events on why the
-                # bloom skip index requires this form.
-                f"SELECT toString(event_id) AS eid FROM {self.database}.events "
-                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
-                "AND template_hash IN {ths:Array(UInt64)}"
-            )
-        if motif_disposition_ids:
-            params["dids"] = motif_disposition_ids
-            branches.append(
-                f"SELECT event_id AS eid FROM {self.database}.motif_occurrences "
-                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
-                "AND has({dids:Array(String)}, disposition_id)"
-            )
+        if not template_hashes:
+            return self.count_motif_occurrences(case_id, motif_disposition_ids or [], source_ids)
+        params["ths"] = template_hashes
+        # `IN`, not `has(...)` — see count_template_events on why the bloom
+        # skip index requires this form.
+        muted = (
+            f"FROM {self.database}.events "
+            "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+            "AND template_hash IN {ths:Array(UInt64)}"
+        )
+        if not motif_disposition_ids:
+            result = self.client.query(f"SELECT count() {muted}", parameters=params)
+            rows = result.result_rows
+            return int(rows[0][0]) if rows else 0
+        params["dids"] = motif_disposition_ids
+        members = (
+            f"FROM {self.database}.motif_occurrences "
+            "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+            "AND has({dids:Array(String)}, disposition_id)"
+        )
+        # The membership side is cast to UUID rather than `event_id` to String:
+        # a string per muted row, per read thread, is the one allocation left
+        # here that grows with the scan instead of with the motif table.
         result = self.client.query(
-            f"SELECT uniqExact(eid) FROM ({' UNION ALL '.join(branches)})",
+            f"SELECT count() + (SELECT uniqExact(event_id) {members}) "
+            f"- countIf(event_id IN (SELECT toUUIDOrZero(event_id) {members})) {muted}",
             parameters=params,
         )
         rows = result.result_rows
@@ -919,6 +940,8 @@ class ClickHouseStore:
                 ) AS m ON e.event_id = m.event_id
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
                 {heavy_scan_settings()}, join_use_nulls = 0, join_algorithm = 'grace_hash',
+                max_bytes_in_join = {heavy_join_bucket_bytes()},
+                query_plan_join_swap_table = 'false',
                 min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
                 """,
                 parameters={

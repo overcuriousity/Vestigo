@@ -19,7 +19,15 @@
     "postgres_mem_limit_bytes": 4294967296,
     "qdrant_mem_limit_bytes": 4294967296
   },
-  "scan_working_set_bytes_per_million_events": 12582912,
+  "scan_memory_model": {
+    "base_peak_bytes": 934155386,
+    "cap_over_peak": 1.25,
+    "measured_max_events": 32000000,
+    "measured_threads": 5,
+    "peak_bytes_per_doubling": 380104605,
+    "reference_events": 2000000,
+    "wide_thread_factor": 1.25
+  },
   "shipped_caches": {
     "index_mark_cache_size": 536870912,
     "mark_cache_size": 2147483648,

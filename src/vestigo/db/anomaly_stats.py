@@ -3647,6 +3647,55 @@ class StatisticalAnomalyService:
                 field_overrides,
             )
 
+        def _alphabet_sql(col: str, where_tail: str, gcol: str | None = None) -> str:
+            """Per-character distinct-value counts plus the distinct total, in one scan.
+
+            Rows are ``(c, n_vals_with_c, n_vals)``, or ``(grp, c, n_vals_with_c,
+            n_vals)`` with *gcol* — one alphabet per group. The distinct pass is a
+            ``GROUP BY``, which spills. The total rides along as the count of an
+            empty-string marker appended to every value's characters:
+            ``extractAll(val, '(?s).')`` never yields an empty match, so the
+            marker is counted exactly once per distinct value. It is read off
+            the marker row by a window over the per-character result — alphabet
+            sized, not corpus sized — and the marker row is then dropped.
+
+            This replaced ``SELECT DISTINCT`` (a set held in memory, no spill)
+            under ``count() OVER ()`` (every distinct value's character array
+            buffered before one row came out). Both grew with the field's
+            cardinality, so high-cardinality fields — the free-text-ish ones
+            injected characters hide in — failed at the per-query cap.
+            """
+            grp_sel = f"{gcol} AS grp, " if gcol else ""
+            grp_key = "grp, " if gcol else ""
+            partition = "PARTITION BY grp" if gcol else ""
+            return f"""
+                SELECT {grp_key}c, n_vals_with_c, n_vals
+                FROM (
+                    SELECT {grp_key}c, n_vals_with_c,
+                           anyIf(n_vals_with_c, c = '') OVER ({partition}) AS n_vals
+                    FROM (
+                        SELECT {grp_key}c, count() AS n_vals_with_c
+                        FROM (
+                            SELECT {grp_key}arrayPushBack(
+                                arrayDistinct(extractAll(val, '(?s).')), ''
+                            ) AS chars
+                            FROM (
+                                SELECT {grp_sel}{col} AS val
+                                FROM {db}.events
+                                WHERE case_id = {{cid:String}}
+                                  AND has({{src:Array(String)}}, source_id)
+                                  AND {col} != ''{where_tail}
+                                GROUP BY {grp_key}val
+                            )
+                        )
+                        ARRAY JOIN chars AS c
+                        GROUP BY {grp_key}c
+                    )
+                )
+                WHERE c != ''
+                {heavy_scan_settings()}
+            """
+
         def _learn_rare_chars(field: str, *, exclude_suspects: bool, basis: str) -> _CharsetLearn:
             """Ungrouped rare-chars reference for *field* — the fallback recipe.
 
@@ -3662,24 +3711,7 @@ class StatisticalAnomalyService:
             if exclude_suspects and windows is not None:
                 _, sps = _window_preds(windows, params, source_offsets)
                 pred = f"\n                                  AND NOT ({' OR '.join(sps)})"
-            sql = f"""
-                SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
-                FROM (
-                    SELECT
-                        count() OVER () AS total,
-                        arrayDistinct(extractAll(val, '(?s).')) AS chars
-                    FROM (
-                        SELECT DISTINCT {fcol} AS val
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {fcol} != ''{pred}
-                    )
-                )
-                ARRAY JOIN chars AS c
-                GROUP BY c
-                {heavy_scan_settings()}
-            """
+            sql = _alphabet_sql(fcol, pred)
             rows = self.ch.client.query(sql, parameters=params).result_rows
             counts = {str(c): int(nv) for c, nv, _ in rows}
             n = int(rows[0][2]) if rows else 0
@@ -3762,32 +3794,14 @@ class StatisticalAnomalyService:
             fallback: _CharsetLearn | None = None
             if windows is None:
                 # Per-character distinct-value counts over the whole corpus,
-                # plus the total distinct-value count in the same scan: a window
-                # `count() OVER ()` over the DISTINCT subquery yields n_vals on
-                # every row, so we avoid a second whole-corpus uniqExact scan of
-                # the identical column/predicate. Grouped: the window and the
-                # GROUP BY partition per group instead.
+                # plus the total distinct-value count in the same scan (see
+                # `_alphabet_sql`), so we avoid a second whole-corpus distinct
+                # count of the identical column/predicate. Grouped: counted and
+                # totalled per group instead.
                 cc_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, cc_params, field_mappings)
                 if group_field is None:
-                    cc_sql = f"""
-                        SELECT c, count() AS n_vals_with_c, any(total) AS n_vals
-                        FROM (
-                            SELECT
-                                count() OVER () AS total,
-                                arrayDistinct(extractAll(val, '(?s).')) AS chars
-                            FROM (
-                                SELECT DISTINCT {col} AS val
-                                FROM {db}.events
-                                WHERE case_id = {{cid:String}}
-                                  AND has({{src:Array(String)}}, source_id)
-                                  AND {col} != ''
-                            )
-                        )
-                        ARRAY JOIN chars AS c
-                        GROUP BY c
-                        {heavy_scan_settings()}
-                    """
+                    cc_sql = _alphabet_sql(col, "")
                     cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
                     char_counts = {str(c): int(nv) for c, nv, _ in cc_rows}
                     n_vals = int(cc_rows[0][2]) if cc_rows else 0
@@ -3807,25 +3821,7 @@ class StatisticalAnomalyService:
                     )
                 else:
                     gcol = _group_expr(group_field, cc_params, field_mappings)
-                    cc_sql = f"""
-                        SELECT grp, c, count() AS n_vals_with_c, any(total) AS n_vals
-                        FROM (
-                            SELECT
-                                grp,
-                                count() OVER (PARTITION BY grp) AS total,
-                                arrayDistinct(extractAll(val, '(?s).')) AS chars
-                            FROM (
-                                SELECT DISTINCT {col} AS val, {gcol} AS grp
-                                FROM {db}.events
-                                WHERE case_id = {{cid:String}}
-                                  AND has({{src:Array(String)}}, source_id)
-                                  AND {col} != ''
-                            )
-                        )
-                        ARRAY JOIN chars AS c
-                        GROUP BY grp, c
-                        {heavy_scan_settings()}
-                    """
+                    cc_sql = _alphabet_sql(col, "", gcol)
                     cc_rows = self.ch.client.query(cc_sql, parameters=cc_params).result_rows
                     by_grp: dict[str, dict[str, int]] = {}
                     n_vals_by_grp: dict[str, int] = {}
@@ -3850,18 +3846,21 @@ class StatisticalAnomalyService:
                 bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
                 bs_bp, _ = _window_preds(windows, bs_params, source_offsets)
+                # The distinct pass is a GROUP BY, not SELECT DISTINCT, for the
+                # reason `_alphabet_sql` gives: it spills, and DISTINCT does not.
                 if group_field is None:
                     bs_sql = f"""
                         SELECT
                             groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
                             count() AS n_vals
                         FROM (
-                            SELECT DISTINCT {col} AS val
+                            SELECT {col} AS val
                             FROM {db}.events
                             WHERE case_id = {{cid:String}}
                               AND has({{src:Array(String)}}, source_id)
                               AND {col} != ''
                               AND {bs_bp}
+                            GROUP BY val
                         )
                         {heavy_scan_settings()}
                     """
@@ -3884,12 +3883,13 @@ class StatisticalAnomalyService:
                             groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
                             count() AS n_vals
                         FROM (
-                            SELECT DISTINCT {col} AS val, {gcol} AS grp
+                            SELECT {col} AS val, {gcol} AS grp
                             FROM {db}.events
                             WHERE case_id = {{cid:String}}
                               AND has({{src:Array(String)}}, source_id)
                               AND {col} != ''
                               AND {bs_bp}
+                            GROUP BY val, grp
                         )
                         GROUP BY grp
                         {heavy_scan_settings()}

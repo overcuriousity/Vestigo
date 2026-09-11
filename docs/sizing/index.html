@@ -125,24 +125,27 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
 </header>
 
 <p class="lede">
-  What a Vestigo deployment needs, from what you expect to put in it. Everything below is
-  computed with the same arithmetic <code>src/vestigo/db/_scan.py</code> uses at runtime —
-  the constants are generated from the source, not transcribed.
+  What a Vestigo deployment needs, from what you expect to put in it. The budget arithmetic is
+  the same <code>src/vestigo/db/_scan.py</code> uses at runtime, with constants generated from
+  the source rather than transcribed. What one scan of your largest timeline needs is measured:
+  the heaviest detector's peak memory on ClickHouse 26.6, which grows with the logarithm of the
+  event count because its sort spills — up to 32M events measured, extrapolated beyond.
 </p>
 <p class="lede">
   Every value comes in two columns. <strong>Minimum</strong> is the smallest configuration that
   still serves the workload you described. <strong>Max for your hardware</strong> spends the
   machine you actually have: as many scan slots as its cores and RAM support without shrinking a
-  query below the size a whole-corpus <code>GROUP BY</code> needs.
+  query below what one scan of your largest timeline needs at the width those slots leave it.
 </p>
 
 <h2>What you expect</h2>
 <div class="panel controls">
   <div>
     <label for="events">Largest timeline <span class="value" id="events-v"></span></label>
-    <input type="range" id="events" min="0" max="100" value="45">
+    <input type="range" id="events" min="0" max="100" value="34">
     <p class="hint">Events in the biggest single timeline an analyst will scan. Detectors read the
-      whole thing, so this is what sizes ClickHouse — not your total across cases.</p>
+      whole thing, so this is what sizes ClickHouse — not your total across cases. Scan memory was
+      measured up to 32M events; above that the figures extrapolate the measured curve.</p>
   </div>
   <div>
     <label for="analysts">Concurrent analysts <span class="value" id="analysts-v"></span></label>
@@ -245,9 +248,9 @@ footer { margin-top: 2.5rem; font-size: 0.8rem; color: var(--color-fg-muted); }
 const GIB = 1024 ** 3;
 let K = null;
 
-/** Slider position 0..100 → events, log-scaled across 1M..1B. */
+/** Slider position 0..100 → events, log-scaled across 1M..10B. */
 function eventsFor(pos) {
-  const decades = Math.log10(1000);           // 1M → 1B
+  const decades = Math.log10(10000);          // 1M → 10B
   const n = 1e6 * Math.pow(10, (pos / 100) * decades);
   const mag = Math.pow(10, Math.floor(Math.log10(n)));
   return Math.round(n / (mag / 10)) * (mag / 10);
@@ -317,10 +320,13 @@ function minimumPlan(input) {
   // grows well below linearly — more slots divide the same budget.
   const concurrency = Math.min(6, Math.max(K.default_concurrency, Math.ceil(analysts / 2)));
   const caches = cacheTotal();
-  const perScan = (events / 1e6) * K.scan_working_set_bytes_per_million_events;
+  const cores = Math.max(4, concurrency * 4);
+  const threads = Math.max(K.min_threads_per_scan, Math.floor(cores / concurrency));
+  // What one scan of this corpus needs at that width, the per-query floor included.
+  const perScan = scanNeed(events, threads, enrichment);
   // Floored at the reference stack — below that, sizing down stops buying
   // anything and just makes every scan spill.
-  const wantedCeiling = Math.max(
+  const ceiling = Math.max(
     K.reference.clickhouse_ceiling_bytes,
     // `concurrency + foreground_slots`, matching budgetFor's divisor: sizing
     // the ceiling for the heavy slots alone would hand each heavy scan
@@ -328,10 +334,6 @@ function minimumPlan(input) {
     // concurrency, half the working set this deployment was just measured to
     // need, so every detector scan spills on the hardware we recommended.
     (perScan * (concurrency + K.foreground_slots)) / K.memory_ratio + caches
-  );
-  const ceiling = Math.max(
-    wantedCeiling,
-    (minPerQuery(enrichment) * (concurrency + K.foreground_slots)) / K.memory_ratio + caches
   );
   const chLimit = roundGib(ceiling / K.reference.ceiling_to_limit_ratio) * GIB;
   const pageCache = pageCacheFor(events);
@@ -342,8 +344,9 @@ function minimumPlan(input) {
     chLimit,
     pageCache,
     ...budgetFor(ceiling, concurrency),
-    cores: Math.max(4, concurrency * 4),
-    threads: Math.max(K.min_threads_per_scan, Math.floor(Math.max(4, concurrency * 4) / concurrency)),
+    perScan,
+    cores,
+    threads,
     hostRam: roundGib(onThisHost * 1.1) * GIB,   // 10% for the OS itself
   };
 }
@@ -357,18 +360,37 @@ function chartThreadsFor(threads) {
   return Math.max(K.min_threads_per_scan, Math.floor((threads * K.foreground_slots) / K.foreground_concurrency));
 }
 
-/** Enrichment rewrites a whole partition under one slot; a per-query cap of a
- *  couple of GiB is where that starts failing on a large source. */
+/** The floor under every scan, whatever the corpus. Enrichment rewrites a whole
+ *  partition under one slot: with its join bucketed it peaked ~800 MiB at a
+ *  1 GiB cap on 2M and 4M events alike, and failed at 512 MiB — so its floor
+ *  does not grow with the source, and 2 GiB leaves room for wider scans. */
 function minPerQuery(enrichment) {
   return enrichment ? 2 * GIB : 1.5 * GIB;
+}
+
+/** Per-query cap one heavy scan of `events` needs at `threads` wide.
+ *
+ * Measured, not assumed — see `scan_memory_model` in
+ * scripts/gen_sizing_constants.py. Sorts and GROUP BYs spill, so memory follows
+ * log2(events) rather than events: sixteen times the corpus cost 2.4 times the
+ * memory. Above `measured_max_events` this extrapolates that curve. */
+function scanNeed(events, threads, enrichment) {
+  const M = K.scan_memory_model;
+  const doublings = Math.max(0, Math.log2(Math.max(events, 1) / M.reference_events));
+  const width = threads > M.measured_threads ? M.wide_thread_factor : 1;
+  const peak = (M.base_peak_bytes + M.peak_bytes_per_doubling * doublings) * width;
+  return Math.max(minPerQuery(enrichment), peak * M.cap_over_peak);
 }
 
 /** What the hardware in hand supports — `null` if it cannot host the stack.
  *
  * Maximum performance is more admitted scans, not a bigger cap on one: the
- * gate is what several analysts queue on. So take every slot the cores can
- * give two threads to, stopping before a query's share drops under what a
- * whole-corpus GROUP BY needs. */
+ * gate is what several analysts queue on. So take the most slots the cores can
+ * give two threads to whose share still covers what one scan of *this* corpus
+ * needs at the width that many slots leave it. More slots mean narrower scans
+ * and the need depends on the width, so walk down from the core bound rather
+ * than dividing once — dividing by a fixed floor is how this column used to
+ * recommend ten 3.4 GiB slots for a timeline one scan of which needs 5 GiB. */
 function maximumPlan(input) {
   const { events, shape, embeddings, enrichment, haveRam, haveCores } = input;
   const pageCache = pageCacheFor(events);
@@ -377,21 +399,31 @@ function maximumPlan(input) {
   const ceiling = Math.floor(chLimit * K.reference.ceiling_to_limit_ratio);
   if (chLimit < 2 * GIB || ceiling <= cacheTotal()) return null;
   const scanTotal = Math.floor((ceiling - cacheTotal()) * K.memory_ratio);
-  const byCores = Math.floor(haveCores / K.min_threads_per_scan);
-  const byMemory = Math.floor(scanTotal / minPerQuery(enrichment)) - K.foreground_slots;
-  // One slot always, even when the budget cannot give it the size a whole-corpus
-  // GROUP BY wants: the answer there is "it runs and spills", which is true, not
-  // "it does not run", which is not. `tight` is what says so out loud.
-  const concurrency = Math.max(1, Math.min(byCores, byMemory));
+  const byCores = Math.max(1, Math.floor(haveCores / K.min_threads_per_scan));
+  const threadsAt = (n) => Math.max(K.min_threads_per_scan, Math.floor(haveCores / n));
+  let concurrency = 0;
+  for (let n = byCores; n >= 1; n--) {
+    if (Math.floor(scanTotal / (n + K.foreground_slots)) >= scanNeed(events, threadsAt(n), enrichment)) {
+      concurrency = n;
+      break;
+    }
+  }
+  // One slot always, even when the budget cannot give a single scan what this
+  // corpus needs: the stack still runs and smaller timelines still scan. `tight`
+  // is what says out loud that a scan of the largest one may fail at its cap.
+  const tight = concurrency === 0;
+  if (tight) concurrency = 1;
+  const threads = threadsAt(concurrency);
   return {
     concurrency,
-    tight: byMemory < 1,
+    tight,
     ceiling,
     chLimit,
     pageCache,
     ...budgetFor(ceiling, concurrency),
+    need: scanNeed(events, threads, enrichment),
     cores: haveCores,
-    threads: Math.max(K.min_threads_per_scan, Math.floor(haveCores / concurrency)),
+    threads,
     hostRam: haveRam,
   };
 }
@@ -428,8 +460,8 @@ function renderVerdict(need, have, max) {
     ? `<strong>Short by ${short.join(" and ")}.</strong>`
     : "<strong>Runs, but every scan spills.</strong>";
   const tail = max.tight
-    ? ` A single scan gets less than the ${gib(minPerQuery(true))} a whole-corpus GROUP BY wants, ` +
-      "so aggregations fall back to disk rather than failing."
+    ? ` Even one scan gets less than the ${gib(max.need)} a scan of this timeline needs, so a ` +
+      "detector sweep over it can fail at its memory cap; smaller timelines are unaffected."
     : " Expect sweeps to queue, and large scans to spill to disk.";
   el.innerHTML = `${lead} This host still runs Vestigo — ${spend}.${tail}`;
 }
@@ -503,12 +535,10 @@ function compute() {
     `Auto resolves to ${need.threads} at the minimum${max ? ` and ${max.threads} at full spend` : ""} — cores ÷ concurrency, from the core count ClickHouse reports for itself. Pin it only to override.`);
   row(set, "→ chart-lane width (derived)", String(chartThreadsFor(need.threads)), m((x) => String(chartThreadsFor(x.threads))),
     `Not a setting: ${K.foreground_slots} heavy slots' worth ÷ ${K.foreground_concurrency} chart queries, applied to the width above. A chart is latency-bound and short, so it runs narrow rather than taking a detector's full width — but this width is added to the core count, not taken out of it, unlike the memory cap.`);
-  row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>",
-    shape === "split" ? String(need.scanTotal) : "0 (auto)",
-    shape === "split" ? m((x) => String(x.scanTotal)) : "0 (auto)",
-    shape === "split"
-      ? "ClickHouse is on another host, so the app cannot derive the budget — pin the total."
-      : "Auto: derived from the ceiling ClickHouse reports, minus its caches. Leave it alone.");
+  row(set, "<code>VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES</code>", "0 (auto)", "0 (auto)",
+    "Auto: derived from the ceiling ClickHouse reports about itself, minus its caches — asked over the " +
+    "same connection every query uses, so it works with ClickHouse on another host too. Leave it alone: " +
+    "a pinned total skips the cache subtraction and stops following memory.xml.");
   row(set, "<code>VESTIGO_STAT_SCAN_MEMORY_RATIO</code>", String(K.memory_ratio), String(K.memory_ratio),
     "Fraction of (ceiling − caches) the scan budget takes; the rest is merge headroom.");
   row(set, "<code>max_server_memory_usage</code>", String(need.ceiling), m((x) => String(x.ceiling)),

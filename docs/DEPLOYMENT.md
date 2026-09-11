@@ -439,6 +439,15 @@ sources; 0 source(s) left unenriched` — the scan and the staging completed, on
 did not, so the derived values sit in the scratch table and `events` is untouched. Nothing is
 corrupt; re-run the enrichment once the cap is raised.
 
+The rewrite's footprint no longer grows with the source. Its `grace_hash` join used to hold
+its entire build side in memory — `max_bytes_in_join` was unset, so it never split into
+buckets, and ClickHouse's `query_plan_join_swap_table = auto` chose the full-width `events`
+rows as that side — so a large source failed at any cap (4M events still failed at 4 GiB; the
+production report was an 819 MiB cap, `While executing FillingRightJoinSide`). The join now
+spills in buckets of a quarter of the cap and holds the narrow staged maps in memory, and
+peaks around 800 MiB at a 1 GiB cap on 2M and 4M events alike. It still has a floor: 512 MiB
+failed. That floor, not a detector `GROUP BY`, is why a cap in the hundreds of MiB is too small.
+
 **`risk` will not warn you about this.** `scan_budget_report` asks whether the aggregate
 (`total_bytes + cache_bytes`) fits under the ceiling — at N = 10 it still does, exactly as it
 does at N = 2, because the total is the same total. It never asks whether the resulting

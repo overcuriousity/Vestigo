@@ -1223,6 +1223,13 @@ carried by one hot value that repeats a million times counts once. This keeps
 a field's reference alphabet a property of its vocabulary, not of its traffic
 volume.
 
+Learning over distinct values is a `GROUP BY`, so it spills to disk under the heavy
+per-query cap, and the distinct-value total comes out of the same scan as the count of an
+empty-string marker appended to every value's characters. It used to be `SELECT DISTINCT`
+under a frameless `count() OVER ()` — a set that cannot spill, beneath a window that
+buffered every distinct value's characters at once — which failed at the cap on exactly the
+high-cardinality fields (millions of distinct query strings) an injected character hides in.
+
 ### Two modes
 
 | | Self-baseline (`rare-chars`) | Temporal (`temporal-charset`) |

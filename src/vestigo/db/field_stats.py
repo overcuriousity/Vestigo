@@ -36,7 +36,7 @@ import asyncio
 import zlib
 from typing import TYPE_CHECKING, Any
 
-from vestigo.db._scan import heavy_scan_settings
+from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
 
 # Top-level categorical columns tracked in the payload — single-sourced from
 # the anomaly recommender, whose inventory this cache replaces.
@@ -116,6 +116,26 @@ def _attach_top_values(entries: dict[str, dict[str, Any]], rows: list[Any]) -> N
 
 
 def compute_source_field_stats(
+    clickhouse: ClickHouseStore, case_id: str, source_id: str
+) -> tuple[int, dict[str, Any]]:
+    """Compute one source's field stats, holding a heavy scan slot throughout.
+
+    Its queries are whole-source scans at the heavy per-query cap, and that cap
+    is only safe while no more than the gate's worth of them run at once.
+    :func:`ensure_source_field_stats` fills every cache miss concurrently, so
+    without the slot a case with many uncached sources stacked one full cap per
+    source on top of the admitted sweeps. No caller holds a heavy slot of its
+    own (routers, the post-ingest/enrichment/import refreshes, the column job),
+    so waiting here cannot deadlock against itself. The wait is unbounded, like
+    every heavy scan's: a cache fill has no cheaper answer to return instead.
+
+    See :func:`_compute_source_field_stats` for the payload.
+    """
+    with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
+        return _compute_source_field_stats(clickhouse, case_id, source_id)
+
+
+def _compute_source_field_stats(
     clickhouse: ClickHouseStore, case_id: str, source_id: str
 ) -> tuple[int, dict[str, Any]]:
     """Compute one source's field stats with four aggregation queries.
