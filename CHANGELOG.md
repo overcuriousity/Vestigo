@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.4] — 2026-09-10
+
+### Fixed
+
+- **The bundled Apache and nginx converters no longer throw away a `%h` that is not an IP.**
+  Re-vendored from `overcuriousity/2timesketch` at `441c75b` (1.4.0), which closes the
+  defect listed under *Known issues* in 1.19.3. Both converters now emit **`client_host`** —
+  the `%h` token exactly as logged, always populated — and set `src_ip` only when it really
+  is an address, the shape `cloudtrail2vestigo` already used for `sourceIPAddress`. Three
+  behaviours change:
+  - `HostnameLookups On` produced an empty `src_ip` and lost the hostname outright; it is
+    now in `client_host`.
+  - A comma-joined `X-Forwarded-For` logged in the `%h` slot shifted every following capture
+    group, so the line matched nothing and **the whole request was dropped**. It parses now,
+    with the leftmost entry (the original client) as `src_ip` and the full chain in
+    `client_host`.
+  - A LogFormat that omits `%l` (`%v %h %u …`) matched with the *vhost* in the address slot,
+    because the vhost-stripping fallback only ran when the first parse failed outright. The
+    fallback now re-runs whenever the first parse found no address and keeps whichever
+    attempt did.
+
+  The Apache error log gets the same treatment: `[client host.example.net:44321]` keeps its
+  host token instead of being reduced to an empty `src_ip`. Every previously-correct row is
+  byte-identical. Nothing in Vestigo keys on the field *name* — the GeoIP and ASN enrichers
+  match attribute values — so existing timelines are unaffected until their sources are
+  re-converted.
+
 ## [1.19.3] — 2026-09-10
 
 ### Fixed
