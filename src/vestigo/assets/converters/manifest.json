@@ -1,7 +1,7 @@
 {
   "upstream": "https://github.com/overcuriousity/2timesketch",
-  "commit": "bb4d69f78c15fafc2ae069075e2308647a09091b",
-  "version": "1.3.0",
+  "commit": "8dd67db02be49a1288a4d423e25d991e254ce02a",
+  "version": "1.4.1",
   "license": "MIT License",
   "converters": [
     {
@@ -13,8 +13,8 @@
         "other_vhosts_access.log*",
         "error.log*"
       ],
-      "size_bytes": 70860,
-      "sha256": "4d1ae5580f27a4ca08afc647ac932978aec95f9c58c14b97de0e91c648d501e7"
+      "size_bytes": 74292,
+      "sha256": "f96865f284859e46a3aa5379eaa1622a558c311a3df6f8f6d56a9f9f846aee38"
     },
     {
       "name": "browser2timesketch",
@@ -25,7 +25,7 @@
         "History (Chromium SQLite)"
       ],
       "size_bytes": 108833,
-      "sha256": "505bfb4ddd1905cfeb2edc903912b2982db6fe32340f4c83fcdb3fc15208a4ca"
+      "sha256": "40ed6825afcd27e3e735da62761c30072329276400fbca49e024cc27b1dc4c38"
     },
     {
       "name": "cloudtrail2timesketch",
@@ -35,7 +35,7 @@
         "CloudTrail .json / .json.gz"
       ],
       "size_bytes": 50166,
-      "sha256": "8b587547dd20eeaea1c11eb8660b9045da4650d0596f188c47ecb60709883dde"
+      "sha256": "5ecce5effe6f5d434e9052e0503103fb39706a6784ebc5ff8a2a5f11da0e972a"
     },
     {
       "name": "cloudtrail2vestigo",
@@ -60,7 +60,7 @@
         "conntrackd*.log*"
       ],
       "size_bytes": 55392,
-      "sha256": "fbb498b7f11523d68b25c033fbfabdd01fd7d0712015bfff39efe4c402da7ca3"
+      "sha256": "e5b95b94abc9a529d8552fc2811eb31c647f66e8a6269bb93b972b24fe729834"
     },
     {
       "name": "cowrie2timesketch",
@@ -72,7 +72,7 @@
         "cowrie.json*.gz"
       ],
       "size_bytes": 51285,
-      "sha256": "c359794d71d9fd7855fdc5d70e71794f050bc655b07049fde1fabb384e38e493"
+      "sha256": "04c7ed3804fc342c711ec9cff4051072858726ba18c9474d6d56fbf2f1fb04eb"
     },
     {
       "name": "evtx2timesketch",
@@ -84,7 +84,7 @@
         "evtx_dump -o jsonl"
       ],
       "size_bytes": 65293,
-      "sha256": "71c6656ce944104f26812069266b2fce630046156a8e974e2de919615168d5ac"
+      "sha256": "2ec19caebde2362ef74f97959ac5d0717db58c398165c64628906b81dfa77f4b"
     },
     {
       "name": "evtx2vestigo",
@@ -110,7 +110,7 @@
         "*.LOG (Exchange '#Log-type:' CSV)"
       ],
       "size_bytes": 59404,
-      "sha256": "15974e0126ccb2354855c55c97e70fe6dd3451501624ef2f96e148c89f032cbd"
+      "sha256": "5d9d1f21fc7b4a0ddfdddbb1b430596a83923e8be9a69ef563f297a2abe80463"
     },
     {
       "name": "filterlog2timesketch",
@@ -120,7 +120,7 @@
         "filter.log (syslog filterlog lines)"
       ],
       "size_bytes": 58683,
-      "sha256": "99b83697823f8beb8ce8b3a734751fd53e3b7b2f817ae3cb798897a61f2e6575"
+      "sha256": "897096ce702148c20c886e490805a29de1fc06d06eca2e4a607ecf1da50ac71b"
     },
     {
       "name": "filterlog2vestigo",
@@ -145,7 +145,7 @@
         "*-json.log (Docker json-file)"
       ],
       "size_bytes": 74181,
-      "sha256": "298e594076f9df4d152635716ce918e0239d9d7e9b2cd098d672c2385dfe4072"
+      "sha256": "4a566dc251c51afb622a739c6bf775aa9dfe44d158ee60922a942636baec6bd9"
     },
     {
       "name": "haproxy2vestigo",
@@ -170,7 +170,7 @@
         "journal directory / journalctl -o json"
       ],
       "size_bytes": 46467,
-      "sha256": "b5d34685f0b73828a6d4c1e8301a63a6acfa6a1423e9e1b53b4673f8cbc0a5de"
+      "sha256": "3d72f867ef55126ec8cd10606efda8f3274ad7c30d7aaf935ce65978600e5a32"
     },
     {
       "name": "nginx2timesketch",
@@ -180,8 +180,8 @@
         "access.log*",
         "error.log*"
       ],
-      "size_bytes": 54137,
-      "sha256": "12be34b2725a4eac4d4130291fbe23b119e15a30ee5c158165c3bdb30e06d576"
+      "size_bytes": 55843,
+      "sha256": "d9d01e5acaf3f6546e4488a8ea34ec69e23adae38745823bfe5c75d3016a35d8"
     },
     {
       "name": "nginx2vestigo",
@@ -207,7 +207,7 @@
         "*.pcapng"
       ],
       "size_bytes": 112133,
-      "sha256": "acfc8efbec9c3d76f0a4b6e86090a57232e01d015f08d0d18ec506ced4152b02"
+      "sha256": "e77f647d755915d17dc9505cabd4d9122ec8f4bb71cd9008b2c60a043e1cd287"
     },
     {
       "name": "pcap2vestigo",
@@ -234,7 +234,7 @@
         "icap.log*"
       ],
       "size_bytes": 62284,
-      "sha256": "31051e6878bc2065e1f5db70e5a4962821c5db53609c6adf338166fd2b977851"
+      "sha256": "d2077b649ec2faa069552942349b72bb5c8164086640d76b248fccd88a026f6d"
     },
     {
       "name": "suricata2timesketch",
@@ -246,7 +246,7 @@
         "OPNsense suricata syslog export"
       ],
       "size_bytes": 61072,
-      "sha256": "8c76cd08248bfe8aabac6a641536f172908a1283d6907cc80d4f847755543cb1"
+      "sha256": "3e961beeb6efb14481a4cf94e98798c6f4207c92cf8b0ef2a5e39bb562322777"
     },
     {
       "name": "suricata2vestigo",
@@ -276,7 +276,7 @@
         "cron.log*"
       ],
       "size_bytes": 64337,
-      "sha256": "f76951694242bb9a8a56c6b5c9672264e18683b79179a7a3cc13599ab29e2daf"
+      "sha256": "b45e7416e062f5ba3146a36f58004ded46a044e541cd9b06d5fedc01c80b8349"
     },
     {
       "name": "timesketch2parquet",
@@ -303,7 +303,7 @@
         "*.log (any '#Fields:' W3C log)"
       ],
       "size_bytes": 61518,
-      "sha256": "67115c413957c713344c0e01399d10bfc018c97cb4b7a4e3c7f5e5eece268458"
+      "sha256": "2d8fbd31ecbae6504063c740bb70725674f7d3276a0ffd37a6ba1bd4ec8a3c1a"
     },
     {
       "name": "w3c2vestigo",
@@ -329,7 +329,7 @@
         "webhoneypot_YYYY-MM-DD.json"
       ],
       "size_bytes": 55705,
-      "sha256": "937532f3e1fa6cdb85faf2dfc6ce103a011322da73f5239426e74c4bf5b03565"
+      "sha256": "1d0e6138ddd39b0a8c062c4d5a63b36ff9dd05de1ac6f25a9aeb9fac1d4126af"
     },
     {
       "name": "zeek2timesketch",
@@ -343,7 +343,7 @@
         "*.log.gz"
       ],
       "size_bytes": 59870,
-      "sha256": "1e7c81420f44c634e9b96f2c5b2279062c02f4b7f300aa97b01034d3dd03d8a5"
+      "sha256": "abc9e4e37c440c2513d2e055bc6ed740a0a43df4af4496c9682af760aa6556d1"
     }
   ]
 }

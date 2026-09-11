@@ -4,7 +4,7 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-10 (1.19.3; session 232 — three field reports triaged: the converter suite's
+Last updated: 2026-09-10 (1.19.4; session 232 — three field reports triaged: the converter suite's
 empty `src_ip`, a source delete that rewrote named timelines in silence, and the enricher
 "field picker" that never existed).
 
@@ -21,6 +21,17 @@ lands in `remote_ident`, and the vhost-stripping fallback never runs because the
 `%h` fails every arm and drops the row outright — counted in the converter's own summary,
 invisible once the CSV is ingested.
 
+Fixed upstream and re-vendored at `8dd67db` (1.4.1) as 1.19.4: both converters emit
+`client_host` (the `%h` token as logged, always populated) and populate `src_ip` only
+when it validates, the address slot accepts a comma-joined chain and resolves to its
+leftmost entry, and Apache's vhost fallback re-runs whenever the first parse found no
+address. The dropped-row case now parses; every previously-correct row is byte-identical.
+The first cut of that chain pattern, `\S+(?:,\s*\S+)*`, reached upstream master before CodeQL
+flagged it on the re-vendor PR: `\S` matches the comma, so element and separator overlap and a
+line of repeated `!,` backtracks exponentially — 95 ms at 20 repetitions, ×4 per two more, on
+input written by whoever sends a request. Each element is `[^\s,]+` in 1.4.1 (0.6 ms on a
+10 kB witness). No local test would have caught it; the scanner did.
+
 Blast radius, surveyed across all 28 vendored converters: the split is between
 `normalize_ip(x) or x` (haproxy, w3c, exchange, conntrackd — keeps the raw value) and bare
 `normalize_ip(x)` (apache, nginx, and the JSON/regex readers whose token is already an
@@ -29,8 +40,9 @@ they lose data; cloudtrail has the best shape of all, keeping `sourceIPAddress` 
 setting `src_ip` only when it validates. Nothing in Vestigo keys on the *name*: the GeoIP and
 ASN enrichers `ARRAY JOIN mapValues(attributes)` and match values against a regex, so the
 consequence is an empty field analysts filter and pivot on, plus derived keys landing as
-`remote_ident:geo_country`. Fix belongs upstream in `overcuriousity/2timesketch` (the
-vendored files carry a do-not-edit header and a manifest sha256); filed in `ROADMAP.md`.
+`remote_ident:geo_country`. The fix had to go upstream — the vendored files carry a
+do-not-edit header and a manifest sha256 — which is why it landed as its own release rather
+than inside 1.19.3.
 `INPUT_FORMATS.md` claimed "the GeoIP enricher wants `src_ip`" — corrected, since that
 belief is what the evtx converter's own comment repeats.
 
