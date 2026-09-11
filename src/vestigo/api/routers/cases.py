@@ -1062,9 +1062,7 @@ async def delete_source(
         raise HTTPException(status_code=404, detail="Source not found")
 
     named_timelines = [
-        t
-        for t in await store.list_timelines_for_source(case_id, source_id)
-        if not t.is_default
+        t for t in await store.list_timelines_for_source(case_id, source_id) if not t.is_default
     ]
     if named_timelines and not force:
         names = ", ".join(f"“{t.name}”" for t in sorted(named_timelines, key=lambda t: t.name))

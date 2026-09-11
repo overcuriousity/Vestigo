@@ -533,9 +533,7 @@ async def test_forced_source_delete_records_the_timelines_it_rewrote(
     assert await store.get_source(case, "s_forced") is None
     rows = await store.query_audit(case_id=case, action="source.delete")
     assert rows[0].detail["forced"] is True
-    assert rows[0].detail["removed_from_timelines"] == [
-        {"id": "tl_forced", "name": "Web servers"}
-    ]
+    assert rows[0].detail["removed_from_timelines"] == [{"id": "tl_forced", "name": "Web servers"}]
 
 
 @pytest.mark.asyncio
@@ -561,9 +559,7 @@ async def test_source_delete_ignores_the_default_timeline(
     await store.add_source_to_timeline(case, default.id, "s_default")
     case_obj = await store.get_case(case)
 
-    response = await cases.delete_source(
-        source_id="s_default", case=case_obj, user=_fake_user()
-    )
+    response = await cases.delete_source(source_id="s_default", case=case_obj, user=_fake_user())
 
     assert response["removed_from_timelines"] == []
     assert await store.get_source(case, "s_default") is None
