@@ -186,7 +186,7 @@ class Settings(BaseSettings):
     # hitting it carries a warning.
     stat_motif_max_candidates: int = 1000
     # Only the top-K merged candidates by support get the second cadence
-    # pass — bounds the PARTITION BY gram window sort (can't spill).
+    # pass — bounds the PARTITION BY gram window sort.
     stat_motif_cadence_top_k: int = 500
     # ── Analysis gate ────────────────────────────────────────────────────────
     # Structural preconditions deciding which methods the Investigate rail
@@ -227,9 +227,8 @@ class Settings(BaseSettings):
     # oversubscription of a 4-core one.
     stat_scan_max_threads: int = 0
     stat_scan_external_group_by_bytes: int = 4_000_000_000
-    # Spill threshold for plain ORDER BY sorts. Window-function sorts cannot
-    # spill (ClickHouse limitation, docs/ANOMALY_DETECTION.md) — those scans
-    # are bounded structurally instead.
+    # Spill threshold for sorts — plain ORDER BY and the sort under a window
+    # function alike. Clamped under each query's cap (db/_scan.py).
     stat_scan_external_sort_bytes: int = 4_000_000_000
     # Total memory budget for heavy scans, shared across concurrent scans:
     # each query's max_memory_usage is budget / (concurrency + 2), the two

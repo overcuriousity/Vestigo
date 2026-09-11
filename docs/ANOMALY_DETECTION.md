@@ -191,12 +191,22 @@ half — how to size the budget and read what resolved — is
   silently accepting an edit that does nothing.
   `VESTIGO_ENRICHMENT_APPLY_INSERT_BLOCK_BYTES` is **not** in that group — it is read
   via `get_settings()` when the apply runs.
-- **Window-function sorts cannot spill** (verified on ClickHouse 26.6: the
-  `MergeSortingTransform` feeding a window function runs into `max_memory_usage`
-  regardless of `max_bytes_before_external_sort`, code 241). So any `lagInFrame`-style
-  scan must bound its sort — the timestamp-order detector scans **per source**, no
-  case-wide `PARTITION BY source_id` — and keep sorted rows slim (fixed-width columns
-  only; `message` is hydrated afterwards). The 300M-row case OOMed on both counts.
+- **Every sort spills only because the clause turns ClickHouse's sort ratio off.**
+  Since 25.1, `max_bytes_ratio_before_external_sort` defaults to 0.5, and a sort then
+  spills only once the query *also* holds half of the server's free memory — normally
+  far above the per-query cap. With it on, `max_bytes_before_external_sort` never fired
+  and any sort larger than the cap died at it (code 241): a plain `ORDER BY` and the
+  sort under a window function alike. `_scan_settings_clause` emits
+  `max_bytes_ratio_before_external_sort = 0`, which makes the absolute threshold the one
+  that applies. The GROUP BY ratio is left on: it only ever *lowers* its absolute
+  threshold (verified on 26.6), so it adds protection rather than overriding the cap.
+  This doc used to say window sorts cannot spill at all; that was this ratio,
+  misread. `tests/test_scan_spill_clickhouse.py` runs a sort and an
+  `interval_periodicity`-shaped window several times larger than a small cap and
+  requires both to finish. Bounding a `lagInFrame` scan structurally is still worth it
+  — the timestamp-order and sequence detectors scan **per source**, and sorted rows stay
+  slim (fixed-width columns; `message` is hydrated afterwards) — because a smaller
+  sort writes fewer spill files, and reading them back costs memory per file.
 - **No-timestamp events are stored as a sentinel, not NULL.** `timestamp` is a
   non-Nullable sort-key column; events without a parseable timestamp carry
   `2299-12-31 23:59:59.999 UTC` (`NULL_TS_SENTINEL`) and are presented as `null` by
@@ -268,8 +278,7 @@ allowed only over a structurally bounded row set — otherwise the count is its 
 aggregate.** These five methods once got their totals from a frameless `OVER ()` in the
 paging statement, on the argument that the window holds only what the `ORDER BY`
 materialises anyway. That argument is wrong: a limit-aware sort keeps top-N, the window
-keeps *every* post-`GROUP BY` row, and window sorts cannot spill (`db/_scan.py`) where the
-`GROUP BY` beneath them can. Here it is worse than the general case — value novelty's
+keeps *every* post-`GROUP BY` row. Here it is worse than the general case — value novelty's
 `HAVING cnt <= rarity_floor` keeps the *rare* values, which on a field like `url` is nearly
 every distinct value in the corpus, and `queries.py::_field_terms_impl` records exactly
 this pattern dying at `max_memory_usage` on exactly the data the query existed for. The
@@ -1675,9 +1684,9 @@ Sequences are assembled entirely in SQL: a `lagInFrame` chain over a window
 - the whole run is reproducible from the recorded queries — no Python-side
   sequence assembly.
 
-Every scan runs **once per source** — window-function sorts cannot spill to
-disk (see [query-cost discipline](#query-cost-discipline-all-statistical-detectors)),
-so the sort must be bounded by one source. Counting stays case-wide:
+Every scan runs **once per source**, which bounds each window sort to one
+source (see [query-cost discipline](#query-cost-discipline-all-statistical-detectors)).
+Counting stays case-wide:
 per-source counts are summed per window in Python, and — because each
 source's scan can only rule out its *own* baseline — a cross-source
 verification pass drops any candidate n-gram that occurs in **any** source's
@@ -1908,7 +1917,7 @@ disposition note below), shrinking what's left to triage.
 **How it works.** Identical n-gram assembly to detector 9 — per source,
 events ordered by (effective) timestamp with record-order tie-breaks, a
 `lagInFrame` chain builds every run of **n consecutive values** of one
-grouping field, once per source (window-function sorts cannot spill; see
+grouping field, once per source (bounding each window sort; see
 [query-cost discipline](#query-cost-discipline-all-statistical-detectors)) —
 but with **no baseline/suspect split**: the whole scanned range is one
 window. Two passes per source:

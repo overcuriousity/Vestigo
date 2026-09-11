@@ -865,10 +865,19 @@ def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> 
     return (
         f"SETTINGS max_threads = {threads}, "
         f"max_bytes_before_external_group_by = {group_by_spill}, "
-        # Plain ORDER BY sorts spill at this threshold. Window-function sorts
-        # cannot spill at all (see docs/ANOMALY_DETECTION.md) — bound those
-        # scans structurally (per source / slim columns) instead.
+        # Every sort feeding this query spills at this threshold — ORDER BY and
+        # the sort under a window function alike — but only with the ratio
+        # below switched off. Since ClickHouse 25.1 it defaults to 0.5, and a
+        # sort then spills only once the query *also* holds half of the
+        # server's free memory: a number unrelated to this query's cap and
+        # normally far above it, so the spill never fired and the query died at
+        # the cap instead (code 241). That is how an 819 MiB interval_periodicity
+        # scan failed on a stock 26.6 server while this clause asked for a
+        # 409 MiB spill. The GROUP BY ratio is left alone on purpose: there it
+        # only ever *lowers* the threshold above (verified on 26.6), which is
+        # extra protection when the server is short of memory, not an override.
         f"max_bytes_before_external_sort = {sort_spill}, "
+        "max_bytes_ratio_before_external_sort = 0, "
         f"max_memory_usage = {budget}{tag}"
     )
 

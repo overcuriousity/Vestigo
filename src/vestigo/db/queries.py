@@ -2725,9 +2725,8 @@ class EventQueryService:
 
         Three deliberate details:
 
-        - **No window functions.** They cannot spill to disk (see
-          ``db/_scan.py``), and a frameless ``OVER ()`` materialises every
-          group besides — which is why ``field_terms`` no longer carries one
+        - **No window functions.** A frameless ``OVER ()`` materialises every
+          group — which is why ``field_terms`` no longer carries one
           either. Plain ``GROUP BY``/``ORDER BY`` under
           ``heavy_scan_settings()`` spills.
         - **Sentinel-safe times.** The no-timestamp storage sentinel is nulled
@@ -3353,8 +3352,8 @@ class EventQueryService:
         matching ``field_terms``' ranking exactly — while ``groupArrayIf``
         keeps sentinel buckets out of the plotted series, matching the old
         bucket scan's ``VESTIGO_NOT_SENTINEL_SQL`` predicate. No window functions:
-        those can't spill to disk (see ``_scan.py``), plain GROUP BY + ORDER
-        BY/LIMIT stay within ``foreground_scan_settings()``' memory budget.
+        plain GROUP BY + ORDER BY/LIMIT stay within
+        ``foreground_scan_settings()``' memory budget.
 
         The timestamp-range scan (when no explicit window is set) stays a
         separate query on purpose: the bucket grid must cover *all* filtered

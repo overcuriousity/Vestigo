@@ -4,9 +4,49 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-10 (1.19.4; session 232 — three field reports triaged: the converter suite's
-empty `src_ip`, a source delete that rewrote named timelines in silence, and the enricher
-"field picker" that never existed).
+Last updated: 2026-09-11 (1.19.5; session 233 — sorts never spilled on ClickHouse ≥ 25.1: the ratio
+setting that made `interval_periodicity` die at its cap on an airgapped 26.6 deployment).
+
+## Session 233 — 2026-09-11: the spill that was asked for and never fired
+
+**The report.** An airgapped v1.19.x full-docker stack, configured from the sizing guide:
+`interval_periodicity` against a baseline definition failed with code 241 at an 819.20 MiB
+cap, `while reading column attributes.key_src_ip`. 819.20 MiB is exactly
+`VESTIGO_STAT_SCAN_CONCURRENCY=4` on the reference 9.5 GiB ceiling. The query is unchanged on
+`main`, so an upgrade would not have helped.
+
+**Reproduced exactly** on the pinned `26.6.1.1193` binary with the events DDL and 30M synthetic
+events (~26M inside the windows): same message, same column, same cap. The documented
+explanation — window-function sorts cannot spill — fell over at the first control: a plain
+`ORDER BY` of the same rows died identically, even with `max_bytes_before_external_sort` at
+100 MiB. The server's trace named the cause: `SortingStep: Adjusting memory limit before
+external sort with 1.24 GiB (ratio: 0.5, available system memory: 2.47 GiB)`. Since 25.1,
+`max_bytes_ratio_before_external_sort` defaults to 0.5, and a sort then spills only once the
+query also holds half of the server's free memory — a number unrelated to the per-query cap
+and far above it. With the ratio at 0, the plain sort *and* the window sort spill, and the
+detector finishes at peak ~490 MiB.
+
+**The fix** is one line in `_scan_settings_clause`: `max_bytes_ratio_before_external_sort = 0`
+on every heavy and foreground scan. Verified end to end: the real `find_interval_periodicity`
+at a pinned 819.20 MiB cap over the 30M-event corpus fails in 4.6 s on the old clause and
+completes in 29.6 s on the new one. `tests/test_scan_spill_clickhouse.py` runs a sort (heavy
+and foreground clause) and an `interval_periodicity`-shaped `lagInFrame` several times larger
+than a 256 MiB cap; all three fail with 241 without the line.
+
+**The GROUP BY ratio is deliberately not zeroed.** A first cut zeroed both, on the assumption
+that aggregation was overridden the same way. A controlled probe (string keys, roomy cap,
+128 MiB threshold) spilled eight times with the ratio on and eight times with it off: for
+GROUP BY the ratio only *lowers* the absolute threshold, which is protection under memory
+pressure, not an override. What the GROUP BY tests did turn up is a separate, pre-existing
+headroom problem — a high-cardinality aggregation can die inside its own spill write at the
+cap ÷ 2 threshold — now a `ROADMAP.md` item rather than a guess at a new divisor.
+
+**Docs corrected.** Every "window sorts cannot spill" in `ANOMALY_DETECTION.md`, `config.py`,
+`settings_registry.py`, `queries.py` and `anomaly_stats.py` now says what bounding a window
+scan per source is actually for (fewer spill files; reading them back costs memory per file).
+The separate claim that a frameless `OVER ()` buffers every group was left alone: a quick probe
+of `count() OVER ()` over 20M rows passed under a 256 MiB cap, which neither confirms nor
+reproduces the production failure those comments describe.
 
 ## Session 232 — 2026-09-10: three bug reports, three different answers
 

@@ -51,6 +51,13 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   with `MEMORY_LIMIT_EXCEEDED` (session-223). Needs a floor to compare against (the rewrite
   is the binding query, not a detector GROUP BY) and copy naming the ceiling, not N, as the
   remedy. Documented in `docs/DEPLOYMENT.md` "The N trap" until then.
+- [ ] **GROUP BY spill thresholds leave too little headroom for the spill itself.**
+  `max_bytes_before_external_group_by` is clamped to cap ÷ 2, but on 26.6 a
+  high-cardinality GROUP BY dies *inside* `Aggregator::writeToTemporaryFile`: 20M UInt64
+  keys under a 256 MiB cap fail at thresholds of 128 and 64 MiB and pass only at 32 MiB
+  (a hash-table resize overshoots between checks, and serializing a bucket allocates on
+  top). Sorts are fine at cap ÷ 2 once their ratio is off. Needs measurement across key
+  types and realistic caps before picking a divisor — each halving doubles spill I/O.
 - [ ] **Per-timeline field scope for enrichers.** Analysts open the enrichers dialog
   expecting to choose which field gets enriched; there is no such control, and the dialog now
   says so. A real scope (an optional allow-list of attribute keys on `TimelineEnricher`)

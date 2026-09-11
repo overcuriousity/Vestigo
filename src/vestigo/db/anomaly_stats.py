@@ -1514,8 +1514,8 @@ def _ngram_inner_sql(
     form. ``None`` keeps the pre-D14 shape bit-identical. The value is an
     int inlined as a literal, same convention as the ``ngram - 1`` frame.
 
-    Callers must run the enclosing query **once per source** (window sorts
-    can't spill — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
+    Callers must run the enclosing query **once per source** (it bounds the
+    window sort — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
     and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
     """
     gram_lags = ", ".join(
@@ -1782,7 +1782,7 @@ class StatisticalAnomalyService:
         post-HAVING group, and the only way to get it inside the paging
         statement is a frameless ``count() OVER ()``. That window buffers
         every one of those groups in memory *after* the (spillable) GROUP BY
-        and **cannot spill** — see ``db/_scan.py`` and
+        and **cannot spill** — see
         :py:meth:`~vestigo.db.queries.EventQueryService._field_terms_impl`,
         where a top-N over a high-cardinality field died at
         ``max_memory_usage`` on exactly the data the query existed for. Here
@@ -6371,9 +6371,8 @@ class StatisticalAnomalyService:
         ``PARTITION BY source_id, w_idx`` window), so an n-gram never mixes
         events from different sources, never spans a window boundary, and the
         whole run is reproducible from the recorded queries. Every scan runs
-        **once per source** — ClickHouse cannot spill window-function sorts
-        to disk (see docs/ANOMALY_DETECTION.md), so the sort must be bounded
-        by one source; a case-wide query OOMs on 100M+-row cases. Counting
+        **once per source**, which bounds each window sort to one source
+        (see docs/ANOMALY_DETECTION.md). Counting
         stays case-wide: per-source counts are summed per window in Python,
         and a candidate n-gram survives only if **no** source's baseline
         contains it (cross-source verification pass). Multi-writer sources
@@ -6646,7 +6645,7 @@ class StatisticalAnomalyService:
            *max_candidates* (cap hit → warning). Merged across sources in
            Python (supports summed, earliest occurrence wins).
         2. *Cadence* (top *cadence_top_k* merged candidates only — bounds the
-           ``PARTITION BY gram`` window sort, which cannot spill): aggregate
+           ``PARTITION BY gram`` window sort): aggregate
            the deltas between consecutive occurrence start-times per gram —
            count/mean/stddev/median/Σδ² — never ``groupArray`` (unbounded).
            Consecutive occurrences of a motif overlap by ``ngram - 1``
@@ -7191,13 +7190,13 @@ class StatisticalAnomalyService:
                 baseline_size=0,
             )
 
-        # One window scan per source, never one case-wide PARTITION BY scan:
-        # ClickHouse (verified on 26.6) cannot spill the sort feeding a window
-        # function to disk — MergeSortingTransform runs into max_memory_usage
-        # regardless of max_bytes_before_external_sort — so sorting a 300M-row
-        # case in one query OOMs (code 241). A per-source scan bounds the sort
-        # to one source, and only slim fixed-width columns travel through it;
-        # `message` is hydrated afterwards for just the reported rows.
+        # One window scan per source, never one case-wide PARTITION BY scan: a
+        # per-source scan bounds the sort to one source, and only slim
+        # fixed-width columns travel through it; `message` is hydrated
+        # afterwards for just the reported rows. (A 300M-row case once OOMed
+        # here in one query, code 241, which was put down to window sorts being
+        # unable to spill. They can; the symptom matches the sort-spill ratio
+        # `_scan_settings_clause` now turns off. A smaller sort still spills less.)
         # `select_cols` ends with a trailing comma when non-empty.
         def _source_inner(select_cols: str) -> str:
             return f"""

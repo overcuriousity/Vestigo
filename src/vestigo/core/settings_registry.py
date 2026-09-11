@@ -622,7 +622,7 @@ _SPECS: tuple[SettingSpec, ...] = (
         "stat_scan_external_sort_bytes",
         "scans",
         "ORDER BY spill threshold (bytes)",
-        "Bytes after which a plain sort spills to disk (window sorts cannot spill).",
+        "Bytes after which a sort spills to disk — ORDER BY and window-function sorts alike.",
     ),
     SettingSpec(
         "stat_scan_max_memory_bytes",
