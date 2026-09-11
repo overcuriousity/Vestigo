@@ -21,11 +21,16 @@ lands in `remote_ident`, and the vhost-stripping fallback never runs because the
 `%h` fails every arm and drops the row outright — counted in the converter's own summary,
 invisible once the CSV is ingested.
 
-Fixed upstream and re-vendored at `441c75b` (1.4.0) as 1.19.4: both converters emit
+Fixed upstream and re-vendored at `8dd67db` (1.4.1) as 1.19.4: both converters emit
 `client_host` (the `%h` token as logged, always populated) and populate `src_ip` only
 when it validates, the address slot accepts a comma-joined chain and resolves to its
 leftmost entry, and Apache's vhost fallback re-runs whenever the first parse found no
 address. The dropped-row case now parses; every previously-correct row is byte-identical.
+The first cut of that chain pattern, `\S+(?:,\s*\S+)*`, reached upstream master before CodeQL
+flagged it on the re-vendor PR: `\S` matches the comma, so element and separator overlap and a
+line of repeated `!,` backtracks exponentially — 95 ms at 20 repetitions, ×4 per two more, on
+input written by whoever sends a request. Each element is `[^\s,]+` in 1.4.1 (0.6 ms on a
+10 kB witness). No local test would have caught it; the scanner did.
 
 Blast radius, surveyed across all 28 vendored converters: the split is between
 `normalize_ip(x) or x` (haproxy, w3c, exchange, conntrackd — keeps the raw value) and bare
