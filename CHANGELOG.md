@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.5] — 2026-09-11
+
+### Fixed
+
+- **Detector scans spill to disk instead of dying at their memory cap.** On ClickHouse
+  25.1 and later — including the 26.6 the reference and airgapped stacks ship — a scan
+  that needed to sort more than its per-query `max_memory_usage` failed with
+  `MEMORY_LIMIT_EXCEEDED` (code 241) rather than spilling, however the stack was sized.
+  Since 25.1, `max_bytes_ratio_before_external_sort` defaults to 0.5, and a sort then spills
+  only once the query also holds half of the server's free memory: a threshold unrelated to
+  the per-query cap and normally far above it, so the `max_bytes_before_external_sort` every
+  scan already set never fired. Every heavy and chart scan now sets that ratio to 0, so the
+  app's own threshold applies. Reported on `interval_periodicity` against a baseline
+  definition (819 MiB cap, `while reading column attributes.key_src_ip`); reproduced exactly
+  on 26.6.1.1193, and the same detector over the same 30M-event corpus now completes at that
+  cap. It affected every sort under a scan — plain `ORDER BY` and the sort beneath a window
+  function alike, so the sequence, motif and timestamp-order detectors too. GROUP BY was
+  never affected: its ratio only lowers the absolute threshold, and it is left as it was.
+  **No configuration change is needed.**
+
+  The documentation said window-function sorts cannot spill at all; that was this setting,
+  misread, and the reference docs now say so. A GROUP BY over a very high-cardinality key can
+  still hit the cap while writing its own spill file — a separate issue, tracked in
+  `ROADMAP.md`.
+
 ## [1.19.4] — 2026-09-10
 
 ### Fixed
