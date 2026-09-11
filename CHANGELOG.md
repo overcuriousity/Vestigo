@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.6] — 2026-09-11
+
+### Fixed
+
+- **Enrichment applies no longer fail on large sources, whatever the memory cap.** The
+  partition rewrite's `grace_hash` join never split into buckets — `max_bytes_in_join` was
+  unset — and ClickHouse's `query_plan_join_swap_table = auto` chose the full-width `events`
+  rows as its in-memory side, so the rewrite's footprint grew with the source: 4M events
+  failed at a 4 GiB cap, and an airgapped 26.6 stack failed at 819 MiB (`While executing
+  FillingRightJoinSide`). The join now spills in buckets of a quarter of the per-query cap and
+  keeps the narrow staged maps in memory: ~800 MiB peak at a 1 GiB cap on 2M and 4M events
+  alike.
+- **Charset novelty learns high-cardinality fields under its cap.** Every learning scan
+  (whole scope, per group, baseline window, and the fallback) read distinct values through
+  `SELECT DISTINCT`, which cannot spill, and the self-baseline ones took the distinct total
+  from a frameless `count() OVER ()` that buffered every value's characters. Three million
+  distinct query strings failed at 256–512 MiB in every mode; the learning pass is now a
+  `GROUP BY` that spills, with the total counted off a marker character in the same scan.
+  Findings are unchanged.
+- **The "routine events collapsed" count no longer holds an entry per muted event.** It ran on
+  every Explorer page with collapse on, carried no per-query cap, and took the union of muted
+  templates and routine motifs as an exact distinct set of event ids — a muted heartbeat on a
+  large case spent the server's memory ceiling, not a query's. It is now inclusion–exclusion
+  over a plain count and the small motif-membership table; three million muted events count
+  under a 32 MiB cap.
+- **Field-stats cache fills queue for a heavy scan slot.** Every uncached source was computed
+  at once, each with whole-source scans at the full heavy cap and no admission slot, so a case
+  with many uncached sources (after an upgrade, an import) stacked caps on top of admitted
+  sweeps. Each source's computation now holds a heavy slot.
+- **The sizing calculator sizes scans from measurement, and stops recommending the N trap.**
+  - Scan memory was modelled as 12 MiB per million events. That sized a 32M-event scan at
+    1.5 GiB, where 2 GiB was measured to fail, and a 10B-event scan at 117 GiB.
+  - It now follows the heaviest detector's measured peak, which grows with log2(events)
+    because its sort spills: 0.97 GiB at 2M events, 2.36 GiB at 32M.
+  - "Max for your hardware" no longer adds slots past the point where a scan of your largest
+    timeline fits. On 96 GiB and 20 cores at 1B events it recommended ten 3.4 GiB slots; it
+    now recommends six 5.2 GiB slots.
+  - The events slider reaches 10B events.
+  - With ClickHouse on its own host, it no longer tells you to pin
+    `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`: the app reads ClickHouse's ceiling over its
+    connection on every deployment shape.
+
 ## [1.19.5] — 2026-09-11
 
 ### Fixed
