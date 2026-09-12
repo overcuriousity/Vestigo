@@ -33,6 +33,8 @@ from vestigo.api.main import create_app
 from vestigo.core import security
 from vestigo.core.config import get_settings
 from vestigo.core.login_backoff import reset_login_backoff
+from vestigo.db import _scan
+from vestigo.db.clickhouse import _EVENT_COLUMNS, ClickHouseStore
 from vestigo.db.postgres import PostgresStore, User
 
 # Embeddings ship *off* (core/config.py::embeddings_enabled): a stock install
@@ -381,6 +383,22 @@ async def store(pg_database, request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_server_settings_probe(monkeypatch):
+    """Keep the once-per-process ``system.settings`` probe out of the suite.
+
+    ``ClickHouseStore.init_schema`` asks the server which version-dependent scan
+    settings it knows, once per process. Under test the first ``init_schema`` is
+    as likely to run against a recording fake as against ClickHouse, and a fake's
+    canned rows read as "the server knows none of them" — which then strips both
+    settings from every clause for the rest of the run. Every server the suite
+    targets knows them, so each test starts from "send all"; the probe's own
+    tests switch it back on.
+    """
+    monkeypatch.setattr("vestigo.db.clickhouse._versioned_settings_probed", True)
+    monkeypatch.setattr(_scan, "_unsupported_settings", frozenset())
+
+
+@pytest.fixture(autouse=True)
 def transfer_temp(tmp_path, monkeypatch):
     """Point export archives at the test's tmp dir.
 
@@ -572,3 +590,83 @@ def builds(monkeypatch, seeds_on_login):
 
     monkeypatch.setattr(demo_mod, "build_demo_case", _fake_build)
     return calls
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse scan-memory tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def cap_scan(monkeypatch):
+    """Pin the heavy scan cap, and optionally its thread width, for one test.
+
+    Returns ``cap(memory_bytes, *, threads=None)``. Every settings clause is
+    derived from the two probes this patches: ``heavy_scan_settings`` carries
+    them as they are, ``foreground_scan_settings`` half the cap and half the
+    width (``db/_scan.py``), so one call bounds whichever clause the code under
+    test carries. Threads are pinned on request only: per-thread read buffers
+    scale with the server's core count and part layout, and a cap sized to
+    measure what grows with the rows must not measure those instead — but a
+    test whose margin is wide enough can leave the probe's own answer alone.
+    """
+
+    def cap(memory_bytes: int, *, threads: int | None = None) -> None:
+        monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: memory_bytes)
+        if threads is not None:
+            monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: threads)
+
+    return cap
+
+
+#: Default column expressions for :func:`insert_generated_events`: a neutral
+#: constant per column, and ``number`` where the row must be distinct.
+_GENERATED_EVENT_DEFAULTS = {
+    "event_id": "generateUUIDv4(number)",
+    "source_file": "'generated.log'",
+    "byte_offset": "number",
+    "line_number": "number",
+    "content_hash": "repeat('0', 64)",
+    "file_hash": "repeat('0', 64)",
+    "parser_name": "'generated'",
+    "parser_version": "'1'",
+    "ingest_time": "now64(3)",
+    "message": "'event'",
+    "timestamp": "toDateTime64('2026-01-01 00:00:00', 3) + number",
+    "timestamp_desc": "'Event'",
+    "artifact": "'generated'",
+    "artifact_long": "'Generated'",
+    "display_name": "'Generated'",
+    "tags": "[]",
+    "attributes": "map()",
+    "embedding_model": "''",
+    "embedding_config_hash": "repeat('0', 64)",
+}
+
+
+def insert_generated_events(
+    store: ClickHouseStore, *, case_id: str, source_id: str, n: int, **columns: str
+) -> None:
+    """Insert ``n`` events for one source, generated server-side from ``numbers(n)``.
+
+    Millions of rows in one ``INSERT ... SELECT`` rather than a client-side
+    batch loop, with one expression per column in ``_EVENT_COLUMNS`` order.
+    Each keyword is a column name and a ClickHouse expression over ``number``;
+    every other column takes a neutral constant (one message, timestamps a
+    second apart from 2026-01-01, an empty attribute map — see
+    ``_GENERATED_EVENT_DEFAULTS``). ``case_id``/``source_id`` are quoted as
+    given. The column list comes from the store's own, so a schema change
+    fails here rather than in three copies of a 21-name string.
+    """
+    unknown = set(columns) - set(_EVENT_COLUMNS)
+    assert not unknown, f"not event columns: {sorted(unknown)}"
+    exprs = {
+        **_GENERATED_EVENT_DEFAULTS,
+        "case_id": f"'{case_id}'",
+        "source_id": f"'{source_id}'",
+        **columns,
+    }
+    store.client.command(
+        f"INSERT INTO {store.database}.events ({', '.join(_EVENT_COLUMNS)}) "
+        f"SELECT {', '.join(exprs[column] for column in _EVENT_COLUMNS)} FROM numbers({n})"
+    )

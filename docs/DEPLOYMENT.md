@@ -388,7 +388,12 @@ slots are part of the same total.
   caches or allocator slack, and the kernel is the only backstop. Mount `memory.xml` and set
   a container limit. The budget still uses the derived ceiling, capped by what the *app's*
   container can see — two guesses, so the lower one — which is what `budget_ceiling_bytes`
-  reports when it differs from `clickhouse_ceiling_bytes`.
+  reports when it differs from `clickhouse_ceiling_bytes`, and no caches are subtracted from
+  it. With ClickHouse on its own host that cap is the app host's RAM, not the ClickHouse
+  host's: a 4 GiB app container beside an unpinned 96 GiB ClickHouse host grants ~0.8 GiB
+  per query. If that host's `memory.xml` cannot be pinned, pin
+  `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` to the scan budget the [sizing
+  calculator](https://overcuriousity.github.io/Vestigo/sizing/) computes for it instead.
 
 `max_threads` is per-*heavy*-scan thread width; the chart lane derives its own from it (above,
 and `foreground.max_threads` in the same block). At `VESTIGO_STAT_SCAN_MAX_THREADS=0` (default)
@@ -438,6 +443,20 @@ in `enrichers/jobs.py::_apply_staged_rows`. The job log reads `failed after cove
 sources; 0 source(s) left unenriched` — the scan and the staging completed, only the apply
 did not, so the derived values sit in the scratch table and `events` is untouched. Nothing is
 corrupt; re-run the enrichment once the cap is raised.
+
+The rewrite's footprint no longer grows with the source. Its `grace_hash` join used to hold
+its entire build side in memory — `max_bytes_in_join` was unset, so it never split into
+buckets, and ClickHouse's `query_plan_join_swap_table = auto` chose the full-width `events`
+rows as that side — so a large source failed at any cap (4M events still failed at 4 GiB; the
+production report was an 819 MiB cap, `While executing FillingRightJoinSide`). The join now
+spills in buckets of a quarter of the cap and holds the narrow staged maps in memory, and
+peaks around 800 MiB at a 1 GiB cap on 2M and 4M events alike. It still has a floor: 512 MiB
+failed. That floor, not a detector `GROUP BY`, is why a cap in the hundreds of MiB is too small.
+
+On a ClickHouse older than 24.12, `query_plan_join_swap_table` does not exist and the app
+leaves it out (together with `max_bytes_ratio_before_external_sort`, from the same release):
+it asks the server once which of the two it knows. There the planner never swaps join sides
+to begin with, so the rewrite keeps the same shape.
 
 **`risk` will not warn you about this.** `scan_budget_report` asks whether the aggregate
 (`total_bytes + cache_bytes`) fits under the ceiling — at N = 10 it still does, exactly as it

@@ -4,8 +4,200 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-11 (1.19.5; session 233 — sorts never spilled on ClickHouse ≥ 25.1: the ratio
-setting that made `interval_periodicity` die at its cap on an airgapped 26.6 deployment).
+Last updated: 2026-09-12 (1.19.6; session 236 — the second review of PR #376: the one
+cache fill that should never 503, two tray phases, and scan settings an older ClickHouse
+refuses; plus the open dependabot PRs folded into the release).
+
+## Session 236 — 2026-09-12: the second review round, and the dependency bumps
+
+A second review of PR #376 reported five findings (one medium, four low); each was checked
+against the branch before it was fixed, and all five were real.
+
+**One cache fill is an optimization, not the answer.** Session 235 routed every interactive
+field-stats fill through `ensure_field_stats_for_request` so a full gate answers 503. That is
+right wherever the cache *is* the answer, and wrong for `viz.get_field_terms`, whose live
+fallback runs on the foreground lane: a miss behind a sweep turned an answerable chart into a
+retry loop. It now catches `ScanBusyResponse` and goes live; a disconnect still propagates.
+The busy path skips `merged_field_terms` rather than passing it `{}` — empty stats read as
+"zero coverage" and would have answered a chart with no values.
+
+**Phases.** `_run_ingestion_job` is shared with the convert-and-ingest job, whose phase map had
+no `field_stats` key, so the tray went blank exactly where the phase was added; the key is
+there now. `_apply_staged_rows` set the phase per source and never cleared it (`JobStore.update`
+merges), labelling each later partition rewrite as field statistics; a `finally` clears it.
+
+**Settings an older server refuses.** `query_plan_join_swap_table` *and* the 1.19.5
+`max_bytes_ratio_before_external_sort` first appear in 24.12 (`system.settings_changes` on
+26.6), and ClickHouse rejects an unknown setting, so every scan failed on an older server. The
+review named only the first. The clause still carries both — the forward-looking reason for
+keeping the JOIN bound in every clause stands — but `ClickHouseStore.init_schema` probes
+`system.settings` once per process and `_scan.configure_server_settings` drops the ones the
+server lacks, which on such a server is already their effect. An unreadable probe records
+nothing and sends both. The probe lives in `init_schema` rather than the startup probe in
+`api/main.py` because the CLI never runs the latter. Under test, the first `init_schema` can be
+a recording fake whose canned rows read as "knows none" and stripped both settings for the
+rest of the run (it failed `test_every_scan_clause_bounds_a_join_from_its_own_cap`), so an
+autouse fixture pins the probe off; its own tests switch it on.
+
+**Motif cleanup.** `delete_source_events` returned inside its `UNKNOWN_TABLE` branch, skipping
+the side-table delete in the one case it most applies to, and the helper did not
+`init_schema()` like its sibling, so a never-created table logged a traceback per delete.
+
+**Dependencies.** The twenty open dependabot PRs are folded into this branch rather than merged
+one by one (they all touch the same two lockfiles). Two did not apply as written: #363 pinned
+`httpcore2` 2.10.0, which `httpx2` 2.12.0 (#362) does not accept, so it resolved to 2.12.0; and
+vitest 5 (#375) needs `@vitest/ui` at the same version and no longer bridges jest-dom's global
+`jest.Matchers` augmentation into `Assertion` — `tsc` failed on 300 matcher calls while every
+test passed at runtime. The setup file now imports `@testing-library/jest-dom/vitest`.
+
+## Session 235 — 2026-09-12: reviewing the 1.19.6 branch before it merges
+
+A multi-agent review of PR #376 (session 234's work) verified 24 findings — ten bugs, fourteen
+cleanups — and every one was fixed on the branch. What the review found, and what changed:
+
+**The field-stats gate moved the problem rather than removing it.** Holding a heavy slot in
+`compute_source_field_stats` was right; where it was waited on was not.
+- Every interactive caller of `ensure_source_field_stats` (Explorer field list, export
+  columns, the anomaly field inventory, Visualize terms and fields, the analysis plan, mapping
+  validation, field coverage) parked *indefinitely* on a gate full of sweeps — outside any scan
+  context, so neither bounded (no 503) nor released on disconnect. Two of them carried comments
+  promising no heavy slot at all.
+- One `asyncio.to_thread` per miss, each now parked, pinned the process's default executor:
+  thirty misses on an eight-core host took every thread from ingest, enrichment and import.
+- The post-ingest, enrichment, import and demo-seed refreshes all park their job in `running`
+  after the source is already browsable, with nothing saying why.
+- Now: `_scan.gated_heavy_scan` is the one decorator for the heavy class (hoisted from
+  `anomaly_stats`; the gate is looked up at call time so tests patch one binding), with
+  `bounded_heavy_wait(seconds)` as the mirror of `unbounded_foreground_wait`. Request handlers
+  fill through `api/scan_exec.ensure_field_stats_for_request`: `run_scan` (cancellable) under a
+  five-second bound, answering the same 503-with-queue-depth a full chart lane does. Jobs keep
+  the unbounded wait and report a `field_stats` phase the tray names ("queued behind running
+  scans"). Fills run at most `gate_size()` at a time, per call. `_resolve_mapping_validation_keys`
+  takes an explicit `interactive` flag because the post-ingest re-validation inherits the
+  upload request's context and must not be bounded.
+
+**The blast-radius survey missed one.** `find_entropy_outliers` learned its band over
+`SELECT DISTINCT` on the same auto-selected free-text fields the charset learner scans — the
+shape the survey had just removed. Now a `GROUP BY`; `test_entropy_memory_clickhouse.py`
+(3M distinct values, 256 MiB, four threads) is red on the old shape.
+
+**The rewritten routine count.** Its docstring diagnosed the missing per-query cap and the
+new query still had none. `count_routine_collapsed` and its two helpers now carry
+`foreground_scan_settings()` (a bound, not a reservation — no slot), so the CHANGELOG's 32 MiB
+describes production. The three code paths collapsed to one query (empty `IN []` is pruned by
+the bloom index; verified on 26.6). `delete_source_events` now drops the source's
+`motif_occurrences` rows: the source id is derived from the file hash, so a re-ingest brought
+stale rows back into scope where they counted as collapsed and hid nothing. The one-row-per-
+`event_id` assumption the count makes is documented where it is made; the CLI's re-ingest path
+that violates it is slated for deprecation, not fixed.
+
+**The calculator.** The minimum sized scans at a fixed four-thread width while the runtime
+runs `cores // N` wide, so a host with more than 5×N cores that met the minimum ran hungrier
+scans than the minimum's cap — the row now names the width and defers a specific host to the
+right-hand column. The verdict said "Sufficient" while admitting fewer slots than the minimum
+asked for (60 GiB / 12 cores at 1B events: 1 of 6.7 GiB against 2 of 5.1 GiB); it now has its
+own wording and a test. The split-host copy said to leave auto alone unconditionally, but an
+*unbounded* remote ceiling is clamped by the app host's RAM with no cache subtraction — the
+copy, `config.py` and `DEPLOYMENT.md` now state the bounded condition and the pin fallback.
+The measured points are data in `gen_sizing_constants.py` and the fit is computed (the
+intercept had been hand-rounded by ~2 MiB).
+
+**Cleanups.** The JOIN bounds (`max_bytes_in_join`, `join_algorithm`, swap off) live in
+`_scan_settings_clause` beside the GROUP BY and sort thresholds, so every clause carries them
+and a fan-out divides them with the cap. The two baseline-window charset learns reuse
+`_alphabet_sql`, which is two SELECTs (window over the aggregate, `QUALIFY`) instead of four;
+one `_DISTINCT_CHARS_SQL` constant. `maximumPlan` uses `budgetFor`. The three memory tests share
+`conftest.insert_generated_events` (built from `_EVENT_COLUMNS`) and `cap_scan`; a `slow`
+marker leaves them out of a quick local run (CI runs everything; a `setup-node` step and a
+CI-only failure replace the silent Node skip). `tests/test_version_parity.py` checks all five
+version files and `scripts/bump_version.py` edits them. The two open decisions live in
+`ROADMAP.md`, where the backlog is.
+
+## Session 234 — 2026-09-11: what the 1.19.5 production stack was still failing on
+
+**The report.** A diagnostics bundle from the same airgapped 26.6 stack, now on 1.19.5, still
+full of code 241. Two misconfigurations sat underneath everything:
+- ClickHouse's container had 64 GiB, but `memory.xml` still pinned the reference 9.5 GiB — the
+  trap `DEPLOYMENT.md` already describes.
+- `VESTIGO_STAT_SCAN_CONCURRENCY=4` then cut that into 819 MiB per query.
+
+The bundle's two post-upgrade failures were not config alone, though:
+- One `interval_periodicity` scan spilled 48 files and died merging them back at that cap.
+- Every enrichment apply died in `FillingRightJoinSide`.
+
+**The enrichment rewrite never spilled.** Reproduced on the pinned binary:
+- The `grace_hash` join splits into buckets only past `max_bytes_in_join`, which was unset (0 =
+  never), and `query_plan_join_swap_table = auto` put the full-width `events` rows on the
+  in-memory side (EXPLAIN: `Type: RIGHT`, events as the right table).
+- Memory grew with the source: 2M events failed at 1, 2 and 4 GiB; 4M failed at 4 GiB.
+- `max_bytes_ratio_before_external_join` was a red herring — setting it changed nothing; it only
+  converts hash joins to grace.
+- Fix, in the scan settings clause itself (session 235 moved it there from a helper the one
+  call site used): bucket at a quarter of the cap, swap off, so the
+  narrow staged maps are the build side. ~800 MiB at a 1 GiB cap on 2M and 4M events alike,
+  output verified row for row.
+- Swap-off is not what makes it pass (the bucket limit alone passed). It is what keeps a
+  billion-event source inside `grace_hash_join_max_buckets` (1024).
+
+**Blast radius.** A survey of every ClickHouse query for memory that escapes the per-query spill,
+each finding checked against the code and the server before acting on it:
+- **Charset novelty** learned every alphabet through `SELECT DISTINCT` (a set that cannot spill)
+  under a frameless `count() OVER ()` (buffers every distinct value). Three million distinct
+  values failed in every mode.
+  - Now a `GROUP BY`, with the distinct total counted off an empty-string marker (`extractAll`
+    never yields an empty match); column shape unchanged, so the Python loop and mock tests are
+    untouched.
+  - Verified identical per-character counts and totals against the old SQL.
+- **`count_routine_collapsed`** — no settings clause, runs on every collapsed Explorer page —
+  held `uniqExact` over every muted event's id: 1 GiB for 20M ids, charged to the server's
+  ceiling. Now inclusion–exclusion (`|T| + |M| − |T∩M|`), exact because `event_id` is one row's
+  provenance hash.
+- **`ensure_source_field_stats`** gathered every cache miss with no gate slot, each a set of
+  full-cap scans. `compute_source_field_stats` now holds a heavy slot; no caller holds one, so it
+  cannot self-deadlock.
+- **Not bugs, on measurement:**
+  - The top-level `uniqExact` inventory columns are LowCardinality.
+  - Window scans with explicit frames spill (already tested).
+  - The grouped charset violation scan needs ~450 MiB at four threads over 3M rows with 20
+    groups *and* with 2000 — not the group-count scaling its per-row constant arrays suggested.
+
+**The sizing calculator was sized on a guess.** Its scan requirement was 12 MiB per million
+events. Measured instead — smallest cap each corpus completed under, heavy clause, five threads:
+
+| Events | window-sort peak (passing cap) | high-cardinality GROUP BY peak (passing cap) |
+|---|---|---|
+| 2M | 0.97 GiB (1 GiB) | 401 MiB (512 MiB) |
+| 4M | 1.21 GiB (2 GiB) | 718 MiB (1 GiB) |
+| 8M | 1.39 GiB (2 GiB) | 714 MiB (1 GiB) |
+| 16M | 1.97 GiB (2 GiB) | 991 MiB (1 GiB) |
+| 32M | 2.36 GiB (4 GiB) | 1.24 GiB (2 GiB) |
+
+10 and 20 threads at 16M needed a cap one step higher than 5 threads did.
+
+Memory follows log2(events), because the sort spills; spill disk and runtime follow events
+(11.8 GiB and 45 s per field at 32M). The calculator now:
+- Uses a least-squares log model of that table: `scanNeed()` in the page, `scan_memory_model`
+  in the generator, with provenance.
+- Walks N down from the core bound until a slot fits the corpus's need at the width N leaves.
+  It used to divide by a fixed 2 GiB floor, which recommended ten 3.4 GiB slots for a
+  5 GiB-per-scan timeline.
+- Has an events slider reaching 10B.
+- No longer tells a split-host deployment to pin the budget (the app's probe asks ClickHouse
+  over its own connection).
+
+`tests/test_sizing_calculator_behavior.py` runs the page's JavaScript under Node and asserts its
+recommendations against the measurements.
+
+**Every fix went red first** on the committed code:
+- `test_enrichment_apply_memory_clickhouse` (1 GiB, 2M events)
+- `test_charset_memory_clickhouse` (256/512 MiB, 3M distinct values; red against a stash of the
+  old SQL)
+- `test_routine_collapse_memory_clickhouse` (32 MiB, 3M muted events)
+- `test_field_stats_admission_clickhouse` (peak in-flight 2 → 1)
+- the calculator tests
+
+Two things measured and left alone — the per-key `uniqExact` in the field-stats cache, and
+the calculator's missing spill-disk line — are Milestone 3 items in `ROADMAP.md`.
 
 ## Session 233 — 2026-09-11: the spill that was asked for and never fired
 

@@ -36,7 +36,12 @@ from vestigo.core.config import get_settings
 from vestigo.db._arrow_schema import EVENT_ARROW_SCHEMA
 from vestigo.db._columns import decode_fixed_string_columns
 from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
-from vestigo.db._scan import HEAVY_SCAN_GATE, acquire_scan_slot, heavy_scan_settings
+from vestigo.db._scan import (
+    HEAVY_SCAN_GATE,
+    acquire_scan_slot,
+    foreground_scan_settings,
+    heavy_scan_settings,
+)
 from vestigo.db._template import template_hash_expr
 from vestigo.models.event import Event
 
@@ -232,6 +237,43 @@ def _events_to_record_batch(events: list[Event]) -> pa.RecordBatch:
     return pa.RecordBatch.from_pydict(columns, schema=EVENT_ARROW_SCHEMA)
 
 
+#: Set once per process by the first :func:`_probe_versioned_settings`.
+_versioned_settings_probed = False
+
+
+def _probe_versioned_settings(client: Any) -> None:
+    """Tell ``db/_scan.py`` which of its version-dependent settings this server knows.
+
+    Once per process, from the first ``init_schema`` — which runs before every
+    scan path, the CLI's and the tests' included, where the startup probe in
+    ``api/main.py`` does not. A failed read of ``system.settings`` records
+    nothing, which keeps sending every setting: no answer is not evidence that
+    the server lacks one. See :data:`vestigo.db._scan.VERSIONED_SETTINGS`.
+    """
+    global _versioned_settings_probed  # noqa: PLW0603
+    if _versioned_settings_probed:
+        return
+    from vestigo.db._scan import VERSIONED_SETTINGS, configure_server_settings
+
+    _versioned_settings_probed = True
+    try:
+        rows = client.query(
+            "SELECT name FROM system.settings WHERE name IN {names:Array(String)}",
+            parameters={"names": list(VERSIONED_SETTINGS)},
+        ).result_rows
+    except Exception:  # noqa: BLE001 — an unreadable system table must not block a scan
+        logger.warning("could not read system.settings; sending every scan setting", exc_info=True)
+        return
+    present = {row[0] for row in rows}
+    configure_server_settings(present)
+    if missing := sorted(set(VERSIONED_SETTINGS) - present):
+        logger.warning(
+            "ClickHouse does not know %s (added in 24.12); scans leave them out, "
+            "which on this server is already their effect",
+            ", ".join(missing),
+        )
+
+
 class ClickHouseStore:
     """Sync ClickHouse client for event data."""
 
@@ -320,6 +362,7 @@ class ClickHouseStore:
         self._ensure_template_hash()
         self.client.command(_MOTIF_OCCURRENCES_DDL.format(database=self.database))
         self._schema_ready = True
+        _probe_versioned_settings(self.client)
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
         # databases are documented as deprecated and the data is derived —
@@ -541,7 +584,8 @@ class ClickHouseStore:
 
         The "N routine events collapsed" number: distinct because occurrences
         of one motif overlap by ``ngram - 1`` events, and two routine motifs
-        can share events.
+        can share events. Capped like the other counts here — see
+        :meth:`count_routine_collapsed` for why a count carries a cap at all.
         """
         if not disposition_ids:
             return 0
@@ -554,7 +598,7 @@ class ClickHouseStore:
         result = self.client.query(
             f"SELECT uniqExact(event_id) FROM {self.database}.motif_occurrences "
             "WHERE case_id = {cid:String} AND has({dids:Array(String)}, disposition_id)"
-            + source_pred,
+            f"{source_pred} {foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -567,7 +611,8 @@ class ClickHouseStore:
 
         Unlike motif occurrences, membership needs no side table — it's a
         direct predicate on the materialized ``template_hash`` column — so
-        this is a plain count, not a lookup against an aux table.
+        this is a plain count, not a lookup against an aux table. Capped like
+        the other counts here — see :meth:`count_routine_collapsed`.
 
         The template predicate is written ``template_hash IN {ths}``, not the
         ``has({ths}, template_hash)`` form used everywhere else in this file.
@@ -590,7 +635,8 @@ class ClickHouseStore:
             source_pred = " AND has({sids:Array(String)}, source_id)"
         result = self.client.query(
             f"SELECT count() FROM {self.database}.events "
-            "WHERE case_id = {cid:String} AND template_hash IN {ths:Array(UInt64)}" + source_pred,
+            "WHERE case_id = {cid:String} AND template_hash IN {ths:Array(UInt64)}"
+            f"{source_pred} {foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -609,32 +655,71 @@ class ClickHouseStore:
         would double-count an event that is both a motif-occurrence member
         *and* carries a muted template — the grid excludes it on either
         predicate matching (an OR at the set level), so the reported count
-        must be the union's cardinality, not the sum. One UNION ALL query
-        (deduped by ``uniqExact``) over both sources is the union count.
+        must be the union's cardinality, not the sum.
+
+        Taken by inclusion–exclusion rather than as ``uniqExact`` over both
+        branches' ids: ``|T| + |M| − |T ∩ M|``. The muted side ``T`` is a plain
+        count over ``events``, so the only set held in memory is the
+        motif-occurrence membership ``M``, a side table bounded per disposition
+        (``resolve_motif_occurrences`` writes at most 500k rows each). The id
+        set this replaced held one entry per *muted* event: a muted heartbeat
+        on a billion-event case, on every Explorer page with collapse on.
+
+        One query for every combination of arguments: an empty template list
+        makes ``template_hash IN []`` read nothing (the bloom-filter skip index
+        prunes every granule, verified on 26.6), and an empty disposition list
+        makes both motif terms zero. Only "nothing is collapsed at all" skips
+        the round-trip, since the answer is known.
+
+        **Assumes one ``events`` row per ``event_id``.** ``|T|`` and the
+        intersection are row counts while ``|M|`` is distinct ids, so a
+        duplicated event row would put the badge off by one from both the
+        rows the grid hides and the distinct events behind them. Nothing in
+        the schema enforces the assumption (plain ``MergeTree``, no insert
+        deduplication): it holds because ``event_id`` is derived from the row's
+        provenance and every API ingest refuses a source whose file hash is
+        already present and drops the partition of a failed one. ``vestigo
+        ingest`` on the CLI performs neither check, and re-running it inserts
+        every event twice — it is slated for deprecation rather than fixed.
+
+        Carries the foreground cap, like its two helpers. Bounded by
+        construction as it is, the cap is a bound and not a reservation — no
+        gate slot is taken — so an unforeseen growth (a side table that
+        outlived its dispositions, say) fails this one query at the cap rather
+        than spending the server's ceiling on an Explorer page load.
         """
-        if not motif_disposition_ids and not template_hashes:
+        dispositions = motif_disposition_ids or []
+        templates = template_hashes or []
+        if not dispositions and not templates:
             return 0
         self.init_schema()
-        params: dict[str, Any] = {"cid": case_id, "sids": source_ids}
-        branches = []
-        if template_hashes:
-            params["ths"] = template_hashes
-            branches.append(
-                # `IN`, not `has(...)` — see count_template_events on why the
-                # bloom skip index requires this form.
-                f"SELECT toString(event_id) AS eid FROM {self.database}.events "
-                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
-                "AND template_hash IN {ths:Array(UInt64)}"
-            )
-        if motif_disposition_ids:
-            params["dids"] = motif_disposition_ids
-            branches.append(
-                f"SELECT event_id AS eid FROM {self.database}.motif_occurrences "
-                "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
-                "AND has({dids:Array(String)}, disposition_id)"
-            )
+        params: dict[str, Any] = {
+            "cid": case_id,
+            "sids": source_ids,
+            "ths": templates,
+            "dids": dispositions,
+        }
+        # `IN`, not `has(...)` — see count_template_events on why the bloom
+        # skip index requires this form.
+        muted = (
+            f"FROM {self.database}.events "
+            "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+            "AND template_hash IN {ths:Array(UInt64)}"
+        )
+        members = (
+            f"FROM {self.database}.motif_occurrences "
+            "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
+            "AND has({dids:Array(String)}, disposition_id)"
+        )
+        # The membership side is cast to UUID rather than `event_id` to String:
+        # a string per muted row, per read thread, is the one allocation left
+        # here that grows with the scan instead of with the motif table. The
+        # side table is read twice (a scalar subquery and an IN set); a named
+        # WITH would not change that, since ClickHouse inlines it at each use.
         result = self.client.query(
-            f"SELECT uniqExact(eid) FROM ({' UNION ALL '.join(branches)})",
+            f"SELECT count() + (SELECT uniqExact(event_id) {members}) "
+            f"- countIf(event_id IN (SELECT toUUIDOrZero(event_id) {members})) {muted} "
+            f"{foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -918,7 +1003,7 @@ class ClickHouseStore:
                     GROUP BY event_id
                 ) AS m ON e.event_id = m.event_id
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-                {heavy_scan_settings()}, join_use_nulls = 0, join_algorithm = 'grace_hash',
+                {heavy_scan_settings()}, join_use_nulls = 0,
                 min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
                 """,
                 parameters={
@@ -1216,9 +1301,12 @@ class ClickHouseStore:
         ``DROP PARTITION`` is instant and does not require a full-table scan.
         A missing partition is a server-side no-op; a missing ``events``
         table (fresh install, schema never initialized) is treated as a
-        benign no-op too. Any other failure is logged and re-raised — a
-        silently failed evidence delete would leave orphan events behind a
-        "successful" delete, which is a forensic-integrity violation.
+        benign no-op too — but not as a reason to skip the side-table
+        cleanup below, which is exactly the case where rows from an earlier
+        schema may still be sitting there. Any other failure is logged and
+        re-raised — a silently failed evidence delete would leave orphan
+        events behind a "successful" delete, which is a forensic-integrity
+        violation.
         """
         partition_expr = _partition_expr(case_id, source_id)
         try:
@@ -1226,14 +1314,46 @@ class ClickHouseStore:
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
         except Exception as exc:
-            if "UNKNOWN_TABLE" in str(exc):
-                logger.debug(
-                    "events table missing while deleting source %s (case %s); nothing to drop",
-                    source_id,
-                    case_id,
+            if "UNKNOWN_TABLE" not in str(exc):
+                logger.exception(
+                    "Failed to drop events partition for source %s (case %s)", source_id, case_id
                 )
-                return
-            logger.exception(
-                "Failed to drop events partition for source %s (case %s)", source_id, case_id
+                raise
+            logger.debug(
+                "events table missing while deleting source %s (case %s); nothing to drop",
+                source_id,
+                case_id,
             )
-            raise
+        self._delete_source_motif_occurrences(case_id, source_id)
+
+    def _delete_source_motif_occurrences(self, case_id: str, source_id: str) -> None:
+        """Drop a deleted source's rows from the motif-membership side table.
+
+        The rows name events that no longer exist. Left behind they are
+        normally out of scope — every read filters by the timeline's live
+        source ids — but a source id is derived from the file hash, so
+        re-ingesting the same file (under another parser, say) brings the
+        same id back with different event ids, and the stale rows would then
+        be *counted* as collapsed by ``count_routine_collapsed`` while hiding
+        nothing in the grid. Best effort, like ``delete_motif_occurrences``:
+        the evidence delete above has already succeeded, and a failure here
+        leaves derived rows, not evidence. ``init_schema`` first, like the
+        sibling: on a database where the side table was never created this
+        would otherwise warn with a traceback on *every* source delete, and a
+        benign missing table must not read like a failed cleanup.
+        """
+        try:
+            self.init_schema()
+            self.client.command(
+                f"DELETE FROM {self.database}.motif_occurrences "
+                "WHERE case_id = {cid:String} AND source_id = {sid:String}",
+                parameters={"cid": case_id, "sid": source_id},
+            )
+        except Exception:  # noqa: BLE001 — derived rows; the evidence is already gone
+            logger.warning(
+                "Failed to delete motif occurrences for source %s (case %s); "
+                "stale rows stay until the disposition is deleted",
+                source_id,
+                case_id,
+                exc_info=True,
+            )

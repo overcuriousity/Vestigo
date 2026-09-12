@@ -21,6 +21,8 @@ import pytest
 from vestigo.db import _scan
 from vestigo.db.clickhouse import ClickHouseStore
 
+pytestmark = [pytest.mark.clickhouse, pytest.mark.slow]
+
 # The heavy cap; the foreground clause gets half of it. Far below half of any
 # test server's free memory, which is what the ratio would have demanded before
 # a sort could spill.
@@ -28,9 +30,8 @@ _CAP = 256 * 1024**2
 
 
 @pytest.fixture
-def small_cap(monkeypatch):
-    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: _CAP)
-    return _CAP
+def small_cap(cap_scan):
+    cap_scan(_CAP)
 
 
 @pytest.fixture(scope="module")

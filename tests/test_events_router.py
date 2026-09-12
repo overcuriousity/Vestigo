@@ -1239,7 +1239,7 @@ def stub_field_stats_cache(monkeypatch):
     async def _fake_ensure(store, ch, case_id, source_ids):
         return {}
 
-    monkeypatch.setattr(events, "ensure_source_field_stats", _fake_ensure)
+    monkeypatch.setattr(events, "ensure_field_stats_for_request", _fake_ensure)
     monkeypatch.setattr(
         events, "merged_inventory", lambda stats, field_mappings=None: ([("artifact", 2, 10)], 10)
     )

@@ -37,7 +37,7 @@ class _RecordingClient:
         self.queries.append((query, parameters))
         return _FakeResult([(42,)])
 
-    def command(self, cmd):
+    def command(self, cmd, parameters=None):
         self.commands.append(cmd)
 
     def insert_arrow(self, table, arrow_table, **kwargs):
@@ -115,8 +115,8 @@ class _FailingClient(_RecordingClient):
         super().__init__()
         self.message = message
 
-    def command(self, cmd):
-        super().command(cmd)
+    def command(self, cmd, parameters=None):
+        super().command(cmd, parameters)
         raise RuntimeError(self.message)
 
 
@@ -435,6 +435,38 @@ class TestDeleteSourceEventsErrors:
     def test_missing_table_is_benign_noop(self, store):
         store.client = _FailingClient("Code: 60. DB::Exception: UNKNOWN_TABLE")
         store.delete_source_events("case-1", "src-1")  # must not raise
+
+    def test_missing_events_table_still_clears_motif_rows(self, store):
+        """No ``events`` table is exactly when an earlier schema's side rows may remain."""
+
+        class _NoEventsTable(_RecordingClient):
+            def command(self, cmd, parameters=None):
+                super().command(cmd, parameters)
+                if "DROP PARTITION" in cmd:
+                    raise RuntimeError("Code: 60. DB::Exception: UNKNOWN_TABLE")
+
+        store.client = _NoEventsTable()
+        store._schema_ready = True
+        store.delete_source_events("case-1", "src-1")
+        assert any("motif_occurrences" in c and "DELETE" in c for c in store.client.commands)
+
+    def test_motif_cleanup_ensures_the_side_table_first(self, store, caplog):
+        """A never-created side table is created, not reported as a failed cleanup."""
+        store._schema_ready = False
+        store._assert_not_legacy_schema = lambda: None
+        store._ensure_search_blob = lambda: None
+        store._ensure_template_hash = lambda: None
+        with caplog.at_level("WARNING"):
+            store.delete_source_events("case-1", "src-1")
+        commands = store.client.commands
+        create = next(
+            i for i, c in enumerate(commands) if "motif_occurrences" in c and "CREATE" in c
+        )
+        delete = next(
+            i for i, c in enumerate(commands) if "motif_occurrences" in c and "DELETE" in c
+        )
+        assert create < delete
+        assert "Failed to delete motif occurrences" not in caplog.text
 
 
 class TestParseUrl:

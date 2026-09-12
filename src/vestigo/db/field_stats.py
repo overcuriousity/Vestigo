@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import asyncio
 import zlib
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from vestigo.db._scan import heavy_scan_settings
+from vestigo.db._scan import gate_size, gated_heavy_scan, heavy_scan_settings
 
 # Top-level categorical columns tracked in the payload — single-sourced from
 # the anomaly recommender, whose inventory this cache replaces.
@@ -115,10 +116,28 @@ def _attach_top_values(entries: dict[str, dict[str, Any]], rows: list[Any]) -> N
         entries[key]["values"] = values
 
 
+@gated_heavy_scan
 def compute_source_field_stats(
     clickhouse: ClickHouseStore, case_id: str, source_id: str
 ) -> tuple[int, dict[str, Any]]:
     """Compute one source's field stats with four aggregation queries.
+
+    Holds a heavy scan slot throughout (:func:`gated_heavy_scan`): its
+    queries are whole-source scans at the heavy per-query cap, and that cap
+    is only safe while no more than the gate's worth of them run at once.
+    :func:`ensure_source_field_stats` fills every cache miss, so without the
+    slot a case with many uncached sources stacked one full cap per source on
+    top of the admitted sweeps. No caller holds a heavy slot of its own
+    (routers, the post-ingest/enrichment/import refreshes, the column job),
+    so waiting here cannot deadlock against itself.
+
+    The wait is unbounded by default, like every heavy scan's, because a job
+    filling the cache has no cheaper answer to return instead — and it says
+    so: the post-ingest refresh reports the phase to its job so a source that
+    is already browsable but still "running" reads as *queued behind scans*
+    rather than stuck. A request that would rather answer 503 than hold the
+    analyst's screen wraps its call in :func:`_scan.bounded_heavy_wait`; see
+    :func:`ensure_source_field_stats`.
 
     Returns ``(events_total, payload)`` where payload is::
 
@@ -254,27 +273,59 @@ async def refresh_source_field_stats(
     )
 
 
+#: How a cache miss's computation is dispatched off the event loop. The
+#: default is a plain worker thread; a request passes the API's scan runner
+#: so the fill is cancellable on disconnect and bounded on the gate.
+FillRunner = Callable[..., Awaitable[Any]]
+
+
 async def ensure_source_field_stats(
     store: PostgresStore,
     clickhouse: ClickHouseStore,
     case_id: str,
     source_ids: list[str],
+    *,
+    run: FillRunner = asyncio.to_thread,
 ) -> dict[str, tuple[int, dict[str, Any]]]:
     """Return ``{source_id: (events_total, payload)}``, computing misses on the spot.
 
     The self-healing read path: cached rows at the current ``STATS_VERSION``
     are used as-is; anything else is computed synchronously (worker thread)
     and persisted, so pre-existing databases converge to cached reads.
+
+    Misses are filled at most :func:`_scan.gate_size` at a time. Each fill
+    parks on the heavy gate until admitted, and a thread parked is a thread
+    the process's shared default executor has lost until then — with one
+    thread per miss, a thirty-source import opened for the first time held
+    every executor thread for the length of the sweep queue, and every other
+    ``to_thread`` user in the process (ingest, enrichment, the columns job)
+    queued behind it. Bounded to the gate's size, the fills can never park
+    more threads than the gate could admit. The bound is per call rather
+    than process-wide because an ``asyncio`` primitive binds to the loop that
+    first uses it, and this runs on the request loop, the job loop and the
+    CLI's alike.
+
+    *run* is how each fill leaves the event loop. A router passes the API's
+    scan runner (``api/scan_exec.run_scan``) under a bounded heavy wait, so
+    a full gate answers the analyst 503-with-queue-depth instead of holding
+    their screen for the length of every admitted sweep, and a disconnect
+    releases the wait; a job keeps the default thread and the unbounded wait.
+    A fill that does raise leaves its siblings running: their results are
+    persisted and the retry the UI issues five seconds later finds them.
     """
     stats: dict[str, tuple[int, dict[str, Any]]] = {}
     for row in await store.get_source_field_stats(source_ids):
         if row.stats_version == EFFECTIVE_STATS_VERSION:
             stats[row.source_id] = (row.events_total, row.payload)
 
+    misses = [source_id for source_id in source_ids if source_id not in stats]
+    if not misses:
+        return stats
+    admission = asyncio.Semaphore(gate_size())
+
     async def _fill_miss(source_id: str) -> None:
-        total, payload = await asyncio.to_thread(
-            compute_source_field_stats, clickhouse, case_id, source_id
-        )
+        async with admission:
+            total, payload = await run(compute_source_field_stats, clickhouse, case_id, source_id)
         await store.upsert_source_field_stats(
             case_id=case_id,
             source_id=source_id,
@@ -284,9 +335,7 @@ async def ensure_source_field_stats(
         )
         stats[source_id] = (total, payload)
 
-    misses = [source_id for source_id in source_ids if source_id not in stats]
-    if misses:
-        await asyncio.gather(*(_fill_miss(source_id) for source_id in misses))
+    await asyncio.gather(*(_fill_miss(source_id) for source_id in misses))
     return stats
 
 

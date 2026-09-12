@@ -11,6 +11,9 @@
  */
 import type { Job } from "@/api/types";
 
+/** The field-stats refresh queues behind running detector scans; say so. */
+const FIELD_STATS_COPY = "Computing field statistics (queued behind running scans when the gate is full)";
+
 const EXPORT_PHASES: Record<string, string> = {
   queued: "Queued",
   postgres: "Collecting case records",
@@ -25,7 +28,22 @@ const IMPORT_PHASES: Record<string, string> = {
   postgres: "Restoring case records",
   events: "Restoring events",
   blobs: "Restoring original source files",
-  stats: "Recomputing counts",
+  stats: FIELD_STATS_COPY,
+};
+
+/**
+ * Source: `src/vestigo/api/routers/cases.py` (ingest) and
+ * `src/vestigo/enrichers/jobs.py`. Both report one phase: the field-stats
+ * refresh after their rows are written. It holds a heavy scan slot and
+ * queues for one behind admitted sweeps, so a source that is already
+ * browsable can sit "running" for a while — the copy says why.
+ */
+const INGEST_PHASES: Record<string, string> = {
+  field_stats: FIELD_STATS_COPY,
+};
+
+const ENRICH_PHASES: Record<string, string> = {
+  field_stats: FIELD_STATS_COPY,
 };
 
 /** Source: `src/vestigo/columns/jobs.py`. */
@@ -35,7 +53,12 @@ const COLUMN_RECOMMEND_PHASES: Record<string, string> = {
   model: "Asking the model to choose",
 };
 
-/** Source: `src/vestigo/converters/job.py`. */
+/**
+ * Source: `src/vestigo/converters/job.py`, which hands the produced Parquet to
+ * the *same* `_run_ingestion_job` as a plain upload — so a convert-and-ingest
+ * job reports `field_stats` too, under its own kind. Without the key here the
+ * tray would drop its detail line exactly where the ingest path adds one.
+ */
 const CONVERT_INGEST_PHASES: Record<string, string> = {
   queued: "Queued",
   sampling: "Reading a sample of the file",
@@ -43,11 +66,14 @@ const CONVERT_INGEST_PHASES: Record<string, string> = {
   sample_run: "Trying the converter on the sample",
   converting: "Converting the whole file",
   ingesting: "Ingesting",
+  field_stats: FIELD_STATS_COPY,
 };
 
 const PHASES_BY_KIND: Record<string, Record<string, string>> = {
   case_export: EXPORT_PHASES,
   case_import: IMPORT_PHASES,
+  ingest: INGEST_PHASES,
+  enrich: ENRICH_PHASES,
   column_recommend: COLUMN_RECOMMEND_PHASES,
   convert_ingest: CONVERT_INGEST_PHASES,
 };

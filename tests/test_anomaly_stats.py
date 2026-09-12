@@ -44,6 +44,18 @@ from vestigo.db.anomaly_stats import (
     effective_ts_sql,
 )
 
+#: Column shape of the grouped ``_alphabet_sql`` — one row per (group, character).
+_ALPHABET_COLUMNS = ["grp", "c", "n_vals_with_c", "n_vals"]
+
+
+def _alphabet_rows(*groups):
+    """Grouped ``_alphabet_sql`` rows from ``(grp, charset, n_vals)`` triples.
+
+    The per-character count is immaterial to a baseline-window reference (it
+    scores by membership), so every character gets 1.
+    """
+    return [(grp, c, 1, n_vals) for grp, charset, n_vals in groups for c in charset]
+
 
 def _assert_paired(page_sql: str, total_sql: str, *fragments: str) -> None:
     """Assert the page and its companion count carry the same filters.
@@ -2898,7 +2910,10 @@ def test_charset_temporal_flags_never_seen_chars_and_guards_sentinel():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # baseline charset over 50 distinct baseline values
-        FakeQueryResult(result_rows=[(list("abcdefghij"), 50)], column_names=["charset", "n"]),
+        FakeQueryResult(
+            result_rows=[(c, 1, 50) for c in "abcdefghij"],
+            column_names=["c", "n_vals_with_c", "n_vals"],
+        ),
         FakeQueryResult(
             # val, novel, cnt, first_seen, evt_id, win_idx
             result_rows=[("ab☃cd", ["☃"], 1, fs, "evt-snow", 0, 0.0)],
@@ -5715,8 +5730,8 @@ def test_charset_group_field_temporal_falls_back_outside_suspect_windows():
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         # Per-group baseline alphabets: only host-a is in the baseline window.
         FakeQueryResult(
-            result_rows=[("host-a", ["a", "b"], 60)],
-            column_names=["grp", "charset", "n_vals"],
+            result_rows=_alphabet_rows(*[("host-a", ["a", "b"], 60)]),
+            column_names=_ALPHABET_COLUMNS,
         ),
         # Fallback learn (rare-chars outside the suspect windows).
         FakeQueryResult(
@@ -5787,8 +5802,8 @@ def test_charset_group_field_skips_fallback_learn_when_no_group_needs_it():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(
-            result_rows=[("host-a", ["a", "b"], 60), ("host-b", ["a"], 40)],
-            column_names=["grp", "charset", "n_vals"],
+            result_rows=_alphabet_rows(*[("host-a", ["a", "b"], 60), ("host-b", ["a"], 40)]),
+            column_names=_ALPHABET_COLUMNS,
         ),
         # Probe: every suspect-window group already has a baseline reference.
         FakeQueryResult(
@@ -5826,8 +5841,10 @@ def test_charset_group_probe_at_ceiling_assumes_a_fallback_is_needed():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(
-            result_rows=[(f"host-{i}", ["a"], 60) for i in range(_CHARSET_GROUP_PROBE_LIMIT)],
-            column_names=["grp", "charset", "n_vals"],
+            result_rows=_alphabet_rows(
+                *[(f"host-{i}", ["a"], 60) for i in range(_CHARSET_GROUP_PROBE_LIMIT)]
+            ),
+            column_names=_ALPHABET_COLUMNS,
         ),
         # Probe returns exactly the ceiling — all known, but truncated.
         FakeQueryResult(
@@ -5870,12 +5887,12 @@ def test_charset_wide_group_is_dropped_not_scored_by_fallback():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(
-            result_rows=[
+            result_rows=_alphabet_rows(
                 ("host-a", ["a", "b"], 60),
                 # host-prose is CJK free text: alphabet over the ceiling.
                 ("host-prose", wide_charset, 500),
-            ],
-            column_names=["grp", "charset", "n_vals"],
+            ),
+            column_names=_ALPHABET_COLUMNS,
         ),
         # Probe: no group missing a reference, so no fallback learn.
         FakeQueryResult(result_rows=[("host-a",), ("host-prose",)], column_names=["grp"]),
@@ -5928,8 +5945,8 @@ def test_charset_thin_group_is_scored_by_fallback_not_dropped():
     responses = [
         FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
         FakeQueryResult(
-            result_rows=[("host-a", ["a", "b"], 60), ("host-new", ["a"], 3)],
-            column_names=["grp", "charset", "n_vals"],
+            result_rows=_alphabet_rows(*[("host-a", ["a", "b"], 60), ("host-new", ["a"], 3)]),
+            column_names=_ALPHABET_COLUMNS,
         ),
         # Probe: both groups have a reference, thin as host-new's is.
         FakeQueryResult(

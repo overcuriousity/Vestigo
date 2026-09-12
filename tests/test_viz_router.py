@@ -29,7 +29,7 @@ def _fake_inventory(monkeypatch, inventory: list[tuple[str, int, int]], total: i
         calls.append((case_id, source_ids))
         return {}
 
-    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", fake_ensure)
     monkeypatch.setattr(viz, "merged_inventory", lambda stats: (inventory, total))
     return calls
 
@@ -578,7 +578,7 @@ def _patch_terms(monkeypatch, cached_result) -> _FakeTermsService:
     async def fake_ensure(store, clickhouse, case_id, source_ids):
         return {}
 
-    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", fake_ensure)
     monkeypatch.setattr(viz, "merged_field_terms", lambda stats, field, limit: cached_result)
     return svc
 
@@ -597,6 +597,35 @@ async def test_field_terms_unfiltered_served_from_cache(monkeypatch):
 @pytest.mark.asyncio
 async def test_field_terms_cache_gap_falls_back_live(monkeypatch):
     svc = _patch_terms(monkeypatch, None)
+    result = await viz.get_field_terms(
+        "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
+    )
+    assert result == {"kind": "live"}
+    assert len(svc.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_field_terms_busy_cache_fill_falls_back_live_not_503(monkeypatch):
+    """A full heavy gate on a cache miss answers from the live lane, never a 503.
+
+    Top terms is the one caller for which the field-stats cache only saves a
+    scan: the live path runs on the independent foreground lane. And the busy
+    case must skip the cache lookup rather than hand it empty stats, which
+    would read as "zero values" instead of "no answer".
+    """
+    from vestigo.api.scan_exec import ScanBusyResponse
+    from vestigo.db._scan import ScanBusy
+
+    svc = _patch_terms(monkeypatch, None)
+
+    async def busy_ensure(store, clickhouse, case_id, source_ids):
+        raise ScanBusyResponse(ScanBusy(ahead=3, wait=5.0))
+
+    def must_not_merge(stats, field, limit):
+        raise AssertionError("a busy fill has no stats to answer from")
+
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", busy_ensure)
+    monkeypatch.setattr(viz, "merged_field_terms", must_not_merge)
     result = await viz.get_field_terms(
         "c1", "t1", field="artifact", limit=50, case=None, **_FILTER_KWARGS
     )
@@ -733,7 +762,7 @@ async def test_field_terms_honors_routine_collapse(monkeypatch):
     async def no_cache(*args, **kwargs):
         raise AssertionError("collapsed query must not be served from the unfiltered cache")
 
-    monkeypatch.setattr(viz, "ensure_source_field_stats", no_cache)
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", no_cache)
 
     await viz.get_field_terms(
         "c1",
@@ -760,7 +789,7 @@ async def test_field_terms_without_flag_keeps_full_scope(monkeypatch):
     async def fake_ensure(store, clickhouse, case_id, source_ids):
         return {}
 
-    monkeypatch.setattr(viz, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", fake_ensure)
     # Force the live path (cache gap) so the EventQuery is observable.
     monkeypatch.setattr(viz, "merged_field_terms", lambda stats, field, limit: None)
 
@@ -956,7 +985,7 @@ async def test_field_terms_with_derive_never_answers_from_the_stats_cache(monkey
     async def must_not_run(*a, **k):
         raise AssertionError("cache consulted for a derived request")
 
-    monkeypatch.setattr(viz, "ensure_source_field_stats", must_not_run)
+    monkeypatch.setattr(viz, "ensure_field_stats_for_request", must_not_run)
     monkeypatch.setattr(viz, "get_store", lambda: None)
     monkeypatch.setattr(viz, "_get_stat_anomaly_service", lambda: _FakeStatService())
     await viz.get_field_terms(

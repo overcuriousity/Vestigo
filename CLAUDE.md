@@ -66,6 +66,7 @@ uv run vestigo embed -c <case> -s <source>           # CLI embedding job
 uv run pytest                    # full test suite (no coverage; CI adds --cov, see pyproject.toml)
 uv run pytest tests/test_pipeline.py            # single file
 uv run pytest tests/test_pipeline.py::test_name # single test
+uv run pytest -m "not slow"      # leave out the tests that generate millions of rows (CI runs them)
 uv run ruff check .              # lint
 uv run ruff format .             # format
 uv run ruff format --check .     # what CI enforces — `ruff check` passing does NOT imply this

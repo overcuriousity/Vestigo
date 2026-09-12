@@ -5,6 +5,103 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.6] — 2026-09-12
+
+### Fixed
+
+- **Enrichment applies no longer fail on large sources, whatever the memory cap.** The
+  partition rewrite's `grace_hash` join never split into buckets — `max_bytes_in_join` was
+  unset — and ClickHouse's `query_plan_join_swap_table = auto` chose the full-width `events`
+  rows as its in-memory side, so the rewrite's footprint grew with the source: 4M events
+  failed at a 4 GiB cap, and an airgapped 26.6 stack failed at 819 MiB (`While executing
+  FillingRightJoinSide`). The join now spills in buckets of a quarter of the per-query cap and
+  keeps the narrow staged maps in memory: ~800 MiB peak at a 1 GiB cap on 2M and 4M events
+  alike. The bound travels with every scan settings clause, beside the `GROUP BY` and sort
+  spill thresholds, so the next `JOIN` written under either cap is bounded from the start.
+- **Charset novelty learns high-cardinality fields under its cap.** Every learning scan
+  (whole scope, per group, baseline window, and the fallback) read distinct values through
+  `SELECT DISTINCT`, which cannot spill, and the self-baseline ones took the distinct total
+  from a frameless `count() OVER ()` that buffered every value's characters. Three million
+  distinct query strings failed at 256–512 MiB in every mode; the learning pass is now a
+  `GROUP BY` that spills, with the total counted off a marker character in the same scan.
+  Findings are unchanged.
+- **The "routine events collapsed" count no longer holds an entry per muted event.** It ran on
+  every Explorer page with collapse on, carried no per-query cap, and took the union of muted
+  templates and routine motifs as an exact distinct set of event ids — a muted heartbeat on a
+  large case spent the server's memory ceiling, not a query's. It is now inclusion–exclusion
+  over a plain count and the small motif-membership table, and it — like the two counts
+  beside it — carries the foreground per-query cap: three million muted events count under
+  32 MiB. Deleting a source now also drops its rows from that membership table, so
+  re-ingesting the same file can no longer report stale rows as collapsed events the grid does
+  not hide.
+- **Entropy outliers learn high-cardinality fields under their cap.** The band-learning pass
+  read distinct values through the same `SELECT DISTINCT` the charset learner was moved off,
+  over the same auto-selected free-text fields, and failed at the cap on the same corpus. It
+  is now a `GROUP BY` too.
+- **Field-stats cache fills queue for a heavy scan slot, and a request says so.** Every
+  uncached source was computed at once, each with whole-source scans at the full heavy cap
+  and no admission slot, so a case with many uncached sources (after an upgrade, an import)
+  stacked caps on top of admitted sweeps. Each source's computation now holds a heavy slot,
+  and at most a gate's worth of fills run at once, so a burst of misses never parks more
+  worker threads than the gate could admit. A request that fills the cache on the way to an
+  answer — the Explorer's column picker, a Visualize field list, the analysis plan — waits a
+  bounded five seconds and then answers 503 with the queue depth, which the UI retries, and
+  releases its wait when the client leaves; a job (ingest, enrichment, import) keeps queueing
+  and reports the phase, so a source that is already browsable but still "running" reads as
+  queued behind scans rather than stuck.
+- **The sizing calculator sizes scans from measurement, and stops recommending the N trap.**
+  - Scan memory was modelled as 12 MiB per million events. That sized a 32M-event scan at
+    1.5 GiB, where 2 GiB was measured to fail, and a 10B-event scan at 117 GiB.
+  - It now follows the heaviest detector's measured peak, which grows with log2(events)
+    because its sort spills: 0.97 GiB at 2M events, 2.36 GiB at 32M.
+  - "Max for your hardware" no longer adds slots past the point where a scan of your largest
+    timeline fits. On 96 GiB and 20 cores at 1B events it recommended ten 3.4 GiB slots; it
+    now recommends six 5.2 GiB slots.
+  - The events slider reaches 10B events.
+  - With ClickHouse on its own host, it no longer tells you to pin
+    `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` unconditionally: the app reads ClickHouse's ceiling
+    over its connection on every deployment shape, and auto follows it whenever that ceiling
+    is bounded (`max_server_memory_usage` in its `memory.xml`, or a limit on its container).
+    An unbounded remote ceiling is capped by the app host's RAM instead, so for that case the
+    page still says to pin it — to the scan budget it computed.
+- **Scans run on a ClickHouse older than 24.12 again.** `max_bytes_ratio_before_external_sort`
+  (added to every scan in 1.19.5) and `query_plan_join_swap_table` (added above) do not exist
+  before 24.12, and a server that does not know a setting refuses the query — so every
+  detector scan, chart aggregation and routine-collapse count failed with `UNKNOWN_SETTING`.
+  The app now asks the server once which of the two it knows and leaves out the ones it does
+  not. On such a server their absence is already what they ask for: a sort spills on its byte
+  threshold alone, and the planner keeps the join sides as written. A server whose
+  `system.settings` cannot be read still gets both.
+- **A Visualize top-values chart no longer answers "busy" when a live query would have
+  answered.** Unfiltered top values are served from the field-statistics cache when it has
+  them. On a cache miss the fill waited for a heavy slot and answered 503 after five seconds
+  while sweeps held the gate — even though the live query it falls back to runs on the
+  separate chart lane. A full gate now goes straight to that live query.
+- **The job tray names the field-statistics step for AI-converted uploads, and only while it
+  runs.** A convert-and-ingest job goes through the same ingest step as a plain upload and
+  reported the same `field_stats` phase, which the tray had no copy for, so the detail line
+  went blank. A multi-source enrichment kept showing "Computing field statistics" through
+  every later source's rewrite; the phase now clears after each refresh.
+- **Deleting a source clears its motif-membership rows even when the `events` table is
+  missing,** the case where rows from an earlier schema are most likely to remain, and on a
+  database where that side table was never created it is created first, instead of every
+  source delete logging a failed cleanup with a traceback.
+
+### Changed
+
+- Dependencies: `alembic` 1.19.1 → 1.19.2 (#374), `authlib` 1.7.2 → 1.8.0 (#352),
+  `clickhouse-connect` 1.7.2 → 1.8.0 (#373), `httpx2` 2.7.0 → 2.12.0 (#362) with `httpcore2`
+  2.7.0 → 2.12.0 (#363 proposed 2.10.0, which `httpx2` 2.12.0 does not accept), `mcp` 1.29.1
+  → 1.30.0 (#369), `pydantic` 2.13.4 → 2.13.5 (#354), `ruff` 0.16.5 → 0.16.6 (#371),
+  `sentence-transformers` 6.0.0 → 6.0.1 (#356), `typer` 0.27.1 → 0.27.2 (#355);
+  `@tanstack/react-query` 5.102.4 → 5.102.8 (#350), `@tanstack/react-table` 9.1.2 → 9.2.4
+  (#359), `@tanstack/react-virtual` 3.14.10 → 3.14.11 (#367), `@testing-library/react` 16.3.2
+  → 16.3.3 (#351), `@types/node` 26.3.0 → 26.5.0 (#368), `@vitejs/plugin-react` 6.1.0 → 6.1.1
+  (#353), `lucide-react` 1.34.0 → 1.43.0 (#370), `oxlint` 1.80.0 → 1.82.0 (#372),
+  `react-router-dom` 7.18.2 → 7.18.3 (#357), and `vitest` 4.1.11 → 5.0.0 (#375) together with
+  `@vitest/ui`, which vitest 5 requires at the same version. Vitest 5 no longer merges the
+  global `jest` matcher types, so the test setup imports `@testing-library/jest-dom/vitest`.
+
 ## [1.19.5] — 2026-09-11
 
 ### Fixed

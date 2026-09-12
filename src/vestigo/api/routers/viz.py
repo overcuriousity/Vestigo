@@ -40,11 +40,11 @@ from vestigo.api.routers.events import (
     _validate_field_modes,
     _validate_regex,
 )
+from vestigo.api.scan_exec import ScanBusyResponse, ensure_field_stats_for_request
 from vestigo.core.config import get_settings
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.derive import DeriveSpec, parse_derive
 from vestigo.db.field_stats import (
-    ensure_source_field_stats,
     merged_field_terms,
     merged_inventory,
 )
@@ -328,7 +328,7 @@ async def get_field_terms(
         collapse_routine=collapse_routine,
     )
     # M24a: an unfiltered first load is answerable from the per-source
-    # field_stats cache — no ClickHouse scan, no HEAVY_SCAN_GATE slot. A
+    # field_stats cache — no ClickHouse scan and no wait on the heavy gate. A
     # canonical mapped field must stay live (coalesce over several raw keys
     # dedupes per event; not derivable from per-key caches), and any filter
     # or a cache gap falls through to the live path below.
@@ -337,10 +337,23 @@ async def get_field_terms(
         and _is_unfiltered(query)
         and not (query.field_mappings and field in query.field_mappings)
     ):
-        stats = await ensure_source_field_stats(
-            get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
-        )
-        cached = merged_field_terms(stats, field, limit)
+        # A *miss*, though, is a whole-source scan on the heavy lane, and this
+        # is the one caller for which those stats are an optimization rather
+        # than the answer: the live path below runs on the independent
+        # foreground lane and would answer straight away. So a full gate must
+        # not turn into a 503 here — 503 is right where the cache *is* the
+        # answer (the column picker, the field inventories), wrong where it
+        # only saves a scan. A disconnect still propagates: nobody is waiting.
+        # An empty ``stats`` is *not* the way to express that: it reads as
+        # "every source covers this field zero times" and answers 0 values.
+        try:
+            stats = await ensure_field_stats_for_request(
+                get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
+            )
+        except ScanBusyResponse:
+            cached = None
+        else:
+            cached = merged_field_terms(stats, field, limit)
         if cached is not None:
             return {**cached, "cached": True}
     service = _get_query_service()
@@ -1640,7 +1653,7 @@ async def list_viz_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    stats = await ensure_field_stats_for_request(get_store(), svc.ch, case_id, source_ids)
     inventory, total = merged_inventory(stats)
     if total == 0:
         return {"fields": []}

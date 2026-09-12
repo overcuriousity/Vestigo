@@ -1223,6 +1223,13 @@ carried by one hot value that repeats a million times counts once. This keeps
 a field's reference alphabet a property of its vocabulary, not of its traffic
 volume.
 
+Learning over distinct values is a `GROUP BY`, so it spills to disk under the heavy
+per-query cap, and the distinct-value total comes out of the same scan as the count of an
+empty-string marker appended to every value's characters. It used to be `SELECT DISTINCT`
+under a frameless `count() OVER ()` — a set that cannot spill, beneath a window that
+buffered every distinct value's characters at once — which failed at the cap on exactly the
+high-cardinality fields (millions of distinct query strings) an injected character hides in.
+
 ### Two modes
 
 | | Self-baseline (`rare-chars`) | Temporal (`temporal-charset`) |
@@ -1366,6 +1373,12 @@ million times contributes one point to the field's entropy distribution, so
 traffic volume can't drag the band. Values shorter than 6 characters are
 excluded outright (baseline and detect): a 3-character string's entropy is
 degenerate and would flood the band with false lows.
+
+The distinct pass that learns the band is a `GROUP BY`, for the reason given under
+charset novelty: it spills under the heavy per-query cap where `SELECT DISTINCT` holds its
+set in memory until the cap kills the query. Both detectors pick the same free-text-ish
+fields, so the same three million distinct query strings that broke the charset learn broke
+this one (`tests/test_entropy_memory_clickhouse.py`).
 
 ### Two modes
 

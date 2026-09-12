@@ -53,10 +53,13 @@ no container limit and no ``max_server_memory_usage`` — was OOM-killed by the
 kernel with nothing in its own log (session-186). Asking ClickHouse what it is
 allowed to use removes the guess.
 
-:data:`HEAVY_SCAN_GATE` is imported *by value* into every scan module, so
-rebinding it here would not reach those bindings — its size is therefore fixed
-at import (:data:`_GATE_CONCURRENCY`) and ``VESTIGO_STAT_SCAN_CONCURRENCY`` stays
-``restart_required`` in ``core/settings_registry.py``. The per-query divisor
+:data:`HEAVY_SCAN_GATE` is imported *by value* into the scan modules that take a
+slot by hand (the detectors and the field-stats fill go through
+:func:`gated_heavy_scan`, which looks it up here at call time), so rebinding it
+here would not reach those bindings — its size is therefore fixed at import
+(:data:`_GATE_CONCURRENCY`, read back by :func:`gate_size`) and
+``VESTIGO_STAT_SCAN_CONCURRENCY`` stays ``restart_required`` in
+``core/settings_registry.py``. The per-query divisor
 reads that frozen value too, not the live setting: the two halves are one
 budget seen from two sides, and a live edit that moved only the divisor would
 authorize N full-budget queries against a gate still admitting M of them.
@@ -68,6 +71,7 @@ of admitted detector scans and OOM-killed a 32 GiB host mid-apply.
 """
 
 import contextlib
+import functools
 import logging
 import os
 import re
@@ -75,7 +79,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -838,6 +842,100 @@ def foreground_wait_seconds(bounded: float) -> float | None:
     return None if _foreground_unbounded_var.get() else bounded
 
 
+#: Set while a heavy scan runs for a request that would rather hear "busy".
+_heavy_wait_var: ContextVar[float | None] = ContextVar("vestigo_heavy_wait", default=None)
+
+
+@contextlib.contextmanager
+def bounded_heavy_wait(seconds: float) -> Iterator[None]:
+    """Wait at most *seconds* for a heavy slot instead of indefinitely.
+
+    The mirror image of :func:`unbounded_foreground_wait`. A heavy scan is
+    normally a sweep with no one watching a spinner, so it queues behind the
+    gate for as long as that takes. A request that needs one *now* — the
+    Explorer filling a source's field-stats cache on the way to its column
+    picker — is a different situation: parked indefinitely it holds the
+    analyst's screen for the length of every admitted sweep, so it wraps its
+    work in this and gets :class:`ScanBusy` past the bound, which the API
+    turns into the same 503-with-queue-depth a full chart lane answers and
+    the UI already retries.
+
+    Contextvars are copied into worker threads, so a bound set on the event
+    loop reaches the :func:`gated_heavy_scan` wrapper inside the thread.
+    """
+    token = _heavy_wait_var.set(seconds)
+    try:
+        yield
+    finally:
+        _heavy_wait_var.reset(token)
+
+
+def heavy_wait_seconds() -> float | None:
+    """``None`` (queue indefinitely), or the bound set by :func:`bounded_heavy_wait`."""
+    return _heavy_wait_var.get()
+
+
+def gated_heavy_scan(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Admit at most ``VESTIGO_STAT_SCAN_CONCURRENCY`` heavy scans to ClickHouse at once.
+
+    Applied to every public ``find_*`` detector and to the field-stats cache
+    fill — each per-query ``max_memory_usage`` cap is budget/concurrency, so
+    admission control is what makes the total budget actually hold (see the
+    module docstring). Nested helpers (``recommend_*``, ``*_inventory``) are
+    *not* gated: gated scans call them while holding the slot, and gating them
+    too would deadlock.
+
+    The gate is looked up on this module at call time, not captured at
+    decoration, so a test that swaps :data:`HEAVY_SCAN_GATE` for a smaller one
+    is exercising the wrapped function's admission and not a stale reference.
+    The wait is :func:`heavy_wait_seconds`: unbounded unless the caller asked
+    for a bound. Cancellable (#300): a request that disconnects while parked
+    here is noticed within a second instead of taking a slot nobody wants.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=heavy_wait_seconds()):
+            return fn(*args, **kwargs)
+
+    wrapper._scan_class = "heavy"  # type: ignore[attr-defined]
+    return wrapper
+
+
+#: Settings the clause asks for that an older ClickHouse does not have. Both
+#: arrived in 24.12 (``system.settings_changes``), and on a server that
+#: predates them each one's absence is already the behaviour the clause asks
+#: for: without the sort ratio a sort spills on its byte threshold alone, and
+#: without the join swap the planner keeps the sides as written. *Sending*
+#: either to such a server, though, fails every scan with ``UNKNOWN_SETTING``
+#: — for settings inert on all but one query — so the clause leaves out the
+#: ones a probe of the server found missing (:func:`configure_server_settings`).
+VERSIONED_SETTINGS = ("max_bytes_ratio_before_external_sort", "query_plan_join_swap_table")
+
+#: The :data:`VERSIONED_SETTINGS` the server was probed and found not to know.
+#: Empty until a probe says otherwise: every server the reference stack and CI
+#: run accepts them, and a probe that could not read ``system.settings`` is no
+#: evidence that the server lacks anything.
+_unsupported_settings: frozenset[str] = frozenset()
+
+
+def configure_server_settings(present: Collection[str] | None) -> None:
+    """Record which of :data:`VERSIONED_SETTINGS` the server reported knowing.
+
+    *present* is the subset ``system.settings`` listed; ``None`` means the probe
+    could not tell, which sends all of them — the behaviour before the probe.
+    """
+    global _unsupported_settings  # noqa: PLW0603
+    _unsupported_settings = (
+        frozenset() if present is None else frozenset(VERSIONED_SETTINGS) - frozenset(present)
+    )
+
+
+def _versioned(name: str, value: str) -> str:
+    """``"name = value, "``, or nothing on a server probed to lack *name*."""
+    return "" if name in _unsupported_settings else f"{name} = {value}, "
+
+
 def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> str:
     s = get_settings()
     # A gate slot's cap is per *slot*: a caller that fans out splits its own
@@ -877,7 +975,31 @@ def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> 
         # only ever *lowers* the threshold above (verified on 26.6), which is
         # extra protection when the server is short of memory, not an override.
         f"max_bytes_before_external_sort = {sort_spill}, "
-        "max_bytes_ratio_before_external_sort = 0, "
+        f"{_versioned('max_bytes_ratio_before_external_sort', '0')}"
+        # The third spill path, beside the GROUP BY and the sort above. Inert
+        # on a query without a JOIN, and carried by every clause so the next
+        # JOIN written under either cap is bounded the day it is written
+        # rather than the day it fails: the enrichment partition rewrite
+        # (`ClickHouseStore.finalize_enrichment_apply`) was the JOIN that
+        # grew with the source's event count until it died at the cap. Grace
+        # hash splits into another bucket only when one outgrows
+        # `max_bytes_in_join`, and at ClickHouse's default of 0 it never
+        # does; the algorithm has to come with the bound, because under the
+        # default `join_overflow_mode = 'throw'` the same bound on a plain
+        # hash join fails the query at the bucket size instead of spilling
+        # it. A quarter of the cap is what measured green — 2M events at a
+        # 1 GiB cap peak around 750 MiB, and fail with 241 without it — since
+        # the bucket shares one `max_memory_usage` with the GROUP BY feeding
+        # it (which spills at half) and with the read streams. Derived from
+        # the *fanned-out* budget above so a bucket is always a quarter of the
+        # cap the same query carries. The swap is off because
+        # `query_plan_join_swap_table = auto` made the full-width events rows
+        # the in-memory side (`EXPLAIN` showed `Type: RIGHT`). Both it and the
+        # sort ratio above are left out on a server too old to know them — see
+        # `VERSIONED_SETTINGS`.
+        f"max_bytes_in_join = {budget // 4 or 1}, "
+        "join_algorithm = 'grace_hash', "
+        f"{_versioned('query_plan_join_swap_table', chr(39) + 'false' + chr(39))}"
         f"max_memory_usage = {budget}{tag}"
     )
 
@@ -924,6 +1046,12 @@ def foreground_scan_settings() -> str:
 # the total budget by exactly this number — see the comment at that call.
 _GATE_CONCURRENCY = max(get_settings().stat_scan_concurrency, 1)
 HEAVY_SCAN_GATE = threading.BoundedSemaphore(_GATE_CONCURRENCY)
+
+
+def gate_size() -> int:
+    """How many heavy scans the gate admits at once — the number frozen at import."""
+    return _GATE_CONCURRENCY
+
 
 # Admission gate for *foreground* scans: the chart aggregations an analyst is
 # looking at while they wait (histogram, top terms, numeric stats, …). Its own

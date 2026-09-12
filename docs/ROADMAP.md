@@ -42,8 +42,10 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
 
 - [ ] **Make `VESTIGO_STAT_SCAN_CONCURRENCY` live.** Every other `stat_scan_*` value now
   resolves per query; concurrency sizes `HEAVY_SCAN_GATE`, a `BoundedSemaphore` imported by
-  value into four modules, so rebinding the global would not reach them. Needs the gate
-  behind an accessor, plus a decision about what resizing means for held slots.
+  value into three modules (`db/clickhouse.py`, `db/queries.py`, `sigma/runner.py`; the
+  detectors and the field-stats fill go through `gated_heavy_scan`, which looks it up at
+  call time), so rebinding the global would not reach them. Needs the gate behind an
+  accessor, plus a decision about what resizing means for held slots.
 - [ ] **A fourth `scan_budget` risk for an unusably small per-query cap.** `risk` only
   compares `total_bytes + cache_bytes` against the ceiling, so a large
   `VESTIGO_STAT_SCAN_CONCURRENCY` reports `ok` while every slice is too small to scan with —
@@ -58,6 +60,15 @@ designed together in one `MODEL_REFINEMENT.md` round, so the data model migrates
   (a hash-table resize overshoots between checks, and serializing a bucket allocates on
   top). Sorts are fine at cap ÷ 2 once their ratio is off. Needs measurement across key
   types and realistic caps before picking a divisor — each halving doubles spill I/O.
+- [ ] **Per-attribute-key `uniqExact` in the field-stats cache grows with a key's distinct
+  values.** `compute_source_field_stats` holds one exact set per key under the heavy cap; the
+  9.3M-distinct `http_query` of one production IIS source is the shape that fails it. `uniq`
+  bounds the set but turns a displayed count from exact to approximate — a decision about
+  what the number claims, to make before the SQL changes.
+- [ ] **The sizing calculator sizes no spill disk.** Sorts and GROUP BYs now spill under
+  their cap, so disk is what runs out next: 11.8 GiB per window-sort field at 32M events
+  (session-234), and it follows events where memory follows log2(events). Needs a measured
+  disk model beside `scan_memory_model` and a spill-volume line on the page.
 - [ ] **Per-timeline field scope for enrichers.** Analysts open the enrichers dialog
   expecting to choose which field gets enriched; there is no such control, and the dialog now
   says so. A real scope (an optional allow-list of attribute keys on `TimelineEnricher`)
