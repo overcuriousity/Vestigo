@@ -27,8 +27,16 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
 from vestigo.api.request_context import current_request
-from vestigo.db._scan import ScanBusy, ScanCancelled, bind_scan_context, kill_scan_queries
+from vestigo.db._scan import (
+    ScanBusy,
+    ScanCancelled,
+    bind_scan_context,
+    bounded_heavy_wait,
+    kill_scan_queries,
+)
 from vestigo.db.clickhouse import ClickHouseStore
+from vestigo.db.field_stats import ensure_source_field_stats
+from vestigo.db.postgres import PostgresStore
 
 logger = logging.getLogger(__name__)
 
@@ -182,3 +190,31 @@ async def run_scan(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
             raise ScanBusyResponse(exc) from exc
         except ScanCancelled:
             raise ScanCancelledResponse() from None
+
+
+#: How long a request waits for a heavy slot to fill a field-stats cache miss
+#: before answering "busy". The same bound as a chart's on the foreground
+#: lane (``queries.FOREGROUND_WAIT_SECONDS``): past it the analyst is better
+#: served by the 503 the UI retries than by a spinner of unknown length.
+FIELD_STATS_WAIT_SECONDS = 5.0
+
+
+async def ensure_field_stats_for_request(
+    store: PostgresStore, clickhouse: ClickHouseStore, case_id: str, source_ids: list[str]
+) -> dict[str, tuple[int, dict[str, Any]]]:
+    """:func:`ensure_source_field_stats` for a request handler.
+
+    A cache miss is a whole-source scan under the heavy gate, and a handler
+    that fills one is holding an analyst's screen: the Explorer's column
+    picker, a Visualize field list, the analysis plan. Each fill therefore
+    runs through :func:`run_scan` — cancelled when the client leaves — under
+    :func:`bounded_heavy_wait`, so a gate full of sweeps answers 503 with the
+    queue depth (which the UI retries) instead of parking the request for the
+    length of every admitted sweep. Without a request in context (a job that
+    inherited none) this is the plain, unbounded fill, exactly as the job
+    paths call it directly.
+    """
+    if current_request() is None:
+        return await ensure_source_field_stats(store, clickhouse, case_id, source_ids)
+    with bounded_heavy_wait(FIELD_STATS_WAIT_SECONDS):
+        return await ensure_source_field_stats(store, clickhouse, case_id, source_ids, run=run_scan)

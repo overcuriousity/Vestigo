@@ -191,7 +191,6 @@ already-ingested data.
 
 from __future__ import annotations
 
-import functools
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -217,8 +216,7 @@ from vestigo.db._dt import (
 )
 from vestigo.db._offsets import active_offsets, bind_offset_params, effective_ts_sql
 from vestigo.db._scan import (
-    HEAVY_SCAN_GATE,
-    acquire_scan_slot,
+    gated_heavy_scan,
     heavy_scan_settings,
     scan_fanout,
 )
@@ -278,6 +276,12 @@ _MIN_NUMERIC_RATIO = 0.9
 # Minimum distinct baseline values before the charset detector trusts a
 # field's learned character set — below this, "never seen" is noise.
 _MIN_CHARSET_BASELINE = 20
+
+#: The distinct characters of a value, as ClickHouse SQL over an alias ``val``.
+#: One spelling for every scan that splits values into characters — the
+#: alphabet learn and both violation scans — so they cannot drift apart on
+#: the ``(?s)`` that keeps a newline a character like any other.
+_DISTINCT_CHARS_SQL = "arrayDistinct(extractAll(val, '(?s).'))"
 
 # Skip fields whose reference character set exceeds this (free text in large
 # scripts, e.g. CJK) — a huge alphabet makes "novel character" meaningless and
@@ -1725,27 +1729,6 @@ def apply_field_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _gated_scan(fn):
-    """Admit at most VESTIGO_STAT_SCAN_CONCURRENCY heavy scans to ClickHouse at once.
-
-    Applied to every public ``find_*`` detector — each per-query
-    ``max_memory_usage`` cap is budget/concurrency, so admission control is
-    what makes the total budget actually hold (see ``db/_scan.py``). Nested
-    helpers (``recommend_*``, ``*_inventory``) are *not* gated: gated scans
-    call them while holding the slot, and gating them too would deadlock.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        # Cancellable (#300): a request that disconnects while parked here is
-        # noticed within a second instead of taking a slot nobody wants.
-        with acquire_scan_slot(HEAVY_SCAN_GATE, wait=None):
-            return fn(*args, **kwargs)
-
-    wrapper._scan_class = "heavy"  # type: ignore[attr-defined]
-    return wrapper
-
-
 class StatisticalAnomalyService:
     """Statistical anomaly detection over ClickHouse event fields.
 
@@ -2210,7 +2193,7 @@ class StatisticalAnomalyService:
         row = rows[0]
         return int(row[0]), [int(v) for v in row[1:]]
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_value_novelty(
         self,
         case_id: str,
@@ -2762,7 +2745,7 @@ class StatisticalAnomalyService:
             },
         )
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_value_combos(
         self,
         case_id: str,
@@ -3149,7 +3132,7 @@ class StatisticalAnomalyService:
         out.sort(key=lambda f: (not f.recommended, -f.numeric_ratio, -f.coverage, f.token))
         return out
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_range_violations(
         self,
         case_id: str,
@@ -3505,7 +3488,7 @@ class StatisticalAnomalyService:
         picked = picked[:_MAX_AUTO_SCAN_FIELDS]
         return picked, notes + pin_notes
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_charset_novelty(
         self,
         case_id: str,
@@ -3668,31 +3651,23 @@ class StatisticalAnomalyService:
             grp_sel = f"{gcol} AS grp, " if gcol else ""
             grp_key = "grp, " if gcol else ""
             partition = "PARTITION BY grp" if gcol else ""
+            # Two levels: the window runs over the aggregate's own rows and
+            # QUALIFY drops the marker row from the same SELECT, so neither
+            # needs a projection level of its own.
             return f"""
-                SELECT {grp_key}c, n_vals_with_c, n_vals
+                SELECT {grp_key}c, count() AS n_vals_with_c,
+                       anyIf(n_vals_with_c, c = '') OVER ({partition}) AS n_vals
                 FROM (
-                    SELECT {grp_key}c, n_vals_with_c,
-                           anyIf(n_vals_with_c, c = '') OVER ({partition}) AS n_vals
-                    FROM (
-                        SELECT {grp_key}c, count() AS n_vals_with_c
-                        FROM (
-                            SELECT {grp_key}arrayPushBack(
-                                arrayDistinct(extractAll(val, '(?s).')), ''
-                            ) AS chars
-                            FROM (
-                                SELECT {grp_sel}{col} AS val
-                                FROM {db}.events
-                                WHERE case_id = {{cid:String}}
-                                  AND has({{src:Array(String)}}, source_id)
-                                  AND {col} != ''{where_tail}
-                                GROUP BY {grp_key}val
-                            )
-                        )
-                        ARRAY JOIN chars AS c
-                        GROUP BY {grp_key}c
-                    )
+                    SELECT {grp_sel}{col} AS val
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''{where_tail}
+                    GROUP BY {grp_key}val
                 )
-                WHERE c != ''
+                ARRAY JOIN arrayPushBack({_DISTINCT_CHARS_SQL}, '') AS c
+                GROUP BY {grp_key}c
+                QUALIFY c != ''
                 {heavy_scan_settings()}
             """
 
@@ -3846,30 +3821,18 @@ class StatisticalAnomalyService:
                 bs_params: dict[str, Any] = {**base_params}
                 col = _col_expr(field_token, bs_params, field_mappings)
                 bs_bp, _ = _window_preds(windows, bs_params, source_offsets)
-                # The distinct pass is a GROUP BY, not SELECT DISTINCT, for the
-                # reason `_alphabet_sql` gives: it spills, and DISTINCT does not.
+                # The same per-character scan as every other learn; the
+                # reference is the set of characters it returns and the
+                # distinct total rides on every row. No rarity counts: a
+                # baseline-window reference scores by membership alone.
+                bs_tail = f" AND {bs_bp}"
                 if group_field is None:
-                    bs_sql = f"""
-                        SELECT
-                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
-                            count() AS n_vals
-                        FROM (
-                            SELECT {col} AS val
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {col} != ''
-                              AND {bs_bp}
-                            GROUP BY val
-                        )
-                        {heavy_scan_settings()}
-                    """
+                    bs_sql = _alphabet_sql(col, bs_tail)
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
-                    if not bs_rows:
-                        continue
-                    charset_arr, n_vals = bs_rows[0]
-                    n_vals = int(n_vals)
-                    reference = [str(c) for c in (charset_arr or [])]
+                    reference = [str(c) for c, _, _ in bs_rows]
+                    # An empty window returns no rows and lands here as a thin
+                    # learn (n_vals 0), which routes the field to the fallback.
+                    n_vals = int(bs_rows[0][2]) if bs_rows else 0
                     learns.append(
                         _CharsetLearn(
                             None, reference, {}, n_vals, len(reference), "baseline-window"
@@ -3877,34 +3840,15 @@ class StatisticalAnomalyService:
                     )
                 else:
                     gcol = _group_expr(group_field, bs_params, field_mappings)
-                    bs_sql = f"""
-                        SELECT
-                            grp,
-                            groupUniqArrayArray(arrayDistinct(extractAll(val, '(?s).'))) AS charset,
-                            count() AS n_vals
-                        FROM (
-                            SELECT {col} AS val, {gcol} AS grp
-                            FROM {db}.events
-                            WHERE case_id = {{cid:String}}
-                              AND has({{src:Array(String)}}, source_id)
-                              AND {col} != ''
-                              AND {bs_bp}
-                            GROUP BY val, grp
-                        )
-                        GROUP BY grp
-                        {heavy_scan_settings()}
-                    """
+                    bs_sql = _alphabet_sql(col, bs_tail, gcol)
                     bs_rows = self.ch.client.query(bs_sql, parameters=bs_params).result_rows
-                    for grp, charset_arr, grp_n_vals in bs_rows:
-                        reference = [str(c) for c in (charset_arr or [])]
+                    per_group: dict[str, tuple[list[str], int]] = {}
+                    for grp, c, _, grp_n_vals in bs_rows:
+                        per_group.setdefault(str(grp), ([], int(grp_n_vals)))[0].append(str(c))
+                    for grp, (reference, grp_n_vals) in per_group.items():
                         learns.append(
                             _CharsetLearn(
-                                str(grp),
-                                reference,
-                                {},
-                                int(grp_n_vals),
-                                len(reference),
-                                "baseline-window",
+                                grp, reference, {}, grp_n_vals, len(reference), "baseline-window"
                             )
                         )
 
@@ -4050,7 +3994,7 @@ class StatisticalAnomalyService:
                             val,
                             arrayFilter(
                                 c -> NOT has({{base:Array(String)}}, c),
-                                arrayDistinct(extractAll(val, '(?s).'))
+                                {_DISTINCT_CHARS_SQL}
                             ) AS novel,
                             cnt, first_seen, evt_id{win_idx_group}
                         FROM (
@@ -4126,7 +4070,7 @@ class StatisticalAnomalyService:
                                     ),
                                     c
                                 ),
-                                arrayDistinct(extractAll(val, '(?s).'))
+                                {_DISTINCT_CHARS_SQL}
                             ) AS novel,
                             if(gidx = 0, {{fb_rc:Array(String)}},
                                {{rcs:Array(Array(String))}}[greatest(gidx, 1)]) AS g_rc,
@@ -4381,7 +4325,7 @@ class StatisticalAnomalyService:
     # Value entropy outliers
     # ------------------------------------------------------------------
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_entropy_outliers(
         self,
         case_id: str,
@@ -4491,16 +4435,22 @@ class StatisticalAnomalyService:
                 FROM (
                     SELECT arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
                     FROM (
-                        SELECT DISTINCT {col} AS val
+                        SELECT {col} AS val
                         FROM {db}.events
                         WHERE case_id = {{cid:String}}
                           AND has({{src:Array(String)}}, source_id)
                           AND {col} != ''
                           AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
+                        GROUP BY val
                     )
                 )
                 {heavy_scan_settings()}
             """
+            # The distinct pass is a GROUP BY, not SELECT DISTINCT, for the
+            # reason the charset learner's `_alphabet_sql` gives: a GROUP BY
+            # spills at the clause's threshold and DISTINCT holds its set in
+            # memory until the cap kills the query (code 241). Same corpus,
+            # same auto-selected free-text fields, so the same failure.
             srows = self.ch.client.query(stat_sql, parameters=stat_params).result_rows
             if not srows or srows[0][2] is None:
                 continue
@@ -4661,7 +4611,7 @@ class StatisticalAnomalyService:
     # Proportion shift (G-test)
     # ------------------------------------------------------------------
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_proportion_shifts(
         self,
         case_id: str,
@@ -4925,7 +4875,7 @@ class StatisticalAnomalyService:
     # Interval periodicity (cadence)
     # ------------------------------------------------------------------
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_interval_periodicity(
         self,
         case_id: str,
@@ -5407,7 +5357,7 @@ class StatisticalAnomalyService:
         categorical = categorical[: max(_MAX_AUTO_SCAN_FIELDS - len(numeric), len(cat_pins))]
         return numeric, categorical, [*notes, *numeric_notes, *cat_notes]
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_distribution_drift(
         self,
         case_id: str,
@@ -5827,7 +5777,7 @@ class StatisticalAnomalyService:
     # Frequency / volume anomalies
     # ------------------------------------------------------------------
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_frequency_anomalies(
         self,
         case_id: str,
@@ -6341,7 +6291,7 @@ class StatisticalAnomalyService:
     # Timestamp-order violations
     # ------------------------------------------------------------------
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_sequence_novelty(
         self,
         case_id: str,
@@ -6608,7 +6558,7 @@ class StatisticalAnomalyService:
             windows=windows,
         )
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_sequence_motifs(
         self,
         case_id: str,
@@ -6913,7 +6863,7 @@ class StatisticalAnomalyService:
             warnings=run_warnings,
         )
 
-    @_gated_scan
+    @gated_heavy_scan
     def resolve_motif_occurrences(
         self,
         case_id: str,
@@ -7033,7 +6983,7 @@ class StatisticalAnomalyService:
                 )
         return written, warnings
 
-    @_gated_scan
+    @gated_heavy_scan
     def list_log_templates(
         self,
         case_id: str,
@@ -7147,7 +7097,7 @@ class StatisticalAnomalyService:
         ]
         return LogTemplatesResult(field=field, total_templates=total, templates=templates)
 
-    @_gated_scan
+    @gated_heavy_scan
     def find_order_violations(
         self,
         case_id: str,

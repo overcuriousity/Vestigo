@@ -27,7 +27,7 @@ from vestigo.api.deps import (
     require_case_read,
     require_password_current,
 )
-from vestigo.api.scan_exec import run_scan
+from vestigo.api.scan_exec import ensure_field_stats_for_request, run_scan
 from vestigo.core.config import get_settings
 from vestigo.core.events_bus import publish_annotation_change
 from vestigo.db._dt import ensure_utc
@@ -52,7 +52,6 @@ from vestigo.db.anomaly_stats import (
     ValueFinding,
 )
 from vestigo.db.field_stats import (
-    ensure_source_field_stats,
     merged_inventory,
     merged_list_fields,
 )
@@ -1019,7 +1018,7 @@ async def list_fields(
     from vestigo.enrichers.registry import all_enrichers
 
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
-    stats = await ensure_source_field_stats(
+    stats = await ensure_field_stats_for_request(
         get_store(), _get_query_service().store, case_id, source_ids
     )
     result = merged_list_fields(stats, field_mappings)
@@ -1574,7 +1573,7 @@ async def _resolve_export_attr_keys(case_id: str, source_ids: list[str]) -> list
     all, and drop every one of their values behind a row-complete trailer. An
     export carries what was ingested, which is also what JSONL carries.
     """
-    stats = await ensure_source_field_stats(
+    stats = await ensure_field_stats_for_request(
         get_store(), _get_query_service().store, case_id, source_ids
     )
     return merged_list_fields(stats)["attributes"]
@@ -2129,7 +2128,7 @@ async def _resolve_field_inventory(
     novelty path and ``list_anomaly_fields`` so both endpoints agree on which
     fields are candidates.
     """
-    stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
+    stats = await ensure_field_stats_for_request(store, svc.ch, case_id, source_ids)
     inventory, total = merged_inventory(stats, field_mappings)
     if field_mappings and total:
         inventory = inventory + await run_in_threadpool(
@@ -2860,7 +2859,7 @@ async def list_numeric_anomaly_fields(
     """
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    stats = await ensure_field_stats_for_request(get_store(), svc.ch, case_id, source_ids)
     inventory, total = merged_inventory(stats, field_mappings)
     if field_mappings and total:
         inventory = inventory + await run_in_threadpool(

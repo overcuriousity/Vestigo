@@ -28,6 +28,7 @@ from vestigo.api.deps import (
     resolve_case_access,
 )
 from vestigo.api.routers.analysis import DetectorEntryIn, validate_detector_entry
+from vestigo.api.scan_exec import ensure_field_stats_for_request
 from vestigo.api.uploads import receive_upload_to_tmp
 from vestigo.columns.jobs import (
     get_active_recommendation,
@@ -654,6 +655,10 @@ async def _run_ingestion_job(
         # Precompute the per-source field-stats cache (M15). Isolated like the
         # auto-enrichment trigger below: a failure must never roll back a
         # successful ingest, and the read path self-heals on a cache miss.
+        # The computation holds a heavy scan slot and queues for one behind
+        # admitted sweeps, so the job names the phase: the source above is
+        # already browsable, and "running" with no phase would read as stuck.
+        job_store.update(job_id, progress={"phase": "field_stats"})
         try:
             await refresh_source_field_stats(store, clickhouse, case_id, source_id)
         except Exception:  # noqa: BLE001
@@ -663,6 +668,7 @@ async def _run_ingestion_job(
                 source_id,
                 case_id,
             )
+        job_store.update(job_id, progress={"phase": None})
         await _revalidate_stale_field_mappings(store, case_id, source_id)
         # Recommended columns follow the field-stats precompute above, since
         # that is what they read. Isolated for the same reason as the
@@ -1219,9 +1225,20 @@ async def get_timeline(timeline_id: str, case: Case = Depends(require_case_read)
 
 
 async def _resolve_mapping_validation_keys(
-    clickhouse: ClickHouseStore, case_id: str, source_ids: list[str], mappings: dict[str, list[str]]
+    clickhouse: ClickHouseStore,
+    case_id: str,
+    source_ids: list[str],
+    mappings: dict[str, list[str]],
+    *,
+    interactive: bool = False,
 ) -> set[str]:
     """Return the attribute keys to validate *mappings* against.
+
+    *interactive* is set by the request handlers that save a mapping, so a
+    cache miss on the way fills under the bounded, cancellable heavy wait
+    (``ensure_field_stats_for_request``); the post-ingest re-validation runs
+    inside a job that inherited the ingest request's context and must keep
+    the plain unbounded fill, which is why the flag is not inferred.
 
     Starts from the cached, per-source-capped inventory (cheap, the common
     case) and only falls back to a live existence check for the mapping's raw
@@ -1230,7 +1247,8 @@ async def _resolve_mapping_validation_keys(
     payload, so a real but low-coverage raw key can rank outside the cap and
     would otherwise be rejected as nonexistent.
     """
-    stats = await ensure_source_field_stats(get_store(), clickhouse, case_id, source_ids)
+    fill = ensure_field_stats_for_request if interactive else ensure_source_field_stats
+    stats = await fill(get_store(), clickhouse, case_id, source_ids)
     inventory = merged_list_fields(stats)
     keys = set(inventory["attributes"])
     missing_raw = {r for raws in mappings.values() for r in raws} - keys
@@ -1255,7 +1273,7 @@ async def _check_field_mappings(
     """
     if source_ids:
         keys: set[str] | None = await _resolve_mapping_validation_keys(
-            ClickHouseStore(), case_id, source_ids, mappings
+            ClickHouseStore(), case_id, source_ids, mappings, interactive=True
         )
     else:
         keys = None
@@ -1569,7 +1587,7 @@ async def get_field_coverage(
     ids = [sid.strip() for sid in source_ids.split(",") if sid.strip()]
     if not ids:
         raise HTTPException(status_code=422, detail="source_ids must not be empty")
-    stats = await ensure_source_field_stats(get_store(), ClickHouseStore(), case.id, ids)
+    stats = await ensure_field_stats_for_request(get_store(), ClickHouseStore(), case.id, ids)
     return merged_field_coverage(stats)
 
 

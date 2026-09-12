@@ -35,7 +35,7 @@ from vestigo.api.routers.events import (
     _run_stat_detector,
     _serialize_stat_result,
 )
-from vestigo.api.scan_exec import run_scan
+from vestigo.api.scan_exec import ensure_field_stats_for_request, run_scan
 from vestigo.core.config import get_settings
 from vestigo.db._buckets import query_timestamp_range
 from vestigo.db._dt import ensure_utc
@@ -51,7 +51,6 @@ from vestigo.db.analysis_plan import (
 )
 from vestigo.db.field_stats import (
     approximate_canonical_inventory,
-    ensure_source_field_stats,
     merged_inventory,
 )
 from vestigo.db.postgres import Case, _windows_config_hash, dispositions_hash
@@ -125,7 +124,7 @@ async def _collect_plan_inputs(
             has_active_baseline=baseline_id is not None,
         )
 
-    stats = await ensure_source_field_stats(store, svc.ch, case_id, source_ids)
+    stats = await ensure_field_stats_for_request(store, svc.ch, case_id, source_ids)
     # With the timeline's mappings, exactly as every detector path resolves
     # them. Without them the gate counts each mapped raw key as its own field
     # and never sees the canonical token, so `reason_facts` — which the Tools

@@ -1012,3 +1012,125 @@ def test_foreground_wait_is_bounded(monkeypatch):
 
     with pytest.raises(_scan.ScanBusy):
         probe(object())
+
+
+def test_gated_heavy_scan_marks_the_heavy_class():
+    """The decorator is the one way a function joins the heavy class."""
+    from vestigo.db.field_stats import compute_source_field_stats
+
+    @_scan.gated_heavy_scan
+    def scan(x):
+        return x * 2
+
+    assert scan._scan_class == "heavy"
+    assert scan.__wrapped__ is not None
+    assert scan(21) == 42
+    # The field-stats cache fill is a heavy scan like any detector: same
+    # decorator, same marker, so the audit that finds detectors finds it.
+    assert compute_source_field_stats._scan_class == "heavy"
+
+
+def test_gated_heavy_scan_answers_busy_only_under_a_bound(monkeypatch):
+    """Unbounded by default; ``bounded_heavy_wait`` turns a full gate into ScanBusy.
+
+    A job filling a cache has no cheaper answer and queues; a request that
+    would rather answer 503 than hold the analyst's screen says so with the
+    context manager, and the wrapper — looking the gate up at call time —
+    honours it.
+    """
+    import threading
+
+    monkeypatch.setattr(_scan, "HEAVY_SCAN_GATE", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(_scan, "_ACQUIRE_POLL_SECONDS", 0.01)
+    entered = []
+
+    @_scan.gated_heavy_scan
+    def scan():
+        entered.append(True)
+        return "done"
+
+    assert _scan.HEAVY_SCAN_GATE.acquire(blocking=False)
+    try:
+        with _scan.bounded_heavy_wait(0.05), pytest.raises(_scan.ScanBusy) as info:
+            scan()
+        assert info.value.ahead == 0
+        assert entered == []
+        # Without the bound the same call parks until the slot comes back.
+        threading.Timer(0.05, _scan.HEAVY_SCAN_GATE.release).start()
+        assert scan() == "done"
+    finally:
+        # The Timer released the slot the test took; the scan released its own.
+        assert _scan.HEAVY_SCAN_GATE.acquire(blocking=False)
+        _scan.HEAVY_SCAN_GATE.release()
+
+
+def test_every_scan_clause_bounds_a_join_from_its_own_cap(monkeypatch):
+    """The JOIN spill bound lives beside the GROUP BY and sort bounds, in every clause.
+
+    Kept in the clause rather than at the one JOIN that needed it, so the
+    next JOIN written under either cap is bounded the day it is written. The
+    bucket is a quarter of the cap *the same query carries*: under a fan-out
+    both divide by the width, so they cannot disagree.
+    """
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: 1024 * 1024**2)
+    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 8)
+
+    for clause in (_scan.heavy_scan_settings(), _scan.foreground_scan_settings()):
+        cap = int(clause.split("max_memory_usage = ")[1].split(",")[0].split("'")[0])
+        bucket = int(clause.split("max_bytes_in_join = ")[1].split(",")[0])
+        assert bucket == cap // 4
+        assert "join_algorithm = 'grace_hash'" in clause
+        assert "query_plan_join_swap_table = 'false'" in clause
+
+    with _scan.scan_fanout(2):
+        clause = _scan.heavy_scan_settings()
+    assert f"max_bytes_in_join = {(1024 * 1024**2 // 2) // 4}" in clause
+
+
+def test_routine_collapse_counts_carry_the_foreground_cap():
+    """Every collapsed-count query is capped, and only the empty case skips the round-trip.
+
+    The count runs on every Explorer page with collapse on. Bounded by
+    construction, it still carries a per-query cap so an unforeseen growth
+    fails one query rather than spending the server's ceiling — which is
+    what the query it replaced did, and what its docstring diagnosed.
+    """
+    from vestigo.db.clickhouse import ClickHouseStore
+
+    seen: list[str] = []
+
+    class _Rows:
+        result_rows = [[7]]
+
+    class _Client:
+        def command(self, sql, parameters=None):
+            pass
+
+        def query(self, sql, parameters=None):
+            if "system." in sql:
+
+                class _Empty:
+                    result_rows = []
+
+                return _Empty()
+            seen.append(sql)
+            return _Rows()
+
+    store = ClickHouseStore.__new__(ClickHouseStore)
+    store.client = _Client()
+    store.database = "testdb"
+    store._schema_ready = True
+
+    assert store.count_routine_collapsed("c", ["s"], None, None) == 0
+    assert seen == [], "nothing collapsed asks nothing"
+    assert store.count_routine_collapsed("c", ["s"], ["d1"], None) == 7
+    assert store.count_routine_collapsed("c", ["s"], None, [1]) == 7
+    assert store.count_routine_collapsed("c", ["s"], ["d1"], [1]) == 7
+    assert store.count_motif_occurrences("c", ["d1"], ["s"]) == 7
+    assert store.count_template_events("c", [1], ["s"]) == 7
+    assert len(seen) == 5
+    for sql in seen:
+        assert "max_memory_usage = " in sql, sql
+    # One shape for every argument combination: the inclusion–exclusion query.
+    assert all("uniqExact(event_id)" in sql for sql in seen[:3])
+    assert all("template_hash IN {ths:Array(UInt64)}" in sql for sql in seen[:3])

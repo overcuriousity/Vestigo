@@ -39,7 +39,7 @@ from vestigo.db._dt import is_null_ts_sentinel, to_clickhouse_utc
 from vestigo.db._scan import (
     HEAVY_SCAN_GATE,
     acquire_scan_slot,
-    heavy_join_bucket_bytes,
+    foreground_scan_settings,
     heavy_scan_settings,
 )
 from vestigo.db._template import template_hash_expr
@@ -546,7 +546,8 @@ class ClickHouseStore:
 
         The "N routine events collapsed" number: distinct because occurrences
         of one motif overlap by ``ngram - 1`` events, and two routine motifs
-        can share events.
+        can share events. Capped like the other counts here — see
+        :meth:`count_routine_collapsed` for why a count carries a cap at all.
         """
         if not disposition_ids:
             return 0
@@ -559,7 +560,7 @@ class ClickHouseStore:
         result = self.client.query(
             f"SELECT uniqExact(event_id) FROM {self.database}.motif_occurrences "
             "WHERE case_id = {cid:String} AND has({dids:Array(String)}, disposition_id)"
-            + source_pred,
+            f"{source_pred} {foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -572,7 +573,8 @@ class ClickHouseStore:
 
         Unlike motif occurrences, membership needs no side table — it's a
         direct predicate on the materialized ``template_hash`` column — so
-        this is a plain count, not a lookup against an aux table.
+        this is a plain count, not a lookup against an aux table. Capped like
+        the other counts here — see :meth:`count_routine_collapsed`.
 
         The template predicate is written ``template_hash IN {ths}``, not the
         ``has({ths}, template_hash)`` form used everywhere else in this file.
@@ -595,7 +597,8 @@ class ClickHouseStore:
             source_pred = " AND has({sids:Array(String)}, source_id)"
         result = self.client.query(
             f"SELECT count() FROM {self.database}.events "
-            "WHERE case_id = {cid:String} AND template_hash IN {ths:Array(UInt64)}" + source_pred,
+            "WHERE case_id = {cid:String} AND template_hash IN {ths:Array(UInt64)}"
+            f"{source_pred} {foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -618,21 +621,46 @@ class ClickHouseStore:
 
         Taken by inclusion–exclusion rather than as ``uniqExact`` over both
         branches' ids: ``|T| + |M| − |T ∩ M|``. The muted side ``T`` is a plain
-        count over ``events`` (one row per event — ``event_id`` is derived from
-        the row's provenance), so the only set held in memory is the
-        motif-occurrence membership ``M``, a side table bounded per disposition.
-        The id set this replaced held one entry per *muted* event: a muted
-        heartbeat on a billion-event case, on every Explorer page with collapse
-        on, in a query that carries no per-query cap and so spends the server's
-        ceiling instead.
+        count over ``events``, so the only set held in memory is the
+        motif-occurrence membership ``M``, a side table bounded per disposition
+        (``resolve_motif_occurrences`` writes at most 500k rows each). The id
+        set this replaced held one entry per *muted* event: a muted heartbeat
+        on a billion-event case, on every Explorer page with collapse on.
+
+        One query for every combination of arguments: an empty template list
+        makes ``template_hash IN []`` read nothing (the bloom-filter skip index
+        prunes every granule, verified on 26.6), and an empty disposition list
+        makes both motif terms zero. Only "nothing is collapsed at all" skips
+        the round-trip, since the answer is known.
+
+        **Assumes one ``events`` row per ``event_id``.** ``|T|`` and the
+        intersection are row counts while ``|M|`` is distinct ids, so a
+        duplicated event row would put the badge off by one from both the
+        rows the grid hides and the distinct events behind them. Nothing in
+        the schema enforces the assumption (plain ``MergeTree``, no insert
+        deduplication): it holds because ``event_id`` is derived from the row's
+        provenance and every API ingest refuses a source whose file hash is
+        already present and drops the partition of a failed one. ``vestigo
+        ingest`` on the CLI performs neither check, and re-running it inserts
+        every event twice — it is slated for deprecation rather than fixed.
+
+        Carries the foreground cap, like its two helpers. Bounded by
+        construction as it is, the cap is a bound and not a reservation — no
+        gate slot is taken — so an unforeseen growth (a side table that
+        outlived its dispositions, say) fails this one query at the cap rather
+        than spending the server's ceiling on an Explorer page load.
         """
-        if not motif_disposition_ids and not template_hashes:
+        dispositions = motif_disposition_ids or []
+        templates = template_hashes or []
+        if not dispositions and not templates:
             return 0
         self.init_schema()
-        params: dict[str, Any] = {"cid": case_id, "sids": source_ids}
-        if not template_hashes:
-            return self.count_motif_occurrences(case_id, motif_disposition_ids or [], source_ids)
-        params["ths"] = template_hashes
+        params: dict[str, Any] = {
+            "cid": case_id,
+            "sids": source_ids,
+            "ths": templates,
+            "dids": dispositions,
+        }
         # `IN`, not `has(...)` — see count_template_events on why the bloom
         # skip index requires this form.
         muted = (
@@ -640,11 +668,6 @@ class ClickHouseStore:
             "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
             "AND template_hash IN {ths:Array(UInt64)}"
         )
-        if not motif_disposition_ids:
-            result = self.client.query(f"SELECT count() {muted}", parameters=params)
-            rows = result.result_rows
-            return int(rows[0][0]) if rows else 0
-        params["dids"] = motif_disposition_ids
         members = (
             f"FROM {self.database}.motif_occurrences "
             "WHERE case_id = {cid:String} AND has({sids:Array(String)}, source_id) "
@@ -652,10 +675,13 @@ class ClickHouseStore:
         )
         # The membership side is cast to UUID rather than `event_id` to String:
         # a string per muted row, per read thread, is the one allocation left
-        # here that grows with the scan instead of with the motif table.
+        # here that grows with the scan instead of with the motif table. The
+        # side table is read twice (a scalar subquery and an IN set); a named
+        # WITH would not change that, since ClickHouse inlines it at each use.
         result = self.client.query(
             f"SELECT count() + (SELECT uniqExact(event_id) {members}) "
-            f"- countIf(event_id IN (SELECT toUUIDOrZero(event_id) {members})) {muted}",
+            f"- countIf(event_id IN (SELECT toUUIDOrZero(event_id) {members})) {muted} "
+            f"{foreground_scan_settings()}",
             parameters=params,
         )
         rows = result.result_rows
@@ -939,9 +965,7 @@ class ClickHouseStore:
                     GROUP BY event_id
                 ) AS m ON e.event_id = m.event_id
                 WHERE e.case_id = {{case_id:String}} AND e.source_id = {{source_id:String}}
-                {heavy_scan_settings()}, join_use_nulls = 0, join_algorithm = 'grace_hash',
-                max_bytes_in_join = {heavy_join_bucket_bytes()},
-                query_plan_join_swap_table = 'false',
+                {heavy_scan_settings()}, join_use_nulls = 0,
                 min_insert_block_size_bytes = {settings.enrichment_apply_insert_block_bytes}
                 """,
                 parameters={
@@ -1260,3 +1284,32 @@ class ClickHouseStore:
                 "Failed to drop events partition for source %s (case %s)", source_id, case_id
             )
             raise
+        self._delete_source_motif_occurrences(case_id, source_id)
+
+    def _delete_source_motif_occurrences(self, case_id: str, source_id: str) -> None:
+        """Drop a deleted source's rows from the motif-membership side table.
+
+        The rows name events that no longer exist. Left behind they are
+        normally out of scope — every read filters by the timeline's live
+        source ids — but a source id is derived from the file hash, so
+        re-ingesting the same file (under another parser, say) brings the
+        same id back with different event ids, and the stale rows would then
+        be *counted* as collapsed by ``count_routine_collapsed`` while hiding
+        nothing in the grid. Best effort, like ``delete_motif_occurrences``:
+        the evidence delete above has already succeeded, and a failure here
+        leaves derived rows, not evidence.
+        """
+        try:
+            self.client.command(
+                f"DELETE FROM {self.database}.motif_occurrences "
+                "WHERE case_id = {cid:String} AND source_id = {sid:String}",
+                parameters={"cid": case_id, "sid": source_id},
+            )
+        except Exception:  # noqa: BLE001 — derived rows; the evidence is already gone
+            logger.warning(
+                "Failed to delete motif occurrences for source %s (case %s); "
+                "stale rows stay until the disposition is deleted",
+                source_id,
+                case_id,
+                exc_info=True,
+            )

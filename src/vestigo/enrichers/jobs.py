@@ -57,7 +57,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from vestigo.core.config import get_settings
-from vestigo.core.jobs import JobStore
+from vestigo.core.jobs import JobStore, get_job_store
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_stats import refresh_source_field_stats
 from vestigo.db.postgres import EnrichmentJobRun, PostgresStore
@@ -370,6 +370,11 @@ async def _apply_staged_rows(
             # per-source field-stats cache (M15). On failure the now-stale row
             # is dropped instead: a missing row is a cache miss the read path
             # heals, whereas a stale current-version row would be trusted.
+            # Holds a heavy scan slot, queued behind admitted sweeps: the phase
+            # tells the tray why a job whose rows are applied is still running.
+            # A job the store no longer knows (startup reconciliation after a
+            # restart) is a no-op update.
+            get_job_store().update(job_id, progress={"phase": "field_stats"})
             try:
                 await refresh_source_field_stats(store, ch_store, case_id, source_id)
             except Exception:  # noqa: BLE001

@@ -1374,6 +1374,12 @@ traffic volume can't drag the band. Values shorter than 6 characters are
 excluded outright (baseline and detect): a 3-character string's entropy is
 degenerate and would flood the band with false lows.
 
+The distinct pass that learns the band is a `GROUP BY`, for the reason given under
+charset novelty: it spills under the heavy per-query cap where `SELECT DISTINCT` holds its
+set in memory until the cap kills the query. Both detectors pick the same free-text-ish
+fields, so the same three million distinct query strings that broke the charset learn broke
+this one (`tests/test_entropy_memory_clickhouse.py`).
+
 ### Two modes
 
 | | Self-baseline (`iqr`) | Temporal (`temporal-iqr`) |

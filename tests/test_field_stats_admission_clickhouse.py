@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from vestigo.db import field_stats
+from vestigo.db import _scan
 from vestigo.db.clickhouse import ClickHouseStore
 from vestigo.db.field_stats import ensure_source_field_stats
 from vestigo.db.postgres import PostgresStore
@@ -97,7 +97,9 @@ async def test_misses_queue_for_a_heavy_slot(ch_store, pg_store, monkeypatch):
     tracked = ClickHouseStore()
     tracker = _InFlight(tracked.client)
     tracked.client = tracker
-    monkeypatch.setattr(field_stats, "HEAVY_SCAN_GATE", threading.BoundedSemaphore(1))
+    # `gated_heavy_scan` looks the gate up on `_scan` at call time, so this is
+    # the one binding a smaller gate has to replace.
+    monkeypatch.setattr(_scan, "HEAVY_SCAN_GATE", threading.BoundedSemaphore(1))
 
     stats = await ensure_source_field_stats(pg_store, tracked, CASE_ID, [SRC_A, SRC_B])
 

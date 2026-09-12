@@ -25,7 +25,11 @@ def fake_inventory(monkeypatch):
         }
         return dict.fromkeys(source_ids, (3, payload))
 
+    # The mapping handlers fill interactively (bounded, cancellable) and the
+    # post-ingest re-validation fills plainly; both names are faked so a test
+    # exercising either path never reaches ClickHouse.
     monkeypatch.setattr(cases_router, "ensure_source_field_stats", fake_ensure)
+    monkeypatch.setattr(cases_router, "ensure_field_stats_for_request", fake_ensure)
 
 
 def _create_case(client) -> str:

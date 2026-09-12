@@ -18,6 +18,12 @@ describe("jobPhaseLabel", () => {
     for (const phase of ["queued", "verify", "postgres", "events", "blobs", "stats"]) {
       expect(jobPhaseLabel("case_import", { phase })).toBeTruthy();
     }
+    // The field-stats refresh queues behind running scans; ingest and
+    // enrichment both name it so a browsable-but-running source reads as
+    // queued, not stuck.
+    expect(jobPhaseLabel("ingest", { phase: "field_stats" })).toMatch(/queued behind/);
+    expect(jobPhaseLabel("enrich", { phase: "field_stats" })).toMatch(/queued behind/);
+    expect(jobPhaseLabel("case_import", { phase: "stats" })).toMatch(/queued behind/);
   });
 
   it("never leaks a raw token for an unknown phase or kind", () => {
@@ -25,6 +31,7 @@ describe("jobPhaseLabel", () => {
     expect(jobPhaseLabel("case_import", { phase: "manifest" })).toBeNull();
     expect(jobPhaseLabel("case_export", { phase: "brand_new_phase" })).toBeNull();
     expect(jobPhaseLabel("ingest", { phase: "events" })).toBeNull();
+    expect(jobPhaseLabel("ingest", {})).toBeNull();
     expect(jobPhaseLabel(undefined, { phase: "events" })).toBeNull();
   });
 

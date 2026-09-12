@@ -40,11 +40,11 @@ from vestigo.api.routers.events import (
     _validate_field_modes,
     _validate_regex,
 )
+from vestigo.api.scan_exec import ensure_field_stats_for_request
 from vestigo.core.config import get_settings
 from vestigo.db._time_fields import TIME_FIELD_SPECS, resolve_time_field
 from vestigo.db.derive import DeriveSpec, parse_derive
 from vestigo.db.field_stats import (
-    ensure_source_field_stats,
     merged_field_terms,
     merged_inventory,
 )
@@ -337,7 +337,7 @@ async def get_field_terms(
         and _is_unfiltered(query)
         and not (query.field_mappings and field in query.field_mappings)
     ):
-        stats = await ensure_source_field_stats(
+        stats = await ensure_field_stats_for_request(
             get_store(), _get_stat_anomaly_service().ch, case_id, query.source_ids or []
         )
         cached = merged_field_terms(stats, field, limit)
@@ -1640,7 +1640,7 @@ async def list_viz_fields(
     """
     source_ids = await _resolve_timeline_source_ids(case_id, timeline_id)
     svc = _get_stat_anomaly_service()
-    stats = await ensure_source_field_stats(get_store(), svc.ch, case_id, source_ids)
+    stats = await ensure_field_stats_for_request(get_store(), svc.ch, case_id, source_ids)
     inventory, total = merged_inventory(stats)
     if total == 0:
         return {"fields": []}
