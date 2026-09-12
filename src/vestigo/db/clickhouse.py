@@ -237,6 +237,43 @@ def _events_to_record_batch(events: list[Event]) -> pa.RecordBatch:
     return pa.RecordBatch.from_pydict(columns, schema=EVENT_ARROW_SCHEMA)
 
 
+#: Set once per process by the first :func:`_probe_versioned_settings`.
+_versioned_settings_probed = False
+
+
+def _probe_versioned_settings(client: Any) -> None:
+    """Tell ``db/_scan.py`` which of its version-dependent settings this server knows.
+
+    Once per process, from the first ``init_schema`` — which runs before every
+    scan path, the CLI's and the tests' included, where the startup probe in
+    ``api/main.py`` does not. A failed read of ``system.settings`` records
+    nothing, which keeps sending every setting: no answer is not evidence that
+    the server lacks one. See :data:`vestigo.db._scan.VERSIONED_SETTINGS`.
+    """
+    global _versioned_settings_probed  # noqa: PLW0603
+    if _versioned_settings_probed:
+        return
+    from vestigo.db._scan import VERSIONED_SETTINGS, configure_server_settings
+
+    _versioned_settings_probed = True
+    try:
+        rows = client.query(
+            "SELECT name FROM system.settings WHERE name IN {names:Array(String)}",
+            parameters={"names": list(VERSIONED_SETTINGS)},
+        ).result_rows
+    except Exception:  # noqa: BLE001 — an unreadable system table must not block a scan
+        logger.warning("could not read system.settings; sending every scan setting", exc_info=True)
+        return
+    present = {row[0] for row in rows}
+    configure_server_settings(present)
+    if missing := sorted(set(VERSIONED_SETTINGS) - present):
+        logger.warning(
+            "ClickHouse does not know %s (added in 24.12); scans leave them out, "
+            "which on this server is already their effect",
+            ", ".join(missing),
+        )
+
+
 class ClickHouseStore:
     """Sync ClickHouse client for event data."""
 
@@ -325,6 +362,7 @@ class ClickHouseStore:
         self._ensure_template_hash()
         self.client.command(_MOTIF_OCCURRENCES_DDL.format(database=self.database))
         self._schema_ready = True
+        _probe_versioned_settings(self.client)
         # Enrichment output moved into events.attributes (stage_enrichment_rows / finalize_enrichment_apply);
         # the former side table is dead. Destructive, but pre-release
         # databases are documented as deprecated and the data is derived —
@@ -1263,9 +1301,12 @@ class ClickHouseStore:
         ``DROP PARTITION`` is instant and does not require a full-table scan.
         A missing partition is a server-side no-op; a missing ``events``
         table (fresh install, schema never initialized) is treated as a
-        benign no-op too. Any other failure is logged and re-raised — a
-        silently failed evidence delete would leave orphan events behind a
-        "successful" delete, which is a forensic-integrity violation.
+        benign no-op too — but not as a reason to skip the side-table
+        cleanup below, which is exactly the case where rows from an earlier
+        schema may still be sitting there. Any other failure is logged and
+        re-raised — a silently failed evidence delete would leave orphan
+        events behind a "successful" delete, which is a forensic-integrity
+        violation.
         """
         partition_expr = _partition_expr(case_id, source_id)
         try:
@@ -1273,17 +1314,16 @@ class ClickHouseStore:
                 f"ALTER TABLE {self.database}.events DROP PARTITION {partition_expr}"
             )
         except Exception as exc:
-            if "UNKNOWN_TABLE" in str(exc):
-                logger.debug(
-                    "events table missing while deleting source %s (case %s); nothing to drop",
-                    source_id,
-                    case_id,
+            if "UNKNOWN_TABLE" not in str(exc):
+                logger.exception(
+                    "Failed to drop events partition for source %s (case %s)", source_id, case_id
                 )
-                return
-            logger.exception(
-                "Failed to drop events partition for source %s (case %s)", source_id, case_id
+                raise
+            logger.debug(
+                "events table missing while deleting source %s (case %s); nothing to drop",
+                source_id,
+                case_id,
             )
-            raise
         self._delete_source_motif_occurrences(case_id, source_id)
 
     def _delete_source_motif_occurrences(self, case_id: str, source_id: str) -> None:
@@ -1297,9 +1337,13 @@ class ClickHouseStore:
         be *counted* as collapsed by ``count_routine_collapsed`` while hiding
         nothing in the grid. Best effort, like ``delete_motif_occurrences``:
         the evidence delete above has already succeeded, and a failure here
-        leaves derived rows, not evidence.
+        leaves derived rows, not evidence. ``init_schema`` first, like the
+        sibling: on a database where the side table was never created this
+        would otherwise warn with a traceback on *every* source delete, and a
+        benign missing table must not read like a failed cleanup.
         """
         try:
+            self.init_schema()
             self.client.command(
                 f"DELETE FROM {self.database}.motif_occurrences "
                 "WHERE case_id = {cid:String} AND source_id = {sid:String}",

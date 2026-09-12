@@ -53,7 +53,12 @@ const COLUMN_RECOMMEND_PHASES: Record<string, string> = {
   model: "Asking the model to choose",
 };
 
-/** Source: `src/vestigo/converters/job.py`. */
+/**
+ * Source: `src/vestigo/converters/job.py`, which hands the produced Parquet to
+ * the *same* `_run_ingestion_job` as a plain upload — so a convert-and-ingest
+ * job reports `field_stats` too, under its own kind. Without the key here the
+ * tray would drop its detail line exactly where the ingest path adds one.
+ */
 const CONVERT_INGEST_PHASES: Record<string, string> = {
   queued: "Queued",
   sampling: "Reading a sample of the file",
@@ -61,6 +66,7 @@ const CONVERT_INGEST_PHASES: Record<string, string> = {
   sample_run: "Trying the converter on the sample",
   converting: "Converting the whole file",
   ingesting: "Ingesting",
+  field_stats: FIELD_STATS_COPY,
 };
 
 const PHASES_BY_KIND: Record<string, Record<string, string>> = {

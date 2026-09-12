@@ -373,7 +373,10 @@ async def _apply_staged_rows(
             # Holds a heavy scan slot, queued behind admitted sweeps: the phase
             # tells the tray why a job whose rows are applied is still running.
             # A job the store no longer knows (startup reconciliation after a
-            # restart) is a no-op update.
+            # restart) is a no-op update. Cleared again in the ``finally``
+            # below, because this loop has more sources to go: `JobStore.update`
+            # merges, so a phase left set would label the *next* source's
+            # partition rewrite — minutes of it — as field statistics.
             get_job_store().update(job_id, progress={"phase": "field_stats"})
             try:
                 await refresh_source_field_stats(store, ch_store, case_id, source_id)
@@ -405,6 +408,8 @@ async def _apply_staged_rows(
                         target_id=source_id,
                         detail={"job_id": job_id},
                     )
+            finally:
+                get_job_store().update(job_id, progress={"phase": None})
             await store.record_audit(
                 action="enricher.applied",
                 case_id=case_id,

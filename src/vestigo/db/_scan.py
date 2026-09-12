@@ -79,7 +79,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -902,6 +902,40 @@ def gated_heavy_scan(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+#: Settings the clause asks for that an older ClickHouse does not have. Both
+#: arrived in 24.12 (``system.settings_changes``), and on a server that
+#: predates them each one's absence is already the behaviour the clause asks
+#: for: without the sort ratio a sort spills on its byte threshold alone, and
+#: without the join swap the planner keeps the sides as written. *Sending*
+#: either to such a server, though, fails every scan with ``UNKNOWN_SETTING``
+#: — for settings inert on all but one query — so the clause leaves out the
+#: ones a probe of the server found missing (:func:`configure_server_settings`).
+VERSIONED_SETTINGS = ("max_bytes_ratio_before_external_sort", "query_plan_join_swap_table")
+
+#: The :data:`VERSIONED_SETTINGS` the server was probed and found not to know.
+#: Empty until a probe says otherwise: every server the reference stack and CI
+#: run accepts them, and a probe that could not read ``system.settings`` is no
+#: evidence that the server lacks anything.
+_unsupported_settings: frozenset[str] = frozenset()
+
+
+def configure_server_settings(present: Collection[str] | None) -> None:
+    """Record which of :data:`VERSIONED_SETTINGS` the server reported knowing.
+
+    *present* is the subset ``system.settings`` listed; ``None`` means the probe
+    could not tell, which sends all of them — the behaviour before the probe.
+    """
+    global _unsupported_settings  # noqa: PLW0603
+    _unsupported_settings = (
+        frozenset() if present is None else frozenset(VERSIONED_SETTINGS) - frozenset(present)
+    )
+
+
+def _versioned(name: str, value: str) -> str:
+    """``"name = value, "``, or nothing on a server probed to lack *name*."""
+    return "" if name in _unsupported_settings else f"{name} = {value}, "
+
+
 def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> str:
     s = get_settings()
     # A gate slot's cap is per *slot*: a caller that fans out splits its own
@@ -941,7 +975,7 @@ def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> 
         # only ever *lowers* the threshold above (verified on 26.6), which is
         # extra protection when the server is short of memory, not an override.
         f"max_bytes_before_external_sort = {sort_spill}, "
-        "max_bytes_ratio_before_external_sort = 0, "
+        f"{_versioned('max_bytes_ratio_before_external_sort', '0')}"
         # The third spill path, beside the GROUP BY and the sort above. Inert
         # on a query without a JOIN, and carried by every clause so the next
         # JOIN written under either cap is bounded the day it is written
@@ -960,10 +994,12 @@ def _scan_settings_clause(budget: int, threads: int, *, split_threads: bool) -> 
         # the *fanned-out* budget above so a bucket is always a quarter of the
         # cap the same query carries. The swap is off because
         # `query_plan_join_swap_table = auto` made the full-width events rows
-        # the in-memory side (`EXPLAIN` showed `Type: RIGHT`).
+        # the in-memory side (`EXPLAIN` showed `Type: RIGHT`). Both it and the
+        # sort ratio above are left out on a server too old to know them — see
+        # `VERSIONED_SETTINGS`.
         f"max_bytes_in_join = {budget // 4 or 1}, "
         "join_algorithm = 'grace_hash', "
-        "query_plan_join_swap_table = 'false', "
+        f"{_versioned('query_plan_join_swap_table', chr(39) + 'false' + chr(39))}"
         f"max_memory_usage = {budget}{tag}"
     )
 

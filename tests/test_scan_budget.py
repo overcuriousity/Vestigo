@@ -1087,6 +1087,67 @@ def test_every_scan_clause_bounds_a_join_from_its_own_cap(monkeypatch):
     assert f"max_bytes_in_join = {(1024 * 1024**2 // 2) // 4}" in clause
 
 
+def test_clause_leaves_out_settings_the_server_does_not_know(monkeypatch):
+    """A pre-24.12 server gets no setting it would refuse, and nothing else changes.
+
+    ``query_plan_join_swap_table`` and ``max_bytes_ratio_before_external_sort``
+    are ``UNKNOWN_SETTING`` there — on *every* scan, not just the one JOIN — while
+    their absence is already the behaviour the clause asks for. Only a probe
+    that saw the server's setting list may drop one: ``None`` (the probe could
+    not read ``system.settings``) sends everything, as before the probe existed.
+    """
+    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: 1024 * 1024**2)
+    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 8)
+    monkeypatch.setattr(_scan, "_unsupported_settings", frozenset())
+    full = _scan.heavy_scan_settings()
+
+    _scan.configure_server_settings(set())
+    old = _scan.heavy_scan_settings()
+    for name in _scan.VERSIONED_SETTINGS:
+        assert name in full
+        assert name not in old
+    # Everything else is untouched: the JOIN bound, its algorithm, the sort spill.
+    assert old == full.replace("max_bytes_ratio_before_external_sort = 0, ", "").replace(
+        "query_plan_join_swap_table = 'false', ", ""
+    )
+
+    _scan.configure_server_settings({"max_bytes_ratio_before_external_sort"})
+    partial = _scan.foreground_scan_settings()
+    assert "max_bytes_ratio_before_external_sort = 0, " in partial
+    assert "query_plan_join_swap_table" not in partial
+
+    _scan.configure_server_settings(None)
+    assert _scan.heavy_scan_settings() == full
+
+
+def test_versioned_settings_probe_reads_the_server_once(monkeypatch):
+    """The probe records what ``system.settings`` lists, once, and a failure records nothing."""
+    from vestigo.db import clickhouse
+
+    monkeypatch.setattr(_scan, "_unsupported_settings", frozenset())
+    calls: list[str] = []
+
+    class _Client:
+        def __init__(self, rows=None, fail=False):
+            self.rows, self.fail = rows or [], fail
+
+        def query(self, sql, parameters=None):
+            calls.append(sql)
+            if self.fail:
+                raise RuntimeError("no rights on system.settings")
+            return type("R", (), {"result_rows": self.rows})()
+
+    monkeypatch.setattr(clickhouse, "_versioned_settings_probed", False)
+    clickhouse._probe_versioned_settings(_Client(fail=True))
+    assert _scan._unsupported_settings == frozenset()
+
+    monkeypatch.setattr(clickhouse, "_versioned_settings_probed", False)
+    clickhouse._probe_versioned_settings(_Client(rows=[("max_bytes_ratio_before_external_sort",)]))
+    assert _scan._unsupported_settings == {"query_plan_join_swap_table"}
+    clickhouse._probe_versioned_settings(_Client(rows=[]))  # already probed: no second read
+    assert len(calls) == 2
+
+
 def test_routine_collapse_counts_carry_the_foreground_cap():
     """Every collapsed-count query is capped, and only the empty case skips the round-trip.
 

@@ -758,6 +758,65 @@ async def test_apply_skips_and_discards_rows_for_deleted_source(store):
     assert await store.list_source_enrichments("s1") == []
 
 
+@pytest.mark.asyncio
+async def test_apply_clears_the_field_stats_phase_before_the_next_source(store, monkeypatch):
+    """The phase names the refresh it belongs to, and no later source's rewrite.
+
+    ``JobStore.update`` merges progress, so a phase set per source and never
+    cleared would label every following partition rewrite as field statistics.
+    Cleared on a failed refresh too — that path is the one most easily missed.
+    """
+    from vestigo.core.jobs import get_job_store
+    from vestigo.enrichers import jobs as _jobs
+
+    await store.create_case("c1", "Case One")
+    for sid, digest in (("s1", "a"), ("s2", "b")):
+        await store.create_source("c1", sid, sid, file_hash=digest * 64, size_bytes=1)
+    job = get_job_store().create(kind="enrich", case_id="c1")
+    await store.stage_enrichment_results(
+        [
+            {
+                "job_id": job.id,
+                "case_id": "c1",
+                "source_id": sid,
+                "timeline_id": "t1",
+                "event_id": f"e-{sid}",
+                "enricher_key": "geoip",
+                "fields": {"ip:geo_country": "DE"},
+                "computed_at": datetime.now(UTC),
+                "enricher_config_hash": "hash1",
+            }
+            for sid in ("s1", "s2")
+        ]
+    )
+
+    def phase():
+        return (get_job_store().get(job.id).progress or {}).get("phase")
+
+    seen: list[tuple[str, str, str | None]] = []
+
+    class _PhaseRecordingClickHouse(_RecordingClickHouse):
+        def finalize_enrichment_apply(self, case_id, source_id, *args, **kwargs):
+            seen.append(("rewrite", source_id, phase()))
+            super().finalize_enrichment_apply(case_id, source_id, *args, **kwargs)
+
+    async def refresh(store_, ch_, case_id, source_id):
+        seen.append(("refresh", source_id, phase()))
+        if source_id == "s1":
+            raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(_jobs, "refresh_source_field_stats", refresh)
+    await _jobs._apply_staged_rows(store, _PhaseRecordingClickHouse(), job.id)
+
+    assert [(kind, p) for kind, _, p in seen] == [
+        ("rewrite", None),
+        ("refresh", "field_stats"),
+        ("rewrite", None),
+        ("refresh", "field_stats"),
+    ]
+    assert phase() is None
+
+
 # ---------------------------------------------------------------------------
 # apply_enrichments partition rewrite (fake client)
 # ---------------------------------------------------------------------------

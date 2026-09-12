@@ -383,6 +383,22 @@ async def store(pg_database, request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_server_settings_probe(monkeypatch):
+    """Keep the once-per-process ``system.settings`` probe out of the suite.
+
+    ``ClickHouseStore.init_schema`` asks the server which version-dependent scan
+    settings it knows, once per process. Under test the first ``init_schema`` is
+    as likely to run against a recording fake as against ClickHouse, and a fake's
+    canned rows read as "the server knows none of them" — which then strips both
+    settings from every clause for the rest of the run. Every server the suite
+    targets knows them, so each test starts from "send all"; the probe's own
+    tests switch it back on.
+    """
+    monkeypatch.setattr("vestigo.db.clickhouse._versioned_settings_probed", True)
+    monkeypatch.setattr(_scan, "_unsupported_settings", frozenset())
+
+
+@pytest.fixture(autouse=True)
 def transfer_temp(tmp_path, monkeypatch):
     """Point export archives at the test's tmp dir.
 

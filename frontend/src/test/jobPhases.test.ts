@@ -24,6 +24,20 @@ describe("jobPhaseLabel", () => {
     expect(jobPhaseLabel("ingest", { phase: "field_stats" })).toMatch(/queued behind/);
     expect(jobPhaseLabel("enrich", { phase: "field_stats" })).toMatch(/queued behind/);
     expect(jobPhaseLabel("case_import", { phase: "stats" })).toMatch(/queued behind/);
+    // A convert-and-ingest job runs the *same* `_run_ingestion_job`, so it
+    // emits `field_stats` under its own kind — and would otherwise lose its
+    // detail line at exactly the step that added one.
+    for (const phase of [
+      "queued",
+      "sampling",
+      "generating",
+      "sample_run",
+      "converting",
+      "ingesting",
+      "field_stats",
+    ]) {
+      expect(jobPhaseLabel("convert_ingest", { phase })).toBeTruthy();
+    }
   });
 
   it("never leaks a raw token for an unknown phase or kind", () => {
