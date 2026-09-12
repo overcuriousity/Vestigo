@@ -11,12 +11,16 @@ recommends. The expectations come from measurement, not from the page:
 - Across 2M → 32M events its peak grew 0.97 → 2.36 GiB: sixteen times the events
   for 2.4 times the memory, because the sort spills.
 
-Skipped without Node — a tool, not a service; the page is plain JavaScript.
+Skipped without Node locally — a tool, not a service; the page is plain
+JavaScript. Under ``CI`` a missing Node fails instead: the backend job installs
+it on purpose (``actions/setup-node`` in ``ci.yml``), and a runner image without
+it would otherwise turn this file into a green no-op.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,7 +33,18 @@ CONSTANTS = REPO / "docs" / "sizing" / "sizing-constants.json"
 NODE = shutil.which("node")
 GIB = 1024**3
 
-pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+
+@pytest.fixture(autouse=True)
+def _node_or_bust() -> None:
+    """Skip without Node locally; fail under CI, where its absence is a broken job."""
+    if NODE is not None:
+        return
+    if os.environ.get("CI"):
+        pytest.fail(
+            "node is not installed; the backend CI job's setup-node step is missing or broken"
+        )
+    pytest.skip("node is not installed")
+
 
 _HARNESS = r"""
 const fs = require("fs");
@@ -37,13 +52,25 @@ const [page, constants, request] = process.argv.slice(1);
 const html = fs.readFileSync(page, "utf8");
 const js = html.slice(html.indexOf("<script>") + 8, html.indexOf('fetch("sizing-constants.json")'));
 const K = JSON.parse(fs.readFileSync(constants, "utf8"));
+// renderVerdict writes into the page; give it one element to write into.
+const verdictEl = { className: "", innerHTML: "" };
+global.document = { getElementById: (id) => (id === "verdict" ? verdictEl : {}) };
 const api = new Function("K_in", js.replace("let K = null;", "let K = K_in;") +
-  "; return { minimumPlan, maximumPlan, eventsFor };")(K);
+  "; return { minimumPlan, maximumPlan, renderVerdict, eventsFor };")(K);
 const { input, sliderMax } = JSON.parse(request);
-const out = sliderMax ? { sliderMax: api.eventsFor(100) } : {
-  min: api.minimumPlan(input),
-  max: api.maximumPlan(input),
-};
+let out;
+if (sliderMax) {
+  out = { sliderMax: api.eventsFor(100) };
+} else {
+  const min = api.minimumPlan(input);
+  const max = api.maximumPlan(input);
+  api.renderVerdict(min, { haveRam: input.haveRam, haveCores: input.haveCores }, max);
+  out = {
+    min,
+    max,
+    verdict: { className: verdictEl.className, text: verdictEl.innerHTML.replace(/<[^>]+>/g, "") },
+  };
+}
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -58,12 +85,19 @@ def _run(request: dict) -> dict:
     return json.loads(done.stdout)
 
 
-def _plans(events: float, *, ram_gib: int = 96, cores: int = 20, enrichment: bool = True) -> dict:
+def _plans(
+    events: float,
+    *,
+    ram_gib: int = 96,
+    cores: int = 20,
+    enrichment: bool = True,
+    analysts: int = 6,
+) -> dict:
     return _run(
         {
             "input": {
                 "events": events,
-                "analysts": 6,
+                "analysts": analysts,
                 "shape": "docker",
                 "embeddings": False,
                 "enrichment": enrichment,
@@ -100,3 +134,29 @@ def test_ten_times_the_events_does_not_need_ten_times_the_cap():
     one_b = _plans(1e9, enrichment=False)["min"]["perQuery"]
     ten_b = _plans(1e10, enrichment=False)["min"]["perQuery"]
     assert ten_b < 3 * one_b
+
+
+def test_a_host_that_meets_the_minimum_but_admits_fewer_scans_is_not_called_sufficient():
+    """The minimum sizes every scan 4 threads wide; a host with more cores runs
+    them wider, and past the measured width a scan needs more per query. 60 GiB
+    and 12 cores meet the minimum for 1B events and 4 analysts, yet at full
+    spend admit one scan where the minimum asks for two — the verdict must
+    compare that concurrency, not only the per-query cap (PR #376 review)."""
+    plans = _plans(1e9, ram_gib=60, cores=12, enrichment=False, analysts=4)
+    need, full, verdict = plans["min"], plans["max"], plans["verdict"]
+    assert full["perQuery"] >= need["perQuery"], "per-query alone would have passed"
+    assert full["concurrency"] < need["concurrency"]
+    assert not full["tight"]
+    assert verdict["className"] == "note warn"
+    assert not verdict["text"].startswith("Sufficient")
+    assert f"admits {full['concurrency']} concurrent scan" in verdict["text"]
+    assert f"the {need['concurrency']} of" in verdict["text"]
+
+
+def test_a_host_at_the_minimum_width_is_sufficient():
+    """The same workload on 8 cores runs scans at the width the minimum sized
+    for, and admits the slots it asks for."""
+    plans = _plans(1e9, ram_gib=60, cores=8, enrichment=False, analysts=4)
+    assert plans["max"]["concurrency"] >= plans["min"]["concurrency"]
+    assert plans["verdict"]["className"] == "note"
+    assert plans["verdict"]["text"].startswith("Sufficient")

@@ -236,9 +236,12 @@ class Settings(BaseSettings):
     # db/_scan.py::detect_scan_memory_budget). 0 (default) =
     # auto: memory-ratio × detected RAM (cgroup limit when containerized,
     # physical RAM otherwise; see db/_scan.py). Set a nonzero value to pin
-    # it — required when ClickHouse runs on a different host than the app
-    # (size it to *that* host's RAM, leaving headroom for the server's own
-    # caches/merges — ~70% of its RAM is a good start).
+    # it. Auto follows ClickHouse's ceiling on another host too, as long as
+    # that ceiling is bounded (max_server_memory_usage in its memory.xml, or
+    # a limit on its container); an unbounded one is capped by *this* host's
+    # RAM, so on a split deployment whose memory.xml cannot be pinned, pin
+    # this instead (size it to *that* host's RAM, leaving headroom for the
+    # server's own caches/merges — ~70% of its RAM is a good start).
     stat_scan_max_memory_bytes: int = 0
     # Fraction of the ClickHouse ceiling *minus its own caches* that the auto
     # budget uses; the remainder is merge and allocator-slack headroom.

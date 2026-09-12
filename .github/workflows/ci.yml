@@ -87,6 +87,16 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Node
+        # tests/test_sizing_calculator_behavior.py runs the sizing page's
+        # JavaScript under Node. It skips without Node locally and fails
+        # without it here, so a runner image that stopped shipping Node
+        # cannot turn that file into a green no-op. Same major as the
+        # frontend job and the Dockerfile's frontend-build stage.
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
       - name: Set up Python
         run: uv python install
 

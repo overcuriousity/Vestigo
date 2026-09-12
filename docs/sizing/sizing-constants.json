@@ -20,7 +20,7 @@
     "qdrant_mem_limit_bytes": 4294967296
   },
   "scan_memory_model": {
-    "base_peak_bytes": 934155386,
+    "base_peak_bytes": 936302870,
     "cap_over_peak": 1.25,
     "measured_max_events": 32000000,
     "measured_threads": 5,

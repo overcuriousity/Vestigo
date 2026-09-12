@@ -388,7 +388,12 @@ slots are part of the same total.
   caches or allocator slack, and the kernel is the only backstop. Mount `memory.xml` and set
   a container limit. The budget still uses the derived ceiling, capped by what the *app's*
   container can see — two guesses, so the lower one — which is what `budget_ceiling_bytes`
-  reports when it differs from `clickhouse_ceiling_bytes`.
+  reports when it differs from `clickhouse_ceiling_bytes`, and no caches are subtracted from
+  it. With ClickHouse on its own host that cap is the app host's RAM, not the ClickHouse
+  host's: a 4 GiB app container beside an unpinned 96 GiB ClickHouse host grants ~0.8 GiB
+  per query. If that host's `memory.xml` cannot be pinned, pin
+  `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` to the scan budget the [sizing
+  calculator](https://overcuriousity.github.io/Vestigo/sizing/) computes for it instead.
 
 `max_threads` is per-*heavy*-scan thread width; the chart lane derives its own from it (above,
 and `foreground.max_threads` in the same block). At `VESTIGO_STAT_SCAN_MAX_THREADS=0` (default)
