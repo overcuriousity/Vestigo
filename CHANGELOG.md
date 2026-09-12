@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed at a 4 GiB cap, and an airgapped 26.6 stack failed at 819 MiB (`While executing
   FillingRightJoinSide`). The join now spills in buckets of a quarter of the per-query cap and
   keeps the narrow staged maps in memory: ~800 MiB peak at a 1 GiB cap on 2M and 4M events
-  alike.
+  alike. The bound travels with every scan settings clause, beside the `GROUP BY` and sort
+  spill thresholds, so the next `JOIN` written under either cap is bounded from the start.
 - **Charset novelty learns high-cardinality fields under its cap.** Every learning scan
   (whole scope, per group, baseline window, and the fallback) read distinct values through
   `SELECT DISTINCT`, which cannot spill, and the self-baseline ones took the distinct total
@@ -28,12 +29,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every Explorer page with collapse on, carried no per-query cap, and took the union of muted
   templates and routine motifs as an exact distinct set of event ids — a muted heartbeat on a
   large case spent the server's memory ceiling, not a query's. It is now inclusion–exclusion
-  over a plain count and the small motif-membership table; three million muted events count
-  under a 32 MiB cap.
-- **Field-stats cache fills queue for a heavy scan slot.** Every uncached source was computed
-  at once, each with whole-source scans at the full heavy cap and no admission slot, so a case
-  with many uncached sources (after an upgrade, an import) stacked caps on top of admitted
-  sweeps. Each source's computation now holds a heavy slot.
+  over a plain count and the small motif-membership table, and it — like the two counts
+  beside it — carries the foreground per-query cap: three million muted events count under
+  32 MiB. Deleting a source now also drops its rows from that membership table, so
+  re-ingesting the same file can no longer report stale rows as collapsed events the grid does
+  not hide.
+- **Entropy outliers learn high-cardinality fields under their cap.** The band-learning pass
+  read distinct values through the same `SELECT DISTINCT` the charset learner was moved off,
+  over the same auto-selected free-text fields, and failed at the cap on the same corpus. It
+  is now a `GROUP BY` too.
+- **Field-stats cache fills queue for a heavy scan slot, and a request says so.** Every
+  uncached source was computed at once, each with whole-source scans at the full heavy cap
+  and no admission slot, so a case with many uncached sources (after an upgrade, an import)
+  stacked caps on top of admitted sweeps. Each source's computation now holds a heavy slot,
+  and at most a gate's worth of fills run at once, so a burst of misses never parks more
+  worker threads than the gate could admit. A request that fills the cache on the way to an
+  answer — the Explorer's column picker, a Visualize field list, the analysis plan — waits a
+  bounded five seconds and then answers 503 with the queue depth, which the UI retries, and
+  releases its wait when the client leaves; a job (ingest, enrichment, import) keeps queueing
+  and reports the phase, so a source that is already browsable but still "running" reads as
+  queued behind scans rather than stuck.
 - **The sizing calculator sizes scans from measurement, and stops recommending the N trap.**
   - Scan memory was modelled as 12 MiB per million events. That sized a 32M-event scan at
     1.5 GiB, where 2 GiB was measured to fail, and a 10B-event scan at 117 GiB.
@@ -44,8 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     now recommends six 5.2 GiB slots.
   - The events slider reaches 10B events.
   - With ClickHouse on its own host, it no longer tells you to pin
-    `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES`: the app reads ClickHouse's ceiling over its
-    connection on every deployment shape.
+    `VESTIGO_STAT_SCAN_MAX_MEMORY_BYTES` unconditionally: the app reads ClickHouse's ceiling
+    over its connection on every deployment shape, and auto follows it whenever that ceiling
+    is bounded (`max_server_memory_usage` in its `memory.xml`, or a limit on its container).
+    An unbounded remote ceiling is capped by the app host's RAM instead, so for that case the
+    page still says to pin it — to the scan budget it computed.
 
 ## [1.19.5] — 2026-09-11
 

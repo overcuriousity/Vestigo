@@ -4,8 +4,72 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-11 (1.19.6; session 234 — the enrichment join that never bucketed, the
-scans whose memory grew with cardinality, and a sizing calculator rebuilt on measurement).
+Last updated: 2026-09-12 (1.19.6; session 235 — the review of session 234's PR: what the
+field-stats gate did to requests and jobs, the entropy learn the survey missed, and the
+calculator's verdict).
+
+## Session 235 — 2026-09-12: reviewing the 1.19.6 branch before it merges
+
+A multi-agent review of PR #376 (session 234's work) verified 24 findings — ten bugs, fourteen
+cleanups — and every one was fixed on the branch. What the review found, and what changed:
+
+**The field-stats gate moved the problem rather than removing it.** Holding a heavy slot in
+`compute_source_field_stats` was right; where it was waited on was not.
+- Every interactive caller of `ensure_source_field_stats` (Explorer field list, export
+  columns, the anomaly field inventory, Visualize terms and fields, the analysis plan, mapping
+  validation, field coverage) parked *indefinitely* on a gate full of sweeps — outside any scan
+  context, so neither bounded (no 503) nor released on disconnect. Two of them carried comments
+  promising no heavy slot at all.
+- One `asyncio.to_thread` per miss, each now parked, pinned the process's default executor:
+  thirty misses on an eight-core host took every thread from ingest, enrichment and import.
+- The post-ingest, enrichment, import and demo-seed refreshes all park their job in `running`
+  after the source is already browsable, with nothing saying why.
+- Now: `_scan.gated_heavy_scan` is the one decorator for the heavy class (hoisted from
+  `anomaly_stats`; the gate is looked up at call time so tests patch one binding), with
+  `bounded_heavy_wait(seconds)` as the mirror of `unbounded_foreground_wait`. Request handlers
+  fill through `api/scan_exec.ensure_field_stats_for_request`: `run_scan` (cancellable) under a
+  five-second bound, answering the same 503-with-queue-depth a full chart lane does. Jobs keep
+  the unbounded wait and report a `field_stats` phase the tray names ("queued behind running
+  scans"). Fills run at most `gate_size()` at a time, per call. `_resolve_mapping_validation_keys`
+  takes an explicit `interactive` flag because the post-ingest re-validation inherits the
+  upload request's context and must not be bounded.
+
+**The blast-radius survey missed one.** `find_entropy_outliers` learned its band over
+`SELECT DISTINCT` on the same auto-selected free-text fields the charset learner scans — the
+shape the survey had just removed. Now a `GROUP BY`; `test_entropy_memory_clickhouse.py`
+(3M distinct values, 256 MiB, four threads) is red on the old shape.
+
+**The rewritten routine count.** Its docstring diagnosed the missing per-query cap and the
+new query still had none. `count_routine_collapsed` and its two helpers now carry
+`foreground_scan_settings()` (a bound, not a reservation — no slot), so the CHANGELOG's 32 MiB
+describes production. The three code paths collapsed to one query (empty `IN []` is pruned by
+the bloom index; verified on 26.6). `delete_source_events` now drops the source's
+`motif_occurrences` rows: the source id is derived from the file hash, so a re-ingest brought
+stale rows back into scope where they counted as collapsed and hid nothing. The one-row-per-
+`event_id` assumption the count makes is documented where it is made; the CLI's re-ingest path
+that violates it is slated for deprecation, not fixed.
+
+**The calculator.** The minimum sized scans at a fixed four-thread width while the runtime
+runs `cores // N` wide, so a host with more than 5×N cores that met the minimum ran hungrier
+scans than the minimum's cap — the row now names the width and defers a specific host to the
+right-hand column. The verdict said "Sufficient" while admitting fewer slots than the minimum
+asked for (60 GiB / 12 cores at 1B events: 1 of 6.7 GiB against 2 of 5.1 GiB); it now has its
+own wording and a test. The split-host copy said to leave auto alone unconditionally, but an
+*unbounded* remote ceiling is clamped by the app host's RAM with no cache subtraction — the
+copy, `config.py` and `DEPLOYMENT.md` now state the bounded condition and the pin fallback.
+The measured points are data in `gen_sizing_constants.py` and the fit is computed (the
+intercept had been hand-rounded by ~2 MiB).
+
+**Cleanups.** The JOIN bounds (`max_bytes_in_join`, `join_algorithm`, swap off) live in
+`_scan_settings_clause` beside the GROUP BY and sort thresholds, so every clause carries them
+and a fan-out divides them with the cap. The two baseline-window charset learns reuse
+`_alphabet_sql`, which is two SELECTs (window over the aggregate, `QUALIFY`) instead of four;
+one `_DISTINCT_CHARS_SQL` constant. `maximumPlan` uses `budgetFor`. The three memory tests share
+`conftest.insert_generated_events` (built from `_EVENT_COLUMNS`) and `cap_scan`; a `slow`
+marker leaves them out of a quick local run (CI runs everything; a `setup-node` step and a
+CI-only failure replace the silent Node skip). `tests/test_version_parity.py` checks all five
+version files and `scripts/bump_version.py` edits them. The two open decisions live in
+`ROADMAP.md`, where the backlog is.
 
 ## Session 234 — 2026-09-11: what the 1.19.5 production stack was still failing on
 
@@ -26,7 +90,8 @@ The bundle's two post-upgrade failures were not config alone, though:
 - Memory grew with the source: 2M events failed at 1, 2 and 4 GiB; 4M failed at 4 GiB.
 - `max_bytes_ratio_before_external_join` was a red herring — setting it changed nothing; it only
   converts hash joins to grace.
-- Fix, via `_scan.heavy_join_bucket_bytes()`: bucket at a quarter of the cap, swap off, so the
+- Fix, in the scan settings clause itself (session 235 moved it there from a helper the one
+  call site used): bucket at a quarter of the cap, swap off, so the
   narrow staged maps are the build side. ~800 MiB at a 1 GiB cap on 2M and 4M events alike,
   output verified row for row.
 - Swap-off is not what makes it pass (the bucket limit alone passed). It is what keeps a
@@ -89,10 +154,8 @@ recommendations against the measurements.
 - `test_field_stats_admission_clickhouse` (peak in-flight 2 → 1)
 - the calculator tests
 
-**Left for a decision, not done:**
-- Per-attribute-key `uniqExact` in the field-stats cache still grows with a key's distinct
-  values. Switching to `uniq` would change a displayed count from exact to approximate.
-- The calculator sizes no spill disk, which at a billion events is the next thing to run out.
+Two things measured and left alone — the per-key `uniqExact` in the field-stats cache, and
+the calculator's missing spill-disk line — are Milestone 3 items in `ROADMAP.md`.
 
 ## Session 233 — 2026-09-11: the spill that was asked for and never fired
 
