@@ -1,4 +1,4 @@
-import "@testing-library/jest-dom";
+import "@testing-library/jest-dom/vitest";
 
 // jsdom ships no ResizeObserver, but components that measure themselves (the
 // event grid's header offset, react-virtual) construct one unconditionally —
