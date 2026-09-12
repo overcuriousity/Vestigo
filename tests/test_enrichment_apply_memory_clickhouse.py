@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import pytest
 
+from tests.conftest import insert_generated_events
 from vestigo.core.config import set_runtime_overrides
-from vestigo.db import _scan
 from vestigo.db.clickhouse import ClickHouseStore
+
+pytestmark = [pytest.mark.clickhouse, pytest.mark.slow]
 
 _CAP = 1024**3
 _EVENTS = 2_000_000
@@ -33,9 +35,8 @@ _SUFFIX = "memtest_enrich_job"
 
 
 @pytest.fixture
-def bounded_scan(monkeypatch):
-    monkeypatch.setattr(_scan, "detect_scan_memory_budget", lambda: _CAP)
-    monkeypatch.setattr(_scan, "detect_scan_max_threads", lambda: 4)
+def bounded_scan(cap_scan):
+    cap_scan(_CAP, threads=4)
     # The merge wait is about server-side merges after the swap, not about the
     # query under test; five minutes of polling would only slow the suite.
     set_runtime_overrides({"enrichment_apply_merge_wait_seconds": 0})
@@ -49,19 +50,19 @@ def staged_source():
     store.init_schema()
     db = store.database
     store.delete_source_events(_CASE, _SOURCE)
-    store.client.command(
-        f"INSERT INTO {db}.events (event_id, case_id, source_id, source_file, byte_offset, "
-        "line_number, content_hash, file_hash, parser_name, parser_version, ingest_time, "
-        "message, timestamp, timestamp_desc, artifact, artifact_long, display_name, tags, "
-        "attributes, embedding_model, embedding_config_hash) "
-        f"SELECT generateUUIDv4(number), '{_CASE}', '{_SOURCE}', 'u_ex.log', number, number, "
-        "hex(SHA256(toString(number))), repeat('0', 64), 'iis', '1', now64(3), "
-        "concat('GET /owa/', toString(number % 997)), "
-        "toDateTime64('2026-01-01 00:00:00', 3) + intDiv(number, 10), 'Event', 'iis', 'IIS', "
-        "'IIS', [], map('src_ip', IPv4NumToString(toUInt32(number % 30011)), "
-        "'dst_ip', IPv4NumToString(toUInt32(number % 7001)), "
-        "'http_query', toString(cityHash64(number)), 'username', concat('u', toString(number % 50))), "
-        f"'', repeat('0', 64) FROM numbers({_EVENTS})"
+    insert_generated_events(
+        store,
+        case_id=_CASE,
+        source_id=_SOURCE,
+        n=_EVENTS,
+        message="concat('GET /owa/', toString(number % 997))",
+        timestamp="toDateTime64('2026-01-01 00:00:00', 3) + intDiv(number, 10)",
+        attributes=(
+            "map('src_ip', IPv4NumToString(toUInt32(number % 30011)), "
+            "'dst_ip', IPv4NumToString(toUInt32(number % 7001)), "
+            "'http_query', toString(cityHash64(number)), "
+            "'username', concat('u', toString(number % 50)))"
+        ),
     )
     store.create_enrichment_scratch(_SUFFIX)
     rows_table, _ = store._enrichment_scratch_tables(_SUFFIX)

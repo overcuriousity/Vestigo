@@ -191,4 +191,5 @@ asyncio_mode = "auto"
 markers = [
     "clickhouse: requires a reachable ClickHouse (dev compose stack); skipped otherwise",
     "multiloop: drives work on more than one event loop (a second TestClient, the CLI); gives the test an unpooled store, since asyncpg binds a connection to the loop that opened it",
+    "slow: generates millions of rows server-side or runs deliberately near-cap scans; CI runs them all, deselect locally with -m \"not slow\"",
 ]
