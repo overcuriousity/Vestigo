@@ -453,6 +453,11 @@ spills in buckets of a quarter of the cap and holds the narrow staged maps in me
 peaks around 800 MiB at a 1 GiB cap on 2M and 4M events alike. It still has a floor: 512 MiB
 failed. That floor, not a detector `GROUP BY`, is why a cap in the hundreds of MiB is too small.
 
+On a ClickHouse older than 24.12, `query_plan_join_swap_table` does not exist and the app
+leaves it out (together with `max_bytes_ratio_before_external_sort`, from the same release):
+it asks the server once which of the two it knows. There the planner never swaps join sides
+to begin with, so the rewrite keeps the same shape.
+
 **`risk` will not warn you about this.** `scan_budget_report` asks whether the aggregate
 (`total_bytes + cache_bytes`) fits under the ceiling — at N = 10 it still does, exactly as it
 does at N = 2, because the total is the same total. It never asks whether the resulting

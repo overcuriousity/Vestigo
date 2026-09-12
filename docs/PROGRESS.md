@@ -4,9 +4,51 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-12 (1.19.6; session 235 — the review of session 234's PR: what the
-field-stats gate did to requests and jobs, the entropy learn the survey missed, and the
-calculator's verdict).
+Last updated: 2026-09-12 (1.19.6; session 236 — the second review of PR #376: the one
+cache fill that should never 503, two tray phases, and scan settings an older ClickHouse
+refuses; plus the open dependabot PRs folded into the release).
+
+## Session 236 — 2026-09-12: the second review round, and the dependency bumps
+
+A second review of PR #376 reported five findings (one medium, four low); each was checked
+against the branch before it was fixed, and all five were real.
+
+**One cache fill is an optimization, not the answer.** Session 235 routed every interactive
+field-stats fill through `ensure_field_stats_for_request` so a full gate answers 503. That is
+right wherever the cache *is* the answer, and wrong for `viz.get_field_terms`, whose live
+fallback runs on the foreground lane: a miss behind a sweep turned an answerable chart into a
+retry loop. It now catches `ScanBusyResponse` and goes live; a disconnect still propagates.
+The busy path skips `merged_field_terms` rather than passing it `{}` — empty stats read as
+"zero coverage" and would have answered a chart with no values.
+
+**Phases.** `_run_ingestion_job` is shared with the convert-and-ingest job, whose phase map had
+no `field_stats` key, so the tray went blank exactly where the phase was added; the key is
+there now. `_apply_staged_rows` set the phase per source and never cleared it (`JobStore.update`
+merges), labelling each later partition rewrite as field statistics; a `finally` clears it.
+
+**Settings an older server refuses.** `query_plan_join_swap_table` *and* the 1.19.5
+`max_bytes_ratio_before_external_sort` first appear in 24.12 (`system.settings_changes` on
+26.6), and ClickHouse rejects an unknown setting, so every scan failed on an older server. The
+review named only the first. The clause still carries both — the forward-looking reason for
+keeping the JOIN bound in every clause stands — but `ClickHouseStore.init_schema` probes
+`system.settings` once per process and `_scan.configure_server_settings` drops the ones the
+server lacks, which on such a server is already their effect. An unreadable probe records
+nothing and sends both. The probe lives in `init_schema` rather than the startup probe in
+`api/main.py` because the CLI never runs the latter. Under test, the first `init_schema` can be
+a recording fake whose canned rows read as "knows none" and stripped both settings for the
+rest of the run (it failed `test_every_scan_clause_bounds_a_join_from_its_own_cap`), so an
+autouse fixture pins the probe off; its own tests switch it on.
+
+**Motif cleanup.** `delete_source_events` returned inside its `UNKNOWN_TABLE` branch, skipping
+the side-table delete in the one case it most applies to, and the helper did not
+`init_schema()` like its sibling, so a never-created table logged a traceback per delete.
+
+**Dependencies.** The twenty open dependabot PRs are folded into this branch rather than merged
+one by one (they all touch the same two lockfiles). Two did not apply as written: #363 pinned
+`httpcore2` 2.10.0, which `httpx2` 2.12.0 (#362) does not accept, so it resolved to 2.12.0; and
+vitest 5 (#375) needs `@vitest/ui` at the same version and no longer bridges jest-dom's global
+`jest.Matchers` augmentation into `Assertion` — `tsc` failed on 300 matcher calls while every
+test passed at runtime. The setup file now imports `@testing-library/jest-dom/vitest`.
 
 ## Session 235 — 2026-09-12: reviewing the 1.19.6 branch before it merges
 

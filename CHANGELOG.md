@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.19.6] — 2026-09-11
+## [1.19.6] — 2026-09-12
 
 ### Fixed
 
@@ -64,6 +64,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is bounded (`max_server_memory_usage` in its `memory.xml`, or a limit on its container).
     An unbounded remote ceiling is capped by the app host's RAM instead, so for that case the
     page still says to pin it — to the scan budget it computed.
+- **Scans run on a ClickHouse older than 24.12 again.** `max_bytes_ratio_before_external_sort`
+  (added to every scan in 1.19.5) and `query_plan_join_swap_table` (added above) do not exist
+  before 24.12, and a server that does not know a setting refuses the query — so every
+  detector scan, chart aggregation and routine-collapse count failed with `UNKNOWN_SETTING`.
+  The app now asks the server once which of the two it knows and leaves out the ones it does
+  not. On such a server their absence is already what they ask for: a sort spills on its byte
+  threshold alone, and the planner keeps the join sides as written. A server whose
+  `system.settings` cannot be read still gets both.
+- **A Visualize top-values chart no longer answers "busy" when a live query would have
+  answered.** Unfiltered top values are served from the field-statistics cache when it has
+  them. On a cache miss the fill waited for a heavy slot and answered 503 after five seconds
+  while sweeps held the gate — even though the live query it falls back to runs on the
+  separate chart lane. A full gate now goes straight to that live query.
+- **The job tray names the field-statistics step for AI-converted uploads, and only while it
+  runs.** A convert-and-ingest job goes through the same ingest step as a plain upload and
+  reported the same `field_stats` phase, which the tray had no copy for, so the detail line
+  went blank. A multi-source enrichment kept showing "Computing field statistics" through
+  every later source's rewrite; the phase now clears after each refresh.
+- **Deleting a source clears its motif-membership rows even when the `events` table is
+  missing,** the case where rows from an earlier schema are most likely to remain, and on a
+  database where that side table was never created it is created first, instead of every
+  source delete logging a failed cleanup with a traceback.
+
+### Changed
+
+- Dependencies: `alembic` 1.19.1 → 1.19.2 (#374), `authlib` 1.7.2 → 1.8.0 (#352),
+  `clickhouse-connect` 1.7.2 → 1.8.0 (#373), `httpx2` 2.7.0 → 2.12.0 (#362) with `httpcore2`
+  2.7.0 → 2.12.0 (#363 proposed 2.10.0, which `httpx2` 2.12.0 does not accept), `mcp` 1.29.1
+  → 1.30.0 (#369), `pydantic` 2.13.4 → 2.13.5 (#354), `ruff` 0.16.5 → 0.16.6 (#371),
+  `sentence-transformers` 6.0.0 → 6.0.1 (#356), `typer` 0.27.1 → 0.27.2 (#355);
+  `@tanstack/react-query` 5.102.4 → 5.102.8 (#350), `@tanstack/react-table` 9.1.2 → 9.2.4
+  (#359), `@tanstack/react-virtual` 3.14.10 → 3.14.11 (#367), `@testing-library/react` 16.3.2
+  → 16.3.3 (#351), `@types/node` 26.3.0 → 26.5.0 (#368), `@vitejs/plugin-react` 6.1.0 → 6.1.1
+  (#353), `lucide-react` 1.34.0 → 1.43.0 (#370), `oxlint` 1.80.0 → 1.82.0 (#372),
+  `react-router-dom` 7.18.2 → 7.18.3 (#357), and `vitest` 4.1.11 → 5.0.0 (#375) together with
+  `@vitest/ui`, which vitest 5 requires at the same version. Vitest 5 no longer merges the
+  global `jest` matcher types, so the test setup imports `@testing-library/jest-dom/vitest`.
 
 ## [1.19.5] — 2026-09-11
 
