@@ -4,9 +4,60 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-12 (1.19.6; session 236 — the second review of PR #376: the one
-cache fill that should never 503, two tray phases, and scan settings an older ClickHouse
-refuses; plus the open dependabot PRs folded into the release).
+Last updated: 2026-09-14 (unreleased; session 237 — the self frame for the four windowed
+detectors, deterministic quantiles, and entropy's bigram variant: ROADMAP D18, D19, D11).
+
+## Session 237 — 2026-09-14: a baseline never restricts a detector (D18), deterministic quantiles (D19), entropy bigrams (D11)
+
+Three Milestone 4 items on one branch, in the order the roadmap ranked them by truth of
+shipped claims. Design for D18 was approved in issue #366 and lands as `ANOMALY_DETECTION.md`
+§7–§10; the other two were spelled out in `ROADMAP.md`.
+
+**D19 first, because it changes existing findings.** Every detector quantile — the range and
+entropy fences that *gate* findings, the interval medians, the drift quantiles, the motif
+median — was plain `quantile`, a random-generator reservoir above 8192 values. It is now
+`quantileDeterministic` keyed on `cityHash64(event_id)` (or the distinct value where the
+population is one row per value). `quantileExact` was rejected on purpose: it holds every
+value in memory, which is the failure the scan-memory work just fixed on high-cardinality
+fields. A real-ClickHouse test runs each detector twice over 40k rows and compares details.
+
+**D18: the self frame.** Each of the four detectors dispatches to a private `_find_*_self`
+beside its temporal sibling; baseline-frame code is byte-for-byte unchanged.
+- *Slices* (`SelfSlices`): integer-millisecond boundaries over the effective span,
+  `least(K−1, intDiv(dateDiff(ms), width))`, payload and `config_hash` persisted as
+  `slices` / `slices_hash`. Proportion shift tests each in-span slice against its complement
+  (no first-seen exclusion — a one-slice burst has `rest_count = 0` and is the finding);
+  drift folds the top-50 categories by complement count, and runs one KS query per slice
+  that has both sides above `min_samples` — a count scan first, because
+  `kolmogorovSmirnovTest` throws on an empty side, and `assumeNotNull` on the argument,
+  because the plain aggregate over a Nullable column returns a Nullable named tuple the
+  driver cannot decode.
+- *Cadence*: two passes per field. Pass 1 collects per-value deterministic gap quartiles,
+  the longest internal gap with both ends, and first/last arrivals. Pass 2 binds each
+  candidate's pause threshold through `transform(val, …)` and aggregates the retained gaps;
+  a third pass joins per-(value, source) last arrivals to per-source last events for the
+  trailing gap. The silence null is a Gamma fitted from the robust CV and the median
+  (`_gamma_sf` extracted from `_chi2_sf` at a non-integer shape), Šidák over the value's
+  gaps. The fabricated test data first said "trailing" where I meant "internal" — the
+  heartbeat ended a day before its source did, and the detector was right.
+- *Sequences*: the existing n-gram assembly with one pseudo-window, a rarity floor, and an
+  exact case-wide recount on multi-source scopes.
+- The gate's `needs_windows` is gone: only the baseline frame without a baseline is
+  `needs_setup`; the self frame is gated on shape, and a one-instant span is the slice
+  methods' one structural impossibility. `CACHE_VERSION` 2 → 3, since the old
+  `insufficient_data` was cached under exactly the new key.
+- Frontend: `lib/finding-frame.ts` reads `details.method`; rows, verdicts, evidence figures
+  and the scope line branch on it. Whole-scope beaconing draws no figure — its claim is the
+  regularity, stated in the verdict. The wizard's `NEEDS_BASELINE` is deleted.
+
+**D11.** A `variant` knob (`shannon` | `bigram`), not a params key named `method`, since
+`method` names the analysis method everywhere else. The bigram table is learned from the
+reference population's distinct values in two spillable `GROUP BY` passes and bound into
+the scoring scans as parallel arrays via `transform` — a `Map` parameter does not bind
+through the driver — capped at 4096 pairs with a warning. The real-ClickHouse test is the
+headline case: a lowercase-latin DGA among English hostnames, missed by Shannon, top under
+bigram.
+
 
 ## Session 236 — 2026-09-12: the second review round, and the dependency bumps
 

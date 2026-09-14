@@ -67,7 +67,7 @@ def _validate_scope_args(frame: str, baseline_id: str | None) -> None:
 
     The runners key off ``baseline_id`` alone while ``frame`` is what the
     response — and therefore every verdict's recorded provenance — is stamped
-    with. ``frame=self`` plus an id would run the two-window comparison and
+    with. ``frame=self`` plus an id would run the baseline comparison and
     label the result "all events scanned"; ``frame=baseline`` without one would
     do the reverse, and ``build_plan`` would disagree with the runner about the
     same request. Neither is recoverable after the fact, so neither is guessed.

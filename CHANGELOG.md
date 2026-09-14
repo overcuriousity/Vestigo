@@ -5,6 +5,50 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A baseline never restricts a detector (D18, #366).** Proportion shift, distribution
+  drift, interval cadence and event sequences ran only against a baseline definition and
+  answered `insufficient_data` without one, so beaconing on an unbaselined timeline was
+  invisible. Each now has the self frame every other detector has: proportion shift and
+  drift cut the timeline into `stat_self_slices` equal slices (default 24) and test each
+  against the rest of the timeline, inside the value's own active span; interval cadence
+  judges each value over all its arrivals — Greenwood beaconing with pauses longer than
+  `stat_interval_self_pause_ratio` medians excluded and a `stat_interval_self_min_span_seconds`
+  floor, plus a robust-Gamma silence test over the longest internal or trailing gap; event
+  sequences flag orderings under `stat_sequence_rarity_floor` across the scope. Baseline-frame
+  behavior is unchanged. The gate offers all four in the self frame; the wizard offers both
+  frames to every method and defaults to self; finding rows, verdicts and evidence figures
+  read the mode the run recorded (`details.method`), so a slice comparison never renders as
+  "baseline 0 %"; a slice-based run persists its `slices` and `slices_hash` beside
+  `windows`; the analysis cache version moves to 3 so the cached `insufficient_data` answers
+  are not served for the new modes. The demo case asserts its 300 s beacon surfaces with no
+  baseline declared. Nothing filters legitimate clocks — a high-volume heartbeat ranks
+  first, and marking it Normal once is the remedy, which the method card now says.
+- **Entropy: the bigram variant (D11).** A `variant` knob on the entropy detector
+  (`shannon`, the default, or `bigram`). The bigram statistic is AMiner's
+  `EntropyDetector`'s: a character-pair frequency table learned from the reference values
+  with add-one smoothing, each value scored by the mean surprisal of its pairs against the
+  same Tukey fence. A lowercase-latin generated domain among English hostnames has
+  unremarkable Shannon entropy and a mean pair surprisal far above the band — the case the
+  docs used to describe as a gap. Same finding shape; `details.variant` and the persisted run
+  record which statistic produced a finding; the agent tool accepts it.
+
+### Fixed
+
+- **Deterministic quantiles (D19).** The numeric-range and entropy fences, the interval
+  medians, the drift quantiles and the motif cadence median used plain ClickHouse `quantile`,
+  which reservoir-samples with a random generator above 8192 values — so two runs over
+  identical data could disagree about which findings exist. Every detector quantile is now
+  `quantileDeterministic` keyed on a per-row hash: bounded memory kept, answer a pure
+  function of the data. Existing findings on large fields can change once, by the sampling
+  noise they used to carry.
+- The mode label under a detector result classified the four bare temporal modes (`g-test`,
+  `cadence`, `ngram`, `drift`) as self-baseline; a distribution-drift row from a run without
+  a window label rendered "in undefined".
+
 ## [1.19.6] — 2026-09-12
 
 ### Fixed
