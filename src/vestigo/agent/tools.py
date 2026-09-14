@@ -1976,34 +1976,22 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         sequence_novelty, sequence_motif, value_distribution_drift.
         `fields` is a comma-separated field list for value detectors (omit to
         auto-recommend); `series_field` groups frequency/sequence detectors.
-        Every detector runs without a baseline (self frame: the whole
-        timeline is its own reference — proportion_shift and
-        value_distribution_drift compare each time slice with the rest,
-        interval_periodicity looks for whole-timeline beaconing and
-        silences, sequence_novelty for the rarest orderings). Pass a
-        `baseline_id` from list_baselines to compare suspect windows against
-        a known-normal window instead. Tuning knobs (all optional, server defaults
-        otherwise): z_threshold (frequency |z| cutoff), min_skew_seconds
+        Every detector runs without a `baseline_id` (the timeline is its own
+        reference); pass one from list_baselines to score suspect windows
+        against a baseline instead. Optional knobs (server defaults
+        otherwise): z_threshold (frequency), min_skew_seconds
         (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
-        (effect-size floor), ngram_size (sequence length, 2-5), min_support
-        (sequence_motif), start/end (sequence_motif mining window),
-        group_field (charset only: learn one alphabet per value of this
-        field, e.g. per host, instead of one merged alphabet),
-        max_gap_seconds (sequence_novelty/sequence_motif only: break a
-        sequence when consecutive events are farther apart than this),
-        variant (entropy only: "shannon", the default, scores each value's
-        own character entropy; "bigram" scores the mean surprisal of its
-        character pairs under a table learned from the reference values,
-        which catches ordinary characters in an unusual order — a DGA
-        domain among English hostnames).
-        Returns findings plus a persisted run_id the analyst can open. Each
-        finding carries an example `event_id`; how much of that event comes
-        with it depends on the deployment, and the result's `fidelity`/`note`
-        say which. Call get_event on the id for the full record.
-
-        The virtual `time:` fields from list_fields are **not** detector
-        fields — they are for charting and filtering only. Passing one is
-        rejected rather than run.
+        (effect floor), ngram_size (2-5), min_support and start/end
+        (sequence_motif), group_field (charset: one alphabet per value of
+        this field, e.g. per host), max_gap_seconds (sequence_novelty/
+        sequence_motif: break a sequence at longer gaps), variant (entropy:
+        "shannon" = character entropy, default; "bigram" = character-pair
+        surprisal, catches ordinary letters in an unusual order, e.g. a DGA
+        domain). Returns findings plus a persisted run_id. Each finding
+        carries an example `event_id`; the result's `fidelity`/`note` say how
+        much of that event came with it — call get_event for the full record.
+        The virtual `time:` fields from list_fields are rejected here; they
+        are for charting and filtering only.
         """
         _reject_time_fields(fields, "fields")
         _reject_time_fields(series_field, "series_field")

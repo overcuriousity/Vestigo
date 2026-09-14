@@ -711,6 +711,11 @@ them guessing `content`'s shape, and a case with no stories could not be given
 a report at all. One prevented retry pays the 872 back roughly fifty times.
 Prose that does not remove a retry still does not belong in a schema.
 
+`run_anomaly_detector`'s `variant` knob (2026-09-14, D11) and the note that every
+detector runs without a baseline (D18) took it to **43,891 over 35 tools**, ceiling
+unchanged — the first draft landed at 44,197 and the rule was applied: the tool's
+docstring was rewritten compact (−306 chars net) rather than the ceiling moved.
+
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`
 (`_deflate_findings` — on the turn that motivated it: 33.7k → 15.7k tokens);
