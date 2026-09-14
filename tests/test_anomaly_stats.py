@@ -4191,7 +4191,7 @@ def test_range_violations_offset_projects_source_id_in_subquery():
     stat_sql = client.full_queries[1]
     viol_sql = client.full_queries[2]
     # source_id projected into the inner num subqueries (fast path omits it).
-    assert "AS num, timestamp, source_id" in stat_sql
+    assert "AS num, timestamp, event_id, source_id" in stat_sql
     assert "source_id" in viol_sql
     assert "addSeconds(timestamp, transform(source_id" in stat_sql
     assert any(p.get(OFFSET_VAL_PARAM) == [-120] for p in client._all_parameters)

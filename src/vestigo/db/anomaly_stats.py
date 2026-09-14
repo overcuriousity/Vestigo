@@ -1154,6 +1154,24 @@ class LogTemplatesResult:
 # ---------------------------------------------------------------------------
 
 
+def _qdet(level: str, expr: str, determinator: str) -> str:
+    """``quantileDeterministic(level)(expr, determinator)`` — a reproducible quantile.
+
+    Plain ``quantile`` reservoir-samples with a random generator once a
+    population exceeds 8192 values, so two runs over identical data can
+    disagree — and the numeric-range and entropy fences it fed *gate
+    findings* (D19). ``quantileDeterministic`` keeps the same bounded
+    reservoir but decides membership by hashing *determinator*, so the
+    answer is a pure function of the data: identical rows, identical
+    quantile. The determinator must be distinct per row, never the value
+    itself — copies of one value sharing a hash would enter or leave the
+    sample together. ``quantileExact`` was deliberately not chosen: it holds
+    every value in memory, which is the failure shape the heavy-scan
+    machinery exists to avoid on high-cardinality fields.
+    """
+    return f"quantileDeterministic({level})({expr}, {determinator})"
+
+
 def _col_expr(
     field_token: str,
     params: dict[str, Any],
@@ -3212,7 +3230,7 @@ class StatisticalAnomalyService:
             bind_offset_params(source_offsets, stat_params)
             col = _col_expr(field_token, stat_params, field_mappings)
             num_src = (
-                f"SELECT toFloat64OrNull({col}) AS num, timestamp{off_src}"
+                f"SELECT toFloat64OrNull({col}) AS num, timestamp, event_id{off_src}"
                 f" FROM {db}.events"
                 f" WHERE case_id = {{cid:String}}"
                 f" AND has({{src:Array(String)}}, source_id)"
@@ -3220,7 +3238,8 @@ class StatisticalAnomalyService:
             )
             if windows is None:
                 stat_sql = (
-                    f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
+                    f"SELECT {_qdet('0.25', 'num', 'cityHash64(toString(event_id))')} AS q1,"
+                    f" {_qdet('0.75', 'num', 'cityHash64(toString(event_id))')} AS q3, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL {heavy_scan_settings()}"
                 )
             else:
@@ -4431,9 +4450,11 @@ class StatisticalAnomalyService:
                 # sentinel can never fall inside it.
                 baseline_clause = f" AND {stat_bp}"
             stat_sql = f"""
-                SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
+                SELECT {_qdet("0.25", "ent", "cityHash64(val)")} AS q1,
+                       {_qdet("0.75", "ent", "cityHash64(val)")} AS q3,
+                       count() AS n
                 FROM (
-                    SELECT arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
+                    SELECT val, arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
                     FROM (
                         SELECT {col} AS val
                         FROM {db}.events
@@ -5018,7 +5039,8 @@ class StatisticalAnomalyService:
                 f" countIf(win = {w} AND isNotNull(delta)) AS w{w}_k,"
                 f" avgIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_mean,"
                 f" stddevSampIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_std,"
-                f" quantileIf(0.5)(delta, win = {w} AND isNotNull(delta)) AS w{w}_med,"
+                f" quantileDeterministicIf(0.5)(delta, cityHash64(toString(event_id)),"
+                f" win = {w} AND isNotNull(delta)) AS w{w}_med,"
                 f" sumIf(delta * delta, win = {w} AND isNotNull(delta)) AS w{w}_sum2,"
                 f" minIf(ts, win = {w}) AS w{w}_first,"
                 f" maxIf(ts, win = {w}) AS w{w}_last,"
@@ -5466,7 +5488,8 @@ class StatisticalAnomalyService:
             in_ws = ", ".join(f"{sp} AS in_w{i}" for i, sp in enumerate(sps))
             w_blocks = ",\n                    ".join(
                 f"countIf(in_w{i}) AS w{i}_n,"
-                f" quantilesIf(0.05, 0.5, 0.95)(num, in_w{i}) AS w{i}_q,"
+                f" quantilesDeterministicIf(0.05, 0.5, 0.95)(num, cityHash64(toString(event_id)), in_w{i})"
+                f" AS w{i}_q,"
                 f" kolmogorovSmirnovTestIf('two-sided')(num, toUInt8(in_w{i}), in_bl OR in_w{i})"
                 f" AS w{i}_ks,"
                 f" argMinIf((toString(event_id), eff_ts), num, in_w{i}) AS w{i}_lo,"
@@ -5476,7 +5499,7 @@ class StatisticalAnomalyService:
             sql = f"""
                 SELECT
                     countIf(in_bl) AS bl_n,
-                    quantilesIf(0.05, 0.5, 0.95)(num, in_bl) AS bl_q,
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, cityHash64(toString(event_id)), in_bl) AS bl_q,
                     {w_blocks}
                 FROM (
                     SELECT toFloat64OrNull({col}) AS num,
@@ -6731,13 +6754,14 @@ class StatisticalAnomalyService:
                 count() AS k,
                 avg(delta) AS mean,
                 stddevSamp(delta) AS std,
-                quantile(0.5)(delta) AS med,
+                quantileDeterministic(0.5)(delta, cityHash64(first_eid)) AS med,
                 sum(delta * delta) AS sum2,
                 min(occ_ts) AS first,
                 max(occ_ts) AS last
             FROM (
                 SELECT
                     gram,
+                    first_eid,
                     first_ts AS occ_ts,
                     dateDiff('millisecond', lagInFrame(first_ts, 1) OVER w2, first_ts) / 1000.0 AS delta
                 FROM ({inner})
