@@ -3123,6 +3123,100 @@ def test_entropy_self_baseline_iqr_flags_both_directions():
     assert hi.details["baseline_n"] == 200
 
 
+def test_entropy_bigram_variant_learns_a_surprisal_table_and_binds_it():
+    """D11: the bigram variant learns pair totals + the top-K table from the
+    reference distinct values, binds them into both scans, and reports the
+    statistic under `bigram-iqr` with the table's provenance in details."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # pair totals: N = 100 pairs, V = 3 distinct
+            FakeQueryResult(result_rows=[(100, 3)], column_names=["n_pairs", "v"]),
+            # the table, most frequent first
+            FakeQueryResult(
+                result_rows=[("th", 60), ("he", 30), ("er", 10)], column_names=["bg", "c"]
+            ),
+            # band over per-value mean surprisal
+            FakeQueryResult(result_rows=[(1.0, 2.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[("kqzvxwmjpl", 6.2, 2, fs, "evt-dga")],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[1],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="bigram")
+    assert result.status == "ok"
+    assert result.method == "bigram-iqr"
+    f = result.results[0]
+    assert f.direction == "above"
+    assert f.details["variant"] == "bigram"
+    assert f.details["bigram_pairs"] == 100
+    assert f.details["bigram_distinct"] == 3
+    assert f.details["bigram_table"] == 3
+    # Add-one smoothing over N + V + 1 = 104: unseen = -log2(1/104).
+    assert abs(f.details["bigram_unseen_surprisal"] - math.log2(104)) < 1e-3
+    totals_sql, table_sql, band_sql, viol_sql = client.full_queries[1:5]
+    assert "ngrams(val, 2)" in totals_sql and "GROUP BY bg" in table_sql
+    assert "{bgcap:UInt32}" in table_sql
+    for sql in (band_sql, viol_sql):
+        assert "transform(g, {bgk:Array(String)}, {bgv:Array(Float64)}, {bgu:Float64})" in sql
+        assert "arrayReduce('entropy'" not in sql
+    bound = client._all_parameters[3]
+    assert bound["bgk"] == ["th", "he", "er"]
+    assert abs(bound["bgv"][0] - (-math.log2(61 / 104))) < 1e-9
+    assert abs(bound["bgu"] - math.log2(104)) < 1e-9
+    assert client._all_parameters[4]["bgk"] == ["th", "he", "er"]
+
+
+def test_entropy_bigram_variant_warns_when_the_table_is_capped():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100_000, 9000)], column_names=["n_pairs", "v"]),
+            FakeQueryResult(result_rows=[("th", 60)], column_names=["bg", "c"]),
+            FakeQueryResult(result_rows=[(1.0, 2.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ],
+        totals=[0],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="bigram")
+    assert any("capped at 1 of 9000" in w for w in result.warnings)
+    assert result.results == []
+    assert result.status == "ok"
+    with pytest.raises(ValueError, match="variant"):
+        svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="trigram")
+
+
+def test_entropy_shannon_variant_binds_no_table():
+    """The default stays byte-for-byte the pre-D11 scan: no table pass, no bound arrays."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[("kq3v9xz2m8w1", 5.5, 3, fs, "evt-dga")],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[1],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    assert result.method == "iqr"
+    assert result.results[0].details["variant"] == "shannon"
+    assert len(client.full_queries) == 3
+    assert "bgk" not in client._all_parameters[1]
+    assert "arrayReduce('entropy'" in client.full_queries[1]
+
+
 def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
     """Temporal mode: fence from the baseline window only; suspect-window
     values scored with the sentinel excluded; min-length clause applies to

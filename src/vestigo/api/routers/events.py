@@ -2251,6 +2251,7 @@ async def _run_stat_detector(
     end: datetime | None = None,
     group_field: str | None = None,
     max_gap_seconds: int | None = None,
+    variant: str | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2524,22 +2525,29 @@ async def _run_stat_detector(
         return result, resolution
 
     if detector == "entropy":
-        result = await run_scan(
-            svc.find_entropy_outliers,
-            case_id=case_id,
-            source_ids=source_ids,
-            source_offsets=source_offsets,
-            fields=parsed_fields,
-            limit=limit,
-            per_field_limit=cfg.stat_per_field_limit,
-            windows=windows,
-            exclude_event_ids=exclude_ids,
-            allowlist=allowlist,
-            field_mappings=field_mappings,
-            inventory=inventory,
-            inventory_total=inventory_total,
-            field_overrides=field_overrides,
-        )
+        # D11: which statistic the band was learned over is part of what the
+        # run means, so the persisted run records it.
+        resolution["entropy_variant"] = variant or "shannon"
+        try:
+            result = await run_scan(
+                svc.find_entropy_outliers,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                per_field_limit=cfg.stat_per_field_limit,
+                windows=windows,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+                variant=resolution["entropy_variant"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
     if detector == "proportion_shift":
@@ -3147,6 +3155,8 @@ async def _persist_detector_run(
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
             "group_field": resolution.get("charset_group_field"),
+            # entropy: which statistic the band was learned over (D11).
+            "variant": resolution.get("entropy_variant"),
             # sequence_novelty / sequence_motif: gap bound (None = no bound).
             # Disjoint keys, coalesced on presence rather than truthiness: the
             # API floor is currently ge=1, but a persisted 0 must not fall
@@ -3296,6 +3306,15 @@ async def list_anomalies(
             "for no gap bound."
         ),
     ),
+    variant: Literal["shannon", "bigram"] | None = Query(
+        default=None,
+        description=(
+            "entropy only: the per-value statistic the band is learned over — "
+            "'shannon' (the value's own character entropy, the default) or "
+            "'bigram' (mean character-pair surprisal under a table learned from "
+            "the reference values; catches ordinary characters in an unusual order)."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3413,6 +3432,7 @@ async def list_anomalies(
         end=end,
         group_field=group_field,
         max_gap_seconds=max_gap_seconds,
+        variant=variant,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3599,6 +3619,10 @@ class TagAnomaliesRequest(BaseModel):
             "consecutive events are more than this many seconds apart."
         ),
     )
+    variant: Literal["shannon", "bigram"] | None = Field(
+        default=None,
+        description="entropy only: 'shannon' (default) or 'bigram' — the statistic the band is learned over.",
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -3665,6 +3689,7 @@ async def tag_anomalies(
         end=body.end,
         group_field=body.group_field,
         max_gap_seconds=body.max_gap_seconds,
+        variant=body.variant,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )

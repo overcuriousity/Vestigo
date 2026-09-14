@@ -359,6 +359,16 @@ _MIN_ENTROPY_BASELINE = 20
 # degenerate and would swamp the band with false lows.
 _MIN_ENTROPY_VALUE_LEN = 6
 
+#: Entropy's bigram variant (D11): the learned character-pair table is bound
+#: into the scoring scans as two parallel arrays, capped at this many pairs
+#: (most frequent first). Pairs beyond the cap score as unseen; the run says
+#: so. 4096 pairs is a few hundred kilobytes of bound parameter, and a
+#: latin-alphabet field has under 3000 distinct pairs in the first place.
+_BIGRAM_TABLE_MAX = 4096
+
+#: The two statistics the entropy detector can measure a value with.
+ENTROPY_VARIANTS = ("shannon", "bigram")
+
 # Distribution-drift categorical branch: number of named categories in the
 # G-test vector (top by baseline count, deterministic tie-break on value);
 # everything else folds into one exact __other__ bucket. A statistical-shape
@@ -4567,6 +4577,60 @@ class StatisticalAnomalyService:
     # Value entropy outliers
     # ------------------------------------------------------------------
 
+    def _learn_bigram_table(
+        self, distinct_src: str, params: dict[str, Any], field_token: str
+    ) -> tuple[dict[str, Any], dict[str, Any], str | None] | None:
+        """Learn a field's character-bigram surprisal table from *distinct_src*.
+
+        Two ``GROUP BY`` passes over the reference population's distinct
+        values (both spill under the heavy cap): the pair totals ``N`` (pairs)
+        and ``V`` (distinct pairs), then the ``_BIGRAM_TABLE_MAX`` most
+        frequent pairs. Returns the bound parameters for the scoring scans —
+        ``bgk``/``bgv`` (pair → surprisal, bits) and ``bgu`` (the unseen
+        surprisal) — the ``details`` extras, and a cap warning or ``None``.
+        ``None`` altogether when the population has no pairs at all.
+        """
+        pairs_src = f"SELECT arrayJoin(ngrams(val, 2)) AS bg FROM ({distinct_src})"
+        totals_sql = f"""
+            SELECT sum(c) AS n_pairs, count() AS v
+            FROM (SELECT bg, count() AS c FROM ({pairs_src}) GROUP BY bg)
+            {heavy_scan_settings()}
+        """
+        rows = self.ch.client.query(totals_sql, parameters=params).result_rows
+        if not rows or rows[0][0] is None or int(rows[0][0]) == 0:
+            return None
+        n_pairs, v_distinct = int(rows[0][0]), int(rows[0][1])
+        table_sql = f"""
+            SELECT bg, count() AS c
+            FROM ({pairs_src})
+            GROUP BY bg
+            ORDER BY c DESC, bg ASC
+            LIMIT {{bgcap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        trows = self.ch.client.query(
+            table_sql, parameters={**params, "bgcap": _BIGRAM_TABLE_MAX}
+        ).result_rows
+        denom = float(n_pairs + v_distinct + 1)
+        keys = [str(r[0]) for r in trows]
+        vals = [-math.log2((int(r[1]) + 1) / denom) for r in trows]
+        unseen = -math.log2(1.0 / denom)
+        note = None
+        if v_distinct > len(keys):
+            note = (
+                f"Field {field_token!r}: the bigram table was capped at {len(keys)} of "
+                f"{v_distinct} distinct pairs — pairs beyond the cap score as unseen, "
+                f"which overstates the surprisal of values built from them."
+            )
+        bound = {"bgk": keys, "bgv": vals, "bgu": unseen}
+        extra = {
+            "bigram_pairs": n_pairs,
+            "bigram_distinct": v_distinct,
+            "bigram_table": len(keys),
+            "bigram_unseen_surprisal": round(unseen, 4),
+        }
+        return bound, extra, note
+
     @gated_heavy_scan
     def find_entropy_outliers(
         self,
@@ -4583,30 +4647,40 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         field_overrides: dict[str, bool] | None = None,
+        variant: str = "shannon",
     ) -> StatAnomalyResult:
-        """Return values whose Shannon character entropy falls outside a learned band.
+        """Return values whose character statistic falls outside a learned band.
 
-        Per field, compute the character entropy (bits) of each *distinct
-        value* and compare it against the field's baseline entropy
-        distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
-        Values above the band look random (DGA domains, encoded payloads,
-        keys); values below it look degenerate (padding, repeated-character
-        stuffing). Entropy is a property of the characters, never of what the
-        value means.
+        Per field, compute one statistic per *distinct value* and compare it
+        against the field's baseline distribution of that statistic via a
+        Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``. Two *variants*, chosen
+        by *variant*:
 
-        Inspired by AMiner's ``EntropyDetector`` but **not the same statistic**:
-        AMiner scores values against a learned character-*bigram* transition
-        table, which catches ordinary-alphabet-unusual-order values (DGA
-        domains); per-value Shannon entropy does not. See
-        ``docs/ANOMALY_DETECTION.md`` §6 and roadmap D11.
+        * ``shannon`` — the value's own Shannon character entropy (bits).
+          Values above the band look random (encoded payloads, keys); below
+          it, degenerate (padding, repeated-character stuffing). Blind to a
+          value built from ordinary characters in an unusual *order*.
+        * ``bigram`` (D11, AMiner ``EntropyDetector``'s actual statistic) —
+          the mean *surprisal* of the value's character bigrams, in bits per
+          pair, under a pair-frequency table learned from the reference
+          population's distinct values with add-one smoothing:
+          ``s(ab) = −log2((c(ab) + 1) / (N + V + 1))``, unseen pairs
+          ``−log2(1 / (N + V + 1))``. A lowercase-latin DGA domain among
+          English hostnames has unremarkable Shannon entropy and a high mean
+          surprisal — its pairs are ones English never makes. Above the band
+          = unusual pairs; below = a value made only of the field's most
+          common pairs. The table is bound into the scans as arrays capped at
+          ``_BIGRAM_TABLE_MAX`` most frequent pairs (cap → warning).
 
-        Two modes: *self-baseline* (``method="iqr"``) computes the fence over
-        the whole corpus's per-distinct-value entropies (unlike an exact
-        min/max, quartiles are not degenerate over their own population);
-        *temporal* (``method="temporal-iqr"``, *windows* provided) learns the
-        fence from the baseline window and flags only suspect-window values,
-        attributed to the window they appear in; events outside every window
-        are ignored.
+        Both are properties of the characters, never of what the value
+        means. Two modes: *self-baseline* (``method="iqr"`` / ``"bigram-iqr"``)
+        computes the fence over the whole corpus's per-distinct-value
+        statistics (unlike an exact min/max, quartiles are not degenerate over
+        their own population); *temporal* (``method="temporal-iqr"`` /
+        ``"temporal-bigram-iqr"``, *windows* provided) learns the fence — and
+        the bigram table — from the baseline window and flags only
+        suspect-window values, attributed to the window they appear in;
+        events outside every window are ignored.
 
         Entropies are weighted per distinct value, not per row — one hot
         value repeated millions of times cannot drag the band toward itself.
@@ -4615,10 +4689,13 @@ class StatisticalAnomalyService:
         ``_MIN_ENTROPY_BASELINE`` qualifying baseline values is skipped; when
         every scanned field skips the status is ``insufficient_data``.
         """
+        if variant not in ENTROPY_VARIANTS:
+            raise ValueError(f"variant must be one of {', '.join(ENTROPY_VARIANTS)}")
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "iqr" if windows is None else "temporal-iqr"
+        stat = "iqr" if variant == "shannon" else "bigram-iqr"
+        method = stat if windows is None else f"temporal-{stat}"
         eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
@@ -4662,8 +4739,18 @@ class StatisticalAnomalyService:
         n_total = 0
         inexact: list[str] = []
 
+        # The per-value statistic, as SQL over `val`. The bigram table (D11)
+        # rides in as two bound arrays + the unseen surprisal, filled per
+        # field below; the Shannon form binds nothing.
+        shannon_expr = "arrayReduce('entropy', extractAll(val, '(?s).'))"
+        bigram_expr = (
+            "arrayAvg(arrayMap(g -> transform(g, {bgk:Array(String)}, {bgv:Array(Float64)},"
+            " {bgu:Float64}), ngrams(val, 2)))"
+        )
+        ent_expr = shannon_expr if variant == "shannon" else bigram_expr
+
         for field_token in scan_fields:
-            # --- Learn the entropy band from the baseline. ---
+            # --- Learn the band from the baseline. ---
             stat_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
             col = _col_expr(field_token, stat_params, field_mappings)
             baseline_clause = ""
@@ -4672,13 +4759,7 @@ class StatisticalAnomalyService:
                 # The baseline window is a bounded range, so the year-2299
                 # sentinel can never fall inside it.
                 baseline_clause = f" AND {stat_bp}"
-            stat_sql = f"""
-                SELECT {_qdet("0.25", "ent", "cityHash64(val)")} AS q1,
-                       {_qdet("0.75", "ent", "cityHash64(val)")} AS q3,
-                       count() AS n
-                FROM (
-                    SELECT val, arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
-                    FROM (
+            distinct_src = f"""
                         SELECT {col} AS val
                         FROM {db}.events
                         WHERE case_id = {{cid:String}}
@@ -4686,7 +4767,24 @@ class StatisticalAnomalyService:
                           AND {col} != ''
                           AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
                         GROUP BY val
-                    )
+            """
+            bigram_params: dict[str, Any] = {}
+            bigram_extra: dict[str, Any] = {}
+            if variant == "bigram":
+                learned = self._learn_bigram_table(distinct_src, stat_params, field_token)
+                if learned is None:
+                    continue
+                bigram_params, bigram_extra, table_note = learned
+                if table_note:
+                    override_notes.append(table_note)
+                stat_params.update(bigram_params)
+            stat_sql = f"""
+                SELECT {_qdet("0.25", "ent", "cityHash64(val)")} AS q1,
+                       {_qdet("0.75", "ent", "cityHash64(val)")} AS q3,
+                       count() AS n
+                FROM (
+                    SELECT val, {ent_expr} AS ent
+                    FROM ({distinct_src})
                 )
                 {heavy_scan_settings()}
             """
@@ -4711,7 +4809,11 @@ class StatisticalAnomalyService:
             evaluated_fields += 1
 
             # --- Flag values whose entropy falls outside the band. ---
-            viol_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+            viol_params: dict[str, Any] = {
+                **base_params,
+                **bigram_params,
+                "minlen": _MIN_ENTROPY_VALUE_LEN,
+            }
             bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
@@ -4743,7 +4845,7 @@ class StatisticalAnomalyService:
                 FROM (
                     SELECT
                         val,
-                        arrayReduce('entropy', extractAll(val, '(?s).')) AS ent,
+                        {ent_expr} AS ent,
                         cnt, first_seen, evt_id{win_idx_group}
                     FROM (
                         SELECT
@@ -4793,9 +4895,11 @@ class StatisticalAnomalyService:
                 details: dict[str, Any] = {
                     "detector": "entropy",
                     "method": method,
+                    "variant": variant,
                     "field": field_token,
                     "value": str(val),
                     "entropy": round(ent_f, 4),
+                    **bigram_extra,
                     "count": int(cnt),
                     "lower": round(lower, 4),
                     "upper": round(upper, 4),

@@ -1966,6 +1966,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         end: datetime | None = None,
         group_field: str | None = None,
         max_gap_seconds: int | None = Field(default=None, ge=1),
+        variant: Literal["shannon", "bigram"] | None = None,
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
@@ -1989,7 +1990,12 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         group_field (charset only: learn one alphabet per value of this
         field, e.g. per host, instead of one merged alphabet),
         max_gap_seconds (sequence_novelty/sequence_motif only: break a
-        sequence when consecutive events are farther apart than this).
+        sequence when consecutive events are farther apart than this),
+        variant (entropy only: "shannon", the default, scores each value's
+        own character entropy; "bigram" scores the mean surprisal of its
+        character pairs under a table learned from the reference values,
+        which catches ordinary characters in an unusual order — a DGA
+        domain among English hostnames).
         Returns findings plus a persisted run_id the analyst can open. Each
         finding carries an example `event_id`; how much of that event comes
         with it depends on the deployment, and the result's `fidelity`/`note`
@@ -2020,6 +2026,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             end=end,
             group_field=group_field,
             max_gap_seconds=max_gap_seconds,
+            variant=variant,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )

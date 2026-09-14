@@ -317,7 +317,10 @@ class _NumericRangeParams(_FieldsParams):
 
 
 class _EntropyParams(_FieldsParams):
-    pass
+    #: Which per-value statistic the band is learned over (D11): the value's
+    #: own Shannon entropy, or its mean character-bigram surprisal under a
+    #: table learned from the reference population.
+    variant: Literal["shannon", "bigram"] = "shannon"
 
 
 class _CharsetParams(_FieldsParams):
@@ -704,6 +707,7 @@ async def get_analysis_findings(
             ngram_size=kwargs.get("ngram_size"),
             group_field=kwargs.get("group_field"),
             max_gap_seconds=kwargs.get("max_gap_seconds"),
+            variant=kwargs.get("variant"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

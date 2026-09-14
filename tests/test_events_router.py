@@ -1488,6 +1488,54 @@ async def test_run_stat_detector_dispatches_to_entropy(patched_store, monkeypatc
     assert not fake_svc.value_novelty_calls
 
 
+@pytest.mark.asyncio
+async def test_run_stat_detector_entropy_variant_is_passed_and_snapshotted(
+    patched_store, monkeypatch
+):
+    """D11: the variant reaches the service and the persisted run records it;
+    an unknown one is a 422, not a server error."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="entropy",
+        fields="attr:host",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        variant="bigram",
+    )
+    assert fake_svc.entropy_calls[0]["variant"] == "bigram"
+    assert resolution["entropy_variant"] == "bigram"
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="entropy",
+        fields="attr:host",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.entropy_calls[1]["variant"] == "shannon"
+    assert resolution["entropy_variant"] == "shannon"
+    run_id = await events._persist_detector_run(
+        "c1",
+        "t1",
+        detector="entropy",
+        fields="attr:host",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        payload={"results": []},
+        resolution=resolution,
+    )
+    run = await patched_store.get_detector_run("c1", run_id)
+    assert run.params["variant"] == "shannon"
+
+
 def test_serialize_finding_entropy_shape():
     from vestigo.db.anomaly_stats import EntropyFinding
 
