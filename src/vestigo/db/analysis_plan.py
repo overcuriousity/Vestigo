@@ -7,8 +7,8 @@ elsewhere, so planning costs nothing an analyst can feel.
 
 The contract is deliberately narrow. A method is ``not_applicable`` **only**
 when it structurally cannot produce a finding on this data: no numeric field
-for the numeric-range band to learn, no second window for a two-window test, a
-span too short to separate one bucket from the next. It is never gated off for
+for the numeric-range band to learn, a single timestamp that cannot be sliced,
+a span too short to separate one bucket from the next. It is never gated off for
 being *unlikely* to find something interesting — that judgement belongs to the
 analyst, and the UI keeps every gated method one click away with the arithmetic
 on screen.
@@ -252,7 +252,6 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
     """Return one :class:`MethodPlan` per entry in :data:`METHOD_IDS`, in order."""
     cats = _categorical(inputs)
     max_distinct = max((d for _t, d, _c in inputs.inventory), default=0)
-    two_windows = inputs.frame == "baseline" and inputs.has_active_baseline
     per_series = inputs.events_total // max(inputs.series_distinct, 1)
     plans: dict[str, MethodPlan] = {}
 
@@ -328,27 +327,40 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         )
     )
 
-    # Two-window tests: no second window, no test. Recoverable by an analyst
-    # action, so needs_setup rather than not_applicable. `interval_periodicity`
-    # and `sequence_novelty` belong here too — both return `insufficient_data`
-    # the moment their window pair is missing, so their own data-shape gates
-    # below only ever get to speak when a baseline exists. Gating them on shape
-    # alone used to count them as applicable in an unbaselined frame, run them,
-    # and render a dash where the "Set a baseline" button belongs.
-    needs_windows = (
+    # The baseline frame without an active baseline has nothing to compare
+    # against: recoverable by an analyst action, so needs_setup rather than
+    # not_applicable. A baseline never *restricts* a method (D18): in the self
+    # frame every one of these four has its own reference — leave-one-out
+    # slices for the share and drift tests, the whole scope for cadence and
+    # orderings — so the frame decides nothing about applicability there and
+    # the data-shape gates below speak instead.
+    frame_needs_baseline = inputs.frame == "baseline" and not inputs.has_active_baseline
+    for method in (
         "proportion_shift",
         "value_distribution_drift",
         "interval_periodicity",
         "sequence_novelty",
-    )
-    for method in needs_windows:
-        if not two_windows:
+    ):
+        if frame_needs_baseline:
             plans[method] = _setup(
                 method,
                 "needs a baseline window to compare against",
                 {"frame": inputs.frame, "has_active_baseline": inputs.has_active_baseline},
             )
+    # Self frame: the slice tests cut the span into `stat_self_slices` equal
+    # slices, and a span of one instant cannot be sliced. That is the one
+    # structural impossibility; a short span merely yields thin slices, which
+    # the run warns about rather than the gate withholding it.
     for method in ("proportion_shift", "value_distribution_drift"):
+        if inputs.frame == "self" and inputs.span_seconds <= 0.0:
+            plans.setdefault(
+                method,
+                _no(
+                    method,
+                    "one timestamp cannot be sliced",
+                    {"span_seconds": inputs.span_seconds, "slices": cfg.stat_self_slices},
+                ),
+            )
         plans.setdefault(method, _ok(method))
 
     plans.setdefault(

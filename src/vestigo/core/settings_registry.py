@@ -531,6 +531,30 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Novel n-grams fetched per run, rarest first.",
     ),
     SettingSpec(
+        "stat_sequence_rarity_floor",
+        "detectors",
+        "Sequence rarity floor (self frame)",
+        "Without a baseline, an n-gram occurring at most this many times in the scope is a rare ordering.",
+    ),
+    SettingSpec(
+        "stat_self_slices",
+        "detectors",
+        "Self-frame slices",
+        "Without a baseline, proportion shift and distribution drift cut the scope into this many equal slices, each tested against the rest.",
+    ),
+    SettingSpec(
+        "stat_interval_self_pause_ratio",
+        "detectors",
+        "Self-frame pause ratio",
+        "Without a baseline, a gap longer than this many medians counts as the beacon being off and is left out of the regularity test.",
+    ),
+    SettingSpec(
+        "stat_interval_self_min_span_seconds",
+        "detectors",
+        "Self-frame beacon span floor",
+        "Without a baseline, retained gaps must span at least this many seconds before a value can read as beaconing.",
+    ),
+    SettingSpec(
         "stat_motif_min_support",
         "detectors",
         "Motif minimum support",

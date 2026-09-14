@@ -189,7 +189,7 @@ small-context local models.
 | `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
 | `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
 | `similar_events` | | Events similar to an existing event (embeddings-gated: absent when embeddings are unconfigured). |
-| `list_baselines` | | Saved baseline definitions — unlocks the temporal-only detectors. |
+| `list_baselines` | | Saved baseline definitions — a baseline sharpens the windowed detectors; none is required to run one. |
 | `list_dispositions` | | Analyst verdicts on anomaly findings. |
 | `list_saved_views` | | The analyst's saved filter views. |
 | `list_stories` | | The case's stories (the analyst's report documents). |

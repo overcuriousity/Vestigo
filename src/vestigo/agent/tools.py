@@ -1975,8 +1975,13 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         sequence_novelty, sequence_motif, value_distribution_drift.
         `fields` is a comma-separated field list for value detectors (omit to
         auto-recommend); `series_field` groups frequency/sequence detectors.
-        Temporal detectors need a `baseline_id` from list_baselines (omit for
-        a self-baseline run). Tuning knobs (all optional, server defaults
+        Every detector runs without a baseline (self frame: the whole
+        timeline is its own reference — proportion_shift and
+        value_distribution_drift compare each time slice with the rest,
+        interval_periodicity looks for whole-timeline beaconing and
+        silences, sequence_novelty for the rarest orderings). Pass a
+        `baseline_id` from list_baselines to compare suspect windows against
+        a known-normal window instead. Tuning knobs (all optional, server defaults
         otherwise): z_threshold (frequency |z| cutoff), min_skew_seconds
         (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
         (effect-size floor), ngram_size (sequence length, 2-5), min_support
@@ -2451,9 +2456,9 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
     async def list_baselines() -> dict[str, Any]:
         """List saved baseline definitions (baseline range + suspect windows).
 
-        Pass a baseline's id as `baseline_id` to run_anomaly_detector to run
-        temporal detection (proportion_shift, interval_periodicity,
-        sequence_novelty, frequency, value_distribution_drift) against it.
+        Pass a baseline's id as `baseline_id` to run_anomaly_detector to score
+        the suspect windows against the baseline window instead of the whole
+        timeline. A baseline sharpens a detector; none is required to run one.
         """
         from vestigo.api.deps import get_store
 

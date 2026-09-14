@@ -66,11 +66,10 @@ def test_numeric_range_gated_off_without_numeric_fields(cfg):
     assert plan.reason_facts == {"numeric_fields": 0, "sampled": 19, "threshold": 0.9}
 
 
-#: Every method whose detector returns ``insufficient_data`` the moment its
-#: window pair is missing — the two explicit two-window tests plus the two
-#: temporal-only ones, whose data-shape gates only get to speak once a
-#: baseline exists.
-TWO_WINDOW_METHODS = (
+#: The four methods that used to be baseline-only. Since D18 each has a self
+#: frame of its own, so a missing baseline gates them only in the *baseline*
+#: frame — where the analyst asked for a comparison that has no reference yet.
+FORMERLY_TWO_WINDOW_METHODS = (
     "proportion_shift",
     "value_distribution_drift",
     "interval_periodicity",
@@ -78,30 +77,56 @@ TWO_WINDOW_METHODS = (
 )
 
 
-def test_two_window_methods_need_setup_in_self_frame(cfg):
+def test_formerly_two_window_methods_are_applicable_in_the_self_frame(cfg):
+    """A baseline never restricts a detector: the self frame has its own reference."""
     plans = _by_id(build_plan(_inputs(frame="self", has_active_baseline=False), cfg))
-    for method in TWO_WINDOW_METHODS:
+    for method in FORMERLY_TWO_WINDOW_METHODS:
+        assert plans[method].status == "applicable", (method, plans[method].reason)
+
+
+def test_baseline_frame_without_a_baseline_still_needs_setup(cfg):
+    plans = _by_id(build_plan(_inputs(frame="baseline", has_active_baseline=False), cfg))
+    for method in FORMERLY_TWO_WINDOW_METHODS:
         assert plans[method].status == "needs_setup"
         assert "baseline" in plans[method].reason
 
 
-def test_two_window_methods_applicable_once_a_baseline_is_active(cfg):
+def test_formerly_two_window_methods_applicable_once_a_baseline_is_active(cfg):
     plans = _by_id(build_plan(_inputs(frame="baseline", has_active_baseline=True), cfg))
-    for method in TWO_WINDOW_METHODS:
+    for method in FORMERLY_TWO_WINDOW_METHODS:
         assert plans[method].status == "applicable"
 
 
-def test_temporal_only_methods_prefer_setup_over_their_shape_gate(cfg):
-    """A missing baseline outranks the data-shape reason, and is recoverable.
+def test_self_frame_slice_methods_need_more_than_one_instant(cfg):
+    """One timestamp cannot be sliced — the one structural impossibility of the slice tests."""
+    plans = _by_id(
+        build_plan(_inputs(frame="self", has_active_baseline=False, span_seconds=0.0), cfg)
+    )
+    for method in ("proportion_shift", "value_distribution_drift"):
+        assert plans[method].status == "not_applicable"
+        assert plans[method].reason_facts == {"span_seconds": 0.0, "slices": cfg.stat_self_slices}
+    # A short span merely yields thin slices; the run warns, the gate offers.
+    plans = _by_id(
+        build_plan(_inputs(frame="self", has_active_baseline=False, span_seconds=1.0), cfg)
+    )
+    assert plans["proportion_shift"].status == "applicable"
 
-    ``sequence_novelty`` on a single-valued series field cannot produce a
-    finding for two independent reasons. The one the analyst can act on is the
-    one worth reporting, and reporting the other as ``not_applicable`` would
-    hide the "Set a baseline" affordance behind a dead end.
-    """
+
+def test_self_frame_shape_gates_speak_for_cadence_and_sequences(cfg):
+    """In the self frame the data-shape gates decide, as they do for every other method."""
     plans = _by_id(
         build_plan(
             _inputs(frame="self", has_active_baseline=False, series_distinct=1, events_total=2),
+            cfg,
+        )
+    )
+    assert plans["sequence_novelty"].status == "not_applicable"
+    assert plans["interval_periodicity"].status == "not_applicable"
+    # The baseline frame still outranks the shape reason: it is the one the
+    # analyst can act on, and it must not hide the "Set a baseline" affordance.
+    plans = _by_id(
+        build_plan(
+            _inputs(frame="baseline", has_active_baseline=False, series_distinct=1, events_total=2),
             cfg,
         )
     )

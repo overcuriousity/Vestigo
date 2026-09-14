@@ -1176,6 +1176,7 @@ class _FakeStatAnomalyService:
         self.entropy_calls: list[dict] = []
         self.shift_calls: list[dict] = []
         self.interval_calls: list[dict] = []
+        self.drift_calls: list[dict] = []
         self.sequence_calls: list[dict] = []
         self.motif_calls: list[dict] = []
 
@@ -1224,6 +1225,10 @@ class _FakeStatAnomalyService:
     def find_sequence_novelty(self, **kwargs):
         self.sequence_calls.append(kwargs)
         return "sequence-result"
+
+    def find_distribution_drift(self, **kwargs):
+        self.drift_calls.append(kwargs)
+        return "drift-result"
 
     def find_sequence_motifs(self, **kwargs):
         self.motif_calls.append(kwargs)
@@ -2652,6 +2657,96 @@ async def test_persist_detector_run_offsets_none_when_inactive(patched_store):
     )
     run = await patched_store.get_detector_run("c1", run_id)
     assert run.params["source_offsets"] is None
+
+
+@pytest.mark.asyncio
+async def test_persist_detector_run_stamps_self_frame_slices_and_settings(patched_store):
+    """A slice-based self-frame run records its slices, their hash and the
+    resolved self settings beside the (None) windows snapshot — the D18
+    counterpart of `windows` / `windows_hash`."""
+    from types import SimpleNamespace
+
+    from vestigo.db.anomaly_stats import SelfSlices
+
+    slices = SelfSlices.build(
+        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), 24
+    )
+    resolution = {"self_slices": 24}
+    events._snapshot_slices(SimpleNamespace(slices=slices.payload()), resolution)
+    assert resolution["slices"] == slices.payload()
+    assert resolution["slices_hash"] == slices.config_hash()
+    run_id = await events._persist_detector_run(
+        "c1",
+        "t1",
+        detector="proportion_shift",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+        payload={"results": []},
+        resolution=resolution,
+    )
+    run = await patched_store.get_detector_run("c1", run_id)
+    assert run.params["windows"] is None and run.params["windows_hash"] is None
+    assert run.params["slices"]["k"] == 24
+    assert run.params["slices_hash"] == slices.config_hash()
+    assert run.params["self_slices"] == 24
+    # A baseline-frame or non-slice result leaves the snapshot untouched.
+    untouched: dict = {}
+    events._snapshot_slices(SimpleNamespace(slices=None), untouched)
+    assert untouched == {}
+
+
+@pytest.mark.asyncio
+async def test_run_stat_detector_self_frame_passes_the_self_settings(patched_store, monkeypatch):
+    """Without a baseline the four formerly baseline-only detectors run in
+    their self frame, with the server's self-frame settings snapshotted."""
+    fake_svc = _FakeStatAnomalyService()
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: fake_svc)
+    cfg = events.get_settings()
+
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="interval_periodicity",
+        fields="attr:host",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    call = fake_svc.interval_calls[0]
+    assert call["windows"] is None
+    assert call["self_pause_ratio"] == cfg.stat_interval_self_pause_ratio
+    assert call["self_min_span_seconds"] == cfg.stat_interval_self_min_span_seconds
+    assert resolution["pause_ratio"] == cfg.stat_interval_self_pause_ratio
+    assert resolution["min_span_seconds"] == cfg.stat_interval_self_min_span_seconds
+
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="sequence_novelty",
+        fields=None,
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.sequence_calls[0]["rarity_floor"] == cfg.stat_sequence_rarity_floor
+    assert resolution["sequence_rarity_floor"] == cfg.stat_sequence_rarity_floor
+
+    _, resolution = await events._run_stat_detector(
+        "c1",
+        "t1",
+        ["s1"],
+        detector="value_distribution_drift",
+        fields="attr:bytes",
+        series_field="artifact",
+        z_threshold=None,
+        limit=50,
+    )
+    assert fake_svc.drift_calls[0]["self_slices"] == cfg.stat_self_slices
+    assert resolution["self_slices"] == cfg.stat_self_slices
 
 
 # ---------------------------------------------------------------------------

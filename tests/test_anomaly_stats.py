@@ -5,6 +5,7 @@ All tests use fakes/mocks for ClickHouse so they run without external services.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
+    SelfSlices,
     StatAnomalyResult,
     StatisticalAnomalyService,
     TimeWindow,
@@ -35,9 +37,13 @@ from vestigo.db.anomaly_stats import (
     _full_bucket_starts,
     _g_statistic,
     _g_statistic_k,
+    _gamma_from_median,
+    _gamma_sf,
     _greenwood_p,
     _poisson_rate_g,
+    _robust_cv,
     _scalar_total,
+    _sidak_p,
     _sql_suppression,
     _tvd,
     _window_preds,
@@ -3269,17 +3275,6 @@ def _shift_windows() -> AnalysisWindows:
     )
 
 
-def test_proportion_shift_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_proportion_shifts("c1", ["s1"], fields=["attr:user"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "proportion_shift"
-    assert result.method == "g-test"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
-
-
 def test_proportion_shift_no_data():
     svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
     result = svc.find_proportion_shifts(
@@ -3678,17 +3673,6 @@ _BURSTY_BL = (
     "evt-bl-first",
     "evt-bl-last",
 )
-
-
-def test_interval_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_interval_periodicity("c1", ["s1"], fields=["attr:service"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "interval_periodicity"
-    assert result.method == "cadence"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_interval_no_data():
@@ -4316,17 +4300,6 @@ def _seq_responses(
         FakeQueryResult(result_rows=ngram_totals, column_names=_SEQ_TOTALS_COLS),
         FakeQueryResult(result_rows=novel_rows, column_names=_SEQ_NOVEL_COLS),
     ]
-
-
-def test_sequence_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_sequence_novelty("c1", ["s1"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "sequence_novelty"
-    assert result.method == "ngram"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_sequence_ngram_validation():
@@ -5097,17 +5070,6 @@ def _cat_row(val: str, bl: int, w: int) -> tuple:
         datetime(2024, 1, 16, tzinfo=UTC),
         f"evt-w-{val}",
     )
-
-
-def test_distribution_drift_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_distribution_drift("c1", ["s1"], fields=["attr:duration"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "value_distribution_drift"
-    assert result.method == "drift"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_distribution_drift_no_data():
@@ -6260,3 +6222,90 @@ def test_motif_max_gap_reaches_both_passes():
     joined = "\n".join(client.full_queries)
     assert "PARTITION BY source_id, w_idx, seg" in joined
     assert "if(gap_s > 300, 1, 0)" in joined
+
+
+# ---------------------------------------------------------------------------
+# Self frame (D18): slices and the pure math behind the cadence null model
+# ---------------------------------------------------------------------------
+
+
+def test_self_slices_are_integer_arithmetic_and_reproducible():
+    """Boundaries come from ceil(span/k) milliseconds; a rebuild hashes the same."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, 0, 0, 0, 500_000, tzinfo=UTC)
+    a = SelfSlices.build(start, end, 24)
+    b = SelfSlices.build(start, end, 24)
+    assert a is not None and a == b
+    assert a.width_ms == math.ceil(86_400_500 / 24)
+    assert a.config_hash() == b.config_hash()
+    payload = a.payload()
+    assert payload["k"] == 24 and len(payload["slices"]) == 24
+    assert payload["slices"][6]["label"] == "slice 07/24"
+    # Slice i starts exactly i widths after the span start.
+    assert a.bounds(23)[0] == start + timedelta(milliseconds=23 * a.width_ms)
+
+
+def test_self_slices_index_sql_clamps_the_last_event_into_the_last_slice():
+    """least(k-1, …): the span end itself lands in slice k-1, never in a slice k."""
+    slices = SelfSlices.build(
+        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), 24
+    )
+    params: dict = {}
+    sql = slices.index_sql("timestamp", params)
+    assert sql.startswith("least(23, ")
+    assert params["ss"] == "2024-01-01 00:00:00.000"
+    assert params["sw"] == 3_600_000
+    assert "{sw:Int64}" in sql and "{ss:String}" in sql
+
+
+def test_self_slices_reject_a_single_instant():
+    t = datetime(2024, 1, 1, tzinfo=UTC)
+    assert SelfSlices.build(t, t, 24) is None
+
+
+def test_gamma_sf_matches_closed_forms():
+    """Shape 1 is the exponential tail; integer shapes agree with the chi² caller."""
+    assert abs(_gamma_sf(1.0, 2.0) - math.exp(-2.0)) < 1e-12
+    for df in (2, 3, 4, 7, 12):
+        for x in (0.5, 2.0, 9.0, 30.0):
+            assert abs(_gamma_sf(df / 2.0, x / 2.0) - _chi2_sf(x, df)) < 1e-12
+    # Non-integer shape: Q(a, y) is monotone decreasing in y and bounded.
+    tail = [_gamma_sf(4.6, y) for y in (0.1, 1.0, 4.6, 10.0, 40.0)]
+    assert tail == sorted(tail, reverse=True)
+    assert tail[0] > 0.999 and tail[-1] < 1e-9
+    assert _gamma_sf(4.6, 0.0) == 1.0
+
+
+def test_sidak_is_stable_for_tiny_tails():
+    """1 − (1 − sf)^k via expm1/log1p keeps a 1e-300 tail from rounding to zero."""
+    assert _sidak_p(1e-300, 1000) > 0.0
+    assert abs(_sidak_p(0.01, 1) - 0.01) < 1e-15
+    assert abs(_sidak_p(0.1, 3) - (1 - 0.9**3)) < 1e-12
+    assert _sidak_p(1.0, 5) == 1.0
+    assert _sidak_p(0.0, 5) == 0.0
+
+
+def test_robust_cv_sits_on_the_cv_scale_and_is_floored():
+    # Exponential gaps: q1 = ln(4/3)·μ, median = ln2·μ, q3 = ln4·μ → rcv ≈ 1.17.
+    mu = 60.0
+    rcv = _robust_cv(math.log(4 / 3) * mu, math.log(2) * mu, math.log(4) * mu)
+    assert rcv is not None and abs(rcv - 1.175) < 0.01
+    # A clockwork job with IQR = 0 is clamped, never zero.
+    assert _robust_cv(60.0, 60.0, 60.0) == 0.05
+    assert _robust_cv(1.0, 0.0, 2.0) is None
+
+
+def test_gamma_from_median_recovers_the_median():
+    """Wilson–Hilferty inverse: the fitted Gamma's median is the median it was fitted to."""
+    rcv, median = 0.25, 300.0
+    alpha, theta = _gamma_from_median(rcv, median)
+    assert abs(alpha - 16.0) < 1e-9
+    # Bisect Q(alpha, y) = 0.5 and compare y·theta to the median.
+    lo, hi = 0.0, 1000.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if _gamma_sf(alpha, mid) > 0.5:
+            lo = mid
+        else:
+            hi = mid
+    assert abs(lo * theta - median) / median < 0.01
