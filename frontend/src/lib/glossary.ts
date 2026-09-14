@@ -7,7 +7,7 @@
  */
 export const GLOSSARY = {
   scanAllEvents:
-    "Score every event against the whole corpus (self-baseline). No reference window needed — good for a first pass over unfamiliar data. Temporal-only detectors need a baseline and stay empty here.",
+    "Score every event against the whole corpus (self-baseline). No reference window needed — good for a first pass over unfamiliar data. Every method runs here; a baseline sharpens the comparison methods rather than unlocking them.",
   compareBaseline:
     "Score one or more suspect windows against a baseline you trust as normal. Surfaces what changed relative to known-good activity.",
   baseline:

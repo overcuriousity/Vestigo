@@ -21,6 +21,7 @@
  */
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
+import { detailNumber, findingMode } from "@/lib/finding-frame";
 import { truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
@@ -211,39 +212,64 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
           }}
         />
       );
-    case "proportion_shift":
+    case "proportion_shift": {
+      // The self mode's reference is the rest of the timeline, and the labels
+      // must say so: "baseline 0%" over a slice comparison is a false claim.
+      const self = findingMode(finding) === "self-g-test";
       return (
         <TwoBars
           reference={{
-            label: "baseline share",
+            label: self ? "rest-of-timeline share" : "baseline share",
             value: finding.baseline_rate,
             display: `${(finding.baseline_rate * 100).toFixed(2)}%`,
           }}
           observed={{
-            label: "suspect share",
+            label: self ? "slice share" : "suspect share",
             value: finding.window_rate,
             display: `${(finding.window_rate * 100).toFixed(2)}%`,
           }}
         />
       );
-    case "value_distribution_drift":
+    }
+    case "value_distribution_drift": {
       // Event counts on each side of the test — the population the statistic
       // was computed over, which is the checkable part of a whole-field claim.
+      const self = findingMode(finding) === "self-drift";
       return (
         <TwoBars
           reference={{
-            label: "baseline events",
+            label: self ? "rest-of-timeline events" : "baseline events",
             value: finding.baseline_n,
             display: String(finding.baseline_n),
           }}
           observed={{
-            label: "suspect events",
+            label: self ? "slice events" : "suspect events",
             value: finding.window_n,
             display: String(finding.window_n),
           }}
         />
       );
+    }
     case "interval_periodicity": {
+      if (findingMode(finding) === "self-cadence") {
+        // Whole-scope mode: a silence is the longest gap against the median
+        // gap, both measured. Beaconing has no second number to draw — its
+        // claim is the regularity itself, stated in the verdict — so it
+        // draws nothing rather than a figure no measurement backs.
+        const median = detailNumber(finding.details, "median_interval");
+        const longest = detailNumber(finding.details, "longest_gap_seconds");
+        if (finding.direction !== "missed" || median === null || longest === null) return null;
+        return (
+          <TwoBars
+            reference={{ label: "median gap", value: median, display: `${median.toFixed(1)}s` }}
+            observed={{
+              label: "longest gap",
+              value: longest,
+              display: `${longest.toFixed(1)}s`,
+            }}
+          />
+        );
+      }
       const base = finding.baseline_median_interval;
       const window = finding.window_median_interval;
       // Below two occurrences there is no interval to take a median of, and the

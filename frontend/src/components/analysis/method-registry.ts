@@ -85,13 +85,17 @@ export interface MethodKnob {
   param: string;
   label: string;
   /**
-   * `fields` renders `AnomalyFieldPicker`, `field` renders `MethodFieldSelect`.
-   * Neither is a text box: a field name is one of a fixed set of columns plus
-   * this timeline's `attr:` keys, which no analyst can be asked to spell from
-   * memory. `text` is for the knobs that really are free-form.
+   * `fields` renders `AnomalyFieldPicker`, `field` renders `MethodFieldSelect`,
+   * `choice` a fixed list of named options. None of those is a text box: a
+   * field name is one of a fixed set of columns plus this timeline's `attr:`
+   * keys, which no analyst can be asked to spell from memory, and a variant is
+   * one of the statistics the method implements. `text` is for the knobs that
+   * really are free-form.
    */
-  kind: "number" | "text" | "field" | "fields";
+  kind: "number" | "text" | "field" | "fields" | "choice";
   placeholder: string;
+  /** `kind: "choice"` only — the options, first one the default. */
+  options?: { value: string; label: string }[];
   /** `kind: "fields"` only. */
   picker?: FieldPickerConfig;
   /** `kind: "field"` only — the standard (non-attribute) choices, in order. */
@@ -122,11 +126,12 @@ export interface MethodMeta {
    *
    * Set only where the score is continuous and the method has no threshold
    * knob of its own to express "worth looking at" with. `frequency` has
-   * `z_threshold`, the four two-window methods have their q-value cut, and
-   * `charset`'s finding is binary — for those the floor belongs in the run,
-   * not in the rail. What is left is the two band methods, where a value one
-   * band width outside is arithmetically real and, in a feed sorted by
-   * method rotation, sits above findings tens of band widths out.
+   * `z_threshold`, the four significance-tested methods (shift, drift,
+   * cadence, sequences) have their q-value cut, and `charset`'s finding is
+   * binary — for those the floor belongs in the run, not in the rail. What
+   * is left is the two band methods, where a value one band width outside is
+   * arithmetically real and, in a feed sorted by method rotation, sits above
+   * findings tens of band widths out.
    */
   railFloor?: number;
   /** Replaces MethodologyPanel: what this method does, in the analyst's terms. */
@@ -272,9 +277,21 @@ export const METHODS: MethodMeta[] = [
     costClass: "heavy",
     scoreUnit: "× band",
     railFloor: 2,
-    what: "Measures Shannon entropy per value against a learned per-field band, catching both random-looking payloads and degenerate repeats at the other extreme.",
-    querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- Shannon entropy per value against the learned per-field band`,
-    knobs: [fieldsKnob({ autoIncludesIdentifiers: true })],
+    what: "Measures one character statistic per value against a learned per-field band. Shannon entropy catches random-looking payloads and degenerate repeats; the bigram variant scores how unusual a value's character pairs are under a table learned from the field, which catches ordinary letters in an order the field never produces — a generated domain among real hostnames.",
+    querySketch: `SELECT <field> AS value, count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- shannon: entropy per value against the learned per-field band\n-- bigram: mean -log2 P(pair) under the field's learned pair table`,
+    knobs: [
+      fieldsKnob({ autoIncludesIdentifiers: true }),
+      {
+        param: "variant",
+        label: "Statistic",
+        kind: "choice",
+        placeholder: "shannon",
+        options: [
+          { value: "shannon", label: "Shannon entropy" },
+          { value: "bigram", label: "Bigram surprisal" },
+        ],
+      },
+    ],
   },
   {
     id: "frequency",
@@ -298,13 +315,13 @@ export const METHODS: MethodMeta[] = [
     label: "Proportion shift",
     hint: "Value shares that change between windows",
     useWhen:
-      "Use this when you have a baseline and want the values whose share of events changed most in the suspect window. Needs a baseline.",
+      "Use this when you want the values whose share of events changed most — against a baseline you declare, or, without one, in any slice of the timeline against the rest of it.",
     icon: Percent,
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "G",
-    what: "G-tests each value's share of events in the suspect window against its share in the baseline window, so a value can be flagged for changing its proportion even when total volume is flat.",
-    querySketch: `SELECT <field> AS value,\n       countIf(<effective_ts> BETWEEN {b0} AND {b1}) AS base_n,\n       countIf(<effective_ts> BETWEEN {s0} AND {s1}) AS susp_n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- G-test per value, Benjamini-Hochberg across the run`,
+    what: "G-tests each value's share of events in one population against another, so a value can be flagged for changing its proportion even when total volume is flat. With a baseline the populations are the baseline and each suspect window; without one the timeline is cut into equal time slices and each slice is tested against the rest, inside the value's own active span.",
+    querySketch: `SELECT <field> AS value,\n       countIf(<in reference>) AS ref_n,\n       countIf(<in window>) AS win_n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- reference = baseline window, or the rest of the timeline (self)\n-- G-test per value, Benjamini-Hochberg across the run`,
     knobs: [FIELDS_KNOB, FDR_KNOB, RATIO_KNOB],
   },
   {
@@ -312,13 +329,13 @@ export const METHODS: MethodMeta[] = [
     label: "Distribution drift",
     hint: "Whole-field value-mix changes",
     useWhen:
-      "Use this when whole fields, not single values, may have changed shape between the baseline and the suspect window. Needs a baseline.",
+      "Use this when whole fields, not single values, may have changed shape — between a baseline and a suspect window, or, without a baseline, in any slice of the timeline against the rest.",
     icon: Replace,
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "−log₁₀ p",
-    what: "Tests whether a field's entire value mix differs between baseline and suspect windows — the field-level counterpart to proportion shift's per-value test.",
-    querySketch: `SELECT <field> AS value,\n       countIf(<effective_ts> BETWEEN {b0} AND {b1}) AS base_n,\n       countIf(<effective_ts> BETWEEN {s0} AND {s1}) AS susp_n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- KS (numeric) or 2xk G-test (categorical) over the whole mix`,
+    what: "Tests whether a field's entire value mix differs between two populations — the field-level counterpart to proportion shift's per-value test. With a baseline: baseline against each suspect window; without one: each equal time slice against the rest of the timeline.",
+    querySketch: `SELECT <field> AS value,\n       countIf(<in reference>) AS ref_n,\n       countIf(<in window>) AS win_n\nFROM events\nWHERE case_id = {case}\nGROUP BY value\n-- reference = baseline window, or the rest of the timeline (self)\n-- KS (numeric) or 2xk G-test (categorical) over the whole mix`,
     knobs: [FIELDS_KNOB, FDR_KNOB],
   },
   {
@@ -326,13 +343,13 @@ export const METHODS: MethodMeta[] = [
     label: "Interval cadence",
     hint: "Broken heartbeats and new beaconing",
     useWhen:
-      "Use this when beaconing or a missed heartbeat is the question — a value that arrives on a new rhythm, or stopped arriving on its old one. Needs a baseline.",
+      "Use this when beaconing or a missed heartbeat is the question — a value arriving on a clock, or one that stopped. Legitimate clocks rank first; mark them Normal once.",
     icon: Timer,
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "−log₁₀ p",
-    what: "Fits an inter-arrival distribution per series value and tests whether the spacing is more regular than chance allows — new beaconing, or a heartbeat that stopped.",
-    querySketch: `SELECT series, gap FROM (\n  SELECT <series_field> AS series,\n         dateDiff('second', lagInFrame(<effective_ts>) OVER w, <effective_ts>) AS gap\n  FROM events WHERE case_id = {case}\n  WINDOW w AS (PARTITION BY series ORDER BY <effective_ts>)\n)\n-- Poisson-rate G (cadence break) or Greenwood G (new regularity)`,
+    what: "Fits an inter-arrival distribution per series value and tests whether the spacing is more regular than chance allows, and whether a regular value fell silent. With a baseline the rhythm is learned there and tested in the suspect windows; without one each value is judged over all its arrivals across the timeline, with long pauses left out of the regularity test. Nothing filters legitimate clocks: a high-volume heartbeat gets the smallest p and ranks first, and marking it Normal is the remedy.",
+    querySketch: `SELECT series, gap FROM (\n  SELECT <series_field> AS series,\n         dateDiff('second', lagInFrame(<effective_ts>) OVER w, <effective_ts>) AS gap\n  FROM events WHERE case_id = {case}\n  WINDOW w AS (PARTITION BY series ORDER BY <effective_ts>)\n)\n-- baseline: Poisson-rate G (cadence break) or Greenwood G (new regularity)\n-- self: Greenwood G over retained gaps; Gamma tail over the longest gap`,
     knobs: [SERIES_KNOB, FDR_KNOB, RATIO_KNOB],
   },
   {
@@ -354,13 +371,13 @@ export const METHODS: MethodMeta[] = [
     label: "Event sequences",
     hint: "Never-seen event orderings",
     useWhen:
-      "Use this when the order things happened in matters — a host sequence, a command chain — and you want orderings never seen in the baseline. Needs a baseline.",
+      "Use this when the order things happened in matters — a host sequence, a command chain — and you want orderings never seen in the baseline, or, without one, the rarest orderings on the timeline.",
     icon: ListOrdered,
     evidenceClass: "statistical",
     costClass: "heavy",
     scoreUnit: "surprise",
-    what: "Builds n-grams of consecutive artifact types per series and flags orderings that never occur in the reference set — the order is the finding, not any single event in it.",
-    querySketch: `SELECT ngram, count() AS n FROM (\n  SELECT arrayStringConcat([v1, v2, v3], ' -> ') AS ngram\n  FROM (SELECT <series_field> AS v1,\n               leadInFrame(...) AS v2, leadInFrame(...) AS v3\n        FROM events WHERE case_id = {case}\n        WINDOW w AS (PARTITION BY series ORDER BY <effective_ts>))\n)\nGROUP BY ngram\n-- reported when the n-gram has no occurrence in the baseline window`,
+    what: "Builds n-grams of consecutive values per series and flags orderings that never occur in the baseline window — or, without a baseline, that occur at most a few times across the whole timeline. The order is the finding, not any single event in it. A series field with many distinct values makes most orderings rare; prefer one with a few.",
+    querySketch: `SELECT ngram, count() AS n FROM (\n  SELECT arrayStringConcat([v1, v2, v3], ' -> ') AS ngram\n  FROM (SELECT <series_field> AS v1,\n               leadInFrame(...) AS v2, leadInFrame(...) AS v3\n        FROM events WHERE case_id = {case}\n        WINDOW w AS (PARTITION BY series ORDER BY <effective_ts>))\n)\nGROUP BY ngram\n-- baseline: reported when the n-gram never occurs in the baseline window\n-- self: reported when n <= the rarity floor across the timeline`,
     knobs: [
       SERIES_KNOB,
       { param: "ngram_size", label: "n", kind: "number", placeholder: "3" },

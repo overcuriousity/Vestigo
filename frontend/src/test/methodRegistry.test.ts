@@ -40,7 +40,7 @@ describe("method registry", () => {
       value_combo: ["fields"],
       numeric_range: ["fields"],
       charset: ["fields", "group_field"],
-      entropy: ["fields"],
+      entropy: ["fields", "variant"],
       frequency: ["series_field", "z_threshold"],
       proportion_shift: ["fields", "fdr_q", "min_ratio"],
       value_distribution_drift: ["fields", "fdr_q"],

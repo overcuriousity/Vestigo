@@ -533,17 +533,27 @@ export interface EntropyFinding {
   confirmed_other_scope?: boolean;
 }
 
-/** One value-share shift between windows from the proportion_shift detector. */
+/**
+ * One value-share shift from the proportion_shift detector.
+ *
+ * Two frames share this shape (`details.method`): `g-test` compares the
+ * baseline window with a suspect window, `self-g-test` a time slice with the
+ * rest of the timeline. In the self mode the `baseline_*` fields hold the
+ * *rest-of-timeline* numbers and `details` carries `rest_count`,
+ * `rest_total`, `rest_rate`, `slice_index`, `slice_count` — never a
+ * `baseline_*` key. Read `details.method`, not the panel's scope.
+ */
 export interface ProportionShiftFinding {
   type: "proportion_shift";
   field: string;
   value: string;
-  /** Occurrences in the suspect window; 0 = vanished (baseline-only). */
+  /** Occurrences in the suspect window or slice; 0 = vanished. */
   count: number;
+  /** Occurrences in the reference: the baseline window, or the rest of the timeline (self). */
   baseline_count: number;
-  /** baseline_count ÷ baseline window's event total. */
+  /** baseline_count ÷ the reference's event total. */
   baseline_rate: number;
-  /** count ÷ suspect window's event total (0.5-smoothed when count = 0). */
+  /** count ÷ the window's or slice's event total (0.5-smoothed when count = 0). */
   window_rate: number;
   /** window_rate ÷ baseline_rate. */
   rate_ratio: number;
@@ -571,7 +581,17 @@ export interface ProportionShiftFinding {
   confirmed_other_scope?: boolean;
 }
 
-/** One arrival-cadence change between windows from the interval_periodicity detector. */
+/**
+ * One arrival-cadence finding from the interval_periodicity detector.
+ *
+ * `details.method` is `cadence` (baseline vs. suspect window) or
+ * `self-cadence` (each value over all its arrivals across the timeline). In
+ * the self mode the `baseline_*`/`window_*` pairs both describe the whole
+ * scope and `details` carries the real numbers: `median_interval`,
+ * `robust_cv`, and per direction `retained_intervals` / `paused_intervals` /
+ * `retained_span_seconds` (beaconing) or `longest_gap_seconds` / `gap_start`
+ * / `gap_end` / `trailing` / `expected_arrivals_missed` (silence).
+ */
 export interface IntervalPeriodicityFinding {
   type: "interval_periodicity";
   field: string;
@@ -611,7 +631,12 @@ export interface IntervalPeriodicityFinding {
   confirmed_other_scope?: boolean;
 }
 
-/** One never-seen-in-baseline event-order n-gram from the sequence_novelty detector. */
+/**
+ * One event-order n-gram from the sequence_novelty detector: never in the
+ * baseline window (`details.method` `ngram`) or rare across the whole
+ * timeline (`rare-ngram`, with `scope_ngram_total` and `rarity_floor` in
+ * `details` and no window keys).
+ */
 export interface SequenceNoveltyFinding {
   type: "sequence_novelty";
   /** Field token the sequence was built over (e.g. "artifact"). */
@@ -671,11 +696,17 @@ export interface TimestampOrderFinding {
   confirmed_other_scope?: boolean;
 }
 
-/** One whole-field distribution change between windows from the value_distribution_drift detector. */
+/**
+ * One whole-field distribution change from the value_distribution_drift
+ * detector. `details.method` is `drift` (baseline vs. suspect window) or
+ * `self-drift` (a time slice vs. the rest of the timeline); in the self mode
+ * `baseline_n` holds the rest-of-timeline count and `details` carries
+ * `rest_n`, `rest_median` (numeric) and `rest_share` per contributor.
+ */
 export interface DistributionDriftFinding {
   type: "value_distribution_drift";
   field: string;
-  /** Suspect-window label — the finding is per field, so the window names it. */
+  /** Suspect-window or slice label — the finding is per field, so the window names it. */
   window_label: string;
   /** "ks" (numeric Kolmogorov–Smirnov) | "g-test-k" (categorical G-test). */
   test: "ks" | "g-test-k";
@@ -782,6 +813,11 @@ export interface AnomaliesResponse {
   /** Serialized window snapshot for temporal runs driven by a baseline definition. */
   windows?: AnalysisWindowsPayload | null;
   /**
+   * The leave-one-out time slices a self-frame proportion-shift or drift run
+   * compared (`self-g-test` / `self-drift`); null for every other run.
+   */
+  slices?: SelfSlicesPayload | null;
+  /**
    * Findings that survived suppression before the `limit` cap — when it
    * exceeds `results.length` the server truncated and the view offers
    * "load more".
@@ -825,6 +861,15 @@ export interface SuspectWindow {
 }
 
 /** The window snapshot echoed on a temporal AnomaliesResponse / stored in a run. */
+/** `SelfSlices.payload()` — the self frame's leave-one-out slices (D18). */
+export interface SelfSlicesPayload {
+  span_start: string;
+  span_end: string;
+  k: number;
+  width_ms: number;
+  slices: { label: string; start: string; end: string }[];
+}
+
 export interface AnalysisWindowsPayload {
   baseline: { start: string; end: string };
   suspect_windows: SuspectWindow[];

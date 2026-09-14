@@ -386,7 +386,7 @@ function ScopeSection({
       id: "self" as const,
       icon: ScanLine,
       label: "Scan all events",
-      hint: "Self-baseline over the whole corpus. Two-window methods have nothing to compare and stay unavailable.",
+      hint: "Self-baseline over the whole corpus. The comparison methods take their reference from the timeline itself.",
     },
     {
       id: "baseline" as const,
@@ -394,7 +394,7 @@ function ScopeSection({
       label: baselineName ? "Compare baseline" : "Pick a baseline…",
       hint: baselineName
         ? `Suspect windows against “${baselineName}”.`
-        : "Pick or build a baseline definition to enable the comparison methods.",
+        : "Pick or build a baseline definition to score suspect windows against known-normal activity.",
     },
   ];
 

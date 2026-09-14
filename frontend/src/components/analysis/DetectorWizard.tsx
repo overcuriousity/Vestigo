@@ -22,7 +22,7 @@ import { useAnalysisPlan } from "@/hooks/useAnalysisPlan";
 import { useTimelineDetectors } from "@/hooks/useTimelineDetectors";
 import { METHODS, METHODS_BY_ID, type MethodId } from "./method-registry";
 import { MethodKnobForm } from "./MethodKnobForm";
-import { NEEDS_BASELINE, summarize } from "./detector-wizard-summary";
+import { summarize } from "./detector-wizard-summary";
 import { cn } from "@/lib/cn";
 
 type Step = "choose" | "configure" | "confirm";
@@ -74,14 +74,15 @@ export function DetectorWizard({
 
   const existing = method ? detectors.byMethod.get(method) : undefined;
 
-  // Seed for a method: its stored entry when configured, else defaults — a
-  // baseline-only method starts on the baseline frame because it has no other.
+  // Seed for a method: its stored entry when configured, else defaults. Every
+  // method starts on the self frame — a baseline sharpens a detector, none is
+  // required to run one (D18).
   const seed = (id: MethodId | null) => {
     const entry = id ? detectors.byMethod.get(id) : undefined;
     setMethod(id);
     setParams(entry?.params ?? {});
     setBlocker(null);
-    setFrame(entry?.frame ?? (id && NEEDS_BASELINE.has(id) ? "baseline" : "self"));
+    setFrame(entry?.frame ?? "self");
     setBaselineId(entry?.baseline_id ?? null);
   };
 
@@ -196,7 +197,7 @@ export function DetectorWizard({
                   )}
                   {plan?.status === "needs_setup" && (
                     <span className="text-[var(--color-fg-muted)]">
-                      Needs a baseline — you will pick one next.
+                      Needs a baseline in this frame — you will pick one next.
                     </span>
                   )}
                 </button>
@@ -240,21 +241,21 @@ export function DetectorWizard({
               <legend className="font-semibold text-[var(--color-fg-secondary)]">
                 Compare against
               </legend>
-              {!NEEDS_BASELINE.has(method) && (
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    name="frame"
-                    checked={frame === "self"}
-                    onChange={() => setFrame("self")}
-                  />
-                  The whole timeline (self-baseline)
-                </label>
-              )}
               <label className="flex items-center gap-2">
                 <input
                   type="radio"
                   name="frame"
+                  data-testid="wizard-frame-self"
+                  checked={frame === "self"}
+                  onChange={() => setFrame("self")}
+                />
+                The whole timeline (self-baseline)
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="frame"
+                  data-testid="wizard-frame-baseline"
                   checked={frame === "baseline"}
                   onChange={() => setFrame("baseline")}
                 />
@@ -281,9 +282,9 @@ export function DetectorWizard({
                 </p>
               )}
               <p className="text-[var(--color-fg-muted)]">
-                {NEEDS_BASELINE.has(method)
-                  ? "This method compares a known-normal window against suspect windows, so it needs a baseline."
-                  : "With a baseline, the method learns from the baseline window and reports on the suspect windows instead of the whole timeline."}
+                With a baseline, the method learns from the baseline window and reports on the
+                suspect windows instead of the whole timeline. Without one it takes its
+                reference from the timeline itself.
               </p>
             </fieldset>
             {blocker && (

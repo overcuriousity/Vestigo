@@ -386,6 +386,62 @@ describe("the finding sheet's four surfaces", () => {
     expect(evidence).toHaveTextContent("31.00%");
   });
 
+  it("labels a slice-mode comparison as slice vs the rest of the timeline", () => {
+    // Self frame (D18): the reference is the rest of the timeline, and the
+    // figure, the claim and the scope line all have to say so — "baseline 0%"
+    // over a slice comparison would be a false claim.
+    renderSheet({
+      mode: "finding",
+      methodId: "proportion_shift",
+      scope: { frame: "self", baseline_id: null, baseline_name: null },
+      finding: {
+        type: "proportion_shift",
+        field: "attr:user",
+        value: "eve",
+        count: 500,
+        baseline_count: 0,
+        baseline_rate: 0,
+        window_rate: 0.31,
+        rate_ratio: 15.5,
+        direction: "up",
+        g_statistic: 184.2,
+        p_value: 1e-40,
+        q_value: 1.2e-38,
+        score: 184.2,
+        first_seen: "2026-03-03T21:15:00Z",
+        event_id: "e2",
+        event: null,
+        details: { method: "self-g-test", window_label: "slice 09/24", slice_count: 24 },
+      },
+    });
+    expect(screen.getByTestId("finding-evidence")).toHaveTextContent("rest-of-timeline share");
+    expect(screen.getByTestId("finding-evidence")).toHaveTextContent("slice share");
+    expect(screen.getByTestId("finding-verdict")).toHaveTextContent(/31\.00% in slice 09\/24/);
+    expect(screen.getByTestId("finding-verdict")).toHaveTextContent(/rest of the timeline/);
+    expect(screen.getByTestId("finding-scope")).toHaveTextContent(
+      "24 time slices, each compared with the rest of the timeline",
+    );
+  });
+
+  it("states whole-scope beaconing as a claim and draws no figure for it", () => {
+    renderSheet({
+      mode: "finding",
+      methodId: "interval_periodicity",
+      scope: { frame: "self", baseline_id: null, baseline_name: null },
+      finding: {
+        ...FINDING,
+        window_cv: 0.02,
+        details: { method: "self-cadence", median_interval: 300, paused_intervals: 2 },
+      },
+    });
+    expect(screen.queryByTestId("finding-evidence")).toBeNull();
+    const verdict = screen.getByTestId("finding-verdict");
+    expect(verdict).toHaveTextContent(/more regular than chance allows/i);
+    expect(verdict).toHaveTextContent("median gap 300.0s");
+    expect(verdict).toHaveTextContent("2 pauses excluded");
+    expect(screen.getByTestId("finding-scope")).toHaveTextContent(/Whole timeline/);
+  });
+
   it("draws nothing for a finding with no second number to compare against", () => {
     // A rare value's rarity IS its score. A chart here would be assembled from
     // numbers nobody measured, which in a forensic tool is worse than no chart.

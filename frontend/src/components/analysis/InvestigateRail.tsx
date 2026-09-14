@@ -38,6 +38,7 @@ import { AnalysisEmptyState } from "./detector-shared";
 import { GuidancePanel } from "@/components/ui/GuidancePanel";
 import { DETECTORS } from "./detector-registry";
 import { normalizeFinding } from "@/lib/finding-normalize";
+import { sliceWindowEnd } from "@/lib/finding-frame";
 import { isTemplateRow } from "@/api/analysis";
 import { cn } from "@/lib/cn";
 import type { AnomalyMarker, Event } from "@/api/types";
@@ -193,8 +194,7 @@ export function InvestigateRail({
           sourceId: item.sourceId,
           detector: item.detector as AnomalyMarker["detector"],
           rawDetails: item.raw.details,
-          windowEnd:
-            item.raw.type === "frequency" ? item.raw.window_end : undefined,
+          windowEnd: sliceWindowEnd(item.raw),
         });
       }
     }
