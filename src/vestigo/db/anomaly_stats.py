@@ -529,9 +529,14 @@ class SelfSlices:
         """Bind the span start and width into *params*; return the slice-index expression."""
         params["ss"] = to_clickhouse_utc(self.span_start, precise=True)
         params["sw"] = int(self.width_ms)
+        # No explicit timezone on the bound literal: the events column is
+        # stored naive-UTC and read in the server's zone, and every window
+        # predicate compares it against a naive literal read the same way. A
+        # literal pinned to 'UTC' would drift by the server offset wherever the
+        # server zone is not UTC.
         return (
             f"least({self.k - 1}, toInt32(intDiv(greatest(toInt64(0), "
-            f"dateDiff('millisecond', toDateTime64({{ss:String}}, 3, 'UTC'), {ts_expr})), "
+            f"dateDiff('millisecond', toDateTime64({{ss:String}}, 3), {ts_expr})), "
             f"{{sw:Int64}})))"
         )
 
