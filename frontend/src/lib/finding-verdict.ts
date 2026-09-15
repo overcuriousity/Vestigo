@@ -21,7 +21,12 @@
 import type { AnomalyFinding } from "@/api/types";
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
-import { detailNumber, detailString, findingMode } from "@/lib/finding-frame";
+import {
+  detailNumber,
+  detailString,
+  findingMode,
+  restFrameLabel,
+} from "@/lib/finding-frame";
 import { anomalyFieldLabel as fieldLabel, shortId, truncate } from "@/lib/format";
 
 export interface Verdict {
@@ -84,7 +89,7 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         return {
           lead: `This value's share of ${fieldLabel(f.field)} is`,
           highlight: `${pct(f.window_rate)} in ${detailString(f.details, "window_label") ?? "this slice"}`,
-          tail: `against ${pct(f.baseline_rate)} across the rest of the timeline (${f.direction}, ${f.rate_ratio.toFixed(1)}×, q=${f.q_value.toExponential(1)}).`,
+          tail: `against ${pct(f.baseline_rate)} across ${restFrameLabel(f.details)} (${f.direction}, ${f.rate_ratio.toFixed(1)}×, q=${f.q_value.toExponential(1)}).`,
         };
       }
       return {

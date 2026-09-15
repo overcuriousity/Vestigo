@@ -75,3 +75,27 @@ export function detailString(details: Record<string, unknown>, key: string): str
   const v = details[key];
   return typeof v === "string" ? v : null;
 }
+
+/**
+ * What a self-frame proportion-shift finding was measured against, in words.
+ *
+ * The complement is the value's own active span minus the slice under test —
+ * not the whole timeline, which would divide a short-lived value's rate by
+ * the fraction of the timeline it lived through. The exception is a value
+ * confined to a single slice: it has no within-life complement, so it keeps
+ * the whole-scope one, and "exists in exactly one slice" is the finding.
+ * The two answer different questions, so the label has to distinguish them
+ * rather than say "the rest of the timeline" for both.
+ */
+export function restFrameLabel(details: Record<string, unknown>): string {
+  return detailString(details, "rest_frame") === "active-span"
+    ? "the rest of this value's own activity"
+    : "the rest of the timeline";
+}
+
+/** The short form of {@link restFrameLabel}, for a bar label. */
+export function restFrameShortLabel(details: Record<string, unknown>): string {
+  return detailString(details, "rest_frame") === "active-span"
+    ? "rest-of-activity share"
+    : "rest-of-timeline share";
+}

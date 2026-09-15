@@ -21,7 +21,7 @@
  */
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
-import { detailNumber, findingMode } from "@/lib/finding-frame";
+import { detailNumber, findingMode, restFrameShortLabel } from "@/lib/finding-frame";
 import { truncate } from "@/lib/format";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 
@@ -213,13 +213,15 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
         />
       );
     case "proportion_shift": {
-      // The self mode's reference is the rest of the timeline, and the labels
-      // must say so: "baseline 0%" over a slice comparison is a false claim.
+      // The self mode's reference is never the baseline, and the labels must
+      // say so: "baseline 0%" over a slice comparison is a false claim. Which
+      // complement it *is* depends on the finding — a value's own active span,
+      // or the whole scope when the value lives in a single slice.
       const self = findingMode(finding) === "self-g-test";
       return (
         <TwoBars
           reference={{
-            label: self ? "rest-of-timeline share" : "baseline share",
+            label: self ? restFrameShortLabel(finding.details) : "baseline share",
             value: finding.baseline_rate,
             display: `${(finding.baseline_rate * 100).toFixed(2)}%`,
           }}

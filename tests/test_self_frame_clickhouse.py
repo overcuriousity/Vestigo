@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.conftest import insert_generated_events
+from vestigo.db import anomaly_stats
 from vestigo.db.anomaly_stats import StatisticalAnomalyService
 from vestigo.db.clickhouse import ClickHouseStore
 
@@ -258,6 +259,41 @@ def test_self_g_test_active_span_rule_keeps_a_late_starter_quiet_before_its_life
     assert not _by_value(result).get("bob")
 
 
+def test_self_g_test_measures_a_bounded_value_against_its_own_life(svc):
+    """`late` is uniform across day 3, so it is unremarkable *for itself*.
+
+    The complement is the value's own lifetime minus the slice under test,
+    not the whole scope. A whole-scope denominator would divide `late`'s rate
+    by the third of the timeline it lived through and report it "up" in every
+    one of its own slices — the arithmetic alone clears min_ratio, with no
+    change in behaviour to point at. Churning identifiers are exactly what
+    this detector is pointed at, so that shape is a systematic false positive
+    rather than an edge case.
+    """
+    result = svc.find_proportion_shifts(_CASE, [_MAIN], fields=["attr:user"], limit=200)
+    assert result.status == "ok", result.warnings
+    assert not _by_value(result, "up").get("late")
+
+
+def test_self_g_test_reports_the_complement_frame_it_measured_against(svc):
+    """An analyst reading a rate ratio must know what the denominator was.
+
+    `eve` is confined to a single slice and keeps the whole-scope complement;
+    a value spanning several slices is measured against its own life. Both
+    are on the finding, because the two answer different questions.
+    """
+    result = svc.find_proportion_shifts(_CASE, [_MAIN], fields=["attr:user"], limit=200)
+    eve = _by_value(result, "up")["eve"][0]
+    assert eve.details["value_active_slices"] == 1
+    assert eve.details["rest_frame"] == "whole-scope"
+    assert eve.details["rest_count"] == 0
+    for findings in _by_value(result).values():
+        for f in findings:
+            if f.details["value_active_slices"] > 1:
+                assert f.details["rest_frame"] == "active-span"
+                assert f.details["rest_slices"] == f.details["value_active_slices"] - 1
+
+
 # ---------------------------------------------------------------------------
 # Distribution drift — self-drift
 # ---------------------------------------------------------------------------
@@ -289,6 +325,27 @@ def test_self_drift_categorical_mix_change_names_its_contributors(svc):
     contributors = {c["value"] for c in top.details["top_contributors"]}
     assert contributors & {"eve", "late"}
     assert all("rest_share" in c for c in top.details["top_contributors"])
+
+
+def test_self_drift_bounds_its_per_slice_scans_and_says_what_it_skipped(svc, monkeypatch):
+    """The numeric branch costs one whole-scope scan per (field, slice).
+
+    Unbounded that is _MAX_AUTO_SCAN_FIELDS x stat_self_slices full passes in
+    a single request, and the analysis cache cannot help the first run on a
+    timeline — the one most likely to time out. The budget is spent
+    round-robin so a narrowed run loses slice resolution rather than whole
+    fields, and what it did not reach is disclosed rather than read as
+    "nothing there".
+    """
+    monkeypatch.setattr(anomaly_stats, "_MAX_SELF_KS_QUERIES", 3)
+    result = svc.find_distribution_drift(_CASE, [_MAIN], fields=["attr:bytes"], limit=100)
+    assert result.status == "ok", result.warnings
+    budget_note = [w for w in result.warnings if "scan budget" in w]
+    assert budget_note, result.warnings
+    assert "3 ran" in budget_note[0]
+    assert "not evidence of nothing" in budget_note[0]
+    ks = [f for f in result.results if f.test == "ks"]
+    assert len(ks) <= 3
 
 
 def test_self_drift_skips_and_warns_on_thin_slices(svc):

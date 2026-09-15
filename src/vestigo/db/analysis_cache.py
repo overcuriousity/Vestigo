@@ -51,7 +51,13 @@ if TYPE_CHECKING:
 #: any of the four cached `insufficient_data` under exactly the key the new
 #: modes answer, so without the bump the four would stay empty forever on
 #: every timeline that had once been opened.
-CACHE_VERSION = 3
+#:
+#: 4 — the self frame's proportion shift measures a value against its own
+#: active span rather than the whole scope, and self-drift's numeric branch
+#: spends a bounded scan budget. Both are the runner answering differently
+#: for the same inputs: a v3 row holds "up" findings for every short-lived
+#: value on the timeline, which is the shape this bump exists to retire.
+CACHE_VERSION = 4
 
 
 def fingerprint(

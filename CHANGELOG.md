@@ -14,8 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered `insufficient_data` without one, so beaconing on an unbaselined timeline was
   invisible. Each now has the self frame every other detector has: proportion shift and
   drift cut the timeline into `stat_self_slices` equal slices (default 24) and test each
-  against the rest of the timeline, inside the value's own active span; interval cadence
-  judges each value over all its arrivals — Greenwood beaconing with pauses longer than
+  against the rest of the timeline, bounded to the value's own active span at both ends —
+  only in-span slices are tested, and the complement is drawn from that span too, so a
+  short-lived value is not reported "up" merely for having lived through a fraction of the
+  timeline (a value confined to a single slice keeps the whole-scope complement, since
+  existing in exactly one slice is the finding); drift's numeric branch spends a bounded
+  per-(field, slice) scan budget round-robin across fields and discloses what it did not
+  reach; interval cadence judges each value over all its arrivals — Greenwood beaconing
+  with pauses longer than
   `stat_interval_self_pause_ratio` medians excluded and a `stat_interval_self_min_span_seconds`
   floor, plus a robust-Gamma silence test over the longest internal or trailing gap; event
   sequences flag orderings under `stat_sequence_rarity_floor` across the scope. Baseline-frame
@@ -23,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frames to every method and defaults to self; finding rows, verdicts and evidence figures
   read the mode the run recorded (`details.method`), so a slice comparison never renders as
   "baseline 0 %"; a slice-based run persists its `slices` and `slices_hash` beside
-  `windows`; the analysis cache version moves to 3 so the cached `insufficient_data` answers
+  `windows`; the analysis cache version moves to 4 so the cached `insufficient_data` answers
   are not served for the new modes. The demo case asserts its 300 s beacon surfaces with no
   baseline declared. Nothing filters legitimate clocks — a high-volume heartbeat ranks
   first, and marking it Normal once is the remedy, which the method card now says.

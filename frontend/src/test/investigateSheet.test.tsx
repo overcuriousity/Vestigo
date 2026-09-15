@@ -411,7 +411,13 @@ describe("the finding sheet's four surfaces", () => {
         first_seen: "2026-03-03T21:15:00Z",
         event_id: "e2",
         event: null,
-        details: { method: "self-g-test", window_label: "slice 09/24", slice_count: 24 },
+        details: {
+          method: "self-g-test",
+          window_label: "slice 09/24",
+          slice_count: 24,
+          rest_frame: "whole-scope",
+          value_active_slices: 1,
+        },
       },
     });
     expect(screen.getByTestId("finding-evidence")).toHaveTextContent("rest-of-timeline share");
@@ -420,6 +426,50 @@ describe("the finding sheet's four surfaces", () => {
     expect(screen.getByTestId("finding-verdict")).toHaveTextContent(/rest of the timeline/);
     expect(screen.getByTestId("finding-scope")).toHaveTextContent(
       "24 time slices, each compared with the rest of the timeline",
+    );
+  });
+
+  it("names the value's own activity when that is what the slice was measured against", () => {
+    // A value spanning several slices is measured against its own lifetime
+    // minus this slice, not the whole timeline — a whole-scope denominator
+    // would divide a short-lived value's rate by the fraction of the timeline
+    // it lived through. The two references answer different questions, so
+    // calling both "the rest of the timeline" would misreport the ratio.
+    renderSheet({
+      mode: "finding",
+      methodId: "proportion_shift",
+      scope: { frame: "self", baseline_id: null, baseline_name: null },
+      finding: {
+        type: "proportion_shift",
+        field: "attr:session",
+        value: "s-4821",
+        count: 120,
+        baseline_count: 300,
+        baseline_rate: 0.1,
+        window_rate: 0.35,
+        rate_ratio: 3.5,
+        direction: "up",
+        g_statistic: 44.1,
+        p_value: 1e-11,
+        q_value: 4e-10,
+        score: 44.1,
+        first_seen: "2026-03-03T21:15:00Z",
+        event_id: "e9",
+        event: null,
+        details: {
+          method: "self-g-test",
+          window_label: "slice 09/24",
+          slice_count: 24,
+          rest_frame: "active-span",
+          value_active_slices: 6,
+          rest_slices: 5,
+        },
+      },
+    });
+    expect(screen.getByTestId("finding-evidence")).toHaveTextContent("rest-of-activity share");
+    expect(screen.getByTestId("finding-evidence")).not.toHaveTextContent("rest-of-timeline share");
+    expect(screen.getByTestId("finding-verdict")).toHaveTextContent(
+      /rest of this value's own activity/,
     );
   });
 

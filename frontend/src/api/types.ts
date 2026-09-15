@@ -537,11 +537,20 @@ export interface EntropyFinding {
  * One value-share shift from the proportion_shift detector.
  *
  * Two frames share this shape (`details.method`): `g-test` compares the
- * baseline window with a suspect window, `self-g-test` a time slice with the
- * rest of the timeline. In the self mode the `baseline_*` fields hold the
- * *rest-of-timeline* numbers and `details` carries `rest_count`,
- * `rest_total`, `rest_rate`, `slice_index`, `slice_count` — never a
- * `baseline_*` key. Read `details.method`, not the panel's scope.
+ * baseline window with a suspect window, `self-g-test` a time slice with its
+ * complement. In the self mode the `baseline_*` fields hold the complement's
+ * numbers and `details` carries `rest_count`, `rest_total`, `rest_rate`,
+ * `slice_index`, `slice_count` — never a `baseline_*` key. Read
+ * `details.method`, not the panel's scope.
+ *
+ * *Which* complement is in `details.rest_frame`, and it is not cosmetic: a
+ * value spanning several slices is measured against `active-span` — its own
+ * lifetime minus this slice — because a whole-scope denominator divides a
+ * short-lived value's rate by the fraction of the timeline it lived through.
+ * A value confined to one slice has no within-life complement and keeps
+ * `whole-scope`. `rest_slices` and `value_active_slices` say how much of the
+ * timeline each covers. A rate ratio cannot be read without them, so never
+ * label this reference "the rest of the timeline" unconditionally.
  */
 export interface ProportionShiftFinding {
   type: "proportion_shift";

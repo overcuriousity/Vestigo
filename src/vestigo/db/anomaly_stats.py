@@ -264,6 +264,54 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 # sorts by (recommended, -coverage).
 _MAX_AUTO_SCAN_FIELDS = 15
 
+# Self-drift's numeric branch is the one place a detector issues a whole-scope
+# scan per (field, *slice*) rather than per field: each KS state holds the
+# whole field, so folding K slices into one query is K x memory, and the
+# cheaper trade is K x time (see _find_distribution_drift_self). Unbounded
+# that is _MAX_AUTO_SCAN_FIELDS x stat_self_slices full passes in one
+# request — 360 at the defaults, 1800 with stat_self_slices at its ceiling —
+# and the analysis cache cannot help the first run on a timeline, which is
+# the one that would time out. This budget bounds it at four times the
+# module's ordinary per-detector scan count. It is spent round-robin across
+# fields, the same quota-with-backfill rule _select_auto_scan_tokens uses for
+# the field cap: a prefix truncation would give the first fields every slice
+# and the last fields none, and any pair the budget does not reach is
+# disclosed in warnings.
+_MAX_SELF_KS_QUERIES = 60
+
+
+def _spend_ks_budget(eligible: Sequence[Sequence[int]], budget: int) -> list[tuple[int, int]]:
+    """Pick ``budget`` (field, slice) pairs, round-robin over the fields.
+
+    *eligible* is one ascending list of slice indices per field. Every field
+    yields its earliest eligible slice before any field yields a second, so a
+    budgeted run narrows each field's slice resolution instead of covering
+    the first fields fully and dropping the last — the same
+    quota-with-backfill rule :func:`_select_auto_scan_tokens` applies to the
+    field cap, and for the same reason: a prefix truncation would report on a
+    field it never scanned. A field with fewer eligible slices than its share
+    simply runs out and the others backfill the slack.
+
+    Returns the pairs in field-major order, so a budgeted run executes and
+    reports in the order an unbudgeted one would.
+    """
+    picked: list[tuple[int, int]] = []
+    cursors = [0] * len(eligible)
+    while len(picked) < budget:
+        advanced = False
+        for fi, slices in enumerate(eligible):
+            if len(picked) >= budget:
+                break
+            if cursors[fi] < len(slices):
+                picked.append((fi, slices[cursors[fi]]))
+                cursors[fi] += 1
+                advanced = True
+        if not advanced:
+            break
+    picked.sort()
+    return picked
+
+
 # Of the auto-scan cap, the number of slots reserved for identifier-kind fields
 # (URLs, hashes, user agents) in the charset/entropy detectors so a source with
 # many categorical columns can't crowd them out — they are those detectors'
@@ -518,8 +566,33 @@ class SelfSlices:
         return cls(span_start=start, span_end=end, k=k, width_ms=math.ceil(span_ms / k))
 
     def bounds(self, i: int) -> tuple[datetime, datetime]:
+        """Slice ``i``'s reported interval, right-clamped to the scope's span.
+
+        ``width_ms`` is rounded up, so ``span_start + k·width_ms`` can overrun
+        ``span_end`` by up to ``k−1`` ms. That end is what the run snapshot
+        records and what the Explorer highlights, so an unclamped value would
+        assert a boundary past any event that exists. The SQL index is
+        unaffected (it already clamps with ``least(k−1, …)``), and the overlap
+        arithmetic uses :meth:`covers`, which reads the unclamped edge.
+        """
         start = self.span_start + timedelta(milliseconds=i * self.width_ms)
-        return start, start + timedelta(milliseconds=self.width_ms)
+        end = start + timedelta(milliseconds=self.width_ms)
+        return start, min(end, self.span_end) if i == self.k - 1 else end
+
+    def covers(self, i: int, first: datetime, last: datetime) -> bool:
+        """Does slice ``i`` overlap the closed interval ``[first, last]``?
+
+        Slices are half-open on the right so an instant belongs to exactly one
+        of them — except the last, which is closed, since the SQL index folds
+        everything at or past its start into ``k−1``. Comparing against the
+        clamped end from :meth:`bounds` would drop a value first seen at the
+        very last event, whose ``first`` equals ``span_end``.
+        """
+        start = self.span_start + timedelta(milliseconds=i * self.width_ms)
+        end = start + timedelta(milliseconds=self.width_ms)
+        if start > ensure_utc(last):
+            return False
+        return i == self.k - 1 or end > ensure_utc(first)
 
     def label(self, i: int) -> str:
         width = len(str(self.k))
@@ -2440,14 +2513,32 @@ class StatisticalAnomalyService:
 
     @staticmethod
     def _small_slice_warning(slices: SelfSlices, totals: list[int]) -> list[str]:
+        """Disclose slices too thin to test, and slices holding nothing at all.
+
+        Empty slices get their own sentence rather than being folded into the
+        thin ones. A slice with no events is not tested by any self-frame
+        runner and records no ``skipped_by_field`` entry either, so on a
+        timeline with one dense day and a sparse tail the run advertises
+        ``k`` slices while a handful carry every test. Counting them here is
+        the only place that gap is visible.
+        """
+        empty = sum(1 for t in totals if t <= 0)
         small = sum(1 for t in totals if 0 < t < _MIN_WINDOW_EVENTS)
-        if not small:
-            return []
-        return [
-            f"{small} of {slices.k} slices hold fewer than {_MIN_WINDOW_EVENTS} events — "
-            f"tests over samples that small are unstable; a coarser slice count "
-            f"(stat_self_slices) trades resolution for stability."
-        ]
+        notes: list[str] = []
+        if empty:
+            notes.append(
+                f"{empty} of {slices.k} slices hold no events and were not tested — the "
+                f"scope's events are clustered in {slices.k - empty} of its "
+                f"{slices.k} equal time slices; a coarser slice count "
+                f"(stat_self_slices) spreads them more evenly."
+            )
+        if small:
+            notes.append(
+                f"{small} of {slices.k} slices hold fewer than {_MIN_WINDOW_EVENTS} events — "
+                f"tests over samples that small are unstable; a coarser slice count "
+                f"(stat_self_slices) trades resolution for stability."
+            )
+        return notes
 
     @gated_heavy_scan
     def find_value_novelty(
@@ -5260,23 +5351,32 @@ class StatisticalAnomalyService:
 
         The scope is cut into *self_slices* leave-one-out time slices
         (:class:`SelfSlices`); per (field, value, slice) a 2×2 G-test compares
-        the value's share of the slice against its share of the **complement**
-        (every scope event outside the slice). Test, BH pool, ``min_ratio``
-        floor and the Haldane +0.5 display ratio are the temporal ones. Two
-        rules differ from the baseline frame:
+        the value's share of the slice against its share of the **complement**.
+        Test, BH pool, ``min_ratio`` floor and the Haldane +0.5 display ratio
+        are the temporal ones. Two rules differ from the baseline frame:
 
-        * **Active-span rule.** A slice is tested only if it overlaps the
-          value's own ``[first, last]`` arrival span — frequency's self mode
-          bounds its zero-fill the same way — so a value that starts or ends
-          mid-timeline does not produce a wall of ``down`` findings outside
-          its life. Both directions are tested inside the span.
-        * **No first-seen exclusion.** A value absent from the complement is
-          tested (it is in-span only in its one slice, so it reads ``up``);
-          self-frame novelty is a rarity floor, not first-seen, and a
-          one-slice burst would otherwise be uncovered.
+        * **Active-span rule.** Only the slices overlapping the value's own
+          ``[first, last]`` arrival span are tested, *and they are also the
+          only slices the complement is drawn from* — frequency's self mode
+          bounds its zero-fill the same way. Both halves matter. Testing
+          in-span only stops a value that starts or ends mid-timeline from
+          producing a wall of ``down`` findings outside its life; measuring
+          against an in-span complement stops the mirror-image error, where a
+          whole-scope denominator divides a short-lived value's rate by the
+          fraction of the timeline it lived through and manufactures ``up``
+          findings across every slice of its own life. Both directions are
+          tested inside the span.
+        * **No first-seen exclusion.** A value confined to a single slice has
+          no within-life complement to restrict to, so it keeps the
+          whole-scope one and reads ``up`` against a ``rest_count`` of 0 —
+          "this value exists in exactly one slice" is the finding, and it is
+          the one-hour burst the frame was built for.
+          :meth:`find_value_novelty` does not cover it (its rarity floor is
+          three occurrences; a 500-event burst is confined, not rare).
 
         ``details`` carries the slice as ``window_*`` plus ``rest_*`` for the
-        complement and never a ``baseline_*`` key.
+        in-span complement (``rest_slices`` counts the slices it spans) and
+        never a ``baseline_*`` key.
         """
         method = "self-g-test"
         detector = "proportion_shift"
@@ -5383,35 +5483,66 @@ class StatisticalAnomalyService:
 
         # Phase 2: one G-test per (candidate, in-span non-empty slice), pooled
         # into a single BH-FDR correction for the run.
-        tests: list[tuple[int, int, float, float]] = []
+        tests: list[tuple[int, int, float, float, int]] = []
+        span_slices: dict[int, int] = {}  # candidate index -> slices its life spans
+        rest_frames: dict[int, tuple[str, int]] = {}  # candidate -> (frame, slices in it)
+        nonempty_slices = sum(1 for t in slice_totals if t > 0)
         for ci, (_, _, total, first_ts, last_ts, _, per_slice) in enumerate(candidates):
-            v_first, v_last = ensure_utc(first_ts), ensure_utc(last_ts)
-            for i, (c, _, _) in enumerate(per_slice):
+            # The complement is the value's *own lifetime* minus this slice, not
+            # the whole scope. A value that exists in 2 of 24 slices has no
+            # presence in the other 22 by definition, so a whole-scope
+            # denominator divides its rate by the fraction of the timeline it
+            # lived through — a value alive for a twelfth of the scope clears
+            # any min_ratio up to 12x on arithmetic alone, and fires "up" in
+            # every slice of its own life. Churning identifiers (session ids,
+            # ephemeral hostnames, short-lived processes) are exactly the fields
+            # this detector is pointed at, so that was a systematic false
+            # positive rather than an edge case. Restricting the denominator to
+            # the active span asks the question the frame means: given that this
+            # value existed at all, was this slice unusual for it?
+            in_span = [
+                j for j in range(k) if slice_totals[j] > 0 and slices.covers(j, first_ts, last_ts)
+            ]
+            # A value confined to a single slice is the other case, and it is
+            # not the same question. It has no within-life complement at all,
+            # so there is nothing to restrict the denominator to — and "this
+            # value exists in exactly one slice of the timeline" is itself the
+            # finding the self frame was built to report (the one-hour burst).
+            # find_value_novelty does not cover it: its rarity floor is three
+            # occurrences, and a 500-event burst is not rare, just confined.
+            # So that case keeps the whole-scope complement, where reading
+            # "up" against a rest_count of 0 says exactly the right thing.
+            span_total = sum(slice_totals[j] for j in in_span) if len(in_span) > 1 else scope_total
+            span_slices[ci] = len(in_span)
+            rest_frames[ci] = (
+                ("active-span", len(in_span) - 1)
+                if len(in_span) > 1
+                else ("whole-scope", nonempty_slices - 1)
+            )
+            for i in in_span:
                 n_slice = slice_totals[i]
-                if n_slice <= 0:
-                    continue
-                s_start, s_end = slices.bounds(i)
-                if s_start > v_last or s_end <= v_first:
-                    continue  # outside the value's own active span
+                c = per_slice[i][0]
+                # Every occurrence lies in [first_ts, last_ts], so every one of
+                # them falls in an in-span slice: the scope-wide `total - c` is
+                # already the in-span complement count.
                 a = total - c
-                n_rest = scope_total - n_slice
+                n_rest = span_total - n_slice
                 if n_rest <= 0:
                     continue
                 g = _g_statistic(a, n_rest - a, c, n_slice - c)
-                tests.append((ci, i, g, _chi2_sf_df1(g)))
+                tests.append((ci, i, g, _chi2_sf_df1(g), n_rest))
         qvals = _bh_qvalues([t[3] for t in tests])
         m_tests = len(tests)
 
         # Phase 3: FDR + effect floor, build findings.
         findings: list[ShiftFinding] = []
-        for (ci, i, g, p), q in zip(tests, qvals, strict=True):
+        for (ci, i, g, p, n_rest), q in zip(tests, qvals, strict=True):
             if q > fdr_q:
                 continue
             field_token, val, total, first_ts, last_ts, last_evt, per_slice = candidates[ci]
             c, s_first, s_evt = per_slice[i]
             n_slice = slice_totals[i]
             a = total - c
-            n_rest = scope_total - n_slice
             # Haldane–Anscombe +0.5 for the *displayed* ratio only, on
             # whichever side is empty; the test used the raw counts.
             rate_rest = a / n_rest if a > 0 else 0.5 / n_rest
@@ -5432,6 +5563,14 @@ class StatisticalAnomalyService:
                 "rest_count": a,
                 "rest_total": n_rest,
                 "rest_rate": round(a / n_rest, 6),
+                # Which complement this finding was measured against, and how
+                # much of the timeline it covers. An analyst reading a rate
+                # ratio needs to know whether the denominator was the value's
+                # own lifetime or the whole scope; the two answer different
+                # questions and only one of them is on any given finding.
+                "value_active_slices": span_slices[ci],
+                "rest_frame": rest_frames[ci][0],
+                "rest_slices": rest_frames[ci][1],
                 "count": c,
                 "window_total_events": n_slice,
                 "window_rate": round(c / n_slice, 6),
@@ -6924,7 +7063,12 @@ class StatisticalAnomalyService:
           slice** that has ``min_samples`` on both sides. Not K aggregates in
           one query: each KS state holds the whole field, so K-in-one is K×
           memory; one-per-slice keeps the peak at the baseline frame's worst
-          case and costs K× time, which the analysis cache memoizes.
+          case and costs K× time. The analysis cache memoizes that, but only
+          after the first run pays it, so the eligible (field, slice) pairs
+          are spent against :data:`_MAX_SELF_KS_QUERIES` round-robin across
+          fields — every field is served before any field is served twice, so
+          a budgeted run loses slice resolution rather than whole fields, and
+          the shortfall is disclosed in ``warnings``.
 
         Sides below *min_samples* are skipped and warned about, exactly as
         temporal; one BH pool over both branches. ``details`` carries the
@@ -6975,7 +7119,10 @@ class StatisticalAnomalyService:
         fields_with_tests: set[str] = set()
         skipped_by_field: dict[str, int] = defaultdict(int)
 
-        # --- KS branch: per-slice counts, then one KS query per eligible slice.
+        # --- KS branch: per-slice counts for every field first, then the
+        # eligible (field, slice) pairs are selected against the query budget
+        # and only the selected ones pay a KS scan.
+        ks_plan: list[tuple[str, dict[str, Any], str, str, int, list[int], list[int]]] = []
         for field_token in numeric_fields:
             params = {**base_params}
             bind_offset_params(source_offsets, params)
@@ -7003,6 +7150,7 @@ class StatisticalAnomalyService:
             field_n = sum(per_slice_n)
             if field_n == 0:
                 continue
+            eligible = []
             for i in range(k):
                 w_n = per_slice_n[i]
                 rest_n = field_n - w_n
@@ -7011,57 +7159,82 @@ class StatisticalAnomalyService:
                 if w_n < min_samples or rest_n < min_samples:
                     skipped_by_field[field_token] += 1
                     continue
-                sparams = {**params, "si": i}
-                ks_sql = f"""
-                    SELECT
-                        quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, NOT in_s) AS rest_q,
-                        quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, in_s) AS w_q,
-                        -- assumeNotNull: the plain aggregate over a Nullable argument
-                        -- returns a Nullable tuple the driver cannot decode; the WHERE
-                        -- below already excludes NULLs.
-                        kolmogorovSmirnovTest('two-sided')(assumeNotNull(num), toUInt8(in_s)) AS ks,
-                        argMinIf((toString(event_id), eff_ts), num, in_s) AS lo,
-                        argMaxIf((toString(event_id), eff_ts), num, in_s) AS hi
-                    FROM (
-                        SELECT
-                            toFloat64OrNull({col}) AS num,
-                            {slice_expr} = {{si:Int32}} AS in_s,
-                            event_id,
-                            cityHash64(toString(event_id)) AS h,
-                            {eff} AS eff_ts
-                        FROM {db}.events
-                        WHERE case_id = {{cid:String}}
-                          AND has({{src:Array(String)}}, source_id)
-                          AND {col} != ''
-                          AND {VESTIGO_NOT_SENTINEL_SQL}
-                    )
-                    WHERE num IS NOT NULL
-                    {heavy_scan_settings()}
-                """
-                rows = self.ch.client.query(ks_sql, parameters=sparams).result_rows
-                if not rows:
-                    continue
-                row = rows[0]
-                d_stat, p = _ks_pair(row[2])
-                if math.isnan(d_stat) or math.isnan(p):
-                    continue
-                fields_with_tests.add(field_token)
-                tests.append(
-                    {
-                        "test": "ks",
-                        "field": field_token,
-                        "si": i,
-                        "statistic": d_stat,
-                        "effect": d_stat,
-                        "p": p,
-                        "rest_n": rest_n,
-                        "w_n": w_n,
-                        "rest_q": row[0],
-                        "w_q": row[1],
-                        "lo": row[3],
-                        "hi": row[4],
-                    }
+                eligible.append(i)
+            if eligible:
+                ks_plan.append(
+                    (field_token, params, col, slice_expr, field_n, per_slice_n, eligible)
                 )
+
+        eligible_pairs = sum(len(entry[6]) for entry in ks_plan)
+        if eligible_pairs > _MAX_SELF_KS_QUERIES:
+            selected = _spend_ks_budget([entry[6] for entry in ks_plan], _MAX_SELF_KS_QUERIES)
+            covered_fields = len({ei for ei, _ in selected})
+            run_warnings.append(
+                f"Numeric drift hit the {_MAX_SELF_KS_QUERIES}-scan budget — each "
+                f"(field, slice) pair costs one full scan of the scope, "
+                f"{eligible_pairs} pairs were eligible and {len(selected)} ran, "
+                f"spread evenly over all {covered_fields} of them so none is "
+                f"untested. The slices that did not run are not evidence of "
+                f"nothing; narrow `fields` or lower stat_self_slices to cover them."
+            )
+        else:
+            selected = [(ei, i) for ei, entry in enumerate(ks_plan) for i in entry[6]]
+
+        for ei, i in selected:
+            field_token, params, col, slice_expr, field_n, per_slice_n, _ = ks_plan[ei]
+            w_n = per_slice_n[i]
+            rest_n = field_n - w_n
+            sparams = {**params, "si": i}
+            ks_sql = f"""
+                SELECT
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, NOT in_s) AS rest_q,
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, in_s) AS w_q,
+                    -- assumeNotNull: the plain aggregate over a Nullable argument
+                    -- returns a Nullable tuple the driver cannot decode; the WHERE
+                    -- below already excludes NULLs.
+                    kolmogorovSmirnovTest('two-sided')(assumeNotNull(num), toUInt8(in_s)) AS ks,
+                    argMinIf((toString(event_id), eff_ts), num, in_s) AS lo,
+                    argMaxIf((toString(event_id), eff_ts), num, in_s) AS hi
+                FROM (
+                    SELECT
+                        toFloat64OrNull({col}) AS num,
+                        {slice_expr} = {{si:Int32}} AS in_s,
+                        event_id,
+                        cityHash64(toString(event_id)) AS h,
+                        {eff} AS eff_ts
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                )
+                WHERE num IS NOT NULL
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(ks_sql, parameters=sparams).result_rows
+            if not rows:
+                continue
+            row = rows[0]
+            d_stat, p = _ks_pair(row[2])
+            if math.isnan(d_stat) or math.isnan(p):
+                continue
+            fields_with_tests.add(field_token)
+            tests.append(
+                {
+                    "test": "ks",
+                    "field": field_token,
+                    "si": i,
+                    "statistic": d_stat,
+                    "effect": d_stat,
+                    "p": p,
+                    "rest_n": rest_n,
+                    "w_n": w_n,
+                    "rest_q": row[0],
+                    "w_q": row[1],
+                    "lo": row[3],
+                    "hi": row[4],
+                }
+            )
 
         # --- Categorical branch: one GROUP BY per field, per-slice fold in Python.
         for field_token in categorical_fields:

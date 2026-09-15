@@ -1578,34 +1578,60 @@ data — a rerun reproduces them, and the run persists the slice payload and
 its `slices_hash` beside where a baseline run persists `windows`. A scope
 holding one timestamp cannot be sliced and reports `insufficient_data`.
 
+Slice bounds are *reported* clamped to the span: `width_ms` is rounded up, so
+`start + K·width` can overrun `max` by up to `K−1` ms, and the last slice's
+recorded `end` would otherwise assert a boundary past any event that exists —
+in the persisted `slices` snapshot and in the range the Explorer highlights.
+The SQL index is unaffected (it already clamps with `least(K−1, …)`), and the
+overlap arithmetic below reads the unclamped edge, so a value first seen at
+the very last event still belongs to slice `K−1`.
+
 Per field, one `GROUP BY val` scan collects each value's whole-scope total,
 first and last arrival, and per-slice count, first arrival and representative
-event; slice totals come from one `GROUP BY slice`. The **reference for slice
-`k` is its complement**: `rest_count = total − count_k`,
-`rest_total = scope_total − slice_total_k`, and the 2×2 G-test, the single BH
-pool (every field × value × in-span non-empty slice), `min_ratio` and the
+event; slice totals come from one `GROUP BY slice`. The 2×2 G-test, the single
+BH pool (every field × value × in-span non-empty slice), `min_ratio` and the
 Haldane +0.5 display ratio are exactly the baseline frame's.
 
 Two rules differ, and both are deliberate:
 
-- **Active-span rule.** Slice `k` is tested only if it overlaps the value's
-  own `[first, last]` arrival span — the same "bounded by the series' own
-  active span" rule frequency's self mode uses for zero-fill. Without it every
-  value that starts or ends mid-timeline would produce a wall of `down`
-  findings for the slices before and after its life. Inside the span both
-  directions are tested.
-- **No first-seen exclusion.** A value absent from the complement (`rest_count
-  = 0`) is tested — it is in-span only in its one slice, so it reads `up`.
-  Self-frame value novelty is a rarity floor, not first-seen, so a
-  500-event one-slice burst would otherwise be covered by no detector.
+- **Active-span rule — which slices are tested, *and what they are measured
+  against*.** Slice `k` is tested only if it overlaps the value's own
+  `[first, last]` arrival span — the same "bounded by the series' own active
+  span" rule frequency's self mode uses for zero-fill — and the complement is
+  drawn from that span too: `rest_total = Σ slice_total over the in-span
+  slices − slice_total_k`, with `rest_count = total − count_k` (every
+  occurrence lies inside the span by construction). Both halves matter, and
+  each prevents a different wall of findings. Testing in-span only stops a
+  value that starts or ends mid-timeline from producing `down` findings for
+  the slices before and after its life. Measuring against an in-span
+  complement stops the mirror-image error: a whole-scope denominator divides a
+  short-lived value's rate by the fraction of the timeline it lived through,
+  so a value alive for a twelfth of the scope clears a `min_ratio` of 2.0 on
+  arithmetic alone and reads `up` in *every slice of its own life*. Churning
+  identifiers — session ids, ephemeral hostnames, short-lived processes — are
+  exactly what this detector is pointed at, so that was systematic rather than
+  an edge case. Inside the span both directions are tested.
+- **No first-seen exclusion.** A value confined to a *single* slice is the one
+  case with no within-life complement to restrict to, so it keeps the
+  whole-scope one and is tested — it reads `up` against a `rest_count` of 0,
+  and "this value exists in exactly one slice of the timeline" is the finding.
+  Self-frame value novelty does not cover it: that is a rarity floor of three
+  occurrences, and a 500-event one-slice burst is confined, not rare.
 
 `details` carries the slice as `window_label` / `window_start` / `window_end`
 plus `slice_index`, `slice_count`, `rest_count`, `rest_total`, `rest_rate`,
 `value_first_seen`, `value_last_seen` — and never a `baseline_*` key: a
-client reading them must branch on `method`, not render "baseline 0". The
-finding's `baseline_count` / `baseline_rate` fields hold the complement's
-numbers in this frame. Slices holding fewer than 50 events are counted into
-one warning rather than silently tested.
+client reading them must branch on `method`, not render "baseline 0". It also
+carries `value_active_slices` (how many slices the value's life spans),
+`rest_frame` (`active-span` or `whole-scope`) and `rest_slices` (how many
+slices the complement covers), because a rate ratio cannot be read without
+knowing which denominator produced it. The finding's `baseline_count` /
+`baseline_rate` fields hold the complement's numbers in this frame. Slices
+holding fewer than 50 events are counted into one warning rather than silently
+tested, and slices holding *nothing* get their own — an empty slice is tested
+by no runner and skipped by none either, so on a timeline with one dense day
+and a sparse tail the run would otherwise advertise `K` slices while a handful
+carried every test.
 
 ### Caveats
 
@@ -2007,8 +2033,25 @@ probed over the whole scope.
 - *Numeric:* a per-slice count scan first, then **one KS query per slice**
   that has `min_samples` on both sides. Not K aggregates in one query: each
   KS state holds the whole field, so K-in-one is K× memory; one per slice
-  keeps the peak at the baseline frame's worst case and costs K× time, which
-  the analysis cache memoizes.
+  keeps the peak at the baseline frame's worst case and costs K× time.
+
+  This is the one place a detector issues a whole-scope scan per (field,
+  *slice*) rather than per field, so it is the one place that fan-out is
+  bounded explicitly. Unbounded it is `_MAX_AUTO_SCAN_FIELDS ×
+  stat_self_slices` full passes in a single request — 360 at the defaults,
+  1800 with `stat_self_slices` at its ceiling of 120 — and the analysis cache
+  cannot help the *first* run on a timeline, which is precisely the one at
+  risk of timing out. The eligible (field, slice) pairs are therefore spent
+  against a budget of `_MAX_SELF_KS_QUERIES` (60, four times the module's
+  ordinary per-detector scan count) **round-robin across fields**: every field
+  yields its earliest eligible slice before any field yields a second, and a
+  field with fewer eligible slices than its share leaves slack the others
+  backfill. That is the same quota-with-backfill rule the field cap uses, and
+  for the same reason — a prefix truncation would scan the first fields
+  exhaustively and report on the last ones without having scanned them. A
+  budgeted run therefore loses slice *resolution*, never a whole field, and
+  says so in `warnings`: the slices it did not reach are disclosed, because
+  an unrun slice is not evidence of nothing.
 
 Sides below `min_samples` are skipped and warned about exactly as in the
 baseline frame; one BH pool over both branches. `details` carries the slice as

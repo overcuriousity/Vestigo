@@ -44,6 +44,7 @@ from vestigo.db.anomaly_stats import (
     _robust_cv,
     _scalar_total,
     _sidak_p,
+    _spend_ks_budget,
     _sql_suppression,
     _tvd,
     _window_preds,
@@ -6355,6 +6356,103 @@ def test_self_slices_index_sql_clamps_the_last_event_into_the_last_slice():
 def test_self_slices_reject_a_single_instant():
     t = datetime(2024, 1, 1, tzinfo=UTC)
     assert SelfSlices.build(t, t, 24) is None
+
+
+def test_self_slices_last_reported_end_never_overruns_the_span():
+    """ceil(span/k) can overshoot; the snapshot and the highlight must not.
+
+    The last slice's reported end is what the run snapshot records and what
+    the Explorer highlights, so an unclamped value asserts a boundary past
+    any event that exists.
+    """
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = start + timedelta(milliseconds=100)  # 100 ms over k=8 -> width 13 ms
+    slices = SelfSlices.build(start, end, 8)
+    assert slices is not None and slices.width_ms == 13
+    assert 8 * slices.width_ms == 104 > 100  # the raw arithmetic does overrun
+    assert slices.bounds(7)[1] == end
+    assert slices.bounds(6)[1] == start + timedelta(milliseconds=91)
+    assert slices.payload()["slices"][7]["end"] == end.isoformat()
+    # Every reported interval stays inside the span.
+    assert all(slices.bounds(i)[1] <= end for i in range(8))
+
+
+def test_self_slices_cover_treats_the_last_slice_as_closed_on_the_right():
+    """A value first seen at the span end belongs to the last slice.
+
+    Slices are half-open so an instant falls in exactly one of them, but the
+    SQL index folds everything at or past the last slice's start into k-1.
+    Comparing against the *clamped* end would drop a value whose first
+    occurrence is the very last event.
+    """
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = start + timedelta(milliseconds=100)
+    slices = SelfSlices.build(start, end, 8)
+    assert slices is not None
+    assert slices.covers(7, end, end)  # first == last == span end
+    assert not slices.covers(0, end, end)
+    # A value living entirely in slice 0 touches no later slice.
+    early = start + timedelta(milliseconds=5)
+    assert slices.covers(0, start, early)
+    assert not slices.covers(3, start, early)
+    # A value spanning the middle covers every slice it overlaps.
+    mid_lo, mid_hi = start + timedelta(milliseconds=20), start + timedelta(milliseconds=45)
+    assert [i for i in range(8) if slices.covers(i, mid_lo, mid_hi)] == [1, 2, 3]
+
+
+def test_spend_ks_budget_serves_every_field_before_serving_any_twice():
+    """Round-robin, not a prefix: the budget narrows resolution, not coverage.
+
+    A prefix truncation would give the first fields every slice and the last
+    fields none, so the run would report on a field it never scanned.
+    """
+    eligible = [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3]]
+    picked = _spend_ks_budget(eligible, 6)
+    assert len(picked) == 6
+    # Two slices from each field, not four from the first and two from the second.
+    assert sorted(fi for fi, _ in picked) == [0, 0, 1, 1, 2, 2]
+    # Earliest slices first, and field-major order out.
+    assert picked == [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+
+
+def test_spend_ks_budget_backfills_the_slack_a_short_field_leaves():
+    """A field with fewer eligible slices than its share does not waste it."""
+    eligible = [[5], [0, 1, 2, 3, 4]]
+    picked = _spend_ks_budget(eligible, 4)
+    assert len(picked) == 4
+    assert picked == [(0, 5), (1, 0), (1, 1), (1, 2)]
+
+
+def test_spend_ks_budget_returns_everything_when_the_budget_is_not_binding():
+    eligible = [[0, 1], [2]]
+    assert _spend_ks_budget(eligible, 60) == [(0, 0), (0, 1), (1, 2)]
+    assert _spend_ks_budget([], 60) == []
+    assert _spend_ks_budget([[0, 1]], 0) == []
+
+
+def test_small_slice_warning_counts_empty_slices_separately():
+    """An empty slice is tested by nobody and skipped by nobody — say so.
+
+    A slice with no events produces no test and no skipped_by_field entry, so
+    a sparse timeline advertises k slices while a handful carry every test.
+    """
+    slices = SelfSlices.build(
+        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), 24
+    )
+    assert slices is not None
+    svc = StatisticalAnomalyService
+    # 20 empty, 2 thin, 2 healthy.
+    totals = [0] * 20 + [1, 2] + [10_000, 10_000]
+    notes = svc._small_slice_warning(slices, totals)
+    assert len(notes) == 2
+    assert "20 of 24 slices hold no events" in notes[0]
+    assert "clustered in 4 of its 24" in notes[0]
+    assert "fewer than" in notes[1] and "2 of 24" in notes[1]
+    # Nothing empty, nothing thin -> nothing to say.
+    assert svc._small_slice_warning(slices, [10_000] * 24) == []
+    # Empty only.
+    only_empty = svc._small_slice_warning(slices, [0] * 12 + [10_000] * 12)
+    assert len(only_empty) == 1 and "hold no events" in only_empty[0]
 
 
 def test_gamma_sf_matches_closed_forms():

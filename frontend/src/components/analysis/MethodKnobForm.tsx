@@ -93,6 +93,14 @@ export function seedFromParams(
     if (raw === undefined || raw === null) continue;
     if (knob.kind === "fields") {
       fields[knob.param] = Array.isArray(raw) ? raw.map(String) : String(raw).split(",");
+    } else if (knob.kind === "choice" && String(raw) === knob.options?.[0]?.value) {
+      // A choice's first option is its default, and the form spells the
+      // default "" so an untouched knob stays out of the params entirely.
+      // Seeding the stored value verbatim would hand the <select> a value no
+      // <option> carries, and the browser would silently display the first
+      // option instead — so an entry saved with an explicit default read back
+      // as one the control could not show.
+      values[knob.param] = "";
     } else {
       values[knob.param] = String(raw);
     }
