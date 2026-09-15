@@ -4,7 +4,7 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-15 (unreleased; session 238 — review findings on the D18/D19/D11
+Last updated: 2026-09-15 (v1.19.7; session 238 — review findings on the D18/D19/D11
 branch: the self frame's complement, the per-slice scan budget, three disclosure gaps).
 
 ## Session 238 — 2026-09-15: review of the D18/D19/D11 branch (PR #377)
