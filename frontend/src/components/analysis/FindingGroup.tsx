@@ -18,6 +18,7 @@ import { FindingRowActions, FindingShell } from "./detector-shared";
 import type { EvidenceClass, MethodId, MethodMeta } from "./method-registry";
 import type { MethodState } from "@/hooks/useMethodFindings";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
+import { sliceWindowEnd } from "@/lib/finding-frame";
 import { fmtTimestampCompactUtc as fmtTs } from "@/lib/time";
 import { fmtNum, truncate } from "@/lib/format";
 import { isTemplateRow, type LogTemplateRow } from "@/api/analysis";
@@ -175,11 +176,7 @@ export function ScoredRow({
           onJumpToTime={
             onJumpToTime
               ? (ts, eventId) =>
-                  onJumpToTime(
-                    ts,
-                    eventId,
-                    item.raw.type === "frequency" ? item.raw.window_end : undefined,
-                  )
+                  onJumpToTime(ts, eventId, sliceWindowEnd(item.raw))
               : undefined
           }
           disposition={{

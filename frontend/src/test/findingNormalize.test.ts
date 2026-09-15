@@ -8,7 +8,10 @@ import { describe, expect, it } from "vitest";
 import { interleaveByRank, normalizeFinding, type FeedItem } from "@/lib/finding-normalize";
 import { DETECTORS_BY_ID } from "@/components/analysis/detector-registry";
 import type {
+  DistributionDriftFinding,
   FrequencyFinding,
+  IntervalPeriodicityFinding,
+  ProportionShiftFinding,
   SequenceNoveltyFinding,
   TimestampOrderFinding,
   ValueNoveltyFinding,
@@ -102,6 +105,120 @@ describe("normalizeFinding", () => {
     const item = normalizeFinding(DETECTORS_BY_ID.sequence, f, 1);
     expect(item.title).toContain("a → b → c");
     expect(item.subtitle).toContain("incident");
+  });
+
+  // The self frame (D18): the same four shapes, read by `details.method`
+  // rather than by the scope the panel is in.
+  const shift: ProportionShiftFinding = {
+    ...base,
+    type: "proportion_shift",
+    field: "attr:user",
+    value: "eve",
+    count: 500,
+    baseline_count: 0,
+    baseline_rate: 0,
+    window_rate: 0.31,
+    rate_ratio: 15.5,
+    direction: "up",
+    g_statistic: 184.2,
+    p_value: 1e-40,
+    q_value: 1.2e-38,
+    score: 184.2,
+    first_seen: "2026-02-02T02:00:00Z",
+    event_id: "e5",
+  };
+
+  it("reads a slice-mode proportion shift as slice vs the rest of the timeline", () => {
+    const item = normalizeFinding(
+      DETECTORS_BY_ID.shift,
+      { ...shift, details: { method: "self-g-test", window_label: "slice 09/24" } },
+      0,
+    );
+    expect(item.subtitle).toBe("share 31.00% in slice 09/24 vs 0.00% elsewhere (up, q=1.2e-38)");
+    const temporal = normalizeFinding(DETECTORS_BY_ID.shift, { ...shift, details: { method: "g-test" } }, 0);
+    expect(temporal.subtitle).toBe("share 0.00% → 31.00% (up, q=1.2e-38)");
+  });
+
+  it("reads a whole-scope cadence finding by its own numbers", () => {
+    const cadence: IntervalPeriodicityFinding = {
+      ...base,
+      type: "interval_periodicity",
+      field: "attr:svc",
+      value: "beacon",
+      direction: "missed",
+      count: 4320,
+      baseline_count: 4320,
+      baseline_median_interval: 60,
+      window_median_interval: 60,
+      baseline_cv: 0.05,
+      window_cv: null,
+      statistic: 660,
+      p_value: 1e-20,
+      q_value: 3e-19,
+      score: 18.5,
+      first_seen: "2026-02-01T16:39:00Z",
+      event_id: "e6",
+      details: { method: "self-cadence", longest_gap_seconds: 660, median_interval: 60 },
+    };
+    const item = normalizeFinding(DETECTORS_BY_ID.interval, cadence, 0);
+    expect(item.subtitle).toBe("silent for 660s vs median gap 60.0s (q=3.0e-19)");
+    const beacon = normalizeFinding(
+      DETECTORS_BY_ID.interval,
+      {
+        ...cadence,
+        direction: "new_regularity",
+        window_cv: 0.02,
+        details: { method: "self-cadence", paused_intervals: 2 },
+      },
+      0,
+    );
+    expect(beacon.subtitle).toBe("regular cadence (beaconing), CV 0.02, 2 pauses excluded (q=3.0e-19)");
+  });
+
+  it("reads a rare ordering without a window", () => {
+    const f: SequenceNoveltyFinding = {
+      ...base,
+      type: "sequence_novelty",
+      field: "attr:act",
+      values: ["a", "x", "y"],
+      value: "a → x → y",
+      count: 1,
+      score: 7.6,
+      first_seen: "2026-02-02T00:00:00Z",
+      event_id: "e7",
+      details: { method: "rare-ngram", scope_ngram_total: 2998, rarity_floor: 3 },
+    };
+    expect(normalizeFinding(DETECTORS_BY_ID.sequence, f, 0).subtitle).toBe(
+      "rare ordering · ×1 across the timeline",
+    );
+  });
+
+  it("names the slice for drift and never renders an undefined label", () => {
+    const drift: DistributionDriftFinding = {
+      ...base,
+      type: "value_distribution_drift",
+      field: "attr:bytes",
+      window_label: "slice 09/24",
+      test: "ks",
+      statistic: 0.4,
+      effect: 0.4,
+      direction: "up",
+      baseline_n: 24500,
+      window_n: 500,
+      p_value: 1e-30,
+      q_value: 2e-29,
+      score: 28.7,
+      first_seen: "2026-02-02T02:00:00Z",
+      event_id: "e8",
+      details: { method: "self-drift" },
+    };
+    expect(normalizeFinding(DETECTORS_BY_ID.drift, drift, 0).subtitle).toBe(
+      "KS up in slice 09/24 vs the rest (q=2.0e-29)",
+    );
+    const legacy = { ...drift, window_label: undefined as unknown as string, details: {} };
+    expect(normalizeFinding(DETECTORS_BY_ID.drift, legacy, 0).subtitle).toBe(
+      "KS up in the suspect window (q=2.0e-29)",
+    );
   });
 });
 

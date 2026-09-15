@@ -65,7 +65,10 @@ teaches the tooling instead of the work. What each tool has to find:
 `tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
 actually returns findings. If a retuned threshold silences one of them, that
 test fails — which is the point: the demo's promise is only true as long as it
-is checked.
+is checked. Rows 7–10 are checked in both frames: with no baseline declared,
+the 300 s beacon must still surface as whole-scope regularity (`self-cadence`),
+and the exfil share, the `bytes_out` shape change and the contractor's host
+orderings must surface against the rest of the timeline.
 
 ### Query-cost discipline (all statistical detectors)
 
@@ -74,6 +77,18 @@ Cross-cutting rules that keep detector scans survivable on 100M+-row cases (adde
 half — how to size the budget and read what resolved — is
 [`DEPLOYMENT.md` §Resource sizing](DEPLOYMENT.md#resource-sizing).
 
+- **Deterministic quantiles.** Every quantile a detector gates on — the numeric-range and
+  entropy fences, the interval medians, the drift quantiles, the motif cadence median —
+  is `quantileDeterministic` keyed on a per-row hash (`cityHash64(event_id)`, or the
+  distinct value where the population is one row per value). Plain `quantile` keeps a
+  reservoir of 8192 values and samples into it with a random generator, so two runs over
+  identical data could disagree about a fence that decides which findings exist.
+  `quantileDeterministic` keeps the same bounded reservoir but decides membership by the
+  hash, so the answer is a pure function of the data; `quantileExact` was deliberately not
+  chosen, since it holds every value in memory — the failure shape the rest of this list
+  exists to avoid. The determinator is always distinct per row, never the value itself:
+  copies of one value sharing a hash would enter or leave the sample together
+  (`tests/test_deterministic_quantiles_clickhouse.py`).
 - **Two-phase representative events.** Detector scans aggregate only
   `argMin(event_id, timestamp)` per group — never `argMin(message, …)`, which forces
   decompressing the fat `message` column for *every scanned row* (~136 GiB per field
@@ -341,9 +356,10 @@ checked, and the UI must never present the two the same way.
 | `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
 | `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
-| `interval_periodicity` | a second window, then enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` (window: `needs_setup`) |
-| `sequence_novelty` | a second window, then a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` (window: `needs_setup`) |
-| `proportion_shift`, `value_distribution_drift` | a second window exists | — (reported as `needs_setup`) |
+| `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
+| `sequence_novelty` | a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` |
+| `proportion_shift`, `value_distribution_drift` | a span of more than one instant (self frame: it is cut into slices) | `stat_self_slices` |
+| any of those four in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
 
 Three rows encode a distinction worth stating, because each was once drawn wrong:
 
@@ -360,13 +376,15 @@ Three rows encode a distinction worth stating, because each was once drawn wrong
   asks only that the span be wide enough for a bucket to exceed a second. Both numbers
   appear in `reason_facts` so the arithmetic on screen is checkable.
 
-All four temporal methods share the window precondition, checked *before* their
-data-shape gates. `interval_periodicity` and `sequence_novelty` are temporal-only, so
-gating them on shape alone counted them applicable in the self frame and rendered a dash
-where the "Set a baseline" affordance belongs. When both a missing window and a shape
-problem apply, the window wins: it is the reason the analyst can act on. `needs_setup` is
-a third status, not a weaker skip — an analyst action makes the method applicable, so the
-UI offers that action rather than a "run anyway" that could only produce an empty scan.
+**A baseline never restricts a detector.** The four methods that used to be baseline-only
+(proportion shift, distribution drift, interval cadence, event sequences) each have a
+self frame since D18, so in the self frame they are gated on data shape exactly like every
+other method. Only the *baseline* frame without an active baseline is `needs_setup`: the
+analyst asked for a comparison that has no reference yet, and declaring one is the action
+that makes it applicable. When both a missing baseline and a shape problem apply in that
+frame, the baseline wins: it is the reason the analyst can act on. `needs_setup` is a
+third status, not a weaker skip — the UI offers the action rather than a "run anyway"
+that could only produce an empty scan.
 
 Two properties are load-bearing and test-enforced:
 
@@ -414,7 +432,7 @@ The wizard is three steps. *Choose* lists every method with a one-line "use this
 the plan's verdict for this timeline and its cost class; a `not_applicable` card is
 selectable, with the arithmetic beside it, because the gate is advice. *Configure* is the
 same knob form the sheet's method mode uses, with each knob's help text attached to the
-control, plus the frame — the four two-window methods offer only a baseline. *Confirm*
+control, plus the frame — every method offers both, defaulting to self. *Confirm*
 reads back one sentence saying exactly what will be stored, then applies. In the rail, the
 strip above the feed names every configured detector with its scope and count, and carries
 edit and remove for contribute access.
@@ -629,11 +647,13 @@ findings covered only by an out-of-scope verdict are marked for re-examination.
 ### Baseline definitions, suspect windows, and the normality model
 
 Every temporal detector (value novelty, value combos, frequency, numeric
-range, charset, entropy, proportion shift, interval cadence, event sequences —
-everything except the mode-less timestamp-order detector; proportion shift,
-interval cadence and event sequences are temporal-*only*, having no
-self-baseline mode) answers the same shape of question: *given a period I know was
-normal, what stands out in the periods I'm suspicious of?* Two persistent,
+range, charset, entropy, proportion shift, interval cadence, event sequences,
+distribution drift — everything except the mode-less timestamp-order
+detector) answers the same shape of question: *given a period I know was
+normal, what stands out in the periods I'm suspicious of?* No detector is
+temporal-only: each also runs without a baseline, taking its reference from the
+timeline itself (its "self frame"), and a baseline sharpens the question rather
+than unlocking the method. Two persistent,
 analyst-declared primitives express "normal", and it is worth being precise
 about which is which:
 
@@ -1341,17 +1361,28 @@ the field's normal values — too random, or too repetitive?" A DGA domain
 (`kq3v9xz2m8w1.com`) among human-named hosts, a base64 payload in a field of
 plain words, a padding string of one repeated character.
 
-Inspired by AMiner's `EntropyDetector`, but **a different statistic** — be
-precise about this when comparing the two. AMiner learns a character-*bigram*
-transition table over the field and flags values whose mean pair probability
-falls below a threshold; Vestigo measures each value's own Shannon character
-entropy against a learned band. The consequence is concrete: a value built
-from perfectly ordinary characters in an unusual *order* (a lowercase-latin
-DGA domain among English hostnames) has ordinary Shannon entropy and will
-**not** be flagged here, while AMiner's bigram model catches it. What this
-detector reliably finds is values whose character *mix* is unlike the field's
-— base64/hex blobs among words, and the degenerate low end. The bigram
-variant is roadmap D11.
+Inspired by AMiner's `EntropyDetector`, and offering **two statistics** — be
+precise about which one a finding used (`details.variant`). The default,
+`shannon`, measures each value's own Shannon character entropy against a
+learned band: what it reliably finds is values whose character *mix* is unlike
+the field's — base64/hex blobs among words, and the degenerate low end. It is
+blind to a value built from perfectly ordinary characters in an unusual
+*order*: a lowercase-latin DGA domain among English hostnames has ordinary
+Shannon entropy. The `bigram` variant (D11) is AMiner's actual statistic: it
+learns a character-*bigram* frequency table over the reference values and
+scores each value by the **mean surprisal of its pairs**, in bits per pair —
+`s(ab) = −log2((c(ab) + 1) / (N + V + 1))` with add-one smoothing over `N`
+pairs and `V` distinct pairs, unseen pairs `−log2(1 / (N + V + 1))`. English
+never makes the pairs a DGA does, so the DGA's mean surprisal sits far above
+the field's band while its Shannon entropy sits inside it
+(`tests/test_entropy_bigram_clickhouse.py` is that exact case). Below the
+band under `bigram` is a value made only of the field's most common pairs.
+The table is learned from the reference population's *distinct* values, bound
+into the scoring scans as arrays capped at the 4096 most frequent pairs (a
+latin-alphabet field has under 3000), and a capped table is disclosed in
+`warnings`, since pairs beyond the cap score as unseen. `bigram_pairs`,
+`bigram_distinct`, `bigram_table` and `bigram_unseen_surprisal` in `details`
+record the table a finding was scored against.
 
 **Why it's useful:** Randomness is a fingerprint of machine-generated content
 — DGA domains, encoded/encrypted payloads, session keys dropped into the wrong
@@ -1380,13 +1411,18 @@ set in memory until the cap kills the query. Both detectors pick the same free-t
 fields, so the same three million distinct query strings that broke the charset learn broke
 this one (`tests/test_entropy_memory_clickhouse.py`).
 
-### Two modes
+### Two statistics, two modes
 
-| | Self-baseline (`iqr`) | Temporal (`temporal-iqr`) |
+| | Self-baseline (`iqr` / `bigram-iqr`) | Temporal (`temporal-iqr` / `temporal-bigram-iqr`) |
 |---|---|---|
-| Baseline population | entropies of every distinct value in the corpus | entropies of distinct values in the baseline window |
+| Baseline population | the statistic over every distinct value in the corpus | the statistic over distinct values in the baseline window |
+| Bigram table | learned from the corpus's distinct values | learned from the baseline window's distinct values |
 | Band | Tukey fence `[q1 − 1.5·IQR, q3 + 1.5·IQR]` | same fence, learned from the baseline window |
-| Flags | statistical entropy outliers anywhere | suspect-window values outside the baseline window's band |
+| Flags | statistical outliers anywhere | suspect-window values outside the baseline window's band |
+
+`variant` (request param, `shannon` default / `bigram`) selects the statistic; the
+finding's `entropy` field holds whichever was measured (bits per character, or bits per
+pair), `details.variant` says which, and the persisted run records it.
 
 Unlike the numeric-range detector, *both* modes can use the fence directly:
 quartiles are not degenerate over their own population the way an exact
@@ -1460,10 +1496,20 @@ from the baseline (`baseline_cnt = 0`). Proportion shift requires
 "never seen before" belongs to value novelty, "seen before but its rate
 changed" belongs here. No finding appears in both.
 
-**Temporal-only.** A share can only "shift" between two populations, so this
-detector has no self-baseline mode — it always needs a
-[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
-Without one it reports `insufficient_data` with a warning rather than guessing.
+### Two frames
+
+| | Self (`self-g-test`) | Baseline (`g-test`) |
+|---|---|---|
+| Reference | the rest of the timeline (every scope event outside the slice) | the baseline window |
+| Window | each of `stat_self_slices` equal time slices (default 24) | each suspect window |
+| First-seen values | tested (a rarity floor, not first-seen, is self-frame novelty) | excluded — `baseline_cnt ≥ 1` |
+| Where a value is tested | only in slices overlapping its own `[first, last]` arrival span | every suspect window |
+
+A share can only "shift" between two populations; without a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+the two populations are a time slice and its complement — see
+[the self frame](#self-frame-leave-one-out-slices) below. The test, the FDR pool
+and the effect floor are the same in both.
 
 ### The test: a 2×2 G-test per (value, suspect window)
 
@@ -1520,6 +1566,73 @@ tests performed, so when a field hits the cap the test count `m` is understated
 for that field; the run attaches a warning saying so rather than hiding it.
 Treat marginal q-values on a capped field as exploratory.
 
+### Self frame: leave-one-out slices
+
+Without a baseline (D18) the scope's effective-timestamp span
+`[min, max]` is cut into `K = stat_self_slices` equal slices (default 24,
+4..120): `width_ms = ceil(span_ms / K)`, slice `k` covers
+`[start + k·width, start + (k+1)·width)`, and the SQL index is
+`least(K−1, intDiv(dateDiff('millisecond', start, ts), width))`, so the last
+event lands in slice K−1. Boundaries are integer arithmetic over immutable
+data — a rerun reproduces them, and the run persists the slice payload and
+its `slices_hash` beside where a baseline run persists `windows`. A scope
+holding one timestamp cannot be sliced and reports `insufficient_data`.
+
+Slice bounds are *reported* clamped to the span: `width_ms` is rounded up, so
+`start + K·width` can overrun `max` by up to `K−1` ms, and the last slice's
+recorded `end` would otherwise assert a boundary past any event that exists —
+in the persisted `slices` snapshot and in the range the Explorer highlights.
+The SQL index is unaffected (it already clamps with `least(K−1, …)`), and the
+overlap arithmetic below reads the unclamped edge, so a value first seen at
+the very last event still belongs to slice `K−1`.
+
+Per field, one `GROUP BY val` scan collects each value's whole-scope total,
+first and last arrival, and per-slice count, first arrival and representative
+event; slice totals come from one `GROUP BY slice`. The 2×2 G-test, the single
+BH pool (every field × value × in-span non-empty slice), `min_ratio` and the
+Haldane +0.5 display ratio are exactly the baseline frame's.
+
+Two rules differ, and both are deliberate:
+
+- **Active-span rule — which slices are tested, *and what they are measured
+  against*.** Slice `k` is tested only if it overlaps the value's own
+  `[first, last]` arrival span — the same "bounded by the series' own active
+  span" rule frequency's self mode uses for zero-fill — and the complement is
+  drawn from that span too: `rest_total = Σ slice_total over the in-span
+  slices − slice_total_k`, with `rest_count = total − count_k` (every
+  occurrence lies inside the span by construction). Both halves matter, and
+  each prevents a different wall of findings. Testing in-span only stops a
+  value that starts or ends mid-timeline from producing `down` findings for
+  the slices before and after its life. Measuring against an in-span
+  complement stops the mirror-image error: a whole-scope denominator divides a
+  short-lived value's rate by the fraction of the timeline it lived through,
+  so a value alive for a twelfth of the scope clears a `min_ratio` of 2.0 on
+  arithmetic alone and reads `up` in *every slice of its own life*. Churning
+  identifiers — session ids, ephemeral hostnames, short-lived processes — are
+  exactly what this detector is pointed at, so that was systematic rather than
+  an edge case. Inside the span both directions are tested.
+- **No first-seen exclusion.** A value confined to a *single* slice is the one
+  case with no within-life complement to restrict to, so it keeps the
+  whole-scope one and is tested — it reads `up` against a `rest_count` of 0,
+  and "this value exists in exactly one slice of the timeline" is the finding.
+  Self-frame value novelty does not cover it: that is a rarity floor of three
+  occurrences, and a 500-event one-slice burst is confined, not rare.
+
+`details` carries the slice as `window_label` / `window_start` / `window_end`
+plus `slice_index`, `slice_count`, `rest_count`, `rest_total`, `rest_rate`,
+`value_first_seen`, `value_last_seen` — and never a `baseline_*` key: a
+client reading them must branch on `method`, not render "baseline 0". It also
+carries `value_active_slices` (how many slices the value's life spans),
+`rest_frame` (`active-span` or `whole-scope`) and `rest_slices` (how many
+slices the complement covers), because a rate ratio cannot be read without
+knowing which denominator produced it. The finding's `baseline_count` /
+`baseline_rate` fields hold the complement's numbers in this frame. Slices
+holding fewer than 50 events are counted into one warning rather than silently
+tested, and slices holding *nothing* get their own — an empty slice is tested
+by no runner and skipped by none either, so on a timeline with one dense day
+and a sparse tail the run would otherwise advertise `K` slices while a handful
+carried every test.
+
 ### Caveats
 
 - **Events are not independent.** Log events arrive in bursts, retries, and
@@ -1535,7 +1648,12 @@ Treat marginal q-values on a capped field as exploratory.
   config change all shift proportions. Rank for triage, as everywhere.
 - **Fields:** same categorical auto-selection as value novelty
   (identifier-like fields have no repeating shares to test); override via the
-  Fields picker. First-seen exclusion (`baseline_cnt ≥ 1`) is enforced in SQL.
+  Fields picker. First-seen exclusion (`baseline_cnt ≥ 1`) is enforced in SQL
+  in the baseline frame.
+- **Self frame: more slices, more tests.** K slices multiply the BH pool by K
+  and shrink each slice's sample; a coarser `stat_self_slices` trades
+  resolution for stability, and the run warns when slices fall under 50
+  events.
 
 ---
 
@@ -1569,10 +1687,21 @@ proportion shift owns the *magnitude* axis.
 `baseline_cnt ≥ 1` — a value must exist in the baseline to have a learned
 cadence. First-seen values belong to value novelty; no finding appears in both.
 
-**Temporal-only.** Cadence can only *change* between two populations, so there
-is no self-baseline mode — it always needs a
-[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
-Without one it reports `insufficient_data`.
+### Two frames
+
+| | Self (`self-cadence`) | Baseline (`cadence`) |
+|---|---|---|
+| Reference | each value's own arrivals across the whole scope | the baseline window |
+| Beaconing | Greenwood over the value's gaps with pauses excluded | Greenwood over the suspect window's gaps, for baseline-bursty values |
+| Silence | the longest internal or trailing gap against a robust-Gamma null | Poisson-rate test of the suspect window against the baseline rate |
+| First-seen values | tested | excluded — `baseline_cnt ≥ 1` |
+
+A cadence *change* needs two populations, which is the baseline frame. Without a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+the question becomes "is this value's own rhythm too regular to be chance, and did it
+ever fall silent?" — see [the self frame](#self-frame-whole-scope-cadence) below. No
+slices: a beacon that runs the whole timeline (implant present before collection
+began) would be missed by any slicing.
 
 ### Two tests, one per direction, gated on baseline regularity
 
@@ -1649,9 +1778,82 @@ volume first; when a field hits the cap the BH test count is understated for
 that field and the run attaches a warning. Treat marginal q-values on a capped
 field as exploratory.
 
+### Self frame: whole-scope cadence
+
+Gaps are computed per value over the whole scope (`lagInFrame` partitioned by
+value, ordered by timestamp then event id), in seconds. Every quantile the
+frame gates on is [deterministic](#query-cost-discipline-all-statistical-detectors).
+
+**Robust regularity.** `rcv = IQR / (1.349 · median)` — IQR/1.349 estimates σ
+and the median estimates the mean, so `rcv` sits on the CV scale (exponential
+gaps: `rcv ≈ 1.17` where CV = 1) and `stat_interval_cv_regular_max` (0.5)
+applies unchanged. Robust rather than moment-based because the silence being
+tested would inflate a CV computed from the same gaps. Clamped below at
+`0.05`: second-resolution logs of a clockwork job have IQR = 0, which would
+otherwise make any gap above the median "impossible" under the null model.
+
+**Direction `new_regularity` (beaconing).**
+
+1. **Pauses.** Gaps longer than `stat_interval_self_pause_ratio` × median
+   (default 10) are the beacon being off — host asleep, network down — and
+   are excluded from the regularity statistic, counted as `paused_intervals`.
+   Under random arrivals the median gap is `ln2 · mean`, so the cut sits at
+   `6.93 · mean` and discards `e^−6.93 ≈ 0.1 %` of gaps — a negligible pull
+   toward "regular".
+2. **Floors.** Retained gaps `N ≥ stat_interval_beacon_min_intervals` (10) and
+   retained span `S = Σ retained gaps ≥ stat_interval_self_min_span_seconds`
+   (default 300 — a short evenly spaced retry loop is not a beacon).
+3. **Test.** Greenwood `G = Σ(gap/S)²` over the retained gaps, left tail, as
+   in the baseline frame.
+4. **Effect floor.** CV of the retained gaps ≤ `stat_interval_beacon_cv_max`
+   (0.3).
+
+The representative event is the value's first arrival. `details`:
+`median_interval`, `robust_cv`, `retained_intervals`, `paused_intervals`,
+`retained_span_seconds`, `window_cv` (retained), `greenwood_g`, `greenwood_z`,
+`pause_ratio`, `min_span_seconds`, `beacon_cv_max`, `first_seen`, `last_seen`.
+
+**Direction `missed` (silence).**
+
+1. **Eligibility.** At least `stat_interval_min_baseline_intervals` (5) gaps
+   and `rcv ≤ stat_interval_cv_regular_max` (0.5): a value has to *have* a
+   rhythm before a gap can break it.
+2. **Candidate silence.** The longer of the longest internal gap and the
+   **trailing** gap — the last event of the value's own source minus the
+   value's last arrival in that source, maximized over the sources it occurs
+   in (a per-(value, source) last-arrival subquery joined to a per-source
+   last-event subquery over *all* the source's scope events). Coverage
+   ending is not a silence; the source continuing to log while the value stops
+   is. `details.trailing` says which won, `gap_source_id` names the source for
+   a trailing gap.
+3. **Null model.** Gaps ~ Gamma fitted robustly: shape `α = 1/rcv²`, scale θ
+   from the median via the Wilson–Hilferty approximation
+   `median ≈ αθ(1 − 1/(9α))³`. Shape 1 is the memoryless (Poisson) case; a
+   metronomic heartbeat has a large α and a light tail. `sf(G) = Q(α, G/θ)`,
+   the regularized upper incomplete gamma (`_gamma_sf`, pure `math`, the
+   chi² survival function's own machinery at a non-integer shape).
+4. **p-value.** Šidák over the value's `k` gaps: `p = 1 − (1 − sf)^k`,
+   computed as `−expm1(k · log1p(−sf))` so a tiny tail survives. Enters the
+   run's single BH pool together with the beacon tests.
+5. **Effect floor.** `G ≥ stat_interval_min_rate_ratio × median` (default 2 —
+   at least one fully missed beat).
+
+The representative event is the last arrival before the silence. `details`:
+`longest_gap_seconds`, `gap_start`, `gap_end`, `trailing`, `gap_source_id`,
+`median_interval`, `robust_cv`, `gamma_shape`, `expected_arrivals_missed =
+G/median − 1`, `intervals`, `min_rate_ratio`.
+
+Both directions score `−log10(p)`, share the per-field candidate cap (highest
+volume first, warning on cap) and `stat_interval_fdr_q`. The **honest
+caveat**, stated on the method's card too: nothing filters legitimate clocks.
+NTP, update checks and monitoring agents are beacons by construction, and a
+high-volume clock gets the smallest p and ranks first. Marking it **Normal**
+once is the remedy; `total_findings` discloses what the display limit cut.
+
 ### Caveats
 
-- **Inter-arrival gaps are computed strictly within one window** — the
+- **Inter-arrival gaps are computed strictly within one window** in the
+  baseline frame — the
   `lagInFrame` that produces each gap is partitioned by (value, window index),
   so a gap can never straddle the baseline/suspect boundary and corrupt both
   windows' statistics. A value's first arrival in each window has no predecessor
@@ -1705,11 +1907,25 @@ source's scan can only rule out its *own* baseline — a cross-source
 verification pass drops any candidate n-gram that occurs in **any** source's
 baseline window.
 
-**Temporal-only.** "Never seen before" needs a before — there is no
-self-baseline mode. Without a
+**Two frames.** "Never seen before" needs a before, which is the baseline
+frame (`ngram`). Without a
 [baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
-it reports `insufficient_data`; likewise when the baseline window holds no
-complete sequence of length n.
+the **self frame** (`rare-ngram`, D18) asks the rarity question instead: the
+same n-gram assembly over every scope event, and an ordering occurring at most
+`stat_sequence_rarity_floor` times (default 3 — its own setting, since the
+unit is n-gram occurrences, as the charset floor is its own) across the scope
+is flagged. Per source: the complete-n-gram total (`scope_ngram_total`; below
+50 → warning, 0 → `insufficient_data`), then the orderings under the floor,
+rarest first, capped at `stat_sequence_max_candidates` (cap → warning). On a
+multi-source scope the merged candidates are recounted exactly across every
+source and those above the floor case-wide are dropped — a gram rare in one
+source and common in another is not rare. Score
+`−log(count / scope_ngram_total)`; representative event the first event of the
+earliest occurrence; `details` carry `scope_ngram_total` and `rarity_floor`
+and no window keys. The allowlist key is identical in both frames, so one
+**Normal** verdict covers both. High-cardinality series fields make most
+orderings rare combinatorially — the cap warning fires, and a field with a few
+distinct values is the right choice.
 
 **Score = −log(count / window_ngram_total)** — the same surprise scale as
 value novelty, but the denominator is the suspect window's own count of
@@ -1800,11 +2016,47 @@ outside a learned band. A distribution can drift substantially while every
 single value stays inside the old min/max (e.g. the median doubling within an
 unchanged range). Drift tests the population, range tests the outliers.
 
-**Temporal-only.** A distribution can only drift between two populations, so
-there is no self-baseline mode — it always needs a
-[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model).
-Without one it reports `insufficient_data` with a warning rather than
-guessing.
+**Two frames.** A distribution can only drift between two populations. With a
+[baseline definition](#baseline-definitions-suspect-windows-and-the-normality-model)
+they are the baseline and each suspect window (`drift`); without one the
+**self frame** (`self-drift`, D18) uses the same
+[leave-one-out slices](#self-frame-leave-one-out-slices) proportion shift
+does — each of `stat_self_slices` equal time slices against its complement,
+the rest of the scope. Field classification and auto-selection are unchanged,
+probed over the whole scope.
+
+- *Categorical:* one `GROUP BY val` scan per field with per-slice counts; per
+  slice in Python the complement vector is `total − slice`, the top 50
+  categories are taken **by complement count** with the exact `__other__`
+  fold, then the 2×k G-test, `df = buckets − 1` and the TVD floor as below.
+  Contributors carry `rest_share` rather than `baseline_share`.
+- *Numeric:* a per-slice count scan first, then **one KS query per slice**
+  that has `min_samples` on both sides. Not K aggregates in one query: each
+  KS state holds the whole field, so K-in-one is K× memory; one per slice
+  keeps the peak at the baseline frame's worst case and costs K× time.
+
+  This is the one place a detector issues a whole-scope scan per (field,
+  *slice*) rather than per field, so it is the one place that fan-out is
+  bounded explicitly. Unbounded it is `_MAX_AUTO_SCAN_FIELDS ×
+  stat_self_slices` full passes in a single request — 360 at the defaults,
+  1800 with `stat_self_slices` at its ceiling of 120 — and the analysis cache
+  cannot help the *first* run on a timeline, which is precisely the one at
+  risk of timing out. The eligible (field, slice) pairs are therefore spent
+  against a budget of `_MAX_SELF_KS_QUERIES` (60, four times the module's
+  ordinary per-detector scan count) **round-robin across fields**: every field
+  yields its earliest eligible slice before any field yields a second, and a
+  field with fewer eligible slices than its share leaves slack the others
+  backfill. That is the same quota-with-backfill rule the field cap uses, and
+  for the same reason — a prefix truncation would scan the first fields
+  exhaustively and report on the last ones without having scanned them. A
+  budgeted run therefore loses slice *resolution*, never a whole field, and
+  says so in `warnings`: the slices it did not reach are disclosed, because
+  an unrun slice is not evidence of nothing.
+
+Sides below `min_samples` are skipped and warned about exactly as in the
+baseline frame; one BH pool over both branches. `details` carries the slice as
+`window_*` (plus `slice_index`, `slice_count`) and the complement as `rest_n`,
+`rest_median`, `rest_p05` / `rest_p95` — never a `baseline_*` key.
 
 ### Two tests, one per field kind
 
@@ -2315,7 +2567,10 @@ Every successful scan (`GET .../anomalies` with the default `persist=true`, and
 always for `tag_anomalies`) writes a `DetectorRun` row: the request params it
 ran with — fields, `series_field`, thresholds, `baseline_id`, resolved windows,
 `windows_hash`, `dispositions_hash`, the per-source clock-skew offsets in
-effect — plus the serialized result, and returns its id as `run_id`. Rows
+effect, entropy's `variant`, and for a self-frame run of the slice methods the
+`slices` payload, its `slices_hash` and the resolved self settings
+(`self_slices`, `pause_ratio`, `min_span_seconds`, `sequence_rarity_floor`)
+— plus the serialized result, and returns its id as `run_id`. Rows
 accumulate rather than being overwritten, so a case keeps an auditable history
 of what was scanned, with which parameters, and what it found
 (`db/postgres.py::DetectorRun`).

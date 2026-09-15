@@ -37,6 +37,7 @@ import { DETECTORS } from "./detector-registry";
 import { FindingEvidence } from "./FindingEvidence";
 import { normalizeFinding } from "@/lib/finding-normalize";
 import { evidenceCaption, hasEvidence } from "@/lib/finding-evidence";
+import { detailNumber, findingMode } from "@/lib/finding-frame";
 import { findingSubject } from "@/lib/finding-subject";
 import { findingVerdict } from "@/lib/finding-verdict";
 import { Button } from "@/components/ui/Button";
@@ -342,6 +343,23 @@ function when(finding: MethodResult): string {
   return ts ? fmtTs(ts) : "—";
 }
 
+/**
+ * The scope line for a finding computed without a baseline. The four
+ * formerly baseline-only methods have a reference of their own in the self
+ * frame, and "no baseline comparison" would hide what that reference was.
+ */
+function selfScopeLine(finding: MethodResult): string {
+  if (isTemplateRow(finding)) return "All events scanned — no baseline comparison";
+  const mode = findingMode(finding);
+  if (mode === "self-g-test" || mode === "self-drift") {
+    const k = detailNumber(finding.details, "slice_count");
+    return `${k ?? "Equal"} time slices, each compared with the rest of the timeline`;
+  }
+  if (mode === "self-cadence") return "Whole timeline — each value judged over all its arrivals";
+  if (mode === "rare-ngram") return "Whole timeline — the rarest orderings under the rarity floor";
+  return "All events scanned — no baseline comparison";
+}
+
 function FindingBody({
   caseId,
   timelineId,
@@ -442,7 +460,7 @@ function FindingBody({
         >
           {scope.frame === "baseline" && scope.baseline_name
             ? `Compared against ${scope.baseline_name}`
-            : "All events scanned — no baseline comparison"}
+            : selfScopeLine(finding)}
         </dd>
       </dl>
 

@@ -45,7 +45,19 @@ if TYPE_CHECKING:
 #: §"Totals and truncation"). Rows written before it carry a total that was
 #: the page length and no `total_findings_exact`, which a client reads as an
 #: exact count; they also carry the superseded page ordering.
-CACHE_VERSION = 2
+#:
+#: 3 — the self frame for proportion_shift, value_distribution_drift,
+#: interval_periodicity and sequence_novelty (D18). A self-frame request for
+#: any of the four cached `insufficient_data` under exactly the key the new
+#: modes answer, so without the bump the four would stay empty forever on
+#: every timeline that had once been opened.
+#:
+#: 4 — the self frame's proportion shift measures a value against its own
+#: active span rather than the whole scope, and self-drift's numeric branch
+#: spends a bounded scan budget. Both are the runner answering differently
+#: for the same inputs: a v3 row holds "up" findings for every short-lived
+#: value on the timeline, which is the shape this bump exists to retire.
+CACHE_VERSION = 4
 
 
 def fingerprint(

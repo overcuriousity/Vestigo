@@ -13,11 +13,21 @@
  */
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
+import { findingMode } from "@/lib/finding-frame";
 import { anomalyFieldLabel as fieldLabel } from "@/lib/format";
 
 /** Whether `FindingEvidence` will draw anything for this finding. */
 export function hasEvidence(finding: MethodResult): boolean {
   if (isTemplateRow(finding)) return false;
+  // Whole-scope beaconing carries no second number to compare against: the
+  // regularity is the claim, and the verdict states it.
+  if (
+    finding.type === "interval_periodicity" &&
+    findingMode(finding) === "self-cadence" &&
+    finding.direction !== "missed"
+  ) {
+    return false;
+  }
   return finding.type !== "value_novelty" && finding.type !== "value_combo";
 }
 

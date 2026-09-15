@@ -93,6 +93,14 @@ export function seedFromParams(
     if (raw === undefined || raw === null) continue;
     if (knob.kind === "fields") {
       fields[knob.param] = Array.isArray(raw) ? raw.map(String) : String(raw).split(",");
+    } else if (knob.kind === "choice" && String(raw) === knob.options?.[0]?.value) {
+      // A choice's first option is its default, and the form spells the
+      // default "" so an untouched knob stays out of the params entirely.
+      // Seeding the stored value verbatim would hand the <select> a value no
+      // <option> carries, and the browser would silently display the first
+      // option instead — so an entry saved with an explicit default read back
+      // as one the control could not show.
+      values[knob.param] = "";
     } else {
       values[knob.param] = String(raw);
     }
@@ -127,6 +135,8 @@ export function knobHelp(knob: MethodKnob): string {
       return "Which templates to show first: most common, first seen, or last seen.";
     case "only_new":
       return "Only templates that never appeared in the baseline window.";
+    case "variant":
+      return "Which character statistic the band is learned over. Shannon entropy catches random-looking or degenerate strings; bigram surprisal catches ordinary letters in an order this field never produces.";
     default:
       return knob.label;
   }
@@ -225,6 +235,23 @@ export function MethodKnobForm({
                   value={values[knob.param] ?? ""}
                   onChange={(next) => setValues((v) => ({ ...v, [knob.param]: next }))}
                 />
+              ) : knob.kind === "choice" ? (
+                <select
+                  aria-label={knob.label}
+                  data-testid={`method-knob-${knob.param}`}
+                  value={values[knob.param] ?? ""}
+                  onChange={(e) => setValues((v) => ({ ...v, [knob.param]: e.target.value }))}
+                  className="bg-transparent font-mono text-[var(--color-fg-primary)] outline-none"
+                >
+                  {/* The empty choice is the method's default — omitted from the
+                      params, like every other untouched knob. */}
+                  <option value="">{knob.options?.[0]?.label ?? knob.placeholder} (default)</option>
+                  {(knob.options ?? []).slice(1).map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
               ) : (
                 <input
                   aria-label={knob.label}

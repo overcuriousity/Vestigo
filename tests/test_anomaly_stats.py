@@ -5,6 +5,7 @@ All tests use fakes/mocks for ClickHouse so they run without external services.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     FreqFinding,
     NoveltyFieldInfo,
+    SelfSlices,
     StatAnomalyResult,
     StatisticalAnomalyService,
     TimeWindow,
@@ -35,9 +37,14 @@ from vestigo.db.anomaly_stats import (
     _full_bucket_starts,
     _g_statistic,
     _g_statistic_k,
+    _gamma_from_median,
+    _gamma_sf,
     _greenwood_p,
     _poisson_rate_g,
+    _robust_cv,
     _scalar_total,
+    _sidak_p,
+    _spend_ks_budget,
     _sql_suppression,
     _tvd,
     _window_preds,
@@ -3117,6 +3124,100 @@ def test_entropy_self_baseline_iqr_flags_both_directions():
     assert hi.details["baseline_n"] == 200
 
 
+def test_entropy_bigram_variant_learns_a_surprisal_table_and_binds_it():
+    """D11: the bigram variant learns pair totals + the top-K table from the
+    reference distinct values, binds them into both scans, and reports the
+    statistic under `bigram-iqr` with the table's provenance in details."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            # pair totals: N = 100 pairs, V = 3 distinct
+            FakeQueryResult(result_rows=[(100, 3)], column_names=["n_pairs", "v"]),
+            # the table, most frequent first
+            FakeQueryResult(
+                result_rows=[("th", 60), ("he", 30), ("er", 10)], column_names=["bg", "c"]
+            ),
+            # band over per-value mean surprisal
+            FakeQueryResult(result_rows=[(1.0, 2.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[("kqzvxwmjpl", 6.2, 2, fs, "evt-dga")],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[1],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="bigram")
+    assert result.status == "ok"
+    assert result.method == "bigram-iqr"
+    f = result.results[0]
+    assert f.direction == "above"
+    assert f.details["variant"] == "bigram"
+    assert f.details["bigram_pairs"] == 100
+    assert f.details["bigram_distinct"] == 3
+    assert f.details["bigram_table"] == 3
+    # Add-one smoothing over N + V + 1 = 104: unseen = -log2(1/104).
+    assert abs(f.details["bigram_unseen_surprisal"] - math.log2(104)) < 1e-3
+    totals_sql, table_sql, band_sql, viol_sql = client.full_queries[1:5]
+    assert "ngrams(val, 2)" in totals_sql and "GROUP BY bg" in table_sql
+    assert "{bgcap:UInt32}" in table_sql
+    for sql in (band_sql, viol_sql):
+        assert "transform(g, {bgk:Array(String)}, {bgv:Array(Float64)}, {bgu:Float64})" in sql
+        assert "arrayReduce('entropy'" not in sql
+    bound = client._all_parameters[3]
+    assert bound["bgk"] == ["th", "he", "er"]
+    assert abs(bound["bgv"][0] - (-math.log2(61 / 104))) < 1e-9
+    assert abs(bound["bgu"] - math.log2(104)) < 1e-9
+    assert client._all_parameters[4]["bgk"] == ["th", "he", "er"]
+
+
+def test_entropy_bigram_variant_warns_when_the_table_is_capped():
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(100_000, 9000)], column_names=["n_pairs", "v"]),
+            FakeQueryResult(result_rows=[("th", 60)], column_names=["bg", "c"]),
+            FakeQueryResult(result_rows=[(1.0, 2.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(result_rows=[], column_names=[]),
+        ],
+        totals=[0],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="bigram")
+    assert any("capped at 1 of 9000" in w for w in result.warnings)
+    assert result.results == []
+    assert result.status == "ok"
+    with pytest.raises(ValueError, match="variant"):
+        svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"], variant="trigram")
+
+
+def test_entropy_shannon_variant_binds_no_table():
+    """The default stays byte-for-byte the pre-D11 scan: no table pass, no bound arrays."""
+    fs = datetime(2024, 1, 1, tzinfo=UTC)
+    client = RecordingClient(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[(2.0, 3.0, 200)], column_names=["q1", "q3", "n"]),
+            FakeQueryResult(
+                result_rows=[("kq3v9xz2m8w1", 5.5, 3, fs, "evt-dga")],
+                column_names=["val", "ent", "cnt", "first_seen", "evt_id"],
+            ),
+        ],
+        totals=[1],
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_entropy_outliers("c1", ["s1"], fields=["attr:host"])
+    assert result.method == "iqr"
+    assert result.results[0].details["variant"] == "shannon"
+    assert len(client.full_queries) == 3
+    assert "bgk" not in client._all_parameters[1]
+    assert "arrayReduce('entropy'" in client.full_queries[1]
+
+
 def test_entropy_temporal_learns_band_from_baseline_and_guards_sentinel():
     """Temporal mode: fence from the baseline window only; suspect-window
     values scored with the sentinel excluded; min-length clause applies to
@@ -3267,17 +3368,6 @@ def _shift_windows() -> AnalysisWindows:
         datetime(2024, 1, 20, tzinfo=UTC),
         label="incident",
     )
-
-
-def test_proportion_shift_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_proportion_shifts("c1", ["s1"], fields=["attr:user"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "proportion_shift"
-    assert result.method == "g-test"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_proportion_shift_no_data():
@@ -3678,17 +3768,6 @@ _BURSTY_BL = (
     "evt-bl-first",
     "evt-bl-last",
 )
-
-
-def test_interval_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_interval_periodicity("c1", ["s1"], fields=["attr:service"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "interval_periodicity"
-    assert result.method == "cadence"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_interval_no_data():
@@ -4191,7 +4270,7 @@ def test_range_violations_offset_projects_source_id_in_subquery():
     stat_sql = client.full_queries[1]
     viol_sql = client.full_queries[2]
     # source_id projected into the inner num subqueries (fast path omits it).
-    assert "AS num, timestamp, source_id" in stat_sql
+    assert "AS num, timestamp, event_id, source_id" in stat_sql
     assert "source_id" in viol_sql
     assert "addSeconds(timestamp, transform(source_id" in stat_sql
     assert any(p.get(OFFSET_VAL_PARAM) == [-120] for p in client._all_parameters)
@@ -4316,17 +4395,6 @@ def _seq_responses(
         FakeQueryResult(result_rows=ngram_totals, column_names=_SEQ_TOTALS_COLS),
         FakeQueryResult(result_rows=novel_rows, column_names=_SEQ_NOVEL_COLS),
     ]
-
-
-def test_sequence_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_sequence_novelty("c1", ["s1"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "sequence_novelty"
-    assert result.method == "ngram"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_sequence_ngram_validation():
@@ -5097,17 +5165,6 @@ def _cat_row(val: str, bl: int, w: int) -> tuple:
         datetime(2024, 1, 16, tzinfo=UTC),
         f"evt-w-{val}",
     )
-
-
-def test_distribution_drift_insufficient_data_without_windows():
-    """Temporal-only: no windows → insufficient_data without touching ClickHouse."""
-    svc = _svc([])
-    result = svc.find_distribution_drift("c1", ["s1"], fields=["attr:duration"])
-    assert result.status == "insufficient_data"
-    assert result.detector == "value_distribution_drift"
-    assert result.method == "drift"
-    assert any("temporal-only" in w for w in result.warnings)
-    assert svc.ch.client._calls == []
 
 
 def test_distribution_drift_no_data():
@@ -6260,3 +6317,187 @@ def test_motif_max_gap_reaches_both_passes():
     joined = "\n".join(client.full_queries)
     assert "PARTITION BY source_id, w_idx, seg" in joined
     assert "if(gap_s > 300, 1, 0)" in joined
+
+
+# ---------------------------------------------------------------------------
+# Self frame (D18): slices and the pure math behind the cadence null model
+# ---------------------------------------------------------------------------
+
+
+def test_self_slices_are_integer_arithmetic_and_reproducible():
+    """Boundaries come from ceil(span/k) milliseconds; a rebuild hashes the same."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 2, 0, 0, 0, 500_000, tzinfo=UTC)
+    a = SelfSlices.build(start, end, 24)
+    b = SelfSlices.build(start, end, 24)
+    assert a is not None and a == b
+    assert a.width_ms == math.ceil(86_400_500 / 24)
+    assert a.config_hash() == b.config_hash()
+    payload = a.payload()
+    assert payload["k"] == 24 and len(payload["slices"]) == 24
+    assert payload["slices"][6]["label"] == "slice 07/24"
+    # Slice i starts exactly i widths after the span start.
+    assert a.bounds(23)[0] == start + timedelta(milliseconds=23 * a.width_ms)
+
+
+def test_self_slices_index_sql_clamps_the_last_event_into_the_last_slice():
+    """least(k-1, …): the span end itself lands in slice k-1, never in a slice k."""
+    slices = SelfSlices.build(
+        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), 24
+    )
+    params: dict = {}
+    sql = slices.index_sql("timestamp", params)
+    assert sql.startswith("least(23, ")
+    assert params["ss"] == "2024-01-01 00:00:00.000"
+    assert params["sw"] == 3_600_000
+    assert "{sw:Int64}" in sql and "{ss:String}" in sql
+
+
+def test_self_slices_reject_a_single_instant():
+    t = datetime(2024, 1, 1, tzinfo=UTC)
+    assert SelfSlices.build(t, t, 24) is None
+
+
+def test_self_slices_last_reported_end_never_overruns_the_span():
+    """ceil(span/k) can overshoot; the snapshot and the highlight must not.
+
+    The last slice's reported end is what the run snapshot records and what
+    the Explorer highlights, so an unclamped value asserts a boundary past
+    any event that exists.
+    """
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = start + timedelta(milliseconds=100)  # 100 ms over k=8 -> width 13 ms
+    slices = SelfSlices.build(start, end, 8)
+    assert slices is not None and slices.width_ms == 13
+    assert 8 * slices.width_ms == 104 > 100  # the raw arithmetic does overrun
+    assert slices.bounds(7)[1] == end
+    assert slices.bounds(6)[1] == start + timedelta(milliseconds=91)
+    assert slices.payload()["slices"][7]["end"] == end.isoformat()
+    # Every reported interval stays inside the span.
+    assert all(slices.bounds(i)[1] <= end for i in range(8))
+
+
+def test_self_slices_cover_treats_the_last_slice_as_closed_on_the_right():
+    """A value first seen at the span end belongs to the last slice.
+
+    Slices are half-open so an instant falls in exactly one of them, but the
+    SQL index folds everything at or past the last slice's start into k-1.
+    Comparing against the *clamped* end would drop a value whose first
+    occurrence is the very last event.
+    """
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = start + timedelta(milliseconds=100)
+    slices = SelfSlices.build(start, end, 8)
+    assert slices is not None
+    assert slices.covers(7, end, end)  # first == last == span end
+    assert not slices.covers(0, end, end)
+    # A value living entirely in slice 0 touches no later slice.
+    early = start + timedelta(milliseconds=5)
+    assert slices.covers(0, start, early)
+    assert not slices.covers(3, start, early)
+    # A value spanning the middle covers every slice it overlaps.
+    mid_lo, mid_hi = start + timedelta(milliseconds=20), start + timedelta(milliseconds=45)
+    assert [i for i in range(8) if slices.covers(i, mid_lo, mid_hi)] == [1, 2, 3]
+
+
+def test_spend_ks_budget_serves_every_field_before_serving_any_twice():
+    """Round-robin, not a prefix: the budget narrows resolution, not coverage.
+
+    A prefix truncation would give the first fields every slice and the last
+    fields none, so the run would report on a field it never scanned.
+    """
+    eligible = [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3]]
+    picked = _spend_ks_budget(eligible, 6)
+    assert len(picked) == 6
+    # Two slices from each field, not four from the first and two from the second.
+    assert sorted(fi for fi, _ in picked) == [0, 0, 1, 1, 2, 2]
+    # Earliest slices first, and field-major order out.
+    assert picked == [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+
+
+def test_spend_ks_budget_backfills_the_slack_a_short_field_leaves():
+    """A field with fewer eligible slices than its share does not waste it."""
+    eligible = [[5], [0, 1, 2, 3, 4]]
+    picked = _spend_ks_budget(eligible, 4)
+    assert len(picked) == 4
+    assert picked == [(0, 5), (1, 0), (1, 1), (1, 2)]
+
+
+def test_spend_ks_budget_returns_everything_when_the_budget_is_not_binding():
+    eligible = [[0, 1], [2]]
+    assert _spend_ks_budget(eligible, 60) == [(0, 0), (0, 1), (1, 2)]
+    assert _spend_ks_budget([], 60) == []
+    assert _spend_ks_budget([[0, 1]], 0) == []
+
+
+def test_small_slice_warning_counts_empty_slices_separately():
+    """An empty slice is tested by nobody and skipped by nobody — say so.
+
+    A slice with no events produces no test and no skipped_by_field entry, so
+    a sparse timeline advertises k slices while a handful carry every test.
+    """
+    slices = SelfSlices.build(
+        datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC), 24
+    )
+    assert slices is not None
+    svc = StatisticalAnomalyService
+    # 20 empty, 2 thin, 2 healthy.
+    totals = [0] * 20 + [1, 2] + [10_000, 10_000]
+    notes = svc._small_slice_warning(slices, totals)
+    assert len(notes) == 2
+    assert "20 of 24 slices hold no events" in notes[0]
+    assert "clustered in 4 of its 24" in notes[0]
+    assert "fewer than" in notes[1] and "2 of 24" in notes[1]
+    # Nothing empty, nothing thin -> nothing to say.
+    assert svc._small_slice_warning(slices, [10_000] * 24) == []
+    # Empty only.
+    only_empty = svc._small_slice_warning(slices, [0] * 12 + [10_000] * 12)
+    assert len(only_empty) == 1 and "hold no events" in only_empty[0]
+
+
+def test_gamma_sf_matches_closed_forms():
+    """Shape 1 is the exponential tail; integer shapes agree with the chi² caller."""
+    assert abs(_gamma_sf(1.0, 2.0) - math.exp(-2.0)) < 1e-12
+    for df in (2, 3, 4, 7, 12):
+        for x in (0.5, 2.0, 9.0, 30.0):
+            assert abs(_gamma_sf(df / 2.0, x / 2.0) - _chi2_sf(x, df)) < 1e-12
+    # Non-integer shape: Q(a, y) is monotone decreasing in y and bounded.
+    tail = [_gamma_sf(4.6, y) for y in (0.1, 1.0, 4.6, 10.0, 40.0)]
+    assert tail == sorted(tail, reverse=True)
+    assert tail[0] > 0.999 and tail[-1] < 1e-9
+    assert _gamma_sf(4.6, 0.0) == 1.0
+
+
+def test_sidak_is_stable_for_tiny_tails():
+    """1 − (1 − sf)^k via expm1/log1p keeps a 1e-300 tail from rounding to zero."""
+    assert _sidak_p(1e-300, 1000) > 0.0
+    assert abs(_sidak_p(0.01, 1) - 0.01) < 1e-15
+    assert abs(_sidak_p(0.1, 3) - (1 - 0.9**3)) < 1e-12
+    assert _sidak_p(1.0, 5) == 1.0
+    assert _sidak_p(0.0, 5) == 0.0
+
+
+def test_robust_cv_sits_on_the_cv_scale_and_is_floored():
+    # Exponential gaps: q1 = ln(4/3)·μ, median = ln2·μ, q3 = ln4·μ → rcv ≈ 1.17.
+    mu = 60.0
+    rcv = _robust_cv(math.log(4 / 3) * mu, math.log(2) * mu, math.log(4) * mu)
+    assert rcv is not None and abs(rcv - 1.175) < 0.01
+    # A clockwork job with IQR = 0 is clamped, never zero.
+    assert _robust_cv(60.0, 60.0, 60.0) == 0.05
+    assert _robust_cv(1.0, 0.0, 2.0) is None
+
+
+def test_gamma_from_median_recovers_the_median():
+    """Wilson–Hilferty inverse: the fitted Gamma's median is the median it was fitted to."""
+    rcv, median = 0.25, 300.0
+    alpha, theta = _gamma_from_median(rcv, median)
+    assert abs(alpha - 16.0) < 1e-9
+    # Bisect Q(alpha, y) = 0.5 and compare y·theta to the median.
+    lo, hi = 0.0, 1000.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if _gamma_sf(alpha, mid) > 0.5:
+            lo = mid
+        else:
+            hi = mid
+    assert abs(lo * theta - median) / median < 0.01

@@ -50,6 +50,7 @@ from vestigo.db.anomaly_stats import (
     StatisticalAnomalyService,
     TimeWindow,
     ValueFinding,
+    _canonical_hash,
 )
 from vestigo.db.field_stats import (
     merged_inventory,
@@ -2203,6 +2204,22 @@ async def _resolve_field_overrides(
     return dict(overrides) if overrides else None
 
 
+def _snapshot_slices(result: Any, resolution: dict[str, Any]) -> None:
+    """Record a self-frame run's leave-one-out slices beside the windows snapshot.
+
+    The slice boundaries are integer arithmetic over the scope's span, so a
+    rerun reproduces them — but only while the scope and the slice count are
+    what they were. The payload and its hash go into the persisted run the way
+    ``windows`` / ``windows_hash`` do for a baseline run, so "what exactly did
+    this scan compare?" stays answerable after either changes.
+    """
+    slices = getattr(result, "slices", None)
+    if slices is None:
+        return
+    resolution["slices"] = slices
+    resolution["slices_hash"] = _canonical_hash(slices)
+
+
 #: Sentinel for `_run_stat_detector(field_overrides=...)`: `None` is a real
 #: answer ("this timeline declares nothing for this method"), so a caller that
 #: already resolved the declaration — `/analysis/findings` builds it into its
@@ -2234,6 +2251,7 @@ async def _run_stat_detector(
     end: datetime | None = None,
     group_field: str | None = None,
     max_gap_seconds: int | None = None,
+    variant: str | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2354,6 +2372,10 @@ async def _run_stat_detector(
         )
         # D14: None = no gap bound (pre-1.8.6 behavior).
         resolution["sequence_max_gap_seconds"] = max_gap_seconds
+        if windows is None:
+            # Self frame (D18): the rarity floor decides what "rare ordering"
+            # means, so the run records the value it ran under.
+            resolution["sequence_rarity_floor"] = cfg.stat_sequence_rarity_floor
         try:
             result = await run_scan(
                 svc.find_sequence_novelty,
@@ -2369,6 +2391,7 @@ async def _run_stat_detector(
                 allowlist=allowlist,
                 field_mappings=field_mappings,
                 max_gap_seconds=max_gap_seconds,
+                rarity_floor=cfg.stat_sequence_rarity_floor,
             )
             return result, resolution
         except ValueError as exc:
@@ -2502,22 +2525,29 @@ async def _run_stat_detector(
         return result, resolution
 
     if detector == "entropy":
-        result = await run_scan(
-            svc.find_entropy_outliers,
-            case_id=case_id,
-            source_ids=source_ids,
-            source_offsets=source_offsets,
-            fields=parsed_fields,
-            limit=limit,
-            per_field_limit=cfg.stat_per_field_limit,
-            windows=windows,
-            exclude_event_ids=exclude_ids,
-            allowlist=allowlist,
-            field_mappings=field_mappings,
-            inventory=inventory,
-            inventory_total=inventory_total,
-            field_overrides=field_overrides,
-        )
+        # D11: which statistic the band was learned over is part of what the
+        # run means, so the persisted run records it.
+        resolution["entropy_variant"] = variant or "shannon"
+        try:
+            result = await run_scan(
+                svc.find_entropy_outliers,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                per_field_limit=cfg.stat_per_field_limit,
+                windows=windows,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+                variant=resolution["entropy_variant"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
     if detector == "proportion_shift":
@@ -2527,6 +2557,8 @@ async def _run_stat_detector(
         resolution["shift_min_ratio"] = (
             min_ratio if min_ratio is not None else cfg.stat_shift_min_ratio
         )
+        if windows is None:
+            resolution["self_slices"] = cfg.stat_self_slices
         result = await run_scan(
             svc.find_proportion_shifts,
             case_id=case_id,
@@ -2544,7 +2576,9 @@ async def _run_stat_detector(
             inventory=inventory,
             inventory_total=inventory_total,
             field_overrides=field_overrides,
+            self_slices=cfg.stat_self_slices,
         )
+        _snapshot_slices(result, resolution)
         return result, resolution
 
     if detector == "interval_periodicity":
@@ -2555,6 +2589,12 @@ async def _run_stat_detector(
         resolution["interval_min_rate_ratio"] = (
             min_ratio if min_ratio is not None else cfg.stat_interval_min_rate_ratio
         )
+        if windows is None:
+            # Self frame (D18): the two floors that decide what counts as a
+            # beacon are server config, snapshotted so the run stays
+            # reproducible after a default changes.
+            resolution["pause_ratio"] = cfg.stat_interval_self_pause_ratio
+            resolution["min_span_seconds"] = cfg.stat_interval_self_min_span_seconds
         result = await run_scan(
             svc.find_interval_periodicity,
             case_id=case_id,
@@ -2578,6 +2618,8 @@ async def _run_stat_detector(
             inventory=inventory,
             inventory_total=inventory_total,
             field_overrides=field_overrides,
+            self_pause_ratio=cfg.stat_interval_self_pause_ratio,
+            self_min_span_seconds=cfg.stat_interval_self_min_span_seconds,
         )
         return result, resolution
 
@@ -2587,6 +2629,8 @@ async def _run_stat_detector(
         # units the generic min_ratio param can't express, so they stay
         # server config.
         resolution["drift_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_drift_fdr_q
+        if windows is None:
+            resolution["self_slices"] = cfg.stat_self_slices
         result = await run_scan(
             svc.find_distribution_drift,
             case_id=case_id,
@@ -2605,7 +2649,9 @@ async def _run_stat_detector(
             inventory=inventory,
             inventory_total=inventory_total,
             field_overrides=field_overrides,
+            self_slices=cfg.stat_self_slices,
         )
+        _snapshot_slices(result, resolution)
         return result, resolution
 
     result = await run_scan(
@@ -2917,6 +2963,7 @@ def _serialize_stat_result(result: Any) -> dict[str, Any]:
         "z_threshold": result.z_threshold,
         "warnings": list(getattr(result, "warnings", []) or []),
         "windows": getattr(result, "windows", None),
+        "slices": getattr(result, "slices", None),
         "total_findings": getattr(result, "total_findings", 0),
         # The totals contract (docs/ANOMALY_DETECTION.md): a count the runner
         # could not make exact is flagged, and a client renders it as "N+"
@@ -3108,6 +3155,8 @@ async def _persist_detector_run(
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
             "group_field": resolution.get("charset_group_field"),
+            # entropy: which statistic the band was learned over (D11).
+            "variant": resolution.get("entropy_variant"),
             # sequence_novelty / sequence_motif: gap bound (None = no bound).
             # Disjoint keys, coalesced on presence rather than truthiness: the
             # API floor is currently ge=1, but a persisted 0 must not fall
@@ -3120,6 +3169,15 @@ async def _persist_detector_run(
             "baseline_id": resolution.get("baseline_id"),
             "windows": resolution.get("windows"),
             "windows_hash": resolution.get("windows_hash"),
+            # Self frame (D18): the leave-one-out slices a slice-based run
+            # compared, and the resolved self-frame settings it ran under —
+            # None for every baseline-frame run and every other detector.
+            "slices": resolution.get("slices"),
+            "slices_hash": resolution.get("slices_hash"),
+            "self_slices": resolution.get("self_slices"),
+            "pause_ratio": resolution.get("pause_ratio"),
+            "min_span_seconds": resolution.get("min_span_seconds"),
+            "sequence_rarity_floor": resolution.get("sequence_rarity_floor"),
             "dispositions_hash": resolution.get("dispositions_hash"),
             "dispositions_count": resolution.get("dispositions_count"),
             # The timeline's field declaration for this method at run time
@@ -3248,6 +3306,15 @@ async def list_anomalies(
             "for no gap bound."
         ),
     ),
+    variant: Literal["shannon", "bigram"] | None = Query(
+        default=None,
+        description=(
+            "entropy only: the per-value statistic the band is learned over — "
+            "'shannon' (the value's own character entropy, the default) or "
+            "'bigram' (mean character-pair surprisal under a table learned from "
+            "the reference values; catches ordinary characters in an unusual order)."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3312,22 +3379,24 @@ async def list_anomalies(
     (random-looking or degenerate strings).
 
     **proportion_shift**: per (field, value), flags values whose *share* of
-    events differs significantly between the baseline window and a suspect
-    window (2×2 G-test, Benjamini-Hochberg FDR across the run, rate-ratio
-    effect floor). Temporal-only — requires baseline_id;
-    first-seen values are excluded (value_novelty owns those).
+    events differs significantly between two populations (2×2 G-test,
+    Benjamini-Hochberg FDR across the run, rate-ratio effect floor). With a
+    baseline_id: baseline window vs. each suspect window, first-seen values
+    excluded (value_novelty owns those). Without: each leave-one-out time
+    slice of the scope vs. the rest of it.
 
-    **interval_periodicity**: per (field, value), flags values whose arrival
-    *cadence* changed between the baseline and a suspect window — a
-    baseline-regular value that goes missing/accelerates (Poisson-rate test,
-    covers per-value silence) or a baseline-bursty value that becomes
-    suspiciously regular (Greenwood spacing test, beaconing). Temporal-only;
-    BH-FDR across the run.
+    **interval_periodicity**: per (field, value), flags arrival-*cadence*
+    signals. With a baseline_id: a baseline-regular value that goes
+    missing/accelerates (Poisson-rate test, covers per-value silence) or a
+    baseline-bursty value that becomes suspiciously regular (Greenwood
+    spacing test, beaconing). Without: whole-scope Greenwood beaconing with
+    pauses excluded, and a robust-Gamma silence test. BH-FDR across the run.
 
     **sequence_novelty**: per source, builds time-ordered n-grams of
-    `series_field` values and flags n-grams that occur in a suspect window
-    but never in the baseline window (AMiner EventSequenceDetector analog).
-    Temporal-only; surprise-scored against the window's own n-gram total.
+    `series_field` values and flags orderings that occur in a suspect window
+    but never in the baseline window (AMiner EventSequenceDetector analog),
+    or — without a baseline_id — the rarest orderings across the scope under
+    a rarity floor. Surprise-scored against the population's n-gram total.
 
     **sequence_motif**: per source, builds the same time-ordered n-grams of
     `series_field` values but surfaces the *recurring* ones — the latent
@@ -3336,11 +3405,12 @@ async def list_anomalies(
     `start`/`end` scope the mining frame.
 
     **value_distribution_drift**: per *field*, flags fields whose whole value
-    distribution changed between the baseline and a suspect window — a
-    Kolmogorov-Smirnov test for numeric fields, a k-category G-test (top-50
-    categories + __other__) for categorical ones. Temporal-only; one BH-FDR
-    pool across both branches, effect floors on KS D / total-variation
-    distance (server config).
+    distribution differs between two populations — a Kolmogorov-Smirnov test
+    for numeric fields, a k-category G-test (top-50 categories + __other__)
+    for categorical ones. With a baseline_id: baseline vs. each suspect
+    window; without: each leave-one-out time slice vs. the rest of the
+    scope. One BH-FDR pool across both branches, effect floors on KS D /
+    total-variation distance (server config).
     """
     source_ids, field_mappings, source_offsets = await _resolve_timeline_scope(case_id, timeline_id)
     result, resolution = await _run_stat_detector(
@@ -3362,6 +3432,7 @@ async def list_anomalies(
         end=end,
         group_field=group_field,
         max_gap_seconds=max_gap_seconds,
+        variant=variant,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3548,6 +3619,10 @@ class TagAnomaliesRequest(BaseModel):
             "consecutive events are more than this many seconds apart."
         ),
     )
+    variant: Literal["shannon", "bigram"] | None = Field(
+        default=None,
+        description="entropy only: 'shannon' (default) or 'bigram' — the statistic the band is learned over.",
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -3614,6 +3689,7 @@ async def tag_anomalies(
         end=body.end,
         group_field=body.group_field,
         max_gap_seconds=body.max_gap_seconds,
+        variant=body.variant,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3737,15 +3813,24 @@ async def tag_anomalies(
         elif isinstance(r, SequenceFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
-            where = _window_phrase(r.details) or "the detect window"
-            content = (
-                f"New sequence — {r.field}: {r.value}: this "
-                f"{r.details.get('n')}-event order never occurs among the baseline "
-                f"window's {r.details.get('baseline_ngram_total', 0):,} sequences; "
-                f"first appears in {where} at {r.first_seen} ({r.count} of "
-                f"{r.details.get('window_ngram_total', 0):,} window sequences; "
-                f"surprise {r.score:.2f})"
-            )
+            if r.details.get("method") == "rare-ngram":
+                content = (
+                    f"Rare sequence — {r.field}: {r.value}: this "
+                    f"{r.details.get('n')}-event order occurs only {r.count} time(s) among "
+                    f"the scope's {r.details.get('scope_ngram_total', 0):,} sequences "
+                    f"(rarity floor {r.details.get('rarity_floor')}); first at "
+                    f"{r.first_seen} (surprise {r.score:.2f})"
+                )
+            else:
+                where = _window_phrase(r.details) or "the detect window"
+                content = (
+                    f"New sequence — {r.field}: {r.value}: this "
+                    f"{r.details.get('n')}-event order never occurs among the baseline "
+                    f"window's {r.details.get('baseline_ngram_total', 0):,} sequences; "
+                    f"first appears in {where} at {r.first_seen} ({r.count} of "
+                    f"{r.details.get('window_ngram_total', 0):,} window sequences; "
+                    f"surprise {r.score:.2f})"
+                )
         elif isinstance(r, MotifFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
@@ -3769,7 +3854,29 @@ async def tag_anomalies(
                 if r.baseline_median_interval
                 else "regularly"
             )
-            if r.direction == "new_regularity":
+            if r.details.get("method") == "self-cadence":
+                d = r.details
+                if r.direction == "new_regularity":
+                    content = (
+                        f"Regular cadence — {r.field}={r.value!r}: arrives {cadence} "
+                        f"across the scope ({d.get('retained_intervals')} gaps retained, "
+                        f"{d.get('paused_intervals')} pauses excluded; CV {r.window_cv}) — "
+                        f"more even than chance allows; beaconing pattern "
+                        f"(Greenwood q={r.q_value:.3g})"
+                    )
+                else:
+                    kind = (
+                        "stops while its source keeps logging"
+                        if d.get("trailing")
+                        else "falls silent"
+                    )
+                    content = (
+                        f"Silence — {r.field}={r.value!r}: arrives {cadence} but {kind} "
+                        f"for {d.get('longest_gap_seconds'):g}s from {d.get('gap_start')} "
+                        f"(~{d.get('expected_arrivals_missed')} arrivals missed; "
+                        f"q={r.q_value:.3g})"
+                    )
+            elif r.direction == "new_regularity":
                 w_cadence = (
                     f"every ~{r.window_median_interval:g}s" if r.window_median_interval else ""
                 )
@@ -3799,7 +3906,15 @@ async def tag_anomalies(
             src_id = r.event.get("source_id", "") if r.event else ""
             where = _window_phrase(r.details) or "the suspect window"
             bl_pct = f"{r.baseline_rate * 100:.2g}%"
-            if r.count == 0:
+            if r.details.get("method") == "self-g-test":
+                where = _window_phrase(r.details, prefix="slice") or "the slice"
+                content = (
+                    f"Proportion shift — {r.field}={r.value!r}: share of events is "
+                    f"{r.window_rate * 100:.2g}% in {where} against {bl_pct} across the "
+                    f"rest of the timeline ({r.rate_ratio:.1f}×, {r.direction}; "
+                    f"G={r.g_statistic:.1f}, q={r.q_value:.3g})"
+                )
+            elif r.count == 0:
                 content = (
                     f"Proportion shift — {r.field}={r.value!r}: present "
                     f"{r.baseline_count}× in the {result.baseline_size:,}-event "
@@ -3816,12 +3931,19 @@ async def tag_anomalies(
         elif isinstance(r, DistributionDriftFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""
-            where = _window_phrase(r.details) or f"window {r.window_label!r}"
+            self_mode = r.details.get("method") == "self-drift"
+            where = (
+                _window_phrase(r.details, prefix="slice" if self_mode else "suspect window")
+                or f"window {r.window_label!r}"
+            )
+            if self_mode:
+                where = f"{where} against the rest of the timeline"
             if r.test == "ks":
+                ref_key = "rest_median" if self_mode else "baseline_median"
                 content = (
                     f"Distribution drift — {r.field}: numeric distribution "
                     f"shifted ({r.direction}) in {where}; median "
-                    f"{r.details.get('baseline_median')} → "
+                    f"{r.details.get(ref_key)} → "
                     f"{r.details.get('window_median')} "
                     f"(KS D={r.effect:.2f}, q={r.q_value:.3g})"
                 )

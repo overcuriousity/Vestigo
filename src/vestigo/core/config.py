@@ -179,6 +179,26 @@ class Settings(BaseSettings):
     # Cap on novel n-grams fetched per run (lowest suspect volume first —
     # rarest sequences are the detector's point); hitting it carries a warning.
     stat_sequence_max_candidates: int = 2000
+    # Self-frame rarity floor for event sequences (D18): an n-gram occurring
+    # at most this many times across the whole scope is a rare ordering. Its
+    # own setting rather than stat_rarity_floor because the unit is n-gram
+    # occurrences, not value occurrences — the charset floor is separate for
+    # the same reason.
+    stat_sequence_rarity_floor: int = Field(default=3, ge=1)
+    # ── Self frame for the slice-based detectors (D18) ──────────────────────
+    # How many equal-width time slices proportion_shift and
+    # value_distribution_drift cut the scope into when no baseline is declared;
+    # each slice is tested against its complement (leave-one-out). More slices
+    # resolve shorter bursts and multiply the BH pool; fewer are cheaper.
+    stat_self_slices: int = Field(default=24, ge=4, le=120)
+    # Self-frame interval cadence: a gap longer than this many medians is the
+    # beacon being off (host asleep, network down), excluded from the
+    # regularity statistic. Under random arrivals the median is ln2·mean, so the
+    # default cut at 6.93·mean discards e^-6.93 ≈ 0.1 % of gaps.
+    stat_interval_self_pause_ratio: float = Field(default=10.0, gt=1)
+    # Self-frame beaconing: the retained (non-pause) gaps must span at least
+    # this many seconds — a short evenly spaced retry loop is not a beacon.
+    stat_interval_self_min_span_seconds: float = Field(default=300.0, ge=0)
     # Sequence-motif detector: minimum occurrences before an n-gram counts as
     # a recurring motif. 2 would surface every coincidental repeat.
     stat_motif_min_support: int = Field(default=3, ge=2)

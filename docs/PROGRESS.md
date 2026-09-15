@@ -4,9 +4,116 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-12 (1.19.6; session 236 — the second review of PR #376: the one
-cache fill that should never 503, two tray phases, and scan settings an older ClickHouse
-refuses; plus the open dependabot PRs folded into the release).
+Last updated: 2026-09-15 (v1.19.7; session 238 — review findings on the D18/D19/D11
+branch: the self frame's complement, the per-slice scan budget, three disclosure gaps).
+
+## Session 238 — 2026-09-15: review of the D18/D19/D11 branch (PR #377)
+
+Five findings from a review of the branch, all fixed before merge. Two changed what the
+self frame reports; three closed gaps between what a run did and what it said it did.
+
+**The self frame's complement was the whole scope (the one that mattered).** Proportion
+shift's self mode already tested only the slices overlapping a value's `[first, last]`
+span, but it measured them against `scope_total − slice_total`. That divides a
+short-lived value's rate by the fraction of the timeline it lived through: a value present
+in 2 of 24 slices at a 10 % share in each has a ~0.8 % whole-scope complement share, a
+ratio of ~12×, and fires "up" in *both* slices of its own life — and so does every value
+whose life covers less than half the timeline. Churning identifiers (session ids, ephemeral
+hostnames, short-lived processes) are exactly this detector's target, so it was systematic,
+not an edge case, and it scaled with the candidate cap (2000 values × 15 fields). The
+complement is now drawn from the value's own active span.
+
+The first attempt at that also dropped values confined to a *single* slice, on the argument
+that they have no within-life complement and value novelty covers them. It does not:
+novelty's rarity floor is three occurrences, and the demo/test case for this frame is a
+500-event burst inside one hour — confined, not rare. `_find_proportion_shifts_self`'s own
+docstring had said so ("a one-slice burst would otherwise be uncovered"). So the two cases
+are split: 2+ slices measure against the active span, exactly 1 slice keeps the whole-scope
+complement and reads "up" against `rest_count = 0`, which is the finding. Findings now carry
+`value_active_slices`, `rest_frame` and `rest_slices`, because a rate ratio cannot be read
+without knowing which denominator produced it. `CACHE_VERSION` moves to 4 — this is the
+runner answering differently for identical inputs, which is what that constant is for.
+
+**Self-drift's numeric branch was unbounded.** It issues one whole-scope KS scan per
+(field, slice) — deliberately, since each KS state holds the whole field and K-in-one is K×
+memory. But that is `_MAX_AUTO_SCAN_FIELDS × stat_self_slices` full passes in one request:
+360 at the defaults, 1800 at `stat_self_slices`'s ceiling, and the analysis cache cannot
+help the *first* run on a timeline, which is the one that would time out. The eligible pairs
+now spend a `_MAX_SELF_KS_QUERIES` budget (60) through `_spend_ks_budget`, round-robin across
+fields — the same quota-with-backfill rule `_select_auto_scan_tokens` uses for the field cap,
+because a prefix truncation would scan the first fields exhaustively and report on the last
+ones without scanning them. A budgeted run loses slice resolution, never a whole field, and
+discloses the shortfall: an unrun slice is not evidence of nothing.
+
+**Three disclosure gaps.** `_small_slice_warning` counted only slices with
+`0 < t < 50`, so *empty* slices — tested by no runner, skipped by none either — were
+invisible; a timeline with one dense day and a sparse tail advertised 24 slices while four
+carried every test. `SelfSlices.bounds` returned a last-slice end up to `K−1` ms past the
+span (`width_ms` is rounded up), and that end goes into the hashed run snapshot and the
+Explorer's range highlight, so the record asserted a boundary past any event that exists; it
+is clamped now, with `covers()` keeping the unclamped edge for overlap arithmetic so a value
+first seen at the very last event still belongs to slice `K−1`. And `seedFromParams` seeded a
+stored `variant: "shannon"` verbatim although the form spells a choice's default `""`,
+handing the `<select>` a value no `<option>` carried — the browser then showed the first
+option while the form state said otherwise.
+
+Tests: `_spend_ks_budget`, `SelfSlices.bounds`/`covers` and `_small_slice_warning` are pure
+and unit-tested in `test_anomaly_stats.py`; the complement change is covered in
+`test_self_frame_clickhouse.py` against `late` (uniform across day 3, now silent) and `eve`
+(one-slice burst, still found). Frontend: `methodKnobSeed.test.ts`, including a
+registry-wide invariant that every seeded choice value is one the select can render.
+
+## Session 237 — 2026-09-14: a baseline never restricts a detector (D18), deterministic quantiles (D19), entropy bigrams (D11)
+
+Three Milestone 4 items on one branch, in the order the roadmap ranked them by truth of
+shipped claims. Design for D18 was approved in issue #366 and lands as `ANOMALY_DETECTION.md`
+§7–§10; the other two were spelled out in `ROADMAP.md`.
+
+**D19 first, because it changes existing findings.** Every detector quantile — the range and
+entropy fences that *gate* findings, the interval medians, the drift quantiles, the motif
+median — was plain `quantile`, a random-generator reservoir above 8192 values. It is now
+`quantileDeterministic` keyed on `cityHash64(event_id)` (or the distinct value where the
+population is one row per value). `quantileExact` was rejected on purpose: it holds every
+value in memory, which is the failure the scan-memory work just fixed on high-cardinality
+fields. A real-ClickHouse test runs each detector twice over 40k rows and compares details.
+
+**D18: the self frame.** Each of the four detectors dispatches to a private `_find_*_self`
+beside its temporal sibling; baseline-frame code is byte-for-byte unchanged.
+- *Slices* (`SelfSlices`): integer-millisecond boundaries over the effective span,
+  `least(K−1, intDiv(dateDiff(ms), width))`, payload and `config_hash` persisted as
+  `slices` / `slices_hash`. Proportion shift tests each in-span slice against its complement
+  (no first-seen exclusion — a one-slice burst has `rest_count = 0` and is the finding);
+  drift folds the top-50 categories by complement count, and runs one KS query per slice
+  that has both sides above `min_samples` — a count scan first, because
+  `kolmogorovSmirnovTest` throws on an empty side, and `assumeNotNull` on the argument,
+  because the plain aggregate over a Nullable column returns a Nullable named tuple the
+  driver cannot decode.
+- *Cadence*: two passes per field. Pass 1 collects per-value deterministic gap quartiles,
+  the longest internal gap with both ends, and first/last arrivals. Pass 2 binds each
+  candidate's pause threshold through `transform(val, …)` and aggregates the retained gaps;
+  a third pass joins per-(value, source) last arrivals to per-source last events for the
+  trailing gap. The silence null is a Gamma fitted from the robust CV and the median
+  (`_gamma_sf` extracted from `_chi2_sf` at a non-integer shape), Šidák over the value's
+  gaps. The fabricated test data first said "trailing" where I meant "internal" — the
+  heartbeat ended a day before its source did, and the detector was right.
+- *Sequences*: the existing n-gram assembly with one pseudo-window, a rarity floor, and an
+  exact case-wide recount on multi-source scopes.
+- The gate's `needs_windows` is gone: only the baseline frame without a baseline is
+  `needs_setup`; the self frame is gated on shape, and a one-instant span is the slice
+  methods' one structural impossibility. `CACHE_VERSION` 2 → 3, since the old
+  `insufficient_data` was cached under exactly the new key.
+- Frontend: `lib/finding-frame.ts` reads `details.method`; rows, verdicts, evidence figures
+  and the scope line branch on it. Whole-scope beaconing draws no figure — its claim is the
+  regularity, stated in the verdict. The wizard's `NEEDS_BASELINE` is deleted.
+
+**D11.** A `variant` knob (`shannon` | `bigram`), not a params key named `method`, since
+`method` names the analysis method everywhere else. The bigram table is learned from the
+reference population's distinct values in two spillable `GROUP BY` passes and bound into
+the scoring scans as parallel arrays via `transform` — a `Map` parameter does not bind
+through the driver — capped at 4096 pairs with a warning. The real-ClickHouse test is the
+headline case: a lowercase-latin DGA among English hostnames, missed by Shannon, top under
+bigram.
+
 
 ## Session 236 — 2026-09-12: the second review round, and the dependency bumps
 

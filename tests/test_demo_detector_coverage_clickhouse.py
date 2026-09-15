@@ -102,6 +102,38 @@ def test_windowed_detector_finds_something(demo, ch_store, method):
     assert _findings(result), f"{method} found nothing in the demo case"
 
 
+#: The four detectors that used to be baseline-only. Since D18 each has a self
+#: frame, and the demo's fabricated signals — the 300 s ± 8 s proxy beacon
+#: above all — must surface on a timeline nobody has baselined.
+_SELF_FRAME = {
+    "find_proportion_shifts": {"fields": ["attr:host"]},
+    "find_interval_periodicity": {"fields": ["attr:host"]},
+    "find_distribution_drift": {"fields": ["attr:bytes_out"]},
+    "find_sequence_novelty": {"series_field": "attr:computer_name"},
+}
+
+
+@pytest.mark.parametrize("method", sorted(_SELF_FRAME))
+def test_self_frame_of_a_formerly_baseline_only_detector_finds_something(demo, ch_store, method):
+    case_id, sources, _windows = demo
+    service = StatisticalAnomalyService(ch_store)
+    result = getattr(service, method)(case_id, sources, **_SELF_FRAME[method])
+    assert result.status == "ok", f"{method}: {result.status} {result.warnings}"
+    assert result.method.startswith(("self-", "rare-")), result.method
+    assert _findings(result), f"{method} self frame found nothing in the demo case"
+
+
+def test_self_cadence_surfaces_the_demo_beacon(demo, ch_store):
+    """The proxy beacon (300 s ± 8 s to one destination) is the demo's headline signal."""
+    case_id, sources, _windows = demo
+    service = StatisticalAnomalyService(ch_store)
+    result = service.find_interval_periodicity(case_id, sources, fields=["attr:host"], limit=100)
+    regular = [f for f in result.results if f.direction == "new_regularity"]
+    assert any(280 < (f.details.get("median_interval") or 0) < 320 for f in regular), [
+        (f.value, f.details.get("median_interval")) for f in regular
+    ]
+
+
 @pytest.mark.parametrize("method", _WINDOWLESS)
 def test_windowless_detector_finds_something(demo, ch_store, method):
     case_id, sources, _windows = demo
@@ -206,20 +238,9 @@ def test_gate_does_not_skip_a_method_the_demo_case_proves_applicable(demo, ch_st
     plans = {p.method: p for p in build_plan(inputs, cfg)}
 
     for method, plan in plans.items():
-        # The two-window methods legitimately need setup in the self frame —
-        # there is no second window to test against until an analyst declares
-        # one, and the two temporal-only methods return `insufficient_data`
-        # without that pair just as flatly as the explicit drift tests do.
-        # Every other method must be offered on data this file proves they
-        # find things in.
-        if method in {
-            "proportion_shift",
-            "value_distribution_drift",
-            "interval_periodicity",
-            "sequence_novelty",
-        }:
-            assert plan.status == "needs_setup", f"{method}: {plan.status} ({plan.reason})"
-            continue
+        # Every method must be offered on data this file proves they find
+        # things in — the self frame included, since D18 gave the four
+        # formerly baseline-only methods a reference of their own.
         assert plan.status == "applicable", (
             f"gate skipped {method} on the demo case ({plan.reason}: {plan.reason_facts}), "
             "but this file asserts that method finds something here"

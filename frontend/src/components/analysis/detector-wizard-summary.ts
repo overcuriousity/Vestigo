@@ -3,15 +3,7 @@
  * it can be tested without rendering: it is the one place the analyst reads
  * back what is about to be stored, so it has to say every part of it.
  */
-import type { MethodId, MethodMeta } from "./method-registry";
-
-/** Methods that compare a baseline window against suspect windows — no self frame. */
-export const NEEDS_BASELINE: ReadonlySet<MethodId> = new Set<MethodId>([
-  "proportion_shift",
-  "value_distribution_drift",
-  "interval_periodicity",
-  "sequence_novelty",
-]);
+import type { MethodMeta } from "./method-registry";
 
 function fieldsClause(params: Record<string, unknown>): string | null {
   const raw = params.fields;
@@ -42,6 +34,8 @@ export function summarize(
     if (v === undefined || v === null || v === "") continue;
     parts.push(`${knob.label.toLowerCase()} ${v}`);
   }
+  // Every method has both frames (D18): without a baseline the four
+  // comparison methods take their reference from the timeline itself.
   const scope =
     frame === "baseline"
       ? `comparing to baseline “${baselineName ?? "(unnamed)"}”`

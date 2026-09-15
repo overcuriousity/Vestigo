@@ -4,21 +4,19 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-09-02, v1.18.3):** three open issues — #307 (Milestone 10 G1), #345
-(Milestone 11, Hayabusa) and #346 (THOR scanner, a candidate second consumer of the
-Milestone 11 protocol; no design yet); added 2026-09-11: #366 (Milestone 4 D18). Phase 3 is complete and the queue is feature-shaped.
-Every item below was re-verified against the code on 2026-09-02; counts are from that day. **Milestone 10 — AI agent log
-investigation — is the 2.0 thrust and outranks everything below**; the numbered list orders
-the remaining 1.x work by payoff-per-effort:
+**State (verified 2026-09-02, v1.18.3; D11/D18/D19 landed 2026-09-14):** three open issues — #307
+(Milestone 10 G1), #345 (Milestone 11, Hayabusa) and #346 (THOR scanner, a candidate second
+consumer of the Milestone 11 protocol; no design yet). Phase 3 is complete and the queue is
+feature-shaped. Every item below was re-verified against the code on 2026-09-02; counts are
+from that day. **Milestone 10 — AI agent log investigation — is the 2.0 thrust and outranks
+everything below**; the numbered list orders the remaining 1.x work by payoff-per-effort:
 
-1. **D11** entropy bigram variant — closes a capability gap the docs used to overclaim;
-   truth of what we ship outranks new surface.
-2. **A12** local transform tools — no design round, no OPSEC gate.
-3. **D12** / **D13** / **D15** — cheap detectors reusing existing SQL machinery.
-4. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-5. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-6. **D10** / **D16** — heaviest lifts, last of the detector line.
-7. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
+1. **A12** local transform tools — no design round, no OPSEC gate.
+2. **D12** / **D13** / **D15** — cheap detectors reusing existing SQL machinery.
+3. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+4. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+5. **D10** / **D16** — heaviest lifts, last of the detector line.
+6. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
    Hayabusa engine half lives in `overcuriousity/hayabusa-processor`.
 
 Milestones 2–3 are polish, picked up opportunistically. Milestone 9 is additive work on
@@ -149,30 +147,6 @@ is each detector's contract, updated in the same commit as any detector change.
 Every item below is incomplete until the frontend half lands with it: a plain-language
 method explanation, the SQL/params visible on the finding, disposition + allowlist wiring.
 A detector whose reasoning an analyst cannot read does not count as shipped.
-
-**Truth of shipped claims (first):**
-
-- [ ] **D18 — A baseline never restricts a detector** ([#366](https://github.com/overcuriousity/Vestigo/issues/366),
-  design approved 2026-09-11, spec in the issue). `proportion_shift`,
-  `value_distribution_drift`, `interval_periodicity` and `sequence_novelty` return
-  `insufficient_data` without a baseline, so beaconing on an unbaselined timeline is
-  invisible. Add the self frame every other detector has: leave-one-out time slices for
-  shift/drift, whole-scope Greenwood beaconing (pauses excluded) and a robust-Gamma silence
-  test for cadence, a rarity floor for sequences. Baseline-frame semantics unchanged; gate,
-  wizard, finding copy, cache version and run snapshot (`slices_hash`) follow.
-- [ ] **D19 — Deterministic quantiles.** Numeric-range and entropy IQR fences, drift
-  quantiles, interval medians and motif cadence use plain ClickHouse `quantile*`, which
-  reservoir-samples with a random generator above 8192 values — the range and entropy
-  fences gate findings, so two runs over identical data can disagree. Switch to
-  `quantileDeterministic`/`quantileExact` with a determinism test; its own PR, since it
-  changes existing findings.
-- [ ] **D11 — Entropy: add the bigram variant.** The shipped detector measures per-value
-  Shannon entropy against a Tukey fence; AMiner's learns a character-**bigram** transition
-  table and flags low mean pair probability. Ours misses the case its docs advertise most
-  loudly: a lowercase-latin DGA domain among English hostnames has unremarkable Shannon
-  entropy. Expressible in SQL via `ngrams(val, 2)` into a frequency map learned from the
-  baseline window. Ship as a `method` on the existing detector (`shannon-iqr` | `bigram`),
-  not a fifteenth tool.
 
 **Low effort, high value:**
 

@@ -21,6 +21,12 @@
 import type { AnomalyFinding } from "@/api/types";
 import type { MethodResult } from "@/api/analysis";
 import { isTemplateRow } from "@/api/analysis";
+import {
+  detailNumber,
+  detailString,
+  findingMode,
+  restFrameLabel,
+} from "@/lib/finding-frame";
 import { anomalyFieldLabel as fieldLabel, shortId, truncate } from "@/lib/format";
 
 export interface Verdict {
@@ -79,12 +85,39 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         tail: `, ${f.direction} the band [${f.lower.toFixed(2)}, ${f.upper.toFixed(2)}] learned for ${fieldLabel(f.field)}.`,
       };
     case "proportion_shift":
+      if (findingMode(f) === "self-g-test") {
+        return {
+          lead: `This value's share of ${fieldLabel(f.field)} is`,
+          highlight: `${pct(f.window_rate)} in ${detailString(f.details, "window_label") ?? "this slice"}`,
+          tail: `against ${pct(f.baseline_rate)} across ${restFrameLabel(f.details)} (${f.direction}, ${f.rate_ratio.toFixed(1)}×, q=${f.q_value.toExponential(1)}).`,
+        };
+      }
       return {
         lead: `This value's share of ${fieldLabel(f.field)} went from`,
         highlight: `${pct(f.baseline_rate)} to ${pct(f.window_rate)}`,
         tail: `between the baseline and suspect windows (${f.direction}, ${f.rate_ratio.toFixed(1)}×, q=${f.q_value.toExponential(1)}).`,
       };
     case "interval_periodicity":
+      if (findingMode(f) === "self-cadence") {
+        const median = detailNumber(f.details, "median_interval");
+        const medianText = median === null ? "" : `, median gap ${median.toFixed(1)}s`;
+        if (f.direction === "new_regularity") {
+          const paused = detailNumber(f.details, "paused_intervals") ?? 0;
+          return {
+            lead: "Arrivals for this value are",
+            highlight: "more regular than chance allows",
+            tail: `— ${f.count} occurrences across the timeline${medianText}, coefficient of variation ${f.window_cv?.toFixed(2) ?? "—"} over the retained gaps (${paused} pause${paused === 1 ? "" : "s"} excluded; q=${f.q_value.toExponential(1)}).`,
+          };
+        }
+        const longest = detailNumber(f.details, "longest_gap_seconds");
+        const missed = detailNumber(f.details, "expected_arrivals_missed");
+        const trailing = f.details["trailing"] === true;
+        return {
+          lead: "This value's arrivals",
+          highlight: longest === null ? "fall silent" : `fall silent for ${longest.toFixed(0)}s`,
+          tail: `${trailing ? "while its source keeps logging" : "in the middle of its run"}${medianText}${missed === null ? "" : `, about ${missed.toFixed(0)} arrivals missed`} (q=${f.q_value.toExponential(1)}).`,
+        };
+      }
       return f.direction === "new_regularity"
         ? {
             lead: "Arrivals for this value became",
@@ -97,12 +130,28 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
             tail: `— ${f.baseline_count} occurrences in the baseline window against ${f.count} in the suspect one (q=${f.q_value.toExponential(1)}).`,
           };
     case "sequence_novelty":
+      if (findingMode(f) === "rare-ngram") {
+        const total = detailNumber(f.details, "scope_ngram_total");
+        const floor = detailNumber(f.details, "rarity_floor");
+        return {
+          lead: `This ordering of ${fieldLabel(f.field)} values occurs only`,
+          highlight: `${f.count} time${f.count === 1 ? "" : "s"}`,
+          tail: `among ${total?.toLocaleString() ?? "the"} sequences across the timeline${floor === null ? "" : ` (rarity floor ${floor})`}.`,
+        };
+      }
       return {
         lead: `This ordering of ${fieldLabel(f.field)} values`,
         highlight: "never occurs in the baseline",
         tail: `, and occurs ${f.count} time${f.count === 1 ? "" : "s"} in the suspect window.`,
       };
     case "value_distribution_drift":
+      if (findingMode(f) === "self-drift") {
+        return {
+          lead: `The whole value mix of ${fieldLabel(f.field)} in ${f.window_label}`,
+          highlight: `differs from the rest of the timeline (${f.direction})`,
+          tail: `— ${f.test === "ks" ? "Kolmogorov–Smirnov" : "G-test"} over ${f.window_n} slice and ${f.baseline_n} other events, q=${f.q_value.toExponential(1)}.`,
+        };
+      }
       return {
         lead: `The whole value mix of ${fieldLabel(f.field)}`,
         highlight: `differs between the two windows (${f.direction})`,

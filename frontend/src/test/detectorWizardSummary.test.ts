@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { METHODS_BY_ID } from "@/components/analysis/method-registry";
-import { NEEDS_BASELINE, summarize } from "@/components/analysis/detector-wizard-summary";
+import { summarize } from "@/components/analysis/detector-wizard-summary";
 
 describe("detector wizard summary", () => {
   it("names the method, the fields and the scope in one sentence", () => {
@@ -21,12 +21,11 @@ describe("detector wizard summary", () => {
     ).toBe("Frequency per attr:host, |z| ≥ 3, across the whole timeline. Full scan.");
   });
 
-  it("knows which methods cannot run without a baseline", () => {
-    expect([...NEEDS_BASELINE].sort()).toEqual([
-      "interval_periodicity",
-      "proportion_shift",
-      "sequence_novelty",
-      "value_distribution_drift",
-    ]);
+  it("reads the comparison methods on the self frame like any other method", () => {
+    // A baseline never restricts a detector (D18): proportion shift without
+    // one takes its reference from the timeline itself.
+    expect(summarize(METHODS_BY_ID.proportion_shift, { fdr_q: 0.01 }, "self", null)).toBe(
+      "Proportion shift over fields Vestigo picks, fdr q 0.01, across the whole timeline. Full scan.",
+    );
   });
 });

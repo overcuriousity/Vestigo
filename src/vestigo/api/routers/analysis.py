@@ -67,7 +67,7 @@ def _validate_scope_args(frame: str, baseline_id: str | None) -> None:
 
     The runners key off ``baseline_id`` alone while ``frame`` is what the
     response — and therefore every verdict's recorded provenance — is stamped
-    with. ``frame=self`` plus an id would run the two-window comparison and
+    with. ``frame=self`` plus an id would run the baseline comparison and
     label the result "all events scanned"; ``frame=baseline`` without one would
     do the reverse, and ``build_plan`` would disagree with the runner about the
     same request. Neither is recoverable after the fact, so neither is guessed.
@@ -317,7 +317,10 @@ class _NumericRangeParams(_FieldsParams):
 
 
 class _EntropyParams(_FieldsParams):
-    pass
+    #: Which per-value statistic the band is learned over (D11): the value's
+    #: own Shannon entropy, or its mean character-bigram surprisal under a
+    #: table learned from the reference population.
+    variant: Literal["shannon", "bigram"] = "shannon"
 
 
 class _CharsetParams(_FieldsParams):
@@ -704,6 +707,7 @@ async def get_analysis_findings(
             ngram_size=kwargs.get("ngram_size"),
             group_field=kwargs.get("group_field"),
             max_gap_seconds=kwargs.get("max_gap_seconds"),
+            variant=kwargs.get("variant"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

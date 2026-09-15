@@ -1,9 +1,10 @@
 /**
  * DetectorWizard — choose, configure, confirm.
  *
- * The gate is advice: a not_applicable card is still selectable. The
- * comparison methods cannot proceed without a baseline. Apply stores exactly
- * the params the knob form reported plus the chosen scope.
+ * The gate is advice: a not_applicable card is still selectable. Every method
+ * starts on the self frame; the baseline frame cannot proceed until a
+ * definition is picked. Apply stores exactly the params the knob form reported
+ * plus the chosen scope.
  */
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -116,7 +117,7 @@ describe("DetectorWizard", () => {
     expect(screen.getByTestId("wizard-card-charset")).toHaveTextContent("Cannot apply");
     expect(screen.getByTestId("wizard-card-charset")).toHaveTextContent("fields above ceiling 0");
     expect(screen.getByTestId("wizard-card-interval_periodicity")).toHaveTextContent(
-      "Needs a baseline",
+      "Needs a baseline in this frame",
     );
   });
 
@@ -151,9 +152,14 @@ describe("DetectorWizard", () => {
     );
   });
 
-  it("requires a baseline for the comparison methods and offers the timeline's definitions", async () => {
+  it("offers both frames to the comparison methods and needs a definition only on the baseline one", async () => {
+    // A baseline never restricts a detector (D18): proportion shift starts on
+    // the self frame like every other method and can proceed at once.
     renderWizard();
     fireEvent.click(screen.getByTestId("wizard-card-proportion_shift"));
+    await waitFor(() => expect(screen.getByTestId("wizard-next")).not.toBeDisabled());
+    expect(screen.getByTestId("wizard-frame-self")).toBeChecked();
+    fireEvent.click(screen.getByTestId("wizard-frame-baseline"));
     expect(screen.getByTestId("wizard-next")).toBeDisabled();
     await waitFor(() => expect(screen.getByTestId("wizard-baseline")).toHaveTextContent("week before"));
     fireEvent.change(screen.getByTestId("wizard-baseline"), { target: { value: "b1" } });

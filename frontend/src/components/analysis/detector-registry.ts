@@ -67,7 +67,7 @@ export const DETECTORS: DetectorMeta[] = [
   { id: "interval", detector: "interval_periodicity", icon: Timer, label: "Interval cadence", hint: "Broken heartbeats and new beaconing", category: "volume", scoreUnit: "−log₁₀ p" },
   { id: "drift", detector: "value_distribution_drift", icon: Replace, label: "Distribution drift", hint: "Whole-field value-mix changes between windows", category: "volume", scoreUnit: "−log₁₀ p" },
   { id: "order", detector: "timestamp_order", icon: Rewind, label: "Timestamp order", hint: "Timestamps running backwards", category: "volume", scoreUnit: "s skew" },
-  { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen event orderings (n-grams)", category: "sequences", scoreUnit: "surprise" },
+  { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen or rare event orderings (n-grams)", category: "sequences", scoreUnit: "surprise" },
 ];
 
 export const DETECTORS_BY_ID = Object.fromEntries(DETECTORS.map((d) => [d.id, d])) as Record<

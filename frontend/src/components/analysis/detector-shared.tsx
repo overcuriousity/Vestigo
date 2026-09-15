@@ -21,6 +21,7 @@ import { cn } from "@/lib/cn";
 import { tagResultLabel } from "@/lib/format";
 import { InfoHint } from "@/components/ui/InfoHint";
 import { GLOSSARY } from "@/lib/glossary";
+import { isTemporalMode } from "@/lib/finding-frame";
 
 /**
  * Shown in place of a detector's findings when there are none.
@@ -182,7 +183,7 @@ export function DetectorStatusLine({
         <span className="flex items-center gap-1">
           <span className="capitalize">{data.method}</span>
           <InfoHint
-            content={data.method.startsWith("temporal") ? GLOSSARY.temporal : GLOSSARY.selfBaseline}
+            content={isTemporalMode(data.method) ? GLOSSARY.temporal : GLOSSARY.selfBaseline}
             size={11}
           />
         </span>

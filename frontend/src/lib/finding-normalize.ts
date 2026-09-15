@@ -11,6 +11,7 @@
  */
 import type { DetectorId, DetectorMeta } from "@/components/analysis/detector-registry";
 import type { AnomalyFinding } from "@/api/types";
+import { detailNumber, detailString, findingMode } from "@/lib/finding-frame";
 import { anomalyFieldLabel as fieldLabel, shortId, truncate } from "@/lib/format";
 
 export interface FeedItem {
@@ -82,27 +83,50 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       break;
     case "proportion_shift":
       title = pair(f.field, f.value);
-      subtitle = `share ${(f.baseline_rate * 100).toFixed(2)}% → ${(f.window_rate * 100).toFixed(2)}% (${f.direction}, q=${f.q_value.toExponential(1)})`;
-      ts = ts ?? f.first_seen;
-      break;
-    case "interval_periodicity":
-      title = pair(f.field, f.value);
       subtitle =
-        f.direction === "new_regularity"
-          ? `new regularity (beaconing), CV ${f.window_cv ?? "—"} (q=${f.q_value.toExponential(1)})`
-          : `cadence ${f.direction}, ×${f.count} in window (q=${f.q_value.toExponential(1)})`;
+        findingMode(f) === "self-g-test"
+          ? `share ${(f.window_rate * 100).toFixed(2)}% in ${detailString(f.details, "window_label") ?? "slice"} vs ${(f.baseline_rate * 100).toFixed(2)}% elsewhere (${f.direction}, q=${f.q_value.toExponential(1)})`
+          : `share ${(f.baseline_rate * 100).toFixed(2)}% → ${(f.window_rate * 100).toFixed(2)}% (${f.direction}, q=${f.q_value.toExponential(1)})`;
       ts = ts ?? f.first_seen;
       break;
+    case "interval_periodicity": {
+      title = pair(f.field, f.value);
+      if (findingMode(f) === "self-cadence") {
+        const longest = detailNumber(f.details, "longest_gap_seconds");
+        const median = detailNumber(f.details, "median_interval");
+        subtitle =
+          f.direction === "new_regularity"
+            ? `regular cadence (beaconing), CV ${f.window_cv ?? "—"}, ${detailNumber(f.details, "paused_intervals") ?? 0} pauses excluded (q=${f.q_value.toExponential(1)})`
+            : `silent for ${longest === null ? "—" : `${longest.toFixed(0)}s`} vs median gap ${median === null ? "—" : `${median.toFixed(1)}s`} (q=${f.q_value.toExponential(1)})`;
+      } else {
+        subtitle =
+          f.direction === "new_regularity"
+            ? `new regularity (beaconing), CV ${f.window_cv ?? "—"} (q=${f.q_value.toExponential(1)})`
+            : `cadence ${f.direction}, ×${f.count} in window (q=${f.q_value.toExponential(1)})`;
+      }
+      ts = ts ?? f.first_seen;
+      break;
+    }
     case "sequence_novelty":
       title = `${fieldLabel(f.field)}: ${truncate(f.value, 70)}`;
-      subtitle = `never in baseline · ×${f.count} in ${String(f.details["window_label"] ?? "the suspect window")}`;
+      subtitle =
+        findingMode(f) === "rare-ngram"
+          ? `rare ordering · ×${f.count} across the timeline`
+          : `never in baseline · ×${f.count} in ${String(f.details["window_label"] ?? "the suspect window")}`;
       ts = ts ?? f.first_seen;
       break;
-    case "value_distribution_drift":
+    case "value_distribution_drift": {
       title = `${fieldLabel(f.field)} distribution drift`;
-      subtitle = `${f.test === "ks" ? "KS" : "G-test"} ${f.direction} in ${f.window_label} (q=${f.q_value.toExponential(1)})`;
+      // A run predating the window label stamp would otherwise render
+      // "in undefined"; the details carry the same label where it exists.
+      const where = f.window_label || detailString(f.details, "window_label") || "the suspect window";
+      subtitle =
+        findingMode(f) === "self-drift"
+          ? `${f.test === "ks" ? "KS" : "G-test"} ${f.direction} in ${where} vs the rest (q=${f.q_value.toExponential(1)})`
+          : `${f.test === "ks" ? "KS" : "G-test"} ${f.direction} in ${where} (q=${f.q_value.toExponential(1)})`;
       ts = ts ?? f.first_seen;
       break;
+    }
     case "sequence_motif":
       // Not part of the sweep (mined from Tools -> Explore) — handled for
       // exhaustiveness so the union stays covered if that ever changes.

@@ -189,7 +189,7 @@ small-context local models.
 | `propose_story_block` | core | Propose adding a block to a story; conversation-bound only, analyst must confirm. |
 | `semantic_search` | | Events similar to free text (embeddings-gated: absent when embeddings are unconfigured). |
 | `similar_events` | | Events similar to an existing event (embeddings-gated: absent when embeddings are unconfigured). |
-| `list_baselines` | | Saved baseline definitions — unlocks the temporal-only detectors. |
+| `list_baselines` | | Saved baseline definitions — a baseline sharpens the windowed detectors; none is required to run one. |
 | `list_dispositions` | | Analyst verdicts on anomaly findings. |
 | `list_saved_views` | | The analyst's saved filter views. |
 | `list_stories` | | The case's stories (the analyst's report documents). |
@@ -710,6 +710,11 @@ a whole model request carrying this entire list again. A real turn spent six of
 them guessing `content`'s shape, and a case with no stories could not be given
 a report at all. One prevented retry pays the 872 back roughly fifty times.
 Prose that does not remove a retry still does not belong in a schema.
+
+`run_anomaly_detector`'s `variant` knob (2026-09-14, D11) and the note that every
+detector runs without a baseline (D18) took it to **43,891 over 35 tools**, ceiling
+unchanged — the first draft landed at 44,197 and the rule was applied: the tool's
+docstring was rewritten compact (−306 chars net) rather than the ceiling moved.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

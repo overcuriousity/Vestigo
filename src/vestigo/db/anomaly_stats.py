@@ -102,10 +102,13 @@ already-ingested data.
     findings carry ``direction`` ("up"/"down"), and a value that vanishes
     from a suspect window entirely is a maximal "down" (its rate ratio uses
     Haldane–Anscombe +0.5 smoothing; the test itself always uses raw counts).
-    Temporal-only (``method="g-test"``): a share can only "shift" between two
-    populations, so there is no self-baseline mode. First-seen values
-    (``baseline_cnt = 0``) are excluded by construction — temporal
-    value_novelty owns those. Score = the G statistic.
+    Two frames: *baseline* (``method="g-test"``) compares the baseline
+    window with each suspect window, first-seen values (``baseline_cnt = 0``)
+    excluded by construction — temporal value_novelty owns those; *self*
+    (``method="self-g-test"``, D18) cuts the scope into leave-one-out time
+    slices (:class:`SelfSlices`) and tests each slice's share against the
+    rest of the scope, inside the value's own active span. Score = the G
+    statistic.
 
 **interval_periodicity** (``detector="interval_periodicity"``)
     Per (field, value), test whether the value's *arrival cadence* changed
@@ -139,12 +142,14 @@ already-ingested data.
 
     The CV band between the regular ceiling and the irregular floor is a
     deliberate dead band — values there are ambiguous and get no test. All
-    tests in a run share one Benjamini–Hochberg FDR pool. Temporal-only
-    (``method="cadence"``): cadence can only change between two populations.
-    First-seen values (``baseline_cnt = 0``) are excluded by construction —
-    temporal value_novelty owns those. Score = ``-log10(p)`` (unlike
-    proportion_shift's raw G: two different statistics must rank on a common
-    scale).
+    tests in a run share one Benjamini–Hochberg FDR pool. In the baseline
+    frame (``method="cadence"``) first-seen values (``baseline_cnt = 0``) are
+    excluded by construction — temporal value_novelty owns those. The *self*
+    frame (``method="self-cadence"``, D18) judges each value over the whole
+    scope: Greenwood beaconing over its gaps with pauses excluded, and a
+    robust-Gamma silence test over its longest internal or trailing gap.
+    Score = ``-log10(p)`` (unlike proportion_shift's raw G: two different
+    statistics must rank on a common scale).
 
 **value_distribution_drift** (``detector="value_distribution_drift"``)
     Per field, test whether the field's *whole value distribution* changed
@@ -169,8 +174,9 @@ already-ingested data.
     All tests in a run — both branches, every (field × suspect window) —
     share one Benjamini–Hochberg FDR pool. Sides with fewer than
     ``min_samples`` field-bearing events are skipped (excluded from the
-    pool, warned). Temporal-only (``method="drift"``): a distribution can
-    only drift between two populations. Findings are per *field* (the
+    pool, warned). Two frames: *baseline* (``method="drift"``) against the
+    baseline window; *self* (``method="self-drift"``, D18) each leave-one-out
+    time slice against the rest of the scope. Findings are per *field* (the
     allowlist key is ``(field, "*")``); the representative event is the most
     extreme window value in the drifted direction (numeric) or the first
     window occurrence of the most-shifted category (categorical). Score =
@@ -257,6 +263,54 @@ _RECOMMENDER_MAX_ATTR_KEYS = 50
 # highest-coverage recommended fields, since recommend_novelty_fields already
 # sorts by (recommended, -coverage).
 _MAX_AUTO_SCAN_FIELDS = 15
+
+# Self-drift's numeric branch is the one place a detector issues a whole-scope
+# scan per (field, *slice*) rather than per field: each KS state holds the
+# whole field, so folding K slices into one query is K x memory, and the
+# cheaper trade is K x time (see _find_distribution_drift_self). Unbounded
+# that is _MAX_AUTO_SCAN_FIELDS x stat_self_slices full passes in one
+# request — 360 at the defaults, 1800 with stat_self_slices at its ceiling —
+# and the analysis cache cannot help the first run on a timeline, which is
+# the one that would time out. This budget bounds it at four times the
+# module's ordinary per-detector scan count. It is spent round-robin across
+# fields, the same quota-with-backfill rule _select_auto_scan_tokens uses for
+# the field cap: a prefix truncation would give the first fields every slice
+# and the last fields none, and any pair the budget does not reach is
+# disclosed in warnings.
+_MAX_SELF_KS_QUERIES = 60
+
+
+def _spend_ks_budget(eligible: Sequence[Sequence[int]], budget: int) -> list[tuple[int, int]]:
+    """Pick ``budget`` (field, slice) pairs, round-robin over the fields.
+
+    *eligible* is one ascending list of slice indices per field. Every field
+    yields its earliest eligible slice before any field yields a second, so a
+    budgeted run narrows each field's slice resolution instead of covering
+    the first fields fully and dropping the last — the same
+    quota-with-backfill rule :func:`_select_auto_scan_tokens` applies to the
+    field cap, and for the same reason: a prefix truncation would report on a
+    field it never scanned. A field with fewer eligible slices than its share
+    simply runs out and the others backfill the slack.
+
+    Returns the pairs in field-major order, so a budgeted run executes and
+    reports in the order an unbudgeted one would.
+    """
+    picked: list[tuple[int, int]] = []
+    cursors = [0] * len(eligible)
+    while len(picked) < budget:
+        advanced = False
+        for fi, slices in enumerate(eligible):
+            if len(picked) >= budget:
+                break
+            if cursors[fi] < len(slices):
+                picked.append((fi, slices[cursors[fi]]))
+                cursors[fi] += 1
+                advanced = True
+        if not advanced:
+            break
+    picked.sort()
+    return picked
+
 
 # Of the auto-scan cap, the number of slots reserved for identifier-kind fields
 # (URLs, hashes, user agents) in the charset/entropy detectors so a source with
@@ -353,6 +407,16 @@ _MIN_ENTROPY_BASELINE = 20
 # degenerate and would swamp the band with false lows.
 _MIN_ENTROPY_VALUE_LEN = 6
 
+#: Entropy's bigram variant (D11): the learned character-pair table is bound
+#: into the scoring scans as two parallel arrays, capped at this many pairs
+#: (most frequent first). Pairs beyond the cap score as unseen; the run says
+#: so. 4096 pairs is a few hundred kilobytes of bound parameter, and a
+#: latin-alphabet field has under 3000 distinct pairs in the first place.
+_BIGRAM_TABLE_MAX = 4096
+
+#: The two statistics the entropy detector can measure a value with.
+ENTROPY_VARIANTS = ("shannon", "bigram")
+
 # Distribution-drift categorical branch: number of named categories in the
 # G-test vector (top by baseline count, deterministic tie-break on value);
 # everything else folds into one exact __other__ bucket. A statistical-shape
@@ -378,6 +442,12 @@ _MIN_FREQUENCY_STD = 0.5
 # result: per-window surprise denominators over tiny samples are unstable.
 # Warning only — findings are never silently suppressed.
 _MIN_WINDOW_EVENTS = 50
+
+#: Self-frame interval cadence: floor on the robust CV (IQR / (1.349·median)).
+#: Second-resolution logs of a clockwork job have IQR = 0, which would make
+#: any gap above the median "impossible" under the Gamma null; the floor keeps
+#: the null model's tail finite. Documented in docs/ANOMALY_DETECTION.md §8.
+_SELF_RCV_FLOOR = 0.05
 
 # Minimum inter-occurrence deltas before the Greenwood spacing statistic's
 # normal approximation is trusted for a motif's regularity (same floor as the
@@ -453,13 +523,116 @@ class AnalysisWindows:
 
     def config_hash(self) -> str:
         """SHA-256 over the canonical window payload — the run's window identity."""
-        import hashlib
-        import json
+        return _canonical_hash(self.payload())
 
-        canonical = json.dumps(
-            self.payload(), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+
+def _canonical_hash(payload: dict[str, Any]) -> str:
+    """SHA-256 over a canonical JSON rendering — the identity of a run input."""
+    import hashlib
+    import json
+
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SelfSlices:
+    """The self frame's leave-one-out time slices (D18).
+
+    Without a baseline, ``proportion_shift`` and ``value_distribution_drift``
+    cut the scope's effective-timestamp span into ``k`` equal slices and test
+    each slice against its complement — every scope event outside it. Slice
+    ``i`` covers ``[span_start + i·width_ms, span_start + (i+1)·width_ms)``
+    with ``width_ms = ceil(span_ms / k)``; the SQL index is
+    ``least(k−1, intDiv(dateDiff('millisecond', span_start, ts), width_ms))``,
+    so the last event lands in slice ``k−1``. Boundaries are integer
+    arithmetic over immutable data, so a rerun reproduces them exactly, and
+    ``config_hash`` is the run's slice identity the way ``windows_hash`` is a
+    baseline run's.
+    """
+
+    span_start: datetime
+    span_end: datetime
+    k: int
+    width_ms: int
+
+    @classmethod
+    def build(cls, span_start: datetime, span_end: datetime, k: int) -> SelfSlices | None:
+        """Slices over ``[span_start, span_end]``; ``None`` when the span is one instant."""
+        start, end = ensure_utc(span_start), ensure_utc(span_end)
+        span_ms = int(round((end - start).total_seconds() * 1000))
+        if span_ms <= 0 or k < 1:
+            return None
+        return cls(span_start=start, span_end=end, k=k, width_ms=math.ceil(span_ms / k))
+
+    def bounds(self, i: int) -> tuple[datetime, datetime]:
+        """Slice ``i``'s reported interval, right-clamped to the scope's span.
+
+        ``width_ms`` is rounded up, so ``span_start + k·width_ms`` can overrun
+        ``span_end`` by up to ``k−1`` ms. That end is what the run snapshot
+        records and what the Explorer highlights, so an unclamped value would
+        assert a boundary past any event that exists. The SQL index is
+        unaffected (it already clamps with ``least(k−1, …)``), and the overlap
+        arithmetic uses :meth:`covers`, which reads the unclamped edge.
+        """
+        start = self.span_start + timedelta(milliseconds=i * self.width_ms)
+        end = start + timedelta(milliseconds=self.width_ms)
+        return start, min(end, self.span_end) if i == self.k - 1 else end
+
+    def covers(self, i: int, first: datetime, last: datetime) -> bool:
+        """Does slice ``i`` overlap the closed interval ``[first, last]``?
+
+        Slices are half-open on the right so an instant belongs to exactly one
+        of them — except the last, which is closed, since the SQL index folds
+        everything at or past its start into ``k−1``. Comparing against the
+        clamped end from :meth:`bounds` would drop a value first seen at the
+        very last event, whose ``first`` equals ``span_end``.
+        """
+        start = self.span_start + timedelta(milliseconds=i * self.width_ms)
+        end = start + timedelta(milliseconds=self.width_ms)
+        if start > ensure_utc(last):
+            return False
+        return i == self.k - 1 or end > ensure_utc(first)
+
+    def label(self, i: int) -> str:
+        width = len(str(self.k))
+        return f"slice {i + 1:0{width}d}/{self.k}"
+
+    def index_sql(self, ts_expr: str, params: dict[str, Any]) -> str:
+        """Bind the span start and width into *params*; return the slice-index expression."""
+        params["ss"] = to_clickhouse_utc(self.span_start, precise=True)
+        params["sw"] = int(self.width_ms)
+        # No explicit timezone on the bound literal: the events column is
+        # stored naive-UTC and read in the server's zone, and every window
+        # predicate compares it against a naive literal read the same way. A
+        # literal pinned to 'UTC' would drift by the server offset wherever the
+        # server zone is not UTC.
+        return (
+            f"least({self.k - 1}, toInt32(intDiv(greatest(toInt64(0), "
+            f"dateDiff('millisecond', toDateTime64({{ss:String}}, 3), {ts_expr})), "
+            f"{{sw:Int64}})))"
         )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def payload(self) -> dict[str, Any]:
+        """Serializable snapshot (DetectorRun params / result echo shape)."""
+        return {
+            "span_start": self.span_start.isoformat(),
+            "span_end": self.span_end.isoformat(),
+            "k": self.k,
+            "width_ms": self.width_ms,
+            "slices": [
+                {
+                    "label": self.label(i),
+                    "start": self.bounds(i)[0].isoformat(),
+                    "end": self.bounds(i)[1].isoformat(),
+                }
+                for i in range(self.k)
+            ],
+        }
+
+    def config_hash(self) -> str:
+        """SHA-256 over the canonical slice payload — the run's slice identity."""
+        return _canonical_hash(self.payload())
 
 
 def _inexact_note(reasons: Sequence[str]) -> str | None:
@@ -594,16 +767,28 @@ def _chi2_sf(x: float, df: int) -> float:
     """P(χ²_df ≥ x) via the regularized upper incomplete gamma Q(df/2, x/2).
 
     ``df == 1`` delegates to the exact erfc closed form (:func:`_chi2_sf_df1`);
-    ``df ≥ 2`` uses the standard gammp/gammq split (series for ``x/2 < df/2+1``,
-    modified-Lentz continued fraction otherwise) on ``math.lgamma`` — same
-    no-scipy constraint as every other statistic in this module.
+    ``df ≥ 2`` is :func:`_gamma_sf` at shape ``df/2``.
     """
     if x <= 0:
         return 1.0
     if df == 1:
         return _chi2_sf_df1(x)
-    a = df / 2.0
-    y = x / 2.0
+    return _gamma_sf(df / 2.0, x / 2.0)
+
+
+def _gamma_sf(a: float, y: float) -> float:
+    """Regularized upper incomplete gamma ``Q(a, y)`` — P(Gamma(shape a, scale 1) ≥ y).
+
+    The standard gammp/gammq split (series for ``y < a + 1``, modified-Lentz
+    continued fraction otherwise) on ``math.lgamma`` — no scipy, per the
+    airgapped-by-default constraint. Shape ``a`` is any positive real: the
+    chi² survival function is the integer-df caller, and the self-frame
+    silence test fits a Gamma with a non-integer shape.
+    """
+    if y <= 0:
+        return 1.0
+    if a <= 0:
+        return 0.0
     log_prefactor = -y + a * math.log(y) - math.lgamma(a)
     if y < a + 1.0:
         # Series for the lower regularized gamma P(a, y); Q = 1 - P.
@@ -639,6 +824,47 @@ def _chi2_sf(x: float, df: int) -> float:
         if abs(delta - 1.0) < 1e-15:
             break
     return max(0.0, min(1.0, h * math.exp(log_prefactor)))
+
+
+def _sidak_p(sf: float, k: int) -> float:
+    """Šidák-adjusted p for the extreme of ``k`` comparisons with per-test tail *sf*.
+
+    ``p = 1 − (1 − sf)^k``, computed as ``-expm1(k · log1p(-sf))`` so a tiny
+    *sf* survives the arithmetic instead of rounding ``1 − sf`` to 1.
+    """
+    if sf >= 1.0:
+        return 1.0
+    if sf <= 0.0 or k <= 0:
+        return 0.0
+    return max(0.0, min(1.0, -math.expm1(k * math.log1p(-sf))))
+
+
+def _robust_cv(q1: float, median: float, q3: float) -> float | None:
+    """``IQR / (1.349 · median)``, clamped below at :data:`_SELF_RCV_FLOOR`.
+
+    IQR/1.349 estimates σ and the median estimates the mean, so the result sits
+    on the CV scale (exponential gaps: ≈ 1.17 where CV = 1) and the temporal
+    CV thresholds apply unchanged. Robust so the silence being tested cannot
+    inflate the statistic the way a moment-based CV would. ``None`` when the
+    median is not positive.
+    """
+    if median is None or median <= 0:
+        return None
+    return max(_SELF_RCV_FLOOR, (q3 - q1) / (1.349 * median))
+
+
+def _gamma_from_median(rcv: float, median: float) -> tuple[float, float]:
+    """``(shape, scale)`` of a Gamma fitted robustly to inter-arrival gaps.
+
+    Shape ``α = 1/rcv²`` (shape 1 is the memoryless Poisson case; a
+    metronomic heartbeat has a large α and a light tail); scale θ from the
+    median via the Wilson–Hilferty approximation
+    ``median ≈ α·θ·(1 − 1/(9α))³``.
+    """
+    alpha = 1.0 / (rcv * rcv)
+    wh = max(1.0 - 1.0 / (9.0 * alpha), 1e-6)
+    theta = median / (alpha * wh**3)
+    return alpha, theta
 
 
 def _ks_pair(value: Any) -> tuple[float, float]:
@@ -1085,6 +1311,9 @@ class StatAnomalyResult:
     # Serialized AnalysisWindows.payload() snapshot for temporal runs driven
     # by explicit windows; None for self-baseline runs.
     windows: dict[str, Any] | None = None
+    # Serialized SelfSlices.payload() for the slice-based self-frame modes
+    # (``self-g-test``, ``self-drift``); None everywhere else.
+    slices: dict[str, Any] | None = None
     # Number of findings that survived suppression *before* the ``limit`` cap,
     # so the UI can say "showing N of M" instead of silently truncating.
     # For the frequency detector this is counted before the per-event
@@ -1152,6 +1381,24 @@ class LogTemplatesResult:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _qdet(level: str, expr: str, determinator: str) -> str:
+    """``quantileDeterministic(level)(expr, determinator)`` — a reproducible quantile.
+
+    Plain ``quantile`` reservoir-samples with a random generator once a
+    population exceeds 8192 values, so two runs over identical data can
+    disagree — and the numeric-range and entropy fences it fed *gate
+    findings* (D19). ``quantileDeterministic`` keeps the same bounded
+    reservoir but decides membership by hashing *determinator*, so the
+    answer is a pure function of the data: identical rows, identical
+    quantile. The determinator must be distinct per row, never the value
+    itself — copies of one value sharing a hash would enter or leave the
+    sample together. ``quantileExact`` was deliberately not chosen: it holds
+    every value in memory, which is the failure shape the heavy-scan
+    machinery exists to avoid on high-cardinality fields.
+    """
+    return f"quantileDeterministic({level})({expr}, {determinator})"
 
 
 def _col_expr(
@@ -1871,6 +2118,7 @@ class StatisticalAnomalyService:
         total_findings: int | None = None,
         total_findings_exact: bool = True,
         total_findings_note: str | None = None,
+        slices: SelfSlices | None = None,
     ) -> StatAnomalyResult:
         """Rank, suppress, cap and hydrate a per-field detector's findings.
 
@@ -1888,6 +2136,7 @@ class StatisticalAnomalyService:
         post-suppression length is the total.
         """
         windows_payload = windows.payload() if windows is not None else None
+        slices_payload = slices.payload() if slices is not None else None
         if evaluated_fields == 0:
             return StatAnomalyResult(
                 status="insufficient_data",
@@ -1896,6 +2145,7 @@ class StatisticalAnomalyService:
                 baseline_size=total_events,
                 warnings=warnings or [],
                 windows=windows_payload,
+                slices=slices_payload,
             )
         findings = _apply_allowlist(findings, allowlist)
         if exclude_event_ids:
@@ -1913,6 +2163,7 @@ class StatisticalAnomalyService:
             results=results,
             warnings=warnings or [],
             windows=windows_payload,
+            slices=slices_payload,
             total_findings=len(findings) if total_findings is None else total_findings,
             total_findings_exact=total_findings_exact,
             total_findings_note=total_findings_note,
@@ -2192,6 +2443,102 @@ class StatisticalAnomalyService:
             return 0, [0] * len(windows.suspects)
         row = rows[0]
         return int(row[0]), [int(v) for v in row[1:]]
+
+    # ------------------------------------------------------------------
+    # Self frame (D18): scope span, leave-one-out slices, slice totals
+    # ------------------------------------------------------------------
+
+    def _self_slices(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        k: int,
+        source_offsets: dict[str, int] | None,
+    ) -> SelfSlices | None:
+        """The scope's leave-one-out slices, or ``None`` when it holds one instant.
+
+        One cheap aggregate over the effective (offset-corrected) timestamp;
+        sentinel rows are excluded centrally by ``query_timestamp_range``.
+        """
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        min_ts, max_ts = query_timestamp_range(
+            self.ch.client,
+            self.ch.database,
+            "case_id = {cid:String} AND has({src:Array(String)}, source_id)",
+            params,
+            ts_expr=effective_ts_sql(source_offsets),
+        )
+        if min_ts is None or max_ts is None:
+            return None
+        return SelfSlices.build(min_ts, max_ts, k)
+
+    def _slice_totals(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        slices: SelfSlices,
+        source_offsets: dict[str, int] | None,
+    ) -> list[int]:
+        """Event count per slice over the whole scope (sentinel rows excluded)."""
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        eff = effective_ts_sql(source_offsets)
+        sql = f"""
+            SELECT {slices.index_sql(eff, params)} AS slice, count() AS n
+            FROM {self.ch.database}.events
+            WHERE case_id = {{cid:String}}
+              AND has({{src:Array(String)}}, source_id)
+              AND {VESTIGO_NOT_SENTINEL_SQL}
+            GROUP BY slice
+            {heavy_scan_settings()}
+        """
+        totals = [0] * slices.k
+        for row in self.ch.client.query(sql, parameters=params).result_rows:
+            idx = int(row[0])
+            if 0 <= idx < slices.k:
+                totals[idx] = int(row[1])
+        return totals
+
+    @staticmethod
+    def _slice_details(slices: SelfSlices, i: int) -> dict[str, Any]:
+        start, end = slices.bounds(i)
+        return {
+            "window_label": slices.label(i),
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "slice_index": i,
+            "slice_count": slices.k,
+        }
+
+    @staticmethod
+    def _small_slice_warning(slices: SelfSlices, totals: list[int]) -> list[str]:
+        """Disclose slices too thin to test, and slices holding nothing at all.
+
+        Empty slices get their own sentence rather than being folded into the
+        thin ones. A slice with no events is not tested by any self-frame
+        runner and records no ``skipped_by_field`` entry either, so on a
+        timeline with one dense day and a sparse tail the run advertises
+        ``k`` slices while a handful carry every test. Counting them here is
+        the only place that gap is visible.
+        """
+        empty = sum(1 for t in totals if t <= 0)
+        small = sum(1 for t in totals if 0 < t < _MIN_WINDOW_EVENTS)
+        notes: list[str] = []
+        if empty:
+            notes.append(
+                f"{empty} of {slices.k} slices hold no events and were not tested — the "
+                f"scope's events are clustered in {slices.k - empty} of its "
+                f"{slices.k} equal time slices; a coarser slice count "
+                f"(stat_self_slices) spreads them more evenly."
+            )
+        if small:
+            notes.append(
+                f"{small} of {slices.k} slices hold fewer than {_MIN_WINDOW_EVENTS} events — "
+                f"tests over samples that small are unstable; a coarser slice count "
+                f"(stat_self_slices) trades resolution for stability."
+            )
+        return notes
 
     @gated_heavy_scan
     def find_value_novelty(
@@ -3212,7 +3559,7 @@ class StatisticalAnomalyService:
             bind_offset_params(source_offsets, stat_params)
             col = _col_expr(field_token, stat_params, field_mappings)
             num_src = (
-                f"SELECT toFloat64OrNull({col}) AS num, timestamp{off_src}"
+                f"SELECT toFloat64OrNull({col}) AS num, timestamp, event_id{off_src}"
                 f" FROM {db}.events"
                 f" WHERE case_id = {{cid:String}}"
                 f" AND has({{src:Array(String)}}, source_id)"
@@ -3220,7 +3567,8 @@ class StatisticalAnomalyService:
             )
             if windows is None:
                 stat_sql = (
-                    f"SELECT quantile(0.25)(num) AS q1, quantile(0.75)(num) AS q3, count() AS n"
+                    f"SELECT {_qdet('0.25', 'num', 'cityHash64(toString(event_id))')} AS q1,"
+                    f" {_qdet('0.75', 'num', 'cityHash64(toString(event_id))')} AS q3, count() AS n"
                     f" FROM ({num_src}) WHERE num IS NOT NULL {heavy_scan_settings()}"
                 )
             else:
@@ -4325,6 +4673,60 @@ class StatisticalAnomalyService:
     # Value entropy outliers
     # ------------------------------------------------------------------
 
+    def _learn_bigram_table(
+        self, distinct_src: str, params: dict[str, Any], field_token: str
+    ) -> tuple[dict[str, Any], dict[str, Any], str | None] | None:
+        """Learn a field's character-bigram surprisal table from *distinct_src*.
+
+        Two ``GROUP BY`` passes over the reference population's distinct
+        values (both spill under the heavy cap): the pair totals ``N`` (pairs)
+        and ``V`` (distinct pairs), then the ``_BIGRAM_TABLE_MAX`` most
+        frequent pairs. Returns the bound parameters for the scoring scans —
+        ``bgk``/``bgv`` (pair → surprisal, bits) and ``bgu`` (the unseen
+        surprisal) — the ``details`` extras, and a cap warning or ``None``.
+        ``None`` altogether when the population has no pairs at all.
+        """
+        pairs_src = f"SELECT arrayJoin(ngrams(val, 2)) AS bg FROM ({distinct_src})"
+        totals_sql = f"""
+            SELECT sum(c) AS n_pairs, count() AS v
+            FROM (SELECT bg, count() AS c FROM ({pairs_src}) GROUP BY bg)
+            {heavy_scan_settings()}
+        """
+        rows = self.ch.client.query(totals_sql, parameters=params).result_rows
+        if not rows or rows[0][0] is None or int(rows[0][0]) == 0:
+            return None
+        n_pairs, v_distinct = int(rows[0][0]), int(rows[0][1])
+        table_sql = f"""
+            SELECT bg, count() AS c
+            FROM ({pairs_src})
+            GROUP BY bg
+            ORDER BY c DESC, bg ASC
+            LIMIT {{bgcap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        trows = self.ch.client.query(
+            table_sql, parameters={**params, "bgcap": _BIGRAM_TABLE_MAX}
+        ).result_rows
+        denom = float(n_pairs + v_distinct + 1)
+        keys = [str(r[0]) for r in trows]
+        vals = [-math.log2((int(r[1]) + 1) / denom) for r in trows]
+        unseen = -math.log2(1.0 / denom)
+        note = None
+        if v_distinct > len(keys):
+            note = (
+                f"Field {field_token!r}: the bigram table was capped at {len(keys)} of "
+                f"{v_distinct} distinct pairs — pairs beyond the cap score as unseen, "
+                f"which overstates the surprisal of values built from them."
+            )
+        bound = {"bgk": keys, "bgv": vals, "bgu": unseen}
+        extra = {
+            "bigram_pairs": n_pairs,
+            "bigram_distinct": v_distinct,
+            "bigram_table": len(keys),
+            "bigram_unseen_surprisal": round(unseen, 4),
+        }
+        return bound, extra, note
+
     @gated_heavy_scan
     def find_entropy_outliers(
         self,
@@ -4341,30 +4743,40 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         field_overrides: dict[str, bool] | None = None,
+        variant: str = "shannon",
     ) -> StatAnomalyResult:
-        """Return values whose Shannon character entropy falls outside a learned band.
+        """Return values whose character statistic falls outside a learned band.
 
-        Per field, compute the character entropy (bits) of each *distinct
-        value* and compare it against the field's baseline entropy
-        distribution via a Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``.
-        Values above the band look random (DGA domains, encoded payloads,
-        keys); values below it look degenerate (padding, repeated-character
-        stuffing). Entropy is a property of the characters, never of what the
-        value means.
+        Per field, compute one statistic per *distinct value* and compare it
+        against the field's baseline distribution of that statistic via a
+        Tukey fence ``[q1 − 1.5·IQR, q3 + 1.5·IQR]``. Two *variants*, chosen
+        by *variant*:
 
-        Inspired by AMiner's ``EntropyDetector`` but **not the same statistic**:
-        AMiner scores values against a learned character-*bigram* transition
-        table, which catches ordinary-alphabet-unusual-order values (DGA
-        domains); per-value Shannon entropy does not. See
-        ``docs/ANOMALY_DETECTION.md`` §6 and roadmap D11.
+        * ``shannon`` — the value's own Shannon character entropy (bits).
+          Values above the band look random (encoded payloads, keys); below
+          it, degenerate (padding, repeated-character stuffing). Blind to a
+          value built from ordinary characters in an unusual *order*.
+        * ``bigram`` (D11, AMiner ``EntropyDetector``'s actual statistic) —
+          the mean *surprisal* of the value's character bigrams, in bits per
+          pair, under a pair-frequency table learned from the reference
+          population's distinct values with add-one smoothing:
+          ``s(ab) = −log2((c(ab) + 1) / (N + V + 1))``, unseen pairs
+          ``−log2(1 / (N + V + 1))``. A lowercase-latin DGA domain among
+          English hostnames has unremarkable Shannon entropy and a high mean
+          surprisal — its pairs are ones English never makes. Above the band
+          = unusual pairs; below = a value made only of the field's most
+          common pairs. The table is bound into the scans as arrays capped at
+          ``_BIGRAM_TABLE_MAX`` most frequent pairs (cap → warning).
 
-        Two modes: *self-baseline* (``method="iqr"``) computes the fence over
-        the whole corpus's per-distinct-value entropies (unlike an exact
-        min/max, quartiles are not degenerate over their own population);
-        *temporal* (``method="temporal-iqr"``, *windows* provided) learns the
-        fence from the baseline window and flags only suspect-window values,
-        attributed to the window they appear in; events outside every window
-        are ignored.
+        Both are properties of the characters, never of what the value
+        means. Two modes: *self-baseline* (``method="iqr"`` / ``"bigram-iqr"``)
+        computes the fence over the whole corpus's per-distinct-value
+        statistics (unlike an exact min/max, quartiles are not degenerate over
+        their own population); *temporal* (``method="temporal-iqr"`` /
+        ``"temporal-bigram-iqr"``, *windows* provided) learns the fence — and
+        the bigram table — from the baseline window and flags only
+        suspect-window values, attributed to the window they appear in;
+        events outside every window are ignored.
 
         Entropies are weighted per distinct value, not per row — one hot
         value repeated millions of times cannot drag the band toward itself.
@@ -4373,10 +4785,13 @@ class StatisticalAnomalyService:
         ``_MIN_ENTROPY_BASELINE`` qualifying baseline values is skipped; when
         every scanned field skips the status is ``insufficient_data``.
         """
+        if variant not in ENTROPY_VARIANTS:
+            raise ValueError(f"variant must be one of {', '.join(ENTROPY_VARIANTS)}")
         self.ch.init_schema()
         db = self.ch.database
         base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
-        method = "iqr" if windows is None else "temporal-iqr"
+        stat = "iqr" if variant == "shannon" else "bigram-iqr"
+        method = stat if windows is None else f"temporal-{stat}"
         eff = effective_ts_sql(source_offsets)
 
         total_events = self._count_events(case_id, source_ids)
@@ -4420,8 +4835,18 @@ class StatisticalAnomalyService:
         n_total = 0
         inexact: list[str] = []
 
+        # The per-value statistic, as SQL over `val`. The bigram table (D11)
+        # rides in as two bound arrays + the unseen surprisal, filled per
+        # field below; the Shannon form binds nothing.
+        shannon_expr = "arrayReduce('entropy', extractAll(val, '(?s).'))"
+        bigram_expr = (
+            "arrayAvg(arrayMap(g -> transform(g, {bgk:Array(String)}, {bgv:Array(Float64)},"
+            " {bgu:Float64}), ngrams(val, 2)))"
+        )
+        ent_expr = shannon_expr if variant == "shannon" else bigram_expr
+
         for field_token in scan_fields:
-            # --- Learn the entropy band from the baseline. ---
+            # --- Learn the band from the baseline. ---
             stat_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
             col = _col_expr(field_token, stat_params, field_mappings)
             baseline_clause = ""
@@ -4430,11 +4855,7 @@ class StatisticalAnomalyService:
                 # The baseline window is a bounded range, so the year-2299
                 # sentinel can never fall inside it.
                 baseline_clause = f" AND {stat_bp}"
-            stat_sql = f"""
-                SELECT quantile(0.25)(ent) AS q1, quantile(0.75)(ent) AS q3, count() AS n
-                FROM (
-                    SELECT arrayReduce('entropy', extractAll(val, '(?s).')) AS ent
-                    FROM (
+            distinct_src = f"""
                         SELECT {col} AS val
                         FROM {db}.events
                         WHERE case_id = {{cid:String}}
@@ -4442,7 +4863,24 @@ class StatisticalAnomalyService:
                           AND {col} != ''
                           AND lengthUTF8({col}) >= {{minlen:UInt32}}{baseline_clause}
                         GROUP BY val
-                    )
+            """
+            bigram_params: dict[str, Any] = {}
+            bigram_extra: dict[str, Any] = {}
+            if variant == "bigram":
+                learned = self._learn_bigram_table(distinct_src, stat_params, field_token)
+                if learned is None:
+                    continue
+                bigram_params, bigram_extra, table_note = learned
+                if table_note:
+                    override_notes.append(table_note)
+                stat_params.update(bigram_params)
+            stat_sql = f"""
+                SELECT {_qdet("0.25", "ent", "cityHash64(val)")} AS q1,
+                       {_qdet("0.75", "ent", "cityHash64(val)")} AS q3,
+                       count() AS n
+                FROM (
+                    SELECT val, {ent_expr} AS ent
+                    FROM ({distinct_src})
                 )
                 {heavy_scan_settings()}
             """
@@ -4467,7 +4905,11 @@ class StatisticalAnomalyService:
             evaluated_fields += 1
 
             # --- Flag values whose entropy falls outside the band. ---
-            viol_params: dict[str, Any] = {**base_params, "minlen": _MIN_ENTROPY_VALUE_LEN}
+            viol_params: dict[str, Any] = {
+                **base_params,
+                **bigram_params,
+                "minlen": _MIN_ENTROPY_VALUE_LEN,
+            }
             bind_offset_params(source_offsets, viol_params)
             vcol = _col_expr(field_token, viol_params, field_mappings)
             viol_params["lo"] = lower
@@ -4499,7 +4941,7 @@ class StatisticalAnomalyService:
                 FROM (
                     SELECT
                         val,
-                        arrayReduce('entropy', extractAll(val, '(?s).')) AS ent,
+                        {ent_expr} AS ent,
                         cnt, first_seen, evt_id{win_idx_group}
                     FROM (
                         SELECT
@@ -4549,9 +4991,11 @@ class StatisticalAnomalyService:
                 details: dict[str, Any] = {
                     "detector": "entropy",
                     "method": method,
+                    "variant": variant,
                     "field": field_token,
                     "value": str(val),
                     "entropy": round(ent_f, 4),
+                    **bigram_extra,
                     "count": int(cnt),
                     "lower": round(lower, 4),
                     "upper": round(upper, 4),
@@ -4629,6 +5073,7 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         field_overrides: dict[str, bool] | None = None,
+        self_slices: int = 24,
     ) -> StatAnomalyResult:
         """Return values whose share of events shifted between baseline and suspect windows.
 
@@ -4643,26 +5088,38 @@ class StatisticalAnomalyService:
         Haldane–Anscombe +0.5 smoothing; the test itself uses raw counts, and
         its representative event is the value's last baseline occurrence).
 
-        Temporal-only: without *windows* the result is ``insufficient_data``
-        — a share can only shift between two populations. First-seen values
-        (``baseline_cnt = 0``) are excluded by construction; temporal
-        value_novelty owns those. The per-field candidate set is capped at
-        *max_candidates_per_field* rows (highest total volume first); hitting
-        the cap understates the FDR pool for that field, which is surfaced as
-        a warning rather than silently accepted. Score = the G statistic.
+        Two frames. *Baseline* (``method="g-test"``, *windows* given): the
+        share is compared between the baseline window and each suspect
+        window; first-seen values (``baseline_cnt = 0``) are excluded by
+        construction — temporal value_novelty owns those. *Self*
+        (``method="self-g-test"``, no *windows*): the scope is cut into
+        leave-one-out time slices and each value's share in a slice is
+        tested against its share in the rest of the scope — see
+        :meth:`_find_proportion_shifts_self`. The per-field candidate set is
+        capped at *max_candidates_per_field* rows (highest total volume
+        first); hitting the cap understates the FDR pool for that field,
+        which is surfaced as a warning rather than silently accepted.
+        Score = the G statistic.
         """
-        method = "g-test"
         if windows is None:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector="proportion_shift",
-                method=method,
-                baseline_size=0,
-                warnings=[
-                    "proportion_shift is temporal-only — select or create a baseline "
-                    "definition (baseline + suspect windows)."
-                ],
+            return self._find_proportion_shifts_self(
+                case_id,
+                source_ids,
+                fields=fields,
+                limit=limit,
+                fdr_q=fdr_q,
+                min_ratio=min_ratio,
+                max_candidates_per_field=max_candidates_per_field,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                source_offsets=source_offsets,
+                field_overrides=field_overrides,
+                self_slices=self_slices,
             )
+        method = "g-test"
 
         self.ch.init_schema()
         db = self.ch.database
@@ -4871,6 +5328,301 @@ class StatisticalAnomalyService:
             windows=windows,
         )
 
+    def _find_proportion_shifts_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        fields: list[str] | None,
+        limit: int,
+        fdr_q: float,
+        min_ratio: float,
+        max_candidates_per_field: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        inventory: list[tuple[str, int, int]] | None,
+        inventory_total: int | None,
+        source_offsets: dict[str, int] | None,
+        field_overrides: dict[str, bool] | None,
+        self_slices: int,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_proportion_shifts` (``method="self-g-test"``).
+
+        The scope is cut into *self_slices* leave-one-out time slices
+        (:class:`SelfSlices`); per (field, value, slice) a 2×2 G-test compares
+        the value's share of the slice against its share of the **complement**.
+        Test, BH pool, ``min_ratio`` floor and the Haldane +0.5 display ratio
+        are the temporal ones. Two rules differ from the baseline frame:
+
+        * **Active-span rule.** Only the slices overlapping the value's own
+          ``[first, last]`` arrival span are tested, *and they are also the
+          only slices the complement is drawn from* — frequency's self mode
+          bounds its zero-fill the same way. Both halves matter. Testing
+          in-span only stops a value that starts or ends mid-timeline from
+          producing a wall of ``down`` findings outside its life; measuring
+          against an in-span complement stops the mirror-image error, where a
+          whole-scope denominator divides a short-lived value's rate by the
+          fraction of the timeline it lived through and manufactures ``up``
+          findings across every slice of its own life. Both directions are
+          tested inside the span.
+        * **No first-seen exclusion.** A value confined to a single slice has
+          no within-life complement to restrict to, so it keeps the
+          whole-scope one and reads ``up`` against a ``rest_count`` of 0 —
+          "this value exists in exactly one slice" is the finding, and it is
+          the one-hour burst the frame was built for.
+          :meth:`find_value_novelty` does not cover it (its rarity floor is
+          three occurrences; a 500-event burst is confined, not rare).
+
+        ``details`` carries the slice as ``window_*`` plus ``rest_*`` for the
+        in-span complement (``rest_slices`` counts the slices it spans) and
+        never a ``baseline_*`` key.
+        """
+        method = "self-g-test"
+        detector = "proportion_shift"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+        slices = self._self_slices(case_id, source_ids, self_slices, source_offsets)
+        if slices is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=total_events,
+                warnings=["The scope holds a single timestamp, so it cannot be sliced."],
+            )
+        slice_totals = self._slice_totals(case_id, source_ids, slices, source_offsets)
+        scope_total = sum(slice_totals)
+        run_warnings = self._small_slice_warning(slices, slice_totals)
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        # Phase 1: per (field, value) whole-scope + per-slice counts, one scan
+        # per field. Same volume-first candidate cap as the baseline frame.
+        # cand = (field, value, total, first_ts, last_ts, last_evt, [(cnt, first, evt)])
+        candidates: list[tuple[str, str, int, Any, Any, Any, list[tuple[int, Any, Any]]]] = []
+        evaluated_fields = 0
+        k = slices.k
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            slice_expr = slices.index_sql(eff, params)
+            params["cap"] = max_candidates_per_field
+            s_blocks = ",\n                    ".join(
+                f"countIf(slice = {i}) AS s{i}_cnt,"
+                f" minIf(ts, slice = {i}) AS s{i}_first,"
+                f" toString(argMinIf(event_id, ts, slice = {i})) AS s{i}_evt"
+                for i in range(k)
+            )
+            sql = f"""
+                SELECT
+                    val,
+                    count() AS total,
+                    min(ts) AS first_ts,
+                    max(ts) AS last_ts,
+                    toString(argMax(event_id, ts)) AS last_evt,
+                    {s_blocks}
+                FROM (
+                    SELECT {col} AS val, {eff} AS ts, event_id, {slice_expr} AS slice
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                )
+                GROUP BY val
+                ORDER BY total DESC, val ASC
+                LIMIT {{cap:UInt32}}
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_fields += 1
+            if len(rows) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — the FDR correction covers only the "
+                    f"{max_candidates_per_field} highest-volume values; treat marginal "
+                    f"q-values for this field as exploratory."
+                )
+            for row in rows:
+                val = row[0]
+                if not val:
+                    continue
+                per_slice = [
+                    (int(row[5 + i * 3]), row[6 + i * 3], row[7 + i * 3]) for i in range(k)
+                ]
+                candidates.append(
+                    (field_token, str(val), int(row[1]), row[2], row[3], row[4], per_slice)
+                )
+
+        # Phase 2: one G-test per (candidate, in-span non-empty slice), pooled
+        # into a single BH-FDR correction for the run.
+        tests: list[tuple[int, int, float, float, int]] = []
+        span_slices: dict[int, int] = {}  # candidate index -> slices its life spans
+        rest_frames: dict[int, tuple[str, int]] = {}  # candidate -> (frame, slices in it)
+        nonempty_slices = sum(1 for t in slice_totals if t > 0)
+        for ci, (_, _, total, first_ts, last_ts, _, per_slice) in enumerate(candidates):
+            # The complement is the value's *own lifetime* minus this slice, not
+            # the whole scope. A value that exists in 2 of 24 slices has no
+            # presence in the other 22 by definition, so a whole-scope
+            # denominator divides its rate by the fraction of the timeline it
+            # lived through — a value alive for a twelfth of the scope clears
+            # any min_ratio up to 12x on arithmetic alone, and fires "up" in
+            # every slice of its own life. Churning identifiers (session ids,
+            # ephemeral hostnames, short-lived processes) are exactly the fields
+            # this detector is pointed at, so that was a systematic false
+            # positive rather than an edge case. Restricting the denominator to
+            # the active span asks the question the frame means: given that this
+            # value existed at all, was this slice unusual for it?
+            in_span = [
+                j for j in range(k) if slice_totals[j] > 0 and slices.covers(j, first_ts, last_ts)
+            ]
+            # A value confined to a single slice is the other case, and it is
+            # not the same question. It has no within-life complement at all,
+            # so there is nothing to restrict the denominator to — and "this
+            # value exists in exactly one slice of the timeline" is itself the
+            # finding the self frame was built to report (the one-hour burst).
+            # find_value_novelty does not cover it: its rarity floor is three
+            # occurrences, and a 500-event burst is not rare, just confined.
+            # So that case keeps the whole-scope complement, where reading
+            # "up" against a rest_count of 0 says exactly the right thing.
+            span_total = sum(slice_totals[j] for j in in_span) if len(in_span) > 1 else scope_total
+            span_slices[ci] = len(in_span)
+            rest_frames[ci] = (
+                ("active-span", len(in_span) - 1)
+                if len(in_span) > 1
+                else ("whole-scope", nonempty_slices - 1)
+            )
+            for i in in_span:
+                n_slice = slice_totals[i]
+                c = per_slice[i][0]
+                # Every occurrence lies in [first_ts, last_ts], so every one of
+                # them falls in an in-span slice: the scope-wide `total - c` is
+                # already the in-span complement count.
+                a = total - c
+                n_rest = span_total - n_slice
+                if n_rest <= 0:
+                    continue
+                g = _g_statistic(a, n_rest - a, c, n_slice - c)
+                tests.append((ci, i, g, _chi2_sf_df1(g), n_rest))
+        qvals = _bh_qvalues([t[3] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: FDR + effect floor, build findings.
+        findings: list[ShiftFinding] = []
+        for (ci, i, g, p, n_rest), q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            field_token, val, total, first_ts, last_ts, last_evt, per_slice = candidates[ci]
+            c, s_first, s_evt = per_slice[i]
+            n_slice = slice_totals[i]
+            a = total - c
+            # Haldane–Anscombe +0.5 for the *displayed* ratio only, on
+            # whichever side is empty; the test used the raw counts.
+            rate_rest = a / n_rest if a > 0 else 0.5 / n_rest
+            rate_w = c / n_slice if c > 0 else 0.5 / n_slice
+            ratio = rate_w / rate_rest
+            if 1.0 / min_ratio < ratio < min_ratio:
+                continue
+            direction = "up" if rate_w > rate_rest else "down"
+            first_seen_str = _present_ts(s_first) if c > 0 else None
+            evt_id = s_evt if c > 0 else last_evt
+            evt_id_str = str(evt_id) if evt_id else None
+            details: dict[str, Any] = {
+                "detector": detector,
+                "method": method,
+                "field": field_token,
+                "value": val,
+                **self._slice_details(slices, i),
+                "rest_count": a,
+                "rest_total": n_rest,
+                "rest_rate": round(a / n_rest, 6),
+                # Which complement this finding was measured against, and how
+                # much of the timeline it covers. An analyst reading a rate
+                # ratio needs to know whether the denominator was the value's
+                # own lifetime or the whole scope; the two answer different
+                # questions and only one of them is on any given finding.
+                "value_active_slices": span_slices[ci],
+                "rest_frame": rest_frames[ci][0],
+                "rest_slices": rest_frames[ci][1],
+                "count": c,
+                "window_total_events": n_slice,
+                "window_rate": round(c / n_slice, 6),
+                "rate_ratio": round(ratio, 4),
+                "direction": direction,
+                "g_statistic": round(g, 4),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "min_ratio": min_ratio,
+                "value_first_seen": _present_ts(first_ts),
+                "value_last_seen": _present_ts(last_ts),
+                "allowlist_field": field_token,
+                "allowlist_value": val,
+            }
+            findings.append(
+                ShiftFinding(
+                    field=field_token,
+                    value=val,
+                    count=c,
+                    baseline_count=a,
+                    baseline_rate=round(a / n_rest, 6),
+                    window_rate=round(c / n_slice, 6),
+                    rate_ratio=round(ratio, 4),
+                    direction=direction,
+                    g_statistic=round(g, 4),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=round(g, 4),
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen_str),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=scope_total,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            slices=slices,
+        )
+
     # ------------------------------------------------------------------
     # Interval periodicity (cadence)
     # ------------------------------------------------------------------
@@ -4899,6 +5651,8 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         field_overrides: dict[str, bool] | None = None,
+        self_pause_ratio: float = 10.0,
+        self_min_span_seconds: float = 300.0,
     ) -> StatAnomalyResult:
         """Return values whose arrival cadence changed between baseline and suspect windows.
 
@@ -4922,25 +5676,41 @@ class StatisticalAnomalyService:
           *beacon_cv_max* and active span ≥ *beacon_min_span* of the window.
 
         The CV dead band between the two gates gets no test. All tests share
-        one Benjamini–Hochberg pool (``q_value ≤ fdr_q``). Temporal-only
-        (``method="cadence"``); first-seen values are excluded by
+        one Benjamini–Hochberg pool (``q_value ≤ fdr_q``). In the baseline
+        frame (``method="cadence"``) first-seen values are excluded by
         construction (``HAVING baseline_cnt >= 1``) — temporal value_novelty
-        owns those. The per-field candidate set is capped at
+        owns those. Without *windows* the **self frame** runs instead
+        (``method="self-cadence"``, :meth:`_find_interval_periodicity_self`):
+        each value is judged over its arrivals across the whole scope —
+        Greenwood beaconing with pauses excluded, and a robust-Gamma silence
+        test. The per-field candidate set is capped at
         *max_candidates_per_field* (highest total volume first) with the
         same warning semantics as proportion_shift. Score = ``-log10(p)``.
         """
-        method = "cadence"
         if windows is None:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector="interval_periodicity",
-                method=method,
-                baseline_size=0,
-                warnings=[
-                    "interval_periodicity is temporal-only — select or create a baseline "
-                    "definition (baseline + suspect windows)."
-                ],
+            return self._find_interval_periodicity_self(
+                case_id,
+                source_ids,
+                fields=fields,
+                limit=limit,
+                fdr_q=fdr_q,
+                min_rate_ratio=min_rate_ratio,
+                min_intervals=min_baseline_intervals,
+                cv_regular_max=cv_regular_max,
+                beacon_min_intervals=beacon_min_intervals,
+                beacon_cv_max=beacon_cv_max,
+                pause_ratio=self_pause_ratio,
+                min_span_seconds=self_min_span_seconds,
+                max_candidates_per_field=max_candidates_per_field,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                source_offsets=source_offsets,
+                field_overrides=field_overrides,
             )
+        method = "cadence"
 
         self.ch.init_schema()
         db = self.ch.database
@@ -5018,7 +5788,8 @@ class StatisticalAnomalyService:
                 f" countIf(win = {w} AND isNotNull(delta)) AS w{w}_k,"
                 f" avgIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_mean,"
                 f" stddevSampIf(delta, win = {w} AND isNotNull(delta)) AS w{w}_std,"
-                f" quantileIf(0.5)(delta, win = {w} AND isNotNull(delta)) AS w{w}_med,"
+                f" quantileDeterministicIf(0.5)(delta, cityHash64(toString(event_id)),"
+                f" win = {w} AND isNotNull(delta)) AS w{w}_med,"
                 f" sumIf(delta * delta, win = {w} AND isNotNull(delta)) AS w{w}_sum2,"
                 f" minIf(ts, win = {w}) AS w{w}_first,"
                 f" maxIf(ts, win = {w}) AS w{w}_last,"
@@ -5234,6 +6005,478 @@ class StatisticalAnomalyService:
             windows=windows,
         )
 
+    def _find_interval_periodicity_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        fields: list[str] | None,
+        limit: int,
+        fdr_q: float,
+        min_rate_ratio: float,
+        min_intervals: int,
+        cv_regular_max: float,
+        beacon_min_intervals: int,
+        beacon_cv_max: float,
+        pause_ratio: float,
+        min_span_seconds: float,
+        max_candidates_per_field: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        inventory: list[tuple[str, int, int]] | None,
+        inventory_total: int | None,
+        source_offsets: dict[str, int] | None,
+        field_overrides: dict[str, bool] | None,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_interval_periodicity` (``method="self-cadence"``).
+
+        No slices: a beacon that runs the whole timeline (implant present
+        before collection began) would be missed by any slicing, so each
+        (field, value) is judged over its arrivals across the scope. Gaps are
+        per value (``lagInFrame`` partitioned by value, ordered by timestamp
+        then event id), in seconds. Every quantile is deterministic
+        (:func:`_qdet`). Two directions, both scored ``-log10(p)`` into one
+        BH pool:
+
+        * ``new_regularity`` (beaconing): gaps longer than *pause_ratio* ×
+          median are the beacon being off and are excluded; the retained
+          gaps need ≥ *beacon_min_intervals* of them spanning ≥
+          *min_span_seconds*; Greenwood's statistic over the retained gaps,
+          left tail; effect floor CV(retained) ≤ *beacon_cv_max*.
+        * ``missed`` (silence): values with ≥ *min_intervals* gaps and robust
+          CV ≤ *cv_regular_max*. The candidate silence is the longer of the
+          longest internal gap and the **trailing** gap (last event of the
+          value's own source − the value's last arrival there, maximized
+          over its sources) — coverage ending is not a silence, the source
+          logging on while the value stops is. Null model: Gamma fitted
+          robustly (shape ``1/rcv²``, scale from the median), ``sf`` via
+          :func:`_gamma_sf`, Šidák over the value's gaps
+          (:func:`_sidak_p`). Effect floor: gap ≥ *min_rate_ratio* × median.
+
+        Nothing filters legitimate clocks (NTP, update checks, agents):
+        high-volume clocks get the smallest p and rank first, and marking
+        one **Normal** is the remedy.
+        """
+        method = "self-cadence"
+        detector = "interval_periodicity"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+
+        run_warnings: list[str] = []
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        def _level1(col: str, cand_filter: str) -> str:
+            return f"""
+                SELECT {col} AS val, {eff} AS ts, event_id, source_id
+                FROM {db}.events
+                WHERE case_id = {{cid:String}}
+                  AND has({{src:Array(String)}}, source_id)
+                  AND {col} != ''
+                  AND {VESTIGO_NOT_SENTINEL_SQL}{cand_filter}
+            """
+
+        def _deltas(col: str, cand_filter: str) -> str:
+            # toNullable: lagInFrame on the bare column yields 1970-01-01 (a
+            # huge fake gap) on each partition's first row instead of NULL.
+            return f"""
+                SELECT
+                    val, ts, event_id, source_id, prev_ts, prev_evt,
+                    dateDiff('millisecond', prev_ts, ts) / 1000.0 AS delta
+                FROM (
+                    SELECT
+                        val, ts, event_id, source_id,
+                        lagInFrame(toNullable(ts)) OVER w AS prev_ts,
+                        lagInFrame(toString(event_id)) OVER w AS prev_evt
+                    FROM ({_level1(col, cand_filter)})
+                    WINDOW w AS (
+                        PARTITION BY val
+                        ORDER BY ts, event_id
+                        ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING
+                    )
+                )
+            """
+
+        # Pass 1 per field: candidates (volume first, capped) with their gap
+        # quantiles, longest internal gap and first/last arrivals.
+        # cand = (field, value, stats)
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
+        evaluated_fields = 0
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            params["cap"] = max_candidates_per_field
+            sql = f"""
+                SELECT
+                    val,
+                    count() AS n,
+                    countIf(isNotNull(delta)) AS k,
+                    quantilesDeterministicIf(0.25, 0.5, 0.75)(delta, cityHash64(toString(event_id)), isNotNull(delta)) AS q,
+                    maxIf(delta, isNotNull(delta)) AS max_gap,
+                    argMaxIf(toString(event_id), delta, isNotNull(delta)) AS gap_end_evt,
+                    argMaxIf(ts, delta, isNotNull(delta)) AS gap_end_ts,
+                    argMaxIf(prev_evt, delta, isNotNull(delta)) AS gap_start_evt,
+                    argMaxIf(prev_ts, delta, isNotNull(delta)) AS gap_start_ts,
+                    min(ts) AS first_ts,
+                    max(ts) AS last_ts,
+                    toString(argMin(event_id, ts)) AS first_evt,
+                    toString(argMax(event_id, ts)) AS last_evt
+                FROM ({_deltas(col, "")})
+                GROUP BY val
+                ORDER BY n DESC, val ASC
+                LIMIT {{cap:UInt32}}
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_fields += 1
+            if len(rows) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — the FDR correction covers only the "
+                    f"{max_candidates_per_field} highest-volume values; treat marginal "
+                    f"q-values for this field as exploratory."
+                )
+            for row in rows:
+                val = row[0]
+                if not val:
+                    continue
+                k = int(row[2])
+                q = [_nan_none(v) for v in (row[3] or [])] if k >= 1 else [None, None, None]
+                q1, med, q3 = (q + [None, None, None])[:3]
+                rcv = _robust_cv(q1, med, q3) if k >= 1 and med is not None else None
+                candidates.append(
+                    (
+                        field_token,
+                        str(val),
+                        {
+                            "n": int(row[1]),
+                            "k": k,
+                            "q1": q1,
+                            "med": med,
+                            "q3": q3,
+                            "rcv": rcv,
+                            "max_gap": _nan_none(row[4]) if k >= 1 else None,
+                            "gap_end_evt": row[5] if k >= 1 else None,
+                            "gap_end_ts": row[6] if k >= 1 else None,
+                            "gap_start_evt": row[7] if k >= 1 else None,
+                            "gap_start_ts": row[8] if k >= 1 else None,
+                            "first_ts": row[9],
+                            "last_ts": row[10],
+                            "first_evt": row[11],
+                            "last_evt": row[12],
+                        },
+                    )
+                )
+
+        # Pass 2 per field: pause-excluded gap aggregates for the beacon-
+        # eligible values. The per-value pause threshold rides in through
+        # `transform` over the (capped) candidate list, so this is one bounded
+        # aggregate, never a groupArray.
+        # Pass 3 per field: trailing gaps for the silence-eligible values —
+        # per-(value, source) last arrival joined to the per-source last event.
+        by_field: dict[str, list[int]] = defaultdict(list)
+        for ci, (field_token, _, _) in enumerate(candidates):
+            by_field[field_token].append(ci)
+        beacon_stats: dict[int, dict[str, Any]] = {}
+        tail_stats: dict[int, dict[str, Any]] = {}
+        for field_token, cis in by_field.items():
+            beacon_cis = [ci for ci in cis if candidates[ci][2]["k"] >= beacon_min_intervals]
+            if beacon_cis:
+                params = {**base_params}
+                bind_offset_params(source_offsets, params)
+                col = _col_expr(field_token, params, field_mappings)
+                params["cv"] = [candidates[ci][1] for ci in beacon_cis]
+                params["ct"] = [
+                    float(pause_ratio * (candidates[ci][2]["med"] or 0.0)) for ci in beacon_cis
+                ]
+                cand_filter = f" AND has({{cv:Array(String)}}, {col})"
+                sql = f"""
+                    SELECT
+                        val,
+                        countIf(delta <= thr) AS kept,
+                        sumIf(delta, delta <= thr) AS s,
+                        sumIf(delta * delta, delta <= thr) AS s2,
+                        avgIf(delta, delta <= thr) AS mean,
+                        stddevSampIf(delta, delta <= thr) AS std,
+                        countIf(delta > thr) AS paused
+                    FROM (
+                        SELECT
+                            val, delta,
+                            transform(val, {{cv:Array(String)}}, {{ct:Array(Float64)}}, 0.) AS thr
+                        FROM ({_deltas(col, cand_filter)})
+                        WHERE delta IS NOT NULL
+                    )
+                    GROUP BY val
+                    {heavy_scan_settings()}
+                """
+                index = {candidates[ci][1]: ci for ci in beacon_cis}
+                for row in self.ch.client.query(sql, parameters=params).result_rows:
+                    ci = index.get(str(row[0]))
+                    if ci is None:
+                        continue
+                    beacon_stats[ci] = {
+                        "kept": int(row[1]),
+                        "s": float(row[2] or 0.0),
+                        "s2": float(row[3] or 0.0),
+                        "mean": _nan_none(row[4]),
+                        "std": _nan_none(row[5]),
+                        "paused": int(row[6]),
+                    }
+            silence_cis = [
+                ci
+                for ci in cis
+                if candidates[ci][2]["k"] >= min_intervals
+                and candidates[ci][2]["rcv"] is not None
+                and candidates[ci][2]["rcv"] <= cv_regular_max
+            ]
+            if silence_cis:
+                params = {**base_params}
+                bind_offset_params(source_offsets, params)
+                col = _col_expr(field_token, params, field_mappings)
+                params["mv"] = [candidates[ci][1] for ci in silence_cis]
+                cand_filter = f" AND has({{mv:Array(String)}}, {col})"
+                sql = f"""
+                    SELECT
+                        val,
+                        max(gap_s) AS tail_gap,
+                        argMax(source_id, gap_s) AS src,
+                        argMax(last_evt, gap_s) AS last_evt,
+                        argMax(last_ts, gap_s) AS last_ts,
+                        argMax(src_last, gap_s) AS src_last
+                    FROM (
+                        SELECT
+                            v.val AS val,
+                            v.source_id AS source_id,
+                            v.last_ts AS last_ts,
+                            v.last_evt AS last_evt,
+                            s.src_last AS src_last,
+                            dateDiff('millisecond', v.last_ts, s.src_last) / 1000.0 AS gap_s
+                        FROM (
+                            SELECT
+                                val, source_id,
+                                max(ts) AS last_ts,
+                                toString(argMax(event_id, ts)) AS last_evt
+                            FROM ({_level1(col, cand_filter)})
+                            GROUP BY val, source_id
+                        ) AS v
+                        INNER JOIN (
+                            SELECT source_id, max({eff}) AS src_last
+                            FROM {db}.events
+                            WHERE case_id = {{cid:String}}
+                              AND has({{src:Array(String)}}, source_id)
+                              AND {VESTIGO_NOT_SENTINEL_SQL}
+                            GROUP BY source_id
+                        ) AS s ON v.source_id = s.source_id
+                    )
+                    GROUP BY val
+                    {heavy_scan_settings()}
+                """
+                index = {candidates[ci][1]: ci for ci in silence_cis}
+                for row in self.ch.client.query(sql, parameters=params).result_rows:
+                    ci = index.get(str(row[0]))
+                    if ci is None:
+                        continue
+                    tail_stats[ci] = {
+                        "gap": _nan_none(row[1]),
+                        "source_id": row[2],
+                        "last_evt": row[3],
+                        "last_ts": row[4],
+                        "src_last": row[5],
+                    }
+
+        # Phase 2: build the tests — both directions into one BH pool.
+        # test = (kind, cand_idx, statistic, p, extra)
+        tests: list[tuple[str, int, float, float, dict[str, Any]]] = []
+        for ci, (_, _, st) in enumerate(candidates):
+            bs = beacon_stats.get(ci)
+            if bs is not None and bs["kept"] >= beacon_min_intervals and bs["s"] > 0:
+                n_kept, span = bs["kept"], bs["s"]
+                if span >= min_span_seconds:
+                    g_w = bs["s2"] / (span * span)
+                    z, p = _greenwood_p(g_w, n_kept)
+                    cv = (
+                        bs["std"] / bs["mean"]
+                        if bs["std"] is not None and bs["mean"] and bs["mean"] > 0
+                        else None
+                    )
+                    tests.append(
+                        (
+                            "beacon",
+                            ci,
+                            g_w,
+                            p,
+                            {"z": z, "span": span, "cv": cv, "paused": bs["paused"]},
+                        )
+                    )
+            rcv, med, k = st["rcv"], st["med"], st["k"]
+            if (
+                k >= min_intervals
+                and rcv is not None
+                and rcv <= cv_regular_max
+                and med is not None
+                and med > 0
+            ):
+                g_int = st["max_gap"] or 0.0
+                tail = tail_stats.get(ci)
+                g_tail = tail["gap"] if tail is not None and tail["gap"] is not None else None
+                trailing = g_tail is not None and g_tail > g_int
+                gap = g_tail if trailing else g_int
+                if gap and gap > 0:
+                    alpha, theta = _gamma_from_median(rcv, med)
+                    sf = _gamma_sf(alpha, gap / theta)
+                    p = _sidak_p(sf, k)
+                    tests.append(
+                        (
+                            "missed",
+                            ci,
+                            gap,
+                            p,
+                            {"trailing": trailing, "alpha": alpha, "sf": sf, "tail": tail},
+                        )
+                    )
+        qvals = _bh_qvalues([t[3] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: FDR + per-direction effect floors, build findings.
+        findings: list[IntervalFinding] = []
+        for (kind, ci, stat, p, extra), q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            field_token, val, st = candidates[ci]
+            med = st["med"]
+            details: dict[str, Any] = {
+                "detector": detector,
+                "method": method,
+                "field": field_token,
+                "value": val,
+                "count": st["n"],
+                "intervals": st["k"],
+                "median_interval": round(med, 4) if med is not None else None,
+                "robust_cv": round(st["rcv"], 4) if st["rcv"] is not None else None,
+                "first_seen": _present_ts(st["first_ts"]),
+                "last_seen": _present_ts(st["last_ts"]),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "allowlist_field": field_token,
+                "allowlist_value": val,
+            }
+            window_cv: float | None = None
+            if kind == "beacon":
+                cv = extra["cv"]
+                if cv is None or cv > beacon_cv_max:
+                    continue
+                direction = "new_regularity"
+                window_cv = round(cv, 4)
+                details.update(
+                    {
+                        "direction": direction,
+                        "retained_intervals": beacon_stats[ci]["kept"],
+                        "paused_intervals": extra["paused"],
+                        "retained_span_seconds": round(extra["span"], 3),
+                        "window_cv": window_cv,
+                        "greenwood_g": round(stat, 6),
+                        "greenwood_z": round(extra["z"], 4),
+                        "pause_ratio": pause_ratio,
+                        "min_span_seconds": min_span_seconds,
+                        "beacon_cv_max": beacon_cv_max,
+                    }
+                )
+                evt_id = st["first_evt"]
+                first_seen_str = _present_ts(st["first_ts"])
+            else:
+                if med is None or stat < min_rate_ratio * med:
+                    continue
+                direction = "missed"
+                trailing = extra["trailing"]
+                tail = extra["tail"]
+                if trailing:
+                    gap_start, gap_end = tail["last_ts"], tail["src_last"]
+                    evt_id = tail["last_evt"]
+                else:
+                    gap_start, gap_end = st["gap_start_ts"], st["gap_end_ts"]
+                    evt_id = st["gap_start_evt"]
+                details.update(
+                    {
+                        "direction": direction,
+                        "longest_gap_seconds": round(stat, 3),
+                        "gap_start": _present_ts(gap_start),
+                        "gap_end": _present_ts(gap_end),
+                        "trailing": trailing,
+                        "gamma_shape": round(extra["alpha"], 4),
+                        "gamma_sf": extra["sf"],
+                        "expected_arrivals_missed": round(stat / med - 1.0, 2),
+                        "min_rate_ratio": min_rate_ratio,
+                    }
+                )
+                if trailing:
+                    details["gap_source_id"] = tail["source_id"]
+                first_seen_str = _present_ts(gap_start)
+            score = round(-math.log10(max(p, 1e-300)), 4)
+            evt_id_str = str(evt_id) if evt_id else None
+            findings.append(
+                IntervalFinding(
+                    field=field_token,
+                    value=val,
+                    direction=direction,
+                    count=st["n"],
+                    baseline_count=st["n"],
+                    baseline_median_interval=round(med, 4) if med is not None else None,
+                    window_median_interval=round(med, 4) if med is not None else None,
+                    baseline_cv=round(st["rcv"], 4) if st["rcv"] is not None else None,
+                    window_cv=window_cv,
+                    statistic=round(stat, 6),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=score,
+                    first_seen=first_seen_str,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen_str),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=total_events,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+        )
+
     # ------------------------------------------------------------------
     # Value-distribution drift
     # ------------------------------------------------------------------
@@ -5376,6 +6619,7 @@ class StatisticalAnomalyService:
         inventory_total: int | None = None,
         source_offsets: dict[str, int] | None = None,
         field_overrides: dict[str, bool] | None = None,
+        self_slices: int = 24,
     ) -> StatAnomalyResult:
         """Return fields whose value distribution drifted between baseline and suspects.
 
@@ -5389,24 +6633,34 @@ class StatisticalAnomalyService:
         fewer than *min_samples* field-bearing events are skipped (not
         pooled) and warned about.
 
-        Temporal-only: without *windows* the result is ``insufficient_data``
-        — a distribution can only drift between two populations. Findings
-        are per field (allowlist key ``(field, "*")``). Score =
+        Two frames: with *windows* the baseline window is the reference
+        (``method="drift"``); without, the **self frame** cuts the scope into
+        leave-one-out time slices and tests each slice against its complement
+        (``method="self-drift"``, :meth:`_find_distribution_drift_self`).
+        Findings are per field (allowlist key ``(field, "*")``). Score =
         ``-log10(p)`` so both test families rank on one scale. See the
-        module docstring and ``docs/ANOMALY_DETECTION.md`` §11.
+        module docstring and ``docs/ANOMALY_DETECTION.md`` §10.
         """
-        method = "drift"
         if windows is None:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector="value_distribution_drift",
-                method=method,
-                baseline_size=0,
-                warnings=[
-                    "value_distribution_drift is temporal-only — select or create a "
-                    "baseline definition (baseline + suspect windows)."
-                ],
+            return self._find_distribution_drift_self(
+                case_id,
+                source_ids,
+                fields=fields,
+                limit=limit,
+                fdr_q=fdr_q,
+                min_ks_d=min_ks_d,
+                min_tvd=min_tvd,
+                min_samples=min_samples,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                source_offsets=source_offsets,
+                field_overrides=field_overrides,
+                self_slices=self_slices,
             )
+        method = "drift"
 
         self.ch.init_schema()
         db = self.ch.database
@@ -5466,7 +6720,8 @@ class StatisticalAnomalyService:
             in_ws = ", ".join(f"{sp} AS in_w{i}" for i, sp in enumerate(sps))
             w_blocks = ",\n                    ".join(
                 f"countIf(in_w{i}) AS w{i}_n,"
-                f" quantilesIf(0.05, 0.5, 0.95)(num, in_w{i}) AS w{i}_q,"
+                f" quantilesDeterministicIf(0.05, 0.5, 0.95)(num, cityHash64(toString(event_id)), in_w{i})"
+                f" AS w{i}_q,"
                 f" kolmogorovSmirnovTestIf('two-sided')(num, toUInt8(in_w{i}), in_bl OR in_w{i})"
                 f" AS w{i}_ks,"
                 f" argMinIf((toString(event_id), eff_ts), num, in_w{i}) AS w{i}_lo,"
@@ -5476,7 +6731,7 @@ class StatisticalAnomalyService:
             sql = f"""
                 SELECT
                     countIf(in_bl) AS bl_n,
-                    quantilesIf(0.05, 0.5, 0.95)(num, in_bl) AS bl_q,
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, cityHash64(toString(event_id)), in_bl) AS bl_q,
                     {w_blocks}
                 FROM (
                     SELECT toFloat64OrNull({col}) AS num,
@@ -5771,6 +7026,448 @@ class StatisticalAnomalyService:
             allowlist=allowlist,
             warnings=run_warnings,
             windows=windows,
+        )
+
+    def _find_distribution_drift_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        fields: list[str] | None,
+        limit: int,
+        fdr_q: float,
+        min_ks_d: float,
+        min_tvd: float,
+        min_samples: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        inventory: list[tuple[str, int, int]] | None,
+        inventory_total: int | None,
+        source_offsets: dict[str, int] | None,
+        field_overrides: dict[str, bool] | None,
+        self_slices: int,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_distribution_drift` (``method="self-drift"``).
+
+        Field classification and auto-selection are the baseline frame's,
+        probed over the whole scope. Per (field, slice) the slice's
+        distribution is tested against its **complement**:
+
+        * categorical — one ``GROUP BY val`` scan per field with per-slice
+          counts; per slice in Python the complement vector is ``total −
+          slice``, the top ``_DRIFT_TOP_K`` categories are taken **by
+          complement count** with an exact ``__other__`` fold, then the 2×k
+          G-test, chi² ``df = buckets − 1`` and the TVD floor as temporal;
+        * numeric — a per-slice count scan first, then **one KS query per
+          slice** that has ``min_samples`` on both sides. Not K aggregates in
+          one query: each KS state holds the whole field, so K-in-one is K×
+          memory; one-per-slice keeps the peak at the baseline frame's worst
+          case and costs K× time. The analysis cache memoizes that, but only
+          after the first run pays it, so the eligible (field, slice) pairs
+          are spent against :data:`_MAX_SELF_KS_QUERIES` round-robin across
+          fields — every field is served before any field is served twice, so
+          a budgeted run loses slice resolution rather than whole fields, and
+          the shortfall is disclosed in ``warnings``.
+
+        Sides below *min_samples* are skipped and warned about, exactly as
+        temporal; one BH pool over both branches. ``details`` carries the
+        slice as ``window_*`` and the complement as ``rest_*``, never a
+        ``baseline_*`` key.
+        """
+        method = "self-drift"
+        detector = "value_distribution_drift"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+        slices = self._self_slices(case_id, source_ids, self_slices, source_offsets)
+        if slices is None:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=total_events,
+                warnings=["The scope holds a single timestamp, so it cannot be sliced."],
+            )
+        slice_totals = self._slice_totals(case_id, source_ids, slices, source_offsets)
+        scope_total = sum(slice_totals)
+        run_warnings = self._small_slice_warning(slices, slice_totals)
+        k = slices.k
+
+        numeric_fields, categorical_fields, override_notes = self._drift_split_fields(
+            case_id,
+            source_ids,
+            fields,
+            total_events,
+            field_mappings,
+            inventory,
+            inventory_total,
+            windows=None,
+            source_offsets=source_offsets,
+            field_overrides=field_overrides,
+        )
+        run_warnings += override_notes
+
+        tests: list[dict[str, Any]] = []
+        fields_with_tests: set[str] = set()
+        skipped_by_field: dict[str, int] = defaultdict(int)
+
+        # --- KS branch: per-slice counts for every field first, then the
+        # eligible (field, slice) pairs are selected against the query budget
+        # and only the selected ones pay a KS scan.
+        ks_plan: list[tuple[str, dict[str, Any], str, str, int, list[int], list[int]]] = []
+        for field_token in numeric_fields:
+            params = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            slice_expr = slices.index_sql(eff, params)
+            count_sql = f"""
+                SELECT slice, count() AS n
+                FROM (
+                    SELECT {slice_expr} AS slice
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND toFloat64OrNull({col}) IS NOT NULL
+                )
+                GROUP BY slice
+                {heavy_scan_settings()}
+            """
+            per_slice_n = [0] * k
+            for row in self.ch.client.query(count_sql, parameters=params).result_rows:
+                idx = int(row[0])
+                if 0 <= idx < k:
+                    per_slice_n[idx] = int(row[1])
+            field_n = sum(per_slice_n)
+            if field_n == 0:
+                continue
+            eligible = []
+            for i in range(k):
+                w_n = per_slice_n[i]
+                rest_n = field_n - w_n
+                if w_n == 0:
+                    continue
+                if w_n < min_samples or rest_n < min_samples:
+                    skipped_by_field[field_token] += 1
+                    continue
+                eligible.append(i)
+            if eligible:
+                ks_plan.append(
+                    (field_token, params, col, slice_expr, field_n, per_slice_n, eligible)
+                )
+
+        eligible_pairs = sum(len(entry[6]) for entry in ks_plan)
+        if eligible_pairs > _MAX_SELF_KS_QUERIES:
+            selected = _spend_ks_budget([entry[6] for entry in ks_plan], _MAX_SELF_KS_QUERIES)
+            covered_fields = len({ei for ei, _ in selected})
+            run_warnings.append(
+                f"Numeric drift hit the {_MAX_SELF_KS_QUERIES}-scan budget — each "
+                f"(field, slice) pair costs one full scan of the scope, "
+                f"{eligible_pairs} pairs were eligible and {len(selected)} ran, "
+                f"spread evenly over all {covered_fields} of them so none is "
+                f"untested. The slices that did not run are not evidence of "
+                f"nothing; narrow `fields` or lower stat_self_slices to cover them."
+            )
+        else:
+            selected = [(ei, i) for ei, entry in enumerate(ks_plan) for i in entry[6]]
+
+        for ei, i in selected:
+            field_token, params, col, slice_expr, field_n, per_slice_n, _ = ks_plan[ei]
+            w_n = per_slice_n[i]
+            rest_n = field_n - w_n
+            sparams = {**params, "si": i}
+            ks_sql = f"""
+                SELECT
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, NOT in_s) AS rest_q,
+                    quantilesDeterministicIf(0.05, 0.5, 0.95)(num, h, in_s) AS w_q,
+                    -- assumeNotNull: the plain aggregate over a Nullable argument
+                    -- returns a Nullable tuple the driver cannot decode; the WHERE
+                    -- below already excludes NULLs.
+                    kolmogorovSmirnovTest('two-sided')(assumeNotNull(num), toUInt8(in_s)) AS ks,
+                    argMinIf((toString(event_id), eff_ts), num, in_s) AS lo,
+                    argMaxIf((toString(event_id), eff_ts), num, in_s) AS hi
+                FROM (
+                    SELECT
+                        toFloat64OrNull({col}) AS num,
+                        {slice_expr} = {{si:Int32}} AS in_s,
+                        event_id,
+                        cityHash64(toString(event_id)) AS h,
+                        {eff} AS eff_ts
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                )
+                WHERE num IS NOT NULL
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(ks_sql, parameters=sparams).result_rows
+            if not rows:
+                continue
+            row = rows[0]
+            d_stat, p = _ks_pair(row[2])
+            if math.isnan(d_stat) or math.isnan(p):
+                continue
+            fields_with_tests.add(field_token)
+            tests.append(
+                {
+                    "test": "ks",
+                    "field": field_token,
+                    "si": i,
+                    "statistic": d_stat,
+                    "effect": d_stat,
+                    "p": p,
+                    "rest_n": rest_n,
+                    "w_n": w_n,
+                    "rest_q": row[0],
+                    "w_q": row[1],
+                    "lo": row[3],
+                    "hi": row[4],
+                }
+            )
+
+        # --- Categorical branch: one GROUP BY per field, per-slice fold in Python.
+        for field_token in categorical_fields:
+            params = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            slice_expr = slices.index_sql(eff, params)
+            params["catcap"] = _DRIFT_MAX_CATEGORY_ROWS
+            s_blocks = ",\n                    ".join(
+                f"countIf(slice = {i}) AS s{i}_cnt,"
+                f" minIf(ts, slice = {i}) AS s{i}_first,"
+                f" toString(argMinIf(event_id, ts, slice = {i})) AS s{i}_evt"
+                for i in range(k)
+            )
+            sql = f"""
+                SELECT
+                    val,
+                    count() AS total,
+                    toString(argMax(event_id, ts)) AS last_evt,
+                    {s_blocks}
+                FROM (
+                    SELECT {col} AS val, {eff} AS ts, event_id, {slice_expr} AS slice
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                )
+                GROUP BY val
+                ORDER BY total DESC, val ASC
+                LIMIT {{catcap:UInt32}}
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            rows = [r for r in rows if r[0]]
+            if not rows:
+                continue
+            if len(rows) >= _DRIFT_MAX_CATEGORY_ROWS:
+                run_warnings.append(
+                    f"Field {field_token!r} exceeded the {_DRIFT_MAX_CATEGORY_ROWS}-category "
+                    f"scan guard — its __other__ bucket is truncated; treat this field's "
+                    f"drift results as exploratory (it does not look categorical)."
+                )
+            for i in range(k):
+                co = 3 + i * 3
+                # (value, rest_cnt, slice_cnt, slice_first, slice_evt, last_evt)
+                cats = [
+                    (str(r[0]), int(r[1]) - int(r[co]), int(r[co]), r[co + 1], r[co + 2], r[2])
+                    for r in rows
+                ]
+                cats.sort(key=lambda c: (-c[1], c[0]))
+                named = cats[:_DRIFT_TOP_K]
+                tail = cats[_DRIFT_TOP_K:]
+                k_truncated = bool(tail)
+                rest_vec = [c[1] for c in named]
+                w_vec = [c[2] for c in named]
+                other_rest = sum(c[1] for c in tail)
+                other_w = sum(c[2] for c in tail)
+                if k_truncated:
+                    rest_vec.append(other_rest)
+                    w_vec.append(other_w)
+                rest_tot, w_tot = sum(rest_vec), sum(w_vec)
+                if w_tot == 0:
+                    continue
+                if rest_tot < min_samples or w_tot < min_samples:
+                    skipped_by_field[field_token] += 1
+                    continue
+                df = sum(1 for b, w in zip(rest_vec, w_vec, strict=True) if b + w > 0) - 1
+                if df < 1:
+                    continue
+                g = _g_statistic_k(rest_vec, w_vec)
+                fields_with_tests.add(field_token)
+                tests.append(
+                    {
+                        "test": "g-test-k",
+                        "field": field_token,
+                        "si": i,
+                        "statistic": g,
+                        "effect": _tvd(rest_vec, w_vec),
+                        "p": _chi2_sf(g, df),
+                        "rest_n": rest_tot,
+                        "w_n": w_tot,
+                        "df": df,
+                        "named": named,
+                        "k_truncated": k_truncated,
+                        "other_rest": other_rest,
+                        "other_w": other_w,
+                    }
+                )
+
+        for field_token, n_skipped in skipped_by_field.items():
+            run_warnings.append(
+                f"Field {field_token!r}: {n_skipped} test(s) skipped — fewer than "
+                f"{min_samples} field-bearing events on one side; skipped tests are "
+                f"not in the FDR pool."
+            )
+
+        qvals = _bh_qvalues([t["p"] for t in tests])
+        m_tests = len(tests)
+        findings: list[DistributionDriftFinding] = []
+        for t, q in zip(tests, qvals, strict=True):
+            if q > fdr_q:
+                continue
+            floor = min_ks_d if t["test"] == "ks" else min_tvd
+            if t["effect"] < floor:
+                continue
+            i = t["si"]
+            p = t["p"]
+            score = round(-math.log10(max(p, 1e-300)), 4)
+            details: dict[str, Any] = {
+                "detector": detector,
+                "method": method,
+                "test": t["test"],
+                "field": t["field"],
+                "statistic": round(t["statistic"], 6),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "score_basis": "-log10(p)",
+                "rest_n": t["rest_n"],
+                "window_n": t["w_n"],
+                **self._slice_details(slices, i),
+                "allowlist_field": t["field"],
+                "allowlist_value": "*",
+            }
+            if t["test"] == "ks":
+                rest_med, w_med = float(t["rest_q"][1]), float(t["w_q"][1])
+                if w_med > rest_med:
+                    direction, rep = "up", t["hi"]
+                elif w_med < rest_med:
+                    direction, rep = "down", t["lo"]
+                else:
+                    direction = "spread"
+                    up_shift = float(t["w_q"][2]) - float(t["rest_q"][2])
+                    down_shift = float(t["rest_q"][0]) - float(t["w_q"][0])
+                    rep = t["hi"] if up_shift >= down_shift else t["lo"]
+                evt_id, rep_ts = (rep[0], rep[1]) if rep and rep[0] else (None, None)
+                first_seen = _present_ts(rep_ts)
+                details.update(
+                    {
+                        "ks_d": round(t["effect"], 6),
+                        "min_ks_d": min_ks_d,
+                        "direction": direction,
+                        "rest_median": round(rest_med, 6),
+                        "window_median": round(w_med, 6),
+                        "rest_p05": round(float(t["rest_q"][0]), 6),
+                        "rest_p95": round(float(t["rest_q"][2]), 6),
+                        "window_p05": round(float(t["w_q"][0]), 6),
+                        "window_p95": round(float(t["w_q"][2]), 6),
+                    }
+                )
+            else:
+                direction = "mixed"
+                named = t["named"]
+                rest_tot, w_tot = t["rest_n"], t["w_n"]
+                contributor_rows = [
+                    {
+                        "value": c[0],
+                        "rest_share": round(c[1] / rest_tot, 6),
+                        "window_share": round(c[2] / w_tot, 6),
+                        "delta": round(c[2] / w_tot - c[1] / rest_tot, 6),
+                    }
+                    for c in named
+                ]
+                if t["k_truncated"]:
+                    contributor_rows.append(
+                        {
+                            "value": "__other__",
+                            "rest_share": round(t["other_rest"] / rest_tot, 6),
+                            "window_share": round(t["other_w"] / w_tot, 6),
+                            "delta": round(t["other_w"] / w_tot - t["other_rest"] / rest_tot, 6),
+                        }
+                    )
+                contributors = sorted(contributor_rows, key=lambda c: abs(c["delta"]), reverse=True)
+                top_named = next((c for c in contributors if c["value"] != "__other__"), None)
+                evt_id, first_seen = None, None
+                if top_named is not None:
+                    top = next(c for c in named if c[0] == top_named["value"])
+                    if top[2] > 0:
+                        evt_id = top[4] or None
+                        first_seen = _present_ts(top[3])
+                    else:
+                        # Vanished from this slice — its last scope occurrence
+                        # represents the finding.
+                        evt_id = top[5] or None
+                details.update(
+                    {
+                        "g_statistic": round(t["statistic"], 6),
+                        "df": t["df"],
+                        "tvd": round(t["effect"], 6),
+                        "min_tvd": min_tvd,
+                        "k_categories": len(named),
+                        "k_truncated": t["k_truncated"],
+                        "other_rest": t["other_rest"],
+                        "other_window": t["other_w"],
+                        "top_contributors": contributors[:5],
+                    }
+                )
+            evt_id_str = str(evt_id) if evt_id else None
+            findings.append(
+                DistributionDriftFinding(
+                    field=t["field"],
+                    window_label=slices.label(i),
+                    test=t["test"],
+                    statistic=round(t["statistic"], 6),
+                    effect=round(t["effect"], 6),
+                    direction=direction,
+                    baseline_n=t["rest_n"],
+                    window_n=t["w_n"],
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=score,
+                    first_seen=first_seen,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen),
+                    details=details,
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=scope_total,
+            evaluated_fields=len(fields_with_tests),
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            slices=slices,
         )
 
     # ------------------------------------------------------------------
@@ -6306,6 +8003,7 @@ class StatisticalAnomalyService:
         field_mappings: dict[str, list[str]] | None = None,
         source_offsets: dict[str, int] | None = None,
         max_gap_seconds: int | None = None,
+        rarity_floor: int = 3,
     ) -> StatAnomalyResult:
         """Return event-order n-grams present in a suspect window but absent from the baseline.
 
@@ -6330,26 +8028,33 @@ class StatisticalAnomalyService:
         interleaving n-grams — a per-stream secondary partition field is a
         possible follow-up, deliberately not implemented yet.
 
-        Temporal-only: without *windows* the result is ``insufficient_data``
-        — "never seen before" needs a before. *allowlist* suppresses findings
-        whose (series_field, " → "-joined n-gram) an analyst declared
-        never-anomalous.
+        Two frames: with *windows*, "never in the baseline window"
+        (``method="ngram"``); without, the **self frame** flags the rarest
+        orderings across the whole scope under a rarity floor
+        (``method="rare-ngram"``, :meth:`_find_sequence_novelty_self`).
+        *allowlist* suppresses findings whose (series_field, " → "-joined
+        n-gram) an analyst declared never-anomalous — the key is identical in
+        both frames, so one Normal verdict covers both.
         """
         detector = "sequence_novelty"
-        method = "ngram"
         if not 2 <= ngram <= 5:
             raise ValueError("ngram must be between 2 and 5")
         if windows is None:
-            return StatAnomalyResult(
-                status="insufficient_data",
-                detector=detector,
-                method=method,
-                baseline_size=0,
-                warnings=[
-                    "sequence_novelty is temporal-only — select or create a baseline "
-                    "definition (baseline + suspect windows)."
-                ],
+            return self._find_sequence_novelty_self(
+                case_id,
+                source_ids,
+                series_field=series_field,
+                ngram=ngram,
+                limit=limit,
+                max_candidates=max_candidates,
+                rarity_floor=rarity_floor,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                source_offsets=source_offsets,
+                max_gap_seconds=max_gap_seconds,
             )
+        method = "ngram"
 
         self.ch.init_schema()
         db = self.ch.database
@@ -6558,6 +8263,203 @@ class StatisticalAnomalyService:
             windows=windows,
         )
 
+    def _find_sequence_novelty_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        series_field: str,
+        ngram: int,
+        limit: int,
+        max_candidates: int,
+        rarity_floor: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        source_offsets: dict[str, int] | None,
+        max_gap_seconds: int | None,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_sequence_novelty` (``method="rare-ngram"``).
+
+        Same n-gram assembly (:func:`_ngram_inner_sql`, per source, record-
+        order tie-breaks, *max_gap_seconds*) with one pseudo-window over every
+        scope event. Per source: the complete-n-gram total (Query A), then the
+        n-grams occurring at most *rarity_floor* times, rarest first, capped
+        at *max_candidates* (Query B). On multi-source scopes the merged
+        candidates are recounted exactly across every source (Query C) and
+        those above the floor case-wide are dropped. Score =
+        ``-log(count / scope_ngram_total)``; the representative event is the
+        first event of the earliest occurrence. High-cardinality series fields
+        make most n-grams rare (combinatorially), which the cap warning
+        discloses — prefer a low-cardinality series field.
+        """
+        detector = "sequence_novelty"
+        method = "rare-ngram"
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        col = _col_expr(series_field, params, field_mappings)
+        eff = effective_ts_sql(source_offsets)
+        inner = _ngram_inner_sql(
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=ngram,
+            w_idx_expr="0",
+            scope_pred="1",
+            max_gap=max_gap_seconds,
+        )
+
+        # Query A (once per source): complete-n-gram total over the scope.
+        totals_sql = f"""
+            SELECT count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL
+            {heavy_scan_settings()}
+        """
+        scope_ngram_total = 0
+        for sid in source_ids:
+            rows = self.ch.client.query(totals_sql, parameters={**params, "src": [sid]}).result_rows
+            scope_ngram_total += _scalar_total(rows)
+        run_warnings: list[str] = []
+        if scope_ngram_total == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=total_events,
+                warnings=[f"The scope contains no complete sequences of length {ngram}."],
+            )
+        if scope_ngram_total < _MIN_WINDOW_EVENTS:
+            run_warnings.append(
+                f"The scope holds only {scope_ngram_total} complete sequences of length "
+                f"{ngram} — surprise scores over samples below {_MIN_WINDOW_EVENTS} are unstable"
+            )
+
+        # Query B (once per source): rare n-grams under the floor, rarest first.
+        params["cap"] = max_candidates
+        params["floor"] = rarity_floor
+        rare_sql = f"""
+            SELECT
+                gram,
+                count() AS cnt,
+                min(first_ts) AS first_seen,
+                argMin(first_eid, first_ts) AS first_evt
+            FROM ({inner})
+            WHERE guard IS NOT NULL
+            GROUP BY gram
+            HAVING cnt <= {{floor:UInt32}}
+            ORDER BY cnt ASC, gram ASC
+            LIMIT {{cap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        # gram -> [count, first_ts, first_eid], merged across sources.
+        merged: dict[tuple[str, ...], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(rare_sql, parameters={**params, "src": [sid]}).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-sequence candidate cap — "
+                    f"only its {max_candidates} rarest sequences were fetched; a "
+                    f"high-cardinality series field makes most orderings rare, so "
+                    f"prefer a field with a few distinct values."
+                )
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                slot = merged.setdefault(gram, [0, None, None])
+                slot[0] += int(row[1])
+                first_ts = row[2]
+                if first_ts is not None and (slot[1] is None or first_ts < slot[1]):
+                    slot[1] = first_ts
+                    slot[2] = row[3]
+
+        # Query C (multi-source only): exact case-wide counts for the merged
+        # candidates — a gram rare in one source and common in another is not
+        # rare in the scope.
+        if merged and len(source_ids) > 1:
+            check_sql = f"""
+                SELECT gram, count() AS cnt, min(first_ts) AS first_seen,
+                       argMin(first_eid, first_ts) AS first_evt
+                FROM ({inner})
+                WHERE guard IS NOT NULL AND has({{cands:Array(Array(String))}}, gram)
+                GROUP BY gram
+                {heavy_scan_settings()}
+            """
+            cands = [list(g) for g in merged]
+            exact: dict[tuple[str, ...], list[Any]] = {}
+            for sid in source_ids:
+                rows = self.ch.client.query(
+                    check_sql, parameters={**params, "src": [sid], "cands": cands}
+                ).result_rows
+                for row in rows:
+                    gram = tuple(str(v) for v in row[0])
+                    slot = exact.setdefault(gram, [0, None, None])
+                    slot[0] += int(row[1])
+                    first_ts = row[2]
+                    if first_ts is not None and (slot[1] is None or first_ts < slot[1]):
+                        slot[1] = first_ts
+                        slot[2] = row[3]
+            merged = {g: slot for g, slot in exact.items() if slot[0] <= rarity_floor}
+
+        findings: list[SequenceFinding] = []
+        for gram, (count, first_ts_val, evt_id) in merged.items():
+            if count <= 0:
+                continue
+            values = list(gram)
+            joined = " → ".join(values)
+            first_seen = _present_ts(first_ts_val)
+            evt_id_str = str(evt_id) if evt_id else None
+            score = -math.log(count / scope_ngram_total)
+            findings.append(
+                SequenceFinding(
+                    field=series_field,
+                    values=values,
+                    value=joined,
+                    count=count,
+                    score=round(score, 4),
+                    first_seen=first_seen,
+                    event_id=evt_id_str,
+                    event=_stub_event(evt_id_str, case_id, first_seen),
+                    details={
+                        "detector": detector,
+                        "method": method,
+                        "field": series_field,
+                        "values": values,
+                        "value": joined,
+                        "n": ngram,
+                        "count": count,
+                        "scope_ngram_total": scope_ngram_total,
+                        "rarity_floor": rarity_floor,
+                        "first_seen": first_seen,
+                        "surprise": round(score, 4),
+                        "allowlist_field": series_field,
+                        "allowlist_value": joined,
+                    },
+                )
+            )
+
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=total_events,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+        )
+
     @gated_heavy_scan
     def find_sequence_motifs(
         self,
@@ -6731,13 +8633,14 @@ class StatisticalAnomalyService:
                 count() AS k,
                 avg(delta) AS mean,
                 stddevSamp(delta) AS std,
-                quantile(0.5)(delta) AS med,
+                quantileDeterministic(0.5)(delta, cityHash64(first_eid)) AS med,
                 sum(delta * delta) AS sum2,
                 min(occ_ts) AS first,
                 max(occ_ts) AS last
             FROM (
                 SELECT
                     gram,
+                    first_eid,
                     first_ts AS occ_ts,
                     dateDiff('millisecond', lagInFrame(first_ts, 1) OVER w2, first_ts) / 1000.0 AS delta
                 FROM ({inner})
