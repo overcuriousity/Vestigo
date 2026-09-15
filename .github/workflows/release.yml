@@ -174,9 +174,18 @@ jobs:
           fi
 
       - name: Create GitHub release
+        # Idempotent: releases are usually cut by hand at tag time, with a
+        # title that says what the release is about. Creating one here would
+        # then fail the whole job with HTTP 422, which is how every tag from
+        # v1.17.1 on went red after a green build. A release that already
+        # exists is the authoritative one — leave its title and notes alone.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Vestigo $GITHUB_REF_NAME" \
-            --notes-file release-notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; leaving it as-is."
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Vestigo ${GITHUB_REF_NAME#v}" \
+              --notes-file release-notes.md
+          fi
