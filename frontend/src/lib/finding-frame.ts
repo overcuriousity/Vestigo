@@ -23,14 +23,19 @@ export const TEMPORAL_MODES: ReadonlySet<string> = new Set([
   "cadence",
   "ngram",
   "drift",
+  "min-transition",
 ]);
 
-/** The self modes of the four formerly baseline-only methods. */
+/**
+ * The self modes of the four formerly baseline-only methods, plus the
+ * transition detector's, which was born with both frames.
+ */
 export const SELF_MODES: ReadonlySet<string> = new Set([
   "self-g-test",
   "self-drift",
   "self-cadence",
   "rare-ngram",
+  "self-min-transition",
 ]);
 
 /** The two self modes that compare leave-one-out time slices with the rest of the scope. */

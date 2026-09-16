@@ -6501,3 +6501,327 @@ def test_gamma_from_median_recovers_the_median():
         else:
             hi = mid
     assert abs(lo * theta - median) / median < 0.01
+
+
+# ---------------------------------------------------------------------------
+# transition_time — detector (D15)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then per source one
+# suspect-candidate scan (Query A) and, when candidates exist, one baseline
+# learn scan (Query B). Query A row layout: gram ([from, to]), w_idx,
+# fastest_ms, evt, at, pval, n. Query B row layout: gram, min_ms, n.
+# Self frame: count, then per source one scan whose rows are gram,
+# two_fastest_ms ([m1, m2]), evt, at, pval, n.
+
+_TRANS_CAND_COLS = ["gram", "w_idx", "fastest_ms", "evt", "at", "pval", "n"]
+_TRANS_LEARN_COLS = ["gram", "min_ms", "n"]
+_TRANS_SELF_COLS = ["gram", "two_fastest_ms", "evt", "at", "pval", "n"]
+
+
+def _trans_responses(
+    total: int,
+    window_totals: tuple[int, int],
+    cand_rows: list[tuple],
+    learn_rows: list[tuple] | None,
+) -> list[FakeQueryResult]:
+    out = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(result_rows=cand_rows, column_names=_TRANS_CAND_COLS),
+    ]
+    if learn_rows is not None:
+        out.append(FakeQueryResult(result_rows=learn_rows, column_names=_TRANS_LEARN_COLS))
+    return out
+
+
+def test_transition_min_ratio_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="min_ratio"):
+        svc.find_transition_times("c1", ["s1"], min_ratio=1.0, windows=_seq_windows())
+    assert svc.ch.client._calls == []
+
+
+def test_transition_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "no_data"
+    assert result.detector == "transition_time"
+    assert result.windows is not None
+
+
+def test_transition_baseline_flags_a_transition_faster_than_the_learned_floor():
+    at = datetime(2024, 1, 17, 12, 0, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            # JUMP-01 → FILE-01 in 3 s during the incident; 4 such transitions.
+            cand_rows=[(["JUMP-01", "FILE-01"], 0, 3_000, "evt-1", at, "m.okonkwo", 4)],
+            # The baseline never saw it faster than 41 minutes, over 12 transitions.
+            learn_rows=[(["JUMP-01", "FILE-01"], 2_460_000, 12)],
+        )
+    )
+    result = svc.find_transition_times(
+        "c1",
+        ["s1"],
+        series_field="attr:computer_name",
+        partition_field="attr:user",
+        windows=_seq_windows(),
+    )
+    assert result.status == "ok"
+    assert result.method == "min-transition"
+    assert result.baseline_size == 8000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.field == "attr:computer_name"
+    assert r.values == ["JUMP-01", "FILE-01"]
+    assert r.value == "JUMP-01 → FILE-01"
+    assert r.partition_field == "attr:user"
+    assert r.partition_value == "m.okonkwo"
+    assert r.observed_seconds == 3.0
+    assert r.reference_seconds == 2460.0
+    assert r.reference_kind == "baseline-min"
+    assert r.count == 4
+    assert r.baseline_count == 12
+    assert abs(r.score - (1 - 3 / 2460)) < 1e-5
+    assert abs(r.speedup - 820.0) < 1e-9
+    assert r.event_id == "evt-1"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T12:00")
+    assert r.details["window_label"] == "incident"
+    assert r.details["min_ratio"] == 2.0
+    assert r.details["min_transitions"] == 3
+    assert r.details["allowlist_field"] == "attr:computer_name"
+    assert r.details["allowlist_value"] == "JUMP-01 → FILE-01"
+    # Both scans ran once for the single source: count, totals, A, B.
+    assert len(svc.ch.client._calls) == 4
+    # The learn scan is bound to the candidate pairs.
+    assert svc.ch.client._all_parameters[3]["cands"] == [["JUMP-01", "FILE-01"]]
+
+
+def test_transition_baseline_effect_floor_and_learning_floor():
+    """A transition merely faster than the floor is not flagged; neither is one
+    whose pair the baseline saw too few times, nor one whose learned floor is
+    zero (second-resolution logs make zero-length transitions routine)."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[
+                # 1.5x faster than the learned floor — under min_ratio 2.
+                (["a", "b"], 0, 20_000, "e1", at, "", 5),
+                # 100x faster, but the baseline holds only 2 transitions.
+                (["b", "c"], 0, 100, "e2", at, "", 5),
+                # Learned floor is 0 — nothing can be faster than instant.
+                (["c", "d"], 0, 0, "e3", at, "", 5),
+                # 10x faster over a well-learned pair: the one finding.
+                (["d", "e"], 0, 1_000, "e4", at, "", 2),
+            ],
+            learn_rows=[
+                (["a", "b"], 30_000, 40),
+                (["b", "c"], 10_000, 2),
+                (["c", "d"], 0, 40),
+                (["d", "e"], 10_000, 40),
+            ],
+        )
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results] == ["d → e"]
+    assert result.results[0].partition_field is None
+    assert result.results[0].partition_value is None
+    assert any("zero" in w for w in result.warnings)
+
+
+def test_transition_baseline_without_learned_pairs_is_insufficient():
+    """No candidate pair has a baseline floor: nothing to compare against."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[(["x", "y"], 0, 100, "e1", at, "", 3)],
+            learn_rows=[],
+        )
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "insufficient_data"
+    assert any("baseline" in w for w in result.warnings)
+
+
+def test_transition_baseline_multi_source_merges_floor_and_fastest():
+    """Per-source scans: the learned floor is the minimum over every source's
+    baseline, counts are summed, and the fastest suspect transition across
+    sources supplies the representative event."""
+    at_fast = datetime(2024, 1, 16, 8, 0, tzinfo=UTC)
+    at_slow = datetime(2024, 1, 17, 8, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(8000, 2000)], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(
+            result_rows=[(["a", "b"], 0, 5_000, "e-s1", at_slow, "", 2)],
+            column_names=_TRANS_CAND_COLS,
+        ),
+        FakeQueryResult(
+            result_rows=[(["a", "b"], 0, 2_000, "e-s2", at_fast, "", 3)],
+            column_names=_TRANS_CAND_COLS,
+        ),
+        FakeQueryResult(result_rows=[(["a", "b"], 60_000, 4)], column_names=_TRANS_LEARN_COLS),
+        FakeQueryResult(result_rows=[(["a", "b"], 30_000, 6)], column_names=_TRANS_LEARN_COLS),
+    ]
+    svc = _svc(responses)
+    result = svc.find_transition_times("c1", ["s1", "s2"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.observed_seconds == 2.0
+    assert r.reference_seconds == 30.0
+    assert r.count == 5
+    assert r.baseline_count == 10
+    assert r.event_id == "e-s2"
+    assert len(svc.ch.client._calls) == 6
+    for p in svc.ch.client._all_parameters[2:]:
+        assert p["src"] in (["s1"], ["s2"])
+
+
+def test_transition_sql_shape_and_partition_field():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[(["a", "b"], 0, 1_000, "e1", at, "u1", 3)],
+            learn_rows=[(["a", "b"], 10_000, 9)],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_transition_times(
+        "c1",
+        ["s1"],
+        series_field="attr:computer_name",
+        partition_field="attr:user",
+        windows=_seq_windows(),
+    )
+    assert result.status == "ok"
+    cand_sql, learn_sql = client.full_queries[2], client.full_queries[3]
+    for sql in (cand_sql, learn_sql):
+        # A transition is one step of the shared n-gram assembly, per stream.
+        assert "PARTITION BY source_id, w_idx, pkey" in sql
+        assert "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW" in sql
+        assert "guard IS NOT NULL" in sql
+        # Same-value repeats are not transitions.
+        assert "gram[1] != gram[2]" in sql
+        assert "dateDiff('millisecond', first_ts, ets)" in sql
+    assert "w_idx >= 0" in cand_sql
+    assert "w_idx = -1" in learn_sql
+    assert "has({cands:Array(Array(String))}, gram)" in learn_sql
+    params = client._all_parameters[2]
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-16 00:00:00.000"
+    # Both fields are bound as attribute keys, never inlined.
+    assert "attributes[{fk:String}]" in cand_sql
+    assert "attributes[{pk:String}]" in cand_sql
+    assert params["fk"] == "computer_name"
+    assert params["pk"] == "user"
+
+
+def test_transition_self_frame_uses_the_next_fastest_transition():
+    """Without a baseline the reference is leave-one-out: the pair's second
+    fastest transition anywhere in the scope."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[
+                    # 2 s against a next-fastest of 600 s: flagged.
+                    (["JUMP-01", "FILE-01"], [2_000, 600_000], "e1", at, "m.okonkwo", 7),
+                    # Two equally fast transitions: leave-one-out floor equals
+                    # the observation, nothing is faster than its own twin.
+                    (["a", "b"], [1_000, 1_000], "e2", at, "", 9),
+                    # Below the transition floor of 3.
+                    (["b", "c"], [1, 900_000], "e3", at, "", 2),
+                    # 1.5x — under min_ratio.
+                    (["c", "d"], [4_000, 6_000], "e4", at, "", 30),
+                ],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times(
+        "c1", ["s1"], series_field="attr:computer_name", partition_field="attr:user"
+    )
+    assert result.status == "ok"
+    assert result.method == "self-min-transition"
+    assert result.windows is None
+    assert [r.value for r in result.results] == ["JUMP-01 → FILE-01"]
+    r = result.results[0]
+    assert r.observed_seconds == 2.0
+    assert r.reference_seconds == 600.0
+    assert r.reference_kind == "next-fastest"
+    assert r.count == 7
+    assert r.baseline_count == 7
+    assert r.partition_value == "m.okonkwo"
+    assert abs(r.score - (1 - 2 / 600)) < 1e-5
+    assert r.details["scope_transitions"] == 7
+    assert "window_label" not in r.details
+    assert len(svc.ch.client._calls) == 2
+
+
+def test_transition_self_frame_multi_source_takes_the_two_fastest_overall():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [50_000, 70_000], "e-s1", at, "", 4)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1_000, 90_000], "e-s2", at, "", 3)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1", "s2"])
+    assert result.status == "ok"
+    r = result.results[0]
+    # Next-fastest is s1's 50 s, not s2's own 90 s.
+    assert r.observed_seconds == 1.0
+    assert r.reference_seconds == 50.0
+    assert r.count == 7
+    assert r.event_id == "e-s2"
+
+
+def test_transition_self_frame_candidate_cap_warns():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [([f"h{i}", f"h{i + 1}"], [1_000, 90_000], f"e{i}", at, "", 5) for i in range(3)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=rows, column_names=_TRANS_SELF_COLS),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], max_candidates=3)
+    assert result.status == "ok"
+    assert any("candidate cap" in w for w in result.warnings)
+    assert svc.ch.client._all_parameters[1]["cap"] == 3
+
+
+def test_transition_allowlist_suppresses_the_pair_in_both_frames():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1_000, 90_000], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], allowlist={("artifact", "a → b")})
+    assert result.status == "ok"
+    assert result.results == []
+    assert result.total_findings == 0

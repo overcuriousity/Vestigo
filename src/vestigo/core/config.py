@@ -185,6 +185,17 @@ class Settings(BaseSettings):
     # occurrences, not value occurrences — the charset floor is separate for
     # the same reason.
     stat_sequence_rarity_floor: int = Field(default=3, ge=1)
+    # Transition-time detector (D15): a suspect transition must undercut the
+    # pair's learned floor by at least this factor to be reported — a floor
+    # learned from a handful of transitions is not precise to the second.
+    stat_transition_min_ratio: float = Field(default=2.0, gt=1)
+    # A pair's floor is learned from at least this many transitions (baseline
+    # window, or the whole scope in the self frame); fewer and the pair is
+    # skipped rather than scored against one or two observations.
+    stat_transition_min_transitions: int = Field(default=3, ge=2)
+    # Cap on candidate pairs fetched per source, fastest first; hitting it
+    # carries a warning.
+    stat_transition_max_candidates: int = 2000
     # ── Self frame for the slice-based detectors (D18) ──────────────────────
     # How many equal-width time slices proportion_shift and
     # value_distribution_drift cut the scope into when no baseline is declared;

@@ -48,13 +48,15 @@ METHOD_IDS: tuple[str, ...] = (
     "interval_periodicity",
     "timestamp_order",
     "sequence_novelty",
+    "transition_time",
     "log_template",
 )
 
 #: The methods that select fields for themselves, and so the only ones a
-#: timeline's ``field_overrides`` can steer. The other four take no field
-#: selection to steer: ``frequency`` and ``sequence_novelty`` take a single
-#: ``series_field`` the analyst names outright, ``timestamp_order`` reads no
+#: timeline's ``field_overrides`` can steer. The other five take no field
+#: selection to steer: ``frequency``, ``sequence_novelty`` and
+#: ``transition_time`` take a single ``series_field`` the analyst names
+#: outright, ``timestamp_order`` reads no
 #: field at all, and ``log_template`` clusters the message text. A declaration
 #: stored against one of those would be audited, rendered as "declared" and
 #: then quietly apply to nothing — which is the same lie an unknown method id
@@ -88,6 +90,7 @@ COST_CLASS: dict[str, str] = {
     "value_distribution_drift": "heavy",
     "interval_periodicity": "heavy",
     "sequence_novelty": "heavy",
+    "transition_time": "heavy",
     "log_template": "heavy",
 }
 
@@ -340,6 +343,7 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         "value_distribution_drift",
         "interval_periodicity",
         "sequence_novelty",
+        "transition_time",
     ):
         if frame_needs_baseline:
             plans[method] = _setup(
@@ -390,6 +394,23 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         else _no(
             "sequence_novelty",
             "the series field holds one value, so every n-gram is the same one",
+            {
+                "series_distinct": inputs.series_distinct,
+                "required": cfg.analysis_gate_min_series_distinct,
+            },
+        ),
+    )
+
+    # A transition is a step between two *different* values of the series
+    # field, so the same floor applies: one distinct value yields no transition
+    # at all. Two values yield two ordered pairs, each with a floor to learn.
+    plans.setdefault(
+        "transition_time",
+        _ok("transition_time")
+        if inputs.series_distinct >= cfg.analysis_gate_min_series_distinct
+        else _no(
+            "transition_time",
+            "the series field holds one value, so no event moves between two",
             {
                 "series_distinct": inputs.series_distinct,
                 "required": cfg.analysis_gate_min_series_distinct,

@@ -357,6 +357,25 @@ class _SequenceNoveltyParams(_Params):
     max_gap_seconds: int | None = Field(default=None, ge=1)
 
 
+class _TransitionTimeParams(_Params):
+    series_field: str = DEFAULT_SERIES_FIELD
+    #: The stream whose transitions are timed (a user, a session); None =
+    #: one stream per source.
+    partition_field: str | None = None
+    min_ratio: float | None = Field(default=None, gt=1)
+
+    @field_validator("partition_field", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: Any) -> Any:
+        """A cleared field select and an omitted knob ask the same question.
+
+        The form spells "per source" as ``""``; the runner spells it ``None``.
+        Normalizing here keeps the two from fingerprinting as different cache
+        keys for one answer.
+        """
+        return None if v == "" else v
+
+
 class _LogTemplateParams(_Params):
     #: Not a `_run_stat_detector` detector — log templating is a browser with
     #: its own service call (see :func:`_run_log_templates`). Routing it through
@@ -378,6 +397,7 @@ METHOD_MODELS: dict[str, type[_Params]] = {
     "interval_periodicity": _IntervalPeriodicityParams,
     "timestamp_order": _TimestampOrderParams,
     "sequence_novelty": _SequenceNoveltyParams,
+    "transition_time": _TransitionTimeParams,
     "log_template": _LogTemplateParams,
 }
 
@@ -708,6 +728,7 @@ async def get_analysis_findings(
             group_field=kwargs.get("group_field"),
             max_gap_seconds=kwargs.get("max_gap_seconds"),
             variant=kwargs.get("variant"),
+            partition_field=kwargs.get("partition_field"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

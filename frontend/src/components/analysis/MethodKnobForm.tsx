@@ -129,6 +129,8 @@ export function knobHelp(knob: MethodKnob): string {
       return "How many consecutive events form one sequence. Three is a good default.";
     case "max_gap_seconds":
       return "Break a sequence when consecutive events are farther apart than this.";
+    case "partition_field":
+      return "Whose moves are timed: transitions are measured within one value of this field, such as one account. Without it every source is a single stream.";
     case "field":
       return "The text field to cluster into templates. Usually the message.";
     case "order":

@@ -182,6 +182,25 @@ already-ingested data.
     window occurrence of the most-shifted category (categorical). Score =
     ``-log10(p)`` so the two statistics rank on one scale.
 
+**transition_time** (``detector="transition_time"``)
+    Per ordered value pair ``a → b`` of a series field, learn the fastest a
+    stream ever moved from ``a`` to ``b`` and flag a transition faster than
+    that floor by at least ``min_ratio``×. Adapted from AMiner's
+    ``MinimalTransitionTimeDetector`` (roadmap D15): the "impossible speed"
+    question — one account on two hosts three seconds apart when the
+    baseline never saw it under forty minutes. Transitions are one step of
+    the sequence detectors' n-gram assembly (:func:`_ngram_inner_sql`,
+    ``n = 2``), per source and optionally per *partition field* (the
+    identifier whose stream is timed — a user, a session), so consecutive
+    events of different identifiers never form one transition; same-value
+    repeats are not transitions. Two frames: *baseline*
+    (``method="min-transition"``) learns each pair's minimum over the baseline
+    window (at least ``min_transitions`` of them, floor > 0) and scores each
+    suspect window's fastest transition of the pair against it; *self*
+    (``method="self-min-transition"``, D18) takes the pair's **next-fastest**
+    transition anywhere in the scope as the leave-one-out floor. Score =
+    ``1 − observed / reference``.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -1241,6 +1260,44 @@ class SequenceFinding:
 
 
 @dataclass
+class TransitionFinding:
+    """One value-to-value transition faster than its learned floor (transition_time, D15)."""
+
+    # Field token whose consecutive values form the transition (e.g. "attr:computer_name").
+    field: str
+    # [from, to].
+    values: list[str]
+    # "from → to" — display form and the allowlist key.
+    value: str
+    # The stream key the transition was timed within (e.g. "attr:user"); None = per source.
+    partition_field: str | None
+    # That key's value on the flagged transition; None when unpartitioned.
+    partition_value: str | None
+    # The fastest transition of this pair in the window (baseline frame) or
+    # the scope (self frame), in seconds.
+    observed_seconds: float
+    # The floor it undercut: the baseline's fastest (baseline frame) or the
+    # pair's next-fastest transition anywhere in the scope (self frame).
+    reference_seconds: float
+    reference_kind: str  # "baseline-min" | "next-fastest"
+    # reference_seconds / observed_seconds; None when the observation is instant.
+    speedup: float | None
+    # Transitions of this pair in the window (baseline frame) or the scope (self).
+    count: int
+    # Transitions the floor was learned from: the baseline's (baseline frame)
+    # or, in the self frame, the same scope count as `count`.
+    baseline_count: int
+    # 1 − observed / reference; 1.0 = instantaneous.
+    score: float
+    # Timestamp of the arriving event of the fastest transition.
+    first_seen: str | None
+    # The arriving event.
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class MotifFinding:
     """One recurring event-order n-gram surfaced by the sequence-motif miner."""
 
@@ -1282,10 +1339,12 @@ class StatAnomalyResult:
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
     #  | "sequence_novelty" | "sequence_motif" | "value_distribution_drift"
+    #  | "transition_time"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test" | "cadence" | "ngram" | "motif" | "drift"
+    #  | "g-test" | "cadence" | "ngram" | "motif" | "drift" | "min-transition"
+    #  | "self-min-transition"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -1301,6 +1360,7 @@ class StatAnomalyResult:
         | SequenceFinding
         | MotifFinding
         | DistributionDriftFinding
+        | TransitionFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -1746,6 +1806,7 @@ def _ngram_inner_sql(
     w_idx_expr: str,
     scope_pred: str,
     max_gap: int | None = None,
+    partition_col: str | None = None,
 ) -> str:
     """Two-level n-gram assembly subquery shared by the sequence detectors.
 
@@ -1765,6 +1826,13 @@ def _ngram_inner_sql(
     form. ``None`` keeps the pre-D14 shape bit-identical. The value is an
     int inlined as a literal, same convention as the ``ngram - 1`` frame.
 
+    *partition_col* (D15) names a second stream key — an identifier such as
+    the user whose host transitions are being timed. Rows are additionally
+    partitioned by it (``pkey``), so consecutive events of *different*
+    identifiers never form one n-gram, and rows without a value for it are
+    left out rather than lumped into one anonymous stream. ``None`` keeps the
+    per-source partition and emits an empty ``pkey``.
+
     Callers must run the enclosing query **once per source** (it bounds the
     window sort — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
     and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
@@ -1772,10 +1840,13 @@ def _ngram_inner_sql(
     gram_lags = ", ".join(
         [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
     )
+    pkey_expr = f"toString({partition_col})" if partition_col is not None else "''"
+    pkey_pred = f"AND {partition_col} != ''" if partition_col is not None else ""
     level1 = f"""
                 SELECT
                     source_id,
                     {col} AS val,
+                    {pkey_expr} AS pkey,
                     toString(event_id) AS eid,
                     {eff} AS ets,
                     byte_offset,
@@ -1786,9 +1857,11 @@ def _ngram_inner_sql(
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
                   AND {col} != ''
+                  {pkey_pred}
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({scope_pred})
             """
+    stream = "source_id, w_idx, pkey" if partition_col is not None else "source_id, w_idx"
     if max_gap is not None:
         gap = int(max_gap)
         # gap_s is NULL on each partition's first row; ClickHouse's `if` takes
@@ -1814,19 +1887,21 @@ def _ngram_inner_sql(
                         age('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
                     FROM ({level1})
                     WINDOW ord AS (
-                        PARTITION BY source_id, w_idx
+                        PARTITION BY {stream}
                         ORDER BY ets, byte_offset, line_number, event_id
                     )
                 )
                 WINDOW ord AS (
-                    PARTITION BY source_id, w_idx
+                    PARTITION BY {stream}
                     ORDER BY ets, byte_offset, line_number, event_id
                 )
             """
-    partition = "source_id, w_idx, seg" if max_gap is not None else "source_id, w_idx"
+    partition = f"{stream}, seg" if max_gap is not None else stream
     return f"""
             SELECT
                 val,
+                pkey,
+                eid AS last_eid,
                 ets,
                 w_idx,
                 [{gram_lags}] AS gram,
@@ -8458,6 +8533,495 @@ class StatisticalAnomalyService:
             source_ids=source_ids,
             allowlist=allowlist,
             warnings=run_warnings,
+        )
+
+    # ------------------------------------------------------------------
+    # Transition time (D15)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_transition_times(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str = "artifact",
+        partition_field: str | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        min_ratio: float = 2.0,
+        min_transitions: int = 3,
+        max_candidates: int = 2000,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> StatAnomalyResult:
+        """Return value-to-value transitions faster than the pair's learned floor.
+
+        AMiner ``MinimalTransitionTimeDetector`` analog (D15). A *transition*
+        is one step ``a → b`` between consecutive events of one stream whose
+        *series_field* values differ; the stream is the source, further split
+        by *partition_field* when given (the identifier whose movements are
+        timed — a user across hosts, a session across states). Transitions are
+        assembled by :func:`_ngram_inner_sql` with ``n = 2``, so they inherit
+        the sequence detectors' ordering, the per-source scan discipline and
+        the guarantee that a pair never spans a window boundary. The duration
+        is ``dateDiff('millisecond', first_ts, ets)``.
+
+        *Baseline frame* (``method="min-transition"``, *windows* given): per
+        pair the floor is the minimum baseline-window transition, learned from
+        at least *min_transitions* of them; each suspect window's fastest
+        transition of the pair is flagged when it undercuts the floor by at
+        least *min_ratio*×. A learned floor of zero cannot be undercut — with
+        second-resolution timestamps zero-length transitions are routine — so
+        such pairs are skipped and counted in a warning. *Self frame*
+        (``method="self-min-transition"``, no *windows*, D18): the floor is the
+        pair's **next-fastest** transition anywhere in the scope
+        (``groupArraySorted(2)``, the leave-one-out minimum), over at least
+        *min_transitions* transitions; two equally fastest transitions vouch
+        for each other and nothing is flagged.
+
+        Candidates are the *max_candidates* fastest pairs per source (cap →
+        warning). On a multi-source scope the floor is the minimum over every
+        source's reference and counts are summed. Score =
+        ``1 − observed / reference``; the representative event is the arriving
+        event of the fastest transition. The allowlist key is
+        ``(series_field, "a → b")`` in both frames.
+        """
+        detector = "transition_time"
+        if min_ratio <= 1.0:
+            raise ValueError("min_ratio must be greater than 1")
+        if windows is None:
+            return self._find_transition_times_self(
+                case_id,
+                source_ids,
+                series_field=series_field,
+                partition_field=partition_field,
+                limit=limit,
+                min_ratio=min_ratio,
+                min_transitions=min_transitions,
+                max_candidates=max_candidates,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                source_offsets=source_offsets,
+            )
+        method = "min-transition"
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+        baseline_size, suspect_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
+        run_warnings = _window_size_warnings(windows, suspect_totals)
+        if baseline_size == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                warnings=[*run_warnings, "The baseline window contains no events."],
+                windows=windows.payload(),
+            )
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        col = _col_expr(series_field, params, field_mappings)
+        pcol = (
+            _col_expr(partition_field, params, field_mappings, prefix="pk")
+            if partition_field
+            else None
+        )
+        bp, sps = _window_preds(windows, params, source_offsets)
+        eff = effective_ts_sql(source_offsets)
+        w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
+        inner = _ngram_inner_sql(
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=2,
+            w_idx_expr=f"multiIf({bp}, -1, {w_branches}, -2)",
+            scope_pred=" OR ".join([bp, *sps]),
+            partition_col=pcol,
+        )
+        dur = "toInt64(dateDiff('millisecond', first_ts, ets))"
+
+        # Query A (once per source): each suspect window's fastest transition
+        # per pair, fastest first — the candidates. The cap keeps the fastest,
+        # which are the ones the question is about; hitting it is disclosed.
+        params["cap"] = max_candidates
+        cand_sql = f"""
+            SELECT
+                gram,
+                w_idx,
+                min({dur}) AS fastest_ms,
+                argMin(last_eid, {dur}) AS evt,
+                argMin(ets, {dur}) AS at,
+                argMin(pkey, {dur}) AS pval,
+                count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2] AND w_idx >= 0
+            GROUP BY gram, w_idx
+            ORDER BY fastest_ms ASC, gram ASC, w_idx ASC
+            LIMIT {{cap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        # (gram, w_idx) -> [fastest_ms, evt, at, pval, n]
+        cands: dict[tuple[tuple[str, ...], int], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(cand_sql, parameters={**params, "src": [sid]}).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-pair candidate cap — only its "
+                    f"{max_candidates} fastest suspect transitions were fetched; slower "
+                    f"pairs that still undercut their floor may be missing."
+                )
+            for row in rows:
+                key = (tuple(str(v) for v in row[0]), int(row[1]))
+                fastest = int(row[2])
+                slot = cands.get(key)
+                if slot is None:
+                    cands[key] = [fastest, row[3], row[4], row[5], int(row[6])]
+                    continue
+                slot[4] += int(row[6])
+                if fastest < slot[0]:
+                    slot[0], slot[1], slot[2], slot[3] = fastest, row[3], row[4], row[5]
+        if not cands:
+            return self._finalize_findings(
+                [],
+                detector=detector,
+                method=method,
+                total_events=baseline_size,
+                evaluated_fields=1,
+                exclude_event_ids=exclude_event_ids,
+                limit=limit,
+                case_id=case_id,
+                source_ids=source_ids,
+                allowlist=allowlist,
+                warnings=run_warnings,
+                windows=windows,
+            )
+
+        # Query B (once per source): the baseline floor for the candidate pairs.
+        pairs = sorted({g for g, _w in cands})
+        learn_sql = f"""
+            SELECT gram, min({dur}) AS min_ms, count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2] AND w_idx = -1
+              AND has({{cands:Array(Array(String))}}, gram)
+            GROUP BY gram
+            {heavy_scan_settings()}
+        """
+        learned: dict[tuple[str, ...], list[int]] = {}  # gram -> [min_ms, n]
+        for sid in source_ids:
+            rows = self.ch.client.query(
+                learn_sql, parameters={**params, "src": [sid], "cands": [list(g) for g in pairs]}
+            ).result_rows
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                slot = learned.setdefault(gram, [int(row[1]), 0])
+                slot[0] = min(slot[0], int(row[1]))
+                slot[1] += int(row[2])
+        if not learned:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=baseline_size,
+                warnings=[
+                    *run_warnings,
+                    "No suspect-window transition has a counterpart in the baseline window, "
+                    "so there is no floor to compare against.",
+                ],
+                windows=windows.payload(),
+            )
+
+        zero_floors = 0
+        findings: list[TransitionFinding] = []
+        for (gram, wi), (fastest, evt, at, pval, n) in cands.items():
+            ref = learned.get(gram)
+            if ref is None or ref[1] < min_transitions:
+                continue
+            floor_ms, n_baseline = ref
+            if floor_ms <= 0:
+                zero_floors += 1
+                continue
+            if fastest * min_ratio >= floor_ms:
+                continue
+            window = windows.suspects[wi]
+            findings.append(
+                self._transition_finding(
+                    case_id=case_id,
+                    detector=detector,
+                    method=method,
+                    series_field=series_field,
+                    partition_field=partition_field,
+                    gram=gram,
+                    fastest_ms=fastest,
+                    reference_ms=floor_ms,
+                    reference_kind="baseline-min",
+                    evt=evt,
+                    at=at,
+                    pval=pval,
+                    count=n,
+                    baseline_count=n_baseline,
+                    min_ratio=min_ratio,
+                    min_transitions=min_transitions,
+                    extra={
+                        "window_label": window.label,
+                        "window_start": ensure_utc(window.start).isoformat(),
+                        "window_end": ensure_utc(window.end).isoformat(),
+                        "window_transitions": n,
+                        "baseline_transitions": n_baseline,
+                        "baseline_size": baseline_size,
+                    },
+                )
+            )
+        if zero_floors:
+            run_warnings.append(
+                f"{zero_floors} pair{'s' if zero_floors != 1 else ''} skipped: the baseline's "
+                f"fastest transition is zero seconds (same-timestamp records), and nothing "
+                f"can be faster than instant."
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
+
+    def _find_transition_times_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        series_field: str,
+        partition_field: str | None,
+        limit: int,
+        min_ratio: float,
+        min_transitions: int,
+        max_candidates: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        source_offsets: dict[str, int] | None,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_transition_times` (``method="self-min-transition"``).
+
+        One pseudo-window over every scope event; per source and pair the two
+        fastest transitions (``groupArraySorted(2)``), the arriving event of
+        the fastest, and the pair's transition count. Merged across sources
+        by taking the two smallest durations overall. The floor is the second
+        of them — every other transition of the pair is at least that slow —
+        and the fastest is flagged when it undercuts the floor by *min_ratio*×
+        over at least *min_transitions* transitions. A zero floor (two
+        instantaneous transitions) is skipped and counted in a warning, as in
+        the baseline frame.
+        """
+        detector = "transition_time"
+        method = "self-min-transition"
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        col = _col_expr(series_field, params, field_mappings)
+        pcol = (
+            _col_expr(partition_field, params, field_mappings, prefix="pk")
+            if partition_field
+            else None
+        )
+        eff = effective_ts_sql(source_offsets)
+        inner = _ngram_inner_sql(
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=2,
+            w_idx_expr="0",
+            scope_pred="1",
+            partition_col=pcol,
+        )
+        dur = "toInt64(dateDiff('millisecond', first_ts, ets))"
+        params["cap"] = max_candidates
+        sql = f"""
+            SELECT
+                gram,
+                groupArraySorted(2)({dur}) AS two_fastest_ms,
+                argMin(last_eid, {dur}) AS evt,
+                argMin(ets, {dur}) AS at,
+                argMin(pkey, {dur}) AS pval,
+                count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2]
+            GROUP BY gram
+            ORDER BY two_fastest_ms[1] ASC, gram ASC
+            LIMIT {{cap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        run_warnings: list[str] = []
+        # gram -> [two_fastest_ms (sorted, ≤ 2), evt, at, pval, n]
+        merged: dict[tuple[str, ...], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(sql, parameters={**params, "src": [sid]}).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-pair candidate cap — only its "
+                    f"{max_candidates} fastest pairs were fetched; slower pairs that still "
+                    f"undercut their floor may be missing."
+                )
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                fastest = [int(v) for v in row[1]]
+                slot = merged.get(gram)
+                if slot is None:
+                    merged[gram] = [fastest[:2], row[2], row[3], row[4], int(row[5])]
+                    continue
+                if fastest and fastest[0] < slot[0][0]:
+                    slot[1], slot[2], slot[3] = row[2], row[3], row[4]
+                slot[0] = sorted(slot[0] + fastest)[:2]
+                slot[4] += int(row[5])
+
+        zero_floors = 0
+        findings: list[TransitionFinding] = []
+        for gram, (two, evt, at, pval, n) in merged.items():
+            if n < min_transitions or len(two) < 2:
+                continue
+            fastest, floor_ms = two[0], two[1]
+            if floor_ms <= 0:
+                zero_floors += 1
+                continue
+            if fastest * min_ratio >= floor_ms:
+                continue
+            findings.append(
+                self._transition_finding(
+                    case_id=case_id,
+                    detector=detector,
+                    method=method,
+                    series_field=series_field,
+                    partition_field=partition_field,
+                    gram=gram,
+                    fastest_ms=fastest,
+                    reference_ms=floor_ms,
+                    reference_kind="next-fastest",
+                    evt=evt,
+                    at=at,
+                    pval=pval,
+                    count=n,
+                    baseline_count=n,
+                    min_ratio=min_ratio,
+                    min_transitions=min_transitions,
+                    extra={"scope_transitions": n},
+                )
+            )
+        if zero_floors:
+            run_warnings.append(
+                f"{zero_floors} pair{'s' if zero_floors != 1 else ''} skipped: the pair's two "
+                f"fastest transitions are both zero seconds (same-timestamp records), and "
+                f"nothing can be faster than instant."
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=total_events,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+        )
+
+    @staticmethod
+    def _transition_finding(
+        *,
+        case_id: str,
+        detector: str,
+        method: str,
+        series_field: str,
+        partition_field: str | None,
+        gram: tuple[str, ...],
+        fastest_ms: int,
+        reference_ms: int,
+        reference_kind: str,
+        evt: Any,
+        at: Any,
+        pval: Any,
+        count: int,
+        baseline_count: int,
+        min_ratio: float,
+        min_transitions: int,
+        extra: dict[str, Any],
+    ) -> TransitionFinding:
+        """Build one :class:`TransitionFinding`; shared by both frames."""
+        values = list(gram)
+        joined = " → ".join(values)
+        observed = fastest_ms / 1000.0
+        reference = reference_ms / 1000.0
+        score = 1.0 - fastest_ms / reference_ms
+        speedup = reference_ms / fastest_ms if fastest_ms > 0 else None
+        first_seen = _present_ts(at)
+        evt_id = str(evt) if evt else None
+        partition_value = str(pval) if partition_field and pval else None
+        details: dict[str, Any] = {
+            "detector": detector,
+            "method": method,
+            "field": series_field,
+            "values": values,
+            "value": joined,
+            "partition_field": partition_field,
+            "partition_value": partition_value,
+            "observed_seconds": observed,
+            "reference_seconds": reference,
+            "reference_kind": reference_kind,
+            "speedup": round(speedup, 4) if speedup is not None else None,
+            "count": count,
+            "min_ratio": min_ratio,
+            "min_transitions": min_transitions,
+            "first_seen": first_seen,
+            **extra,
+            "allowlist_field": series_field,
+            "allowlist_value": joined,
+        }
+        return TransitionFinding(
+            field=series_field,
+            values=values,
+            value=joined,
+            partition_field=partition_field,
+            partition_value=partition_value,
+            observed_seconds=observed,
+            reference_seconds=reference,
+            reference_kind=reference_kind,
+            speedup=round(speedup, 4) if speedup is not None else None,
+            count=count,
+            baseline_count=baseline_count,
+            score=round(score, 6),
+            first_seen=first_seen,
+            event_id=evt_id,
+            event=_stub_event(evt_id, case_id, first_seen),
+            details=details,
         )
 
     @gated_heavy_scan

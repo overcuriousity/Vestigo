@@ -165,7 +165,29 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         highlight: `${f.support} times`,
         tail: `across ${f.sources_count} source${f.sources_count === 1 ? "" : "s"} — a routine pattern, not a finding.`,
       };
+    case "transition_time": {
+      const stream = f.partition_value
+        ? `${fieldLabel(f.partition_field ?? "")} = ${truncate(f.partition_value, 40)} moved `
+        : "A stream moved ";
+      const floor =
+        f.reference_kind === "next-fastest"
+          ? `its next-fastest such move anywhere on the timeline took ${fmtSeconds(f.reference_seconds)} (${f.count} transitions)`
+          : `the baseline never saw it under ${fmtSeconds(f.reference_seconds)} across ${f.baseline_count} transitions`;
+      return {
+        lead: `${stream}${truncate(f.values[0] ?? "", 30)} → ${truncate(f.values[1] ?? "", 30)} in`,
+        highlight: fmtSeconds(f.observed_seconds),
+        tail: `— ${floor}${f.speedup === null ? "" : `, ${f.speedup.toFixed(1)}× faster`}.`,
+      };
+    }
   }
+}
+
+/** Seconds as a short human duration; every figure comes from the finding. */
+function fmtSeconds(s: number): string {
+  if (s < 60) return `${s % 1 === 0 ? s.toFixed(0) : s.toFixed(1)} s`;
+  if (s < 3600) return `${(s / 60).toFixed(1)} min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
+  return `${(s / 86400).toFixed(1)} d`;
 }
 
 export function findingVerdict(finding: MethodResult): Verdict {

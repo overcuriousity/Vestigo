@@ -1,9 +1,11 @@
 """Windows Security channel, shaped like an EVTX-derived Plaso CSV export.
 
 Baseline: ordinary logon churn, process creation from a small software
-vocabulary, and a stable set of service installs. The intrusion adds a
-credential spray, an encoded-PowerShell process creation, a never-before-seen
-service install for persistence, and wmic lateral movement.
+vocabulary, a stable set of service installs, and one administrator's routine
+jump-host hop (JUMP-01, then FILE-01 tens of seconds later). The intrusion adds
+a credential spray, an encoded-PowerShell process creation, a never-before-seen
+service install for persistence, and wmic lateral movement whose remote
+process creation lands the account on FILE-01 two seconds after the call.
 
 Only ``datetime``, ``timestamp_desc``, ``message`` and ``source`` are consumed
 as event fields by the CSV parser; every other column lands in the event's
@@ -165,6 +167,47 @@ def _baseline_process_creation() -> Iterator[dict[str, str]]:
         )
 
 
+#: The administrator whose routine is the jump-host hop below.
+ADMIN_USER = "a.lindqvist"
+
+
+def _admin_hops() -> Iterator[dict[str, str]]:
+    """One administrator's routine: JUMP-01, then FILE-01 tens of seconds later.
+
+    Twice a working day across the whole window, an RDP logon to the jump host
+    followed by a network logon to the file server 20–90 s later — the time a
+    person takes to open the next session. This is the floor the transition
+    detector (§15) learns for the pair JUMP-01 → FILE-01, which the contractor's
+    wmic call then undercuts by an order of magnitude; the hop is kept tight so
+    the administrator's own home-workstation logons rarely fall between the two.
+    """
+    r = scenario.rng("windows-admin-hops")
+    day = scenario.SCENARIO_START
+    while day < scenario.SCENARIO_END:
+        if day.weekday() < 5:
+            for hour in (r.randint(8, 11), r.randint(13, 17)):
+                start = day + timedelta(
+                    hours=hour, minutes=r.randrange(60), seconds=r.randrange(60)
+                )
+                yield _row(
+                    start,
+                    "4624",
+                    f"An account was successfully logged on. Account Name: {ADMIN_USER}",
+                    computer_name=scenario.JUMP_HOST,
+                    user=ADMIN_USER,
+                    logon_type="10",
+                )
+                yield _row(
+                    start + timedelta(seconds=r.uniform(20, 90)),
+                    "4624",
+                    f"An account was successfully logged on. Account Name: {ADMIN_USER}",
+                    computer_name=scenario.FILE_SERVER,
+                    user=ADMIN_USER,
+                    logon_type="3",
+                )
+        day += timedelta(days=1)
+
+
 def _baseline_service_installs() -> Iterator[dict[str, str]]:
     """Roughly two service installs a week, drawn only from the known set."""
     r = scenario.rng("windows-services")
@@ -285,6 +328,17 @@ def _lateral() -> Iterator[dict[str, str]]:
             process_name="wmic.exe",
             command_line=f"wmic /node:{scenario.FILE_SERVER} process call create cmd.exe /c hostname",
         )
+        # The remote process creation logs the account on to the target at
+        # once — a network logon two seconds after the call. From JUMP-01 that
+        # is the pair the administrator's hop takes 20–90 s over (§15).
+        yield _row(
+            moment + timedelta(seconds=r.uniform(1.5, 2.5)),
+            "4624",
+            f"An account was successfully logged on. Account Name: {scenario.COMPROMISED_USER}",
+            computer_name=scenario.FILE_SERVER,
+            user=scenario.COMPROMISED_USER,
+            logon_type="3",
+        )
         moment += timedelta(minutes=r.uniform(20, 90))
 
     yield _row(
@@ -305,6 +359,7 @@ def windows_rows() -> Iterator[dict[str, str]]:
         _baseline_logons,
         _baseline_process_creation,
         _baseline_service_installs,
+        _admin_hops,
         _spray,
         _foothold,
         _lateral,

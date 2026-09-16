@@ -61,6 +61,15 @@ function scoredSubject(f: AnomalyFinding): SubjectPair[] {
       // The claim is about the whole value mix, so naming any one value would
       // misstate what was compared.
       return [{ label: "field", value: fieldLabel(f.field) }];
+    case "transition_time":
+      // The pair is the subject; the stream that made the move is how the
+      // analyst finds the actor, so it is offered when the run had one.
+      return f.partition_field && f.partition_value
+        ? [
+            { label: fieldLabel(f.field), value: String(f.value) },
+            { label: fieldLabel(f.partition_field), value: f.partition_value },
+          ]
+        : [{ label: fieldLabel(f.field), value: String(f.value) }];
   }
 }
 

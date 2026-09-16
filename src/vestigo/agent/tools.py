@@ -1967,15 +1967,20 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         group_field: str | None = None,
         max_gap_seconds: int | None = Field(default=None, ge=1),
         variant: Literal["shannon", "bigram"] | None = None,
+        partition_field: str | None = None,
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
         Detectors: value_novelty (rare/first-seen values), value_combo,
         frequency (volume spikes/silences), timestamp_order, numeric_range,
         charset, entropy, proportion_shift, interval_periodicity,
-        sequence_novelty, sequence_motif, value_distribution_drift.
+        sequence_novelty, sequence_motif, value_distribution_drift,
+        transition_time (a value pair reached faster than the pair's learned
+        floor, e.g. one account on two hosts seconds apart).
         `fields` is a comma-separated field list for value detectors (omit to
-        auto-recommend); `series_field` groups frequency/sequence detectors.
+        auto-recommend); `series_field` groups frequency/sequence/transition
+        detectors; `partition_field` (transition_time) is the stream whose
+        transitions are timed, e.g. attr:user.
         Every detector runs without a `baseline_id` (the timeline is its own
         reference); pass one from list_baselines to score suspect windows
         against a baseline instead. Optional knobs (server defaults
@@ -1995,6 +2000,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         """
         _reject_time_fields(fields, "fields")
         _reject_time_fields(series_field, "series_field")
+        _reject_time_fields(partition_field, "partition_field")
         result, resolution = await _run_stat_detector(
             scope.case_id,
             scope.timeline_id,
@@ -2015,6 +2021,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             group_field=group_field,
             max_gap_seconds=max_gap_seconds,
             variant=variant,
+            partition_field=partition_field,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )

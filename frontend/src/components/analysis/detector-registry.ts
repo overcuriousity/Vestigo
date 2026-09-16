@@ -11,6 +11,7 @@
  */
 import {
   Activity,
+  Gauge,
   Hash,
   Layers,
   ListOrdered,
@@ -32,6 +33,7 @@ export type DetectorId =
   | "interval"
   | "drift"
   | "sequence"
+  | "transition"
   | "order"
   | "range"
   | "charset"
@@ -68,6 +70,7 @@ export const DETECTORS: DetectorMeta[] = [
   { id: "drift", detector: "value_distribution_drift", icon: Replace, label: "Distribution drift", hint: "Whole-field value-mix changes between windows", category: "volume", scoreUnit: "−log₁₀ p" },
   { id: "order", detector: "timestamp_order", icon: Rewind, label: "Timestamp order", hint: "Timestamps running backwards", category: "volume", scoreUnit: "s skew" },
   { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen or rare event orderings (n-grams)", category: "sequences", scoreUnit: "surprise" },
+  { id: "transition", detector: "transition_time", icon: Gauge, label: "Transition speed", hint: "Value-to-value moves faster than ever seen", category: "sequences", scoreUnit: "1 − obs/ref" },
 ];
 
 export const DETECTORS_BY_ID = Object.fromEntries(DETECTORS.map((d) => [d.id, d])) as Record<

@@ -786,6 +786,56 @@ export interface SequenceMotifFinding {
   confirmed_other_scope?: boolean;
 }
 
+/**
+ * One value-to-value transition faster than its learned floor, from the
+ * transition_time detector (D15). `details.method` is `min-transition`
+ * (the floor is the baseline window's fastest transition of the pair, and
+ * `details` carries `window_*` keys) or `self-min-transition` (the floor is
+ * the pair's next-fastest transition anywhere in the timeline, with
+ * `scope_transitions` and no window keys). `reference_kind` names which.
+ */
+export interface TransitionTimeFinding {
+  type: "transition_time";
+  /** Field token whose consecutive values form the transition (e.g. "attr:computer_name"). */
+  field: string;
+  /** [from, to]. */
+  values: string[];
+  /** "from → to" — display form and the allowlist key. */
+  value: string;
+  /** The stream the transition was timed within (e.g. "attr:user"); null = per source. */
+  partition_field: string | null;
+  /** That stream key's value on the flagged transition; null when unpartitioned. */
+  partition_value: string | null;
+  /** The fastest transition of this pair in the window (or the timeline), in seconds. */
+  observed_seconds: number;
+  /** The floor it undercut, in seconds. */
+  reference_seconds: number;
+  reference_kind: "baseline-min" | "next-fastest";
+  /** reference_seconds ÷ observed_seconds; null when the observation is instant. */
+  speedup: number | null;
+  /** Transitions of this pair in the window (baseline frame) or the timeline (self). */
+  count: number;
+  /** Transitions the floor was learned from. */
+  baseline_count: number;
+  /** 1 − observed ÷ reference; 1.0 = instantaneous. */
+  score: number;
+  /** Timestamp of the arriving event of the fastest transition. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -798,7 +848,8 @@ export type AnomalyFinding =
   | IntervalPeriodicityFinding
   | SequenceNoveltyFinding
   | SequenceMotifFinding
-  | DistributionDriftFinding;
+  | DistributionDriftFinding
+  | TransitionTimeFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -1004,7 +1055,8 @@ export interface AnomalyMarker {
     | "proportion_shift"
     | "interval_periodicity"
     | "sequence_novelty"
-    | "value_distribution_drift";
+    | "value_distribution_drift"
+    | "transition_time";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

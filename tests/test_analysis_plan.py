@@ -74,6 +74,9 @@ FORMERLY_TWO_WINDOW_METHODS = (
     "value_distribution_drift",
     "interval_periodicity",
     "sequence_novelty",
+    # Born with both frames (D15), gated the same way: a baseline comparison
+    # with no baseline is the one thing an analyst action repairs.
+    "transition_time",
 )
 
 
@@ -122,6 +125,9 @@ def test_self_frame_shape_gates_speak_for_cadence_and_sequences(cfg):
     )
     assert plans["sequence_novelty"].status == "not_applicable"
     assert plans["interval_periodicity"].status == "not_applicable"
+    # One value: nothing ever moves between two, so there is no transition.
+    assert plans["transition_time"].status == "not_applicable"
+    assert plans["transition_time"].reason_facts == {"series_distinct": 1, "required": 2}
     # The baseline frame still outranks the shape reason: it is the one the
     # analyst can act on, and it must not hide the "Set a baseline" affordance.
     plans = _by_id(

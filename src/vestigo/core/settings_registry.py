@@ -537,6 +537,24 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Without a baseline, an n-gram occurring at most this many times in the scope is a rare ordering.",
     ),
     SettingSpec(
+        "stat_transition_min_ratio",
+        "detectors",
+        "Transition speed-up floor",
+        "A transition is reported only when it is at least this many times faster than the pair's learned floor.",
+    ),
+    SettingSpec(
+        "stat_transition_min_transitions",
+        "detectors",
+        "Transition learning floor",
+        "A value pair's fastest transition is learned from at least this many transitions; fewer and the pair is skipped.",
+    ),
+    SettingSpec(
+        "stat_transition_max_candidates",
+        "detectors",
+        "Transition candidate cap",
+        "Candidate value pairs fetched per source, fastest first.",
+    ),
+    SettingSpec(
         "stat_self_slices",
         "detectors",
         "Self-frame slices",

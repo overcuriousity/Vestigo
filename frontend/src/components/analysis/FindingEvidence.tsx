@@ -326,6 +326,26 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
     case "sequence_novelty":
     case "sequence_motif":
       return <Ngram values={finding.values} />;
+    case "transition_time":
+      // The claim is one duration against one floor, both measured; which
+      // floor is in the label, since the two answer different questions.
+      return (
+        <TwoBars
+          reference={{
+            label:
+              finding.reference_kind === "next-fastest"
+                ? "next-fastest on the timeline"
+                : "baseline minimum",
+            value: finding.reference_seconds,
+            display: `${finding.reference_seconds.toFixed(1)}s`,
+          }}
+          observed={{
+            label: "this transition",
+            value: finding.observed_seconds,
+            display: `${finding.observed_seconds.toFixed(1)}s`,
+          }}
+        />
+      );
     case "timestamp_order":
       return (
         <div className="flex flex-wrap items-center gap-2 font-mono text-xs">

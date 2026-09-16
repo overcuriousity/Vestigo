@@ -49,6 +49,7 @@ from vestigo.db.anomaly_stats import (
     ShiftFinding,
     StatisticalAnomalyService,
     TimeWindow,
+    TransitionFinding,
     ValueFinding,
     _canonical_hash,
 )
@@ -2252,6 +2253,7 @@ async def _run_stat_detector(
     group_field: str | None = None,
     max_gap_seconds: int | None = None,
     variant: str | None = None,
+    partition_field: str | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2392,6 +2394,37 @@ async def _run_stat_detector(
                 field_mappings=field_mappings,
                 max_gap_seconds=max_gap_seconds,
                 rarity_floor=cfg.stat_sequence_rarity_floor,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if detector == "transition_time":
+        # Transitions are steps between consecutive values of the single
+        # series_field, timed per source and per partition_field stream (D15).
+        # Snapshot the effective floors so the persisted run stays
+        # self-describing after a default changes.
+        resolution["transition_min_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_transition_min_ratio
+        )
+        resolution["transition_min_transitions"] = cfg.stat_transition_min_transitions
+        resolution["transition_partition_field"] = partition_field or None
+        try:
+            result = await run_scan(
+                svc.find_transition_times,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                series_field=series_field,
+                partition_field=partition_field or None,
+                limit=limit,
+                windows=windows,
+                min_ratio=resolution["transition_min_ratio"],
+                min_transitions=cfg.stat_transition_min_transitions,
+                max_candidates=cfg.stat_transition_max_candidates,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
             )
             return result, resolution
         except ValueError as exc:
@@ -2763,13 +2796,16 @@ def _serialize_finding(
     | IntervalFinding
     | SequenceFinding
     | MotifFinding
-    | DistributionDriftFinding,
+    | DistributionDriftFinding
+    | TransitionFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding dataclass
-    # fields are exactly the wire keys, so asdict() avoids a hand-maintained
-    # field-by-field transcription that would silently drop any newly added
-    # field.
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition finding
+    # dataclass fields are exactly the wire keys, so asdict() avoids a
+    # hand-maintained field-by-field transcription that would silently drop
+    # any newly added field.
+    if isinstance(r, TransitionFinding):
+        return {"type": "transition_time", **asdict(r)}
     if isinstance(r, DistributionDriftFinding):
         return {"type": "value_distribution_drift", **asdict(r)}
     if isinstance(r, MotifFinding):
@@ -3150,7 +3186,12 @@ async def _persist_detector_run(
             or resolution.get("interval_fdr_q")
             or resolution.get("drift_fdr_q"),
             "min_ratio": resolution.get("shift_min_ratio")
-            or resolution.get("interval_min_rate_ratio"),
+            or resolution.get("interval_min_rate_ratio")
+            or resolution.get("transition_min_ratio"),
+            # transition_time: the stream key transitions were timed within
+            # (None = per source) and the learning floor the run used (D15).
+            "partition_field": resolution.get("transition_partition_field"),
+            "min_transitions": resolution.get("transition_min_transitions"),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
@@ -3225,7 +3266,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', or 'transition_time'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -3315,6 +3356,14 @@ async def list_anomalies(
             "the reference values; catches ordinary characters in an unusual order)."
         ),
     ),
+    partition_field: str | None = Query(
+        default=None,
+        description=(
+            "transition_time only: the stream whose transitions are timed (e.g. "
+            "'attr:user' to time each account's moves between hosts). Omit for "
+            "one stream per source."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3392,6 +3441,11 @@ async def list_anomalies(
     spacing test, beaconing). Without: whole-scope Greenwood beaconing with
     pauses excluded, and a robust-Gamma silence test. BH-FDR across the run.
 
+    **transition_time**: per ordered value pair of `series_field`, learns the
+    fastest a stream (per source, per `partition_field` value) ever moved from
+    one value to the next and flags transitions faster than that floor by
+    `min_ratio`x — the impossible-speed question (D15).
+
     **sequence_novelty**: per source, builds time-ordered n-grams of
     `series_field` values and flags orderings that occur in a suspect window
     but never in the baseline window (AMiner EventSequenceDetector analog),
@@ -3433,6 +3487,7 @@ async def list_anomalies(
         group_field=group_field,
         max_gap_seconds=max_gap_seconds,
         variant=variant,
+        partition_field=partition_field,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3565,7 +3620,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', or 'transition_time'.",
     )
     fields: str | None = Field(
         default=None,
@@ -3622,6 +3677,10 @@ class TagAnomaliesRequest(BaseModel):
     variant: Literal["shannon", "bigram"] | None = Field(
         default=None,
         description="entropy only: 'shannon' (default) or 'bigram' — the statistic the band is learned over.",
+    )
+    partition_field: str | None = Field(
+        default=None,
+        description="transition_time only: the stream whose transitions are timed (e.g. 'attr:user').",
     )
     start: datetime | None = Field(
         default=None,
@@ -3690,6 +3749,7 @@ async def tag_anomalies(
         group_field=body.group_field,
         max_gap_seconds=body.max_gap_seconds,
         variant=body.variant,
+        partition_field=body.partition_field,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )

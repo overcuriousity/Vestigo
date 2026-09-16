@@ -4,8 +4,64 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-15 (v1.19.7; session 238 — review findings on the D18/D19/D11
-branch: the self frame's complement, the per-slice scan budget, three disclosure gaps).
+Last updated: 2026-09-16 (1.20 in progress; session 239 — the transition-speed detector,
+D15, first of the 1.20 detector cluster).
+
+## Session 239 — 2026-09-16: transition speed (D15), the first 1.20 detector
+
+The 1.20 cluster is the three cheap AMiner analogs left on the roadmap — D15, D12, D13 —
+landed one commit each on `feat/1.20`, in that order because each reuses machinery the
+previous fortnight touched. This session is D15, `transition_time`.
+
+**What it is.** A transition is one step `a → b` between consecutive events of one stream
+whose series-field values differ; the detector learns each pair's fastest transition and
+reports one that undercuts it by `min_ratio`×. The stream is the source, split by a new
+`partition_field` (the identifier whose moves are timed), which is the knob that makes
+the question meaningful: without it a Windows log carrying every account times the gap
+between *any* two consecutive logons, and two users on two hosts in the same second reads
+as an impossible move. Rows without a partition value are left out rather than pooled
+into one anonymous stream, for the same reason.
+
+**Built on `_ngram_inner_sql`, not beside it.** A transition is an n-gram of length two
+with `gram[1] != gram[2]`, so the assembly, the per-source scan discipline, the
+record-order tie-breaks and the window-boundary guarantee are the sequence detectors'.
+The helper gained an optional `partition_col` (added to every `PARTITION BY`, `None`
+keeps the sequence detectors' SQL shape) and now emits `pkey` and the arriving event's
+`last_eid` — the representative event is the `b` side, the one that arrived too soon.
+Adding columns to a shared subquery is what moved `CACHE_VERSION` to 5, not the new
+method id, which could not collide with an old key on its own.
+
+**Both frames from day one (D18 is a rule now, not a migration).** Baseline:
+`min-transition`, the floor is the pair's fastest baseline-window transition over at
+least `min_transitions` of them, learned only for the candidate pairs the suspect scan
+surfaced (Query B is bound to Query A's grams). Self: `self-min-transition`, the floor is
+the pair's *next-fastest* transition anywhere in the scope — `groupArraySorted(2)` per
+source, the two smallest merged across sources — which is leave-one-out by construction,
+and two equally fast transitions vouch for each other. A zero floor is skipped in both
+frames and counted in a warning: with second-resolution timestamps zero-length
+transitions are routine, and "faster than instant" is not a claim. The self mode was
+first named `loo-min-transition`; the demo coverage test's `self-`/`rare-` prefix
+convention is the right one, so it is `self-min-transition` like its siblings.
+
+**The demo had no such signal.** The baseline frame found nothing on the demo case: the
+contractor's lateral moves are minutes apart while every account's random alternation
+between its own home hosts produces baseline floors of seconds. Per this file's own rule
+the fabricated signal was strengthened rather than the assertion: one administrator now
+has a routine jump-host hop (JUMP-01 by RDP, FILE-01 by network logon 20–90 s later,
+twice a working day, kept tight so their own workstation logons rarely fall between), and
+each wmic remote process creation during lateral movement now logs the contractor on to
+FILE-01 two seconds later — which from JUMP-01 is the administrator's pair at a tenth of
+the time. Both frames assert on it.
+
+**Surface.** Gate entry (same `series_distinct ≥ 2` floor as sequences: one value has no
+transition; `needs_setup` in the baseline frame without a baseline), `_TransitionTimeParams`
+(`series_field`, `partition_field`, `min_ratio`), the `/anomalies` and tag endpoints and
+the agent tool gain `partition_field`, the persisted run snapshots `partition_field` and
+`min_transitions`, three settings with registry specs. Frontend: the thirteenth method
+card (`Gauge` icon, a "Stream" field knob), `TransitionTimeFinding`, a two-bar evidence
+figure labelled by `reference_kind`, verdict/normalize/subject cases, and the mode sets in
+`finding-frame.ts`. Docs: `ANOMALY_DETECTION.md` §15, the tool list, demo table and gate
+table; README and CLAUDE.md counts.
 
 ## Session 238 — 2026-09-15: review of the D18/D19/D11 branch (PR #377)
 

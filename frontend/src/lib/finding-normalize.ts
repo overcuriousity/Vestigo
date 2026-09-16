@@ -134,6 +134,13 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       subtitle = `×${f.support}${f.period_seconds !== null ? ` every ~${f.period_seconds}s` : ""}`;
       ts = ts ?? f.first_seen;
       break;
+    case "transition_time":
+      title = `${fieldLabel(f.field)}: ${truncate(f.value, 70)}`;
+      subtitle = `${f.observed_seconds}s against a floor of ${f.reference_seconds}s (${
+        f.reference_kind === "next-fastest" ? "next-fastest on the timeline" : "baseline minimum"
+      })${f.partition_value ? ` · ${truncate(f.partition_value, 30)}` : ""}`;
+      ts = ts ?? f.first_seen;
+      break;
   }
   return {
     detectorId: meta.id,

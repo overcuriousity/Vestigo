@@ -31,6 +31,9 @@ pytestmark = pytest.mark.clickhouse
 _SERIES_FIELD = {
     "find_sequence_novelty": {"series_field": "attr:computer_name"},
     "find_sequence_motifs": {"series_field": "attr:event_id"},
+    # Host-to-host moves timed per account: the contractor reaches hosts in
+    # minutes that the baseline population moved between over hours.
+    "find_transition_times": {"series_field": "attr:computer_name", "partition_field": "attr:user"},
 }
 
 #: Detectors that score a baseline against suspect windows.
@@ -45,6 +48,7 @@ _WINDOWED = (
     "find_interval_periodicity",
     "find_distribution_drift",
     "find_sequence_novelty",
+    "find_transition_times",
 )
 
 #: Detectors with no baseline/suspect split at all.
@@ -110,6 +114,7 @@ _SELF_FRAME = {
     "find_interval_periodicity": {"fields": ["attr:host"]},
     "find_distribution_drift": {"fields": ["attr:bytes_out"]},
     "find_sequence_novelty": {"series_field": "attr:computer_name"},
+    "find_transition_times": {"series_field": "attr:computer_name", "partition_field": "attr:user"},
 }
 
 

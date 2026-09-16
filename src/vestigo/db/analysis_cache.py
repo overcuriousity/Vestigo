@@ -57,7 +57,13 @@ if TYPE_CHECKING:
 #: spends a bounded scan budget. Both are the runner answering differently
 #: for the same inputs: a v3 row holds "up" findings for every short-lived
 #: value on the timeline, which is the shape this bump exists to retire.
-CACHE_VERSION = 4
+#:
+#: 5 — the 1.20 detectors (transition_time, D15). New method ids cannot
+#: collide with an older row's key on their own, but the shared n-gram
+#: assembly now emits two more columns, and a key that names the runner's
+#: inputs while the runner's SQL changed underneath it is the case this
+#: constant exists for.
+CACHE_VERSION = 5
 
 
 def fingerprint(

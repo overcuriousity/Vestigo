@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Transition speed (D15).** A thirteenth statistical detector, `transition_time`, adapted
+  from AMiner's `MinimalTransitionTimeDetector`: per ordered value pair of a series field
+  it learns the fastest a stream ever moved from one value to the next and reports a
+  transition that undercuts that floor by at least `stat_transition_min_ratio` (default
+  2×) — one account on two hosts seconds apart, a session skipping states. Transitions are
+  one step of the sequence detectors' n-gram assembly, per source and per value of a new
+  `partition_field` knob (the identifier whose moves are timed; rows without it are left
+  out rather than pooled), so two users' interleaved logons never read as one actor. Both
+  frames from day one: with a baseline the floor is the baseline window's fastest
+  transition of the pair (`min-transition`); without one it is the pair's next-fastest
+  transition anywhere on the timeline (`self-min-transition`, leave-one-out by
+  construction). A floor is learned from at least `stat_transition_min_transitions` (3)
+  transitions, a zero floor is skipped and counted in a warning, the per-source candidate
+  cap `stat_transition_max_candidates` (2000) keeps the fastest pairs and discloses itself,
+  and score is `1 − observed / reference`. The finding carries the pair, the stream that
+  made the move, both durations, which floor was used and the speed-up; the allowlist key
+  is `(series_field, "a → b")` in both frames. Gate, wizard card, evidence figure, agent
+  tool, persisted-run snapshot (`partition_field`, `min_transitions`) and
+  `docs/ANOMALY_DETECTION.md` §15 ship with it; the analysis cache moves to version 5. The
+  demo case gains an administrator's routine jump-host hop as the floor and the
+  contractor's wmic call landing on `FILE-01` two seconds later as the signal, asserted in
+  both frames.
+
 ## [1.19.7] — 2026-09-15
 
 ### Added

@@ -7,7 +7,7 @@ This document covers every detector actually running in the codebase today. If
 a detector described here changes (formula, default, field name), update this
 file and the "Method" tab copy in the same commit.
 
-There are fourteen independent analysis tools in Vestigo:
+There are fifteen independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -23,13 +23,14 @@ There are fourteen independent analysis tools in Vestigo:
 12. [Repeating sequences](#12-repeating-sequences-motif-mining) — recurring time-ordered n-grams of a field's values, ranked by support and cadence regularity; the discovery/mining complement of detector 9 (ClickHouse, no ML)
 13. [Sigma rule runner](#13-sigma-rule-runner-signature-matching) — signature matching: community/custom Sigma rules compiled to ClickHouse predicates (ClickHouse, no ML)
 14. [Log templates](#14-log-templates-structural-line-clustering) — structural clustering of raw lines into templates, so rare *shapes* surface without naming a field (ClickHouse, no ML)
+15. [Transition speed](#15-transition-speed-value-to-value-moves-faster-than-ever-seen) — a stream reaching the next value of a field faster than that pair was ever reached before (ClickHouse, no ML)
 
 All but the eleventh are **statistical or rule-based**: pure counting,
 arithmetic and predicate matching over already-ingested events — no machine
 learning, no network calls, working the instant ingestion finishes. The
 eleventh needs an explicit embedding step first.
 
-Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14),
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14, 15),
 `src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
 (detector 13). UI: `frontend/src/components/analysis/`.
 
@@ -61,6 +62,7 @@ teaches the tooling instead of the work. What each tool has to find:
 | 12 | Repeating sequences | The beacon motif (proxy request + matching firewall allow in the same second), alongside a benign nightly-backup motif. |
 | 13 | Sigma | Four case-scoped rules ship inside the case: encoded PowerShell, suspicious service install, wmic remote process creation, failed-logon burst. |
 | 14 | Log templates | ~40 syslog templates, with an `unattended-upgrade` shape that appears only in the suspect window. |
+| 15 | Transition speed | The contractor account on `FILE-01` two seconds after its wmic call from `JUMP-01`, timed per account over `attr:computer_name`, against an administrator whose routine jump-host hop takes the same pair 20–90 s. |
 
 `tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
 actually returns findings. If a retuned threshold silences one of them, that
@@ -357,9 +359,9 @@ checked, and the UI must never present the two the same way.
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
 | `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
 | `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
-| `sequence_novelty` | a series field with ≥2 distinct values | `analysis_gate_min_series_distinct` |
+| `sequence_novelty`, `transition_time` | a series field with ≥2 distinct values (one value yields no ordering and no transition) | `analysis_gate_min_series_distinct` |
 | `proportion_shift`, `value_distribution_drift` | a span of more than one instant (self frame: it is cut into slices) | `stat_self_slices` |
-| any of those four in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
+| any of those five in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
 
 Three rows encode a distinction worth stating, because each was once drawn wrong:
 
@@ -2538,6 +2540,112 @@ entry if that need grows past a browser flag.
 
 ---
 
+## 15. Transition speed (value-to-value moves faster than ever seen)
+
+**What it answers:** "Did something get from *here* to *there* faster than it ever
+has?" The AMiner `MinimalTransitionTimeDetector` analog (roadmap D15). One account
+logging on to two hosts three seconds apart, a session skipping from `created` to
+`closed` with nothing in between, a workflow reaching its last state in a fraction of
+its usual time — each value is ordinary, each ordering may even be ordinary, but the
+*speed* is not. Event sequences (§9) own the ordering axis; this detector owns the
+time between two consecutive values.
+
+**How it works.** A **transition** is one step `a → b` between two consecutive events
+of one *stream* whose `series_field` values differ (same-value repeats are not
+transitions). The stream is the source, further split by the **partition field** when
+one is set — the identifier whose movements are being timed, `attr:user` for host
+moves, a session id for state moves. Without it every source is a single stream, and
+two users' interleaved logons read as one actor moving between their hosts, which is
+rarely the question. Transitions are one step of the sequence detectors' n-gram
+assembly (`_ngram_inner_sql`, n = 2), so they inherit its deterministic ordering
+(effective timestamp, then record order), the once-per-source scan discipline, and the
+guarantee that a pair never spans a window boundary. The duration is
+`dateDiff('millisecond', previous, current)`. Per ordered pair the detector learns a
+**floor** — the fastest that pair was ever reached in the reference — and flags a
+transition that undercuts it by at least the speed-up factor (`min_ratio`, default 2):
+a floor learned from a handful of transitions is not precise to the second, so
+"slightly faster" is not a finding.
+
+**Two frames.**
+
+| | Self (`self-min-transition`) | Baseline (`min-transition`) |
+|---|---|---|
+| Reference | the pair's **next-fastest** transition anywhere in the scope | the pair's fastest transition in the baseline window |
+| Learned from | at least `stat_transition_min_transitions` transitions of the pair in the scope (default 3) | at least that many in the baseline window |
+| Flags | the pair's single fastest transition, when it undercuts the next-fastest by `min_ratio`× | each suspect window's fastest transition of the pair, when it undercuts the baseline floor by `min_ratio`× |
+| Zero floor | two instantaneous transitions: skipped, counted in a warning | a baseline floor of zero: skipped, counted in a warning |
+
+The self frame is leave-one-out by construction: every other transition of the pair is
+at least as slow as the second-fastest, so the fastest is judged against everything
+else that pair ever did. Two equally fast transitions vouch for each other and nothing
+is flagged. A zero floor cannot be undercut — with second-resolution timestamps,
+zero-length transitions are routine — so such pairs are skipped rather than scored, and
+the run says how many.
+
+Per source: the `stat_transition_max_candidates` fastest pairs (baseline frame: per
+suspect window) are fetched fastest-first, with a warning when the cap is hit — the cap
+keeps the fastest, which are the ones the question is about; in the baseline frame the
+floor is then learned for exactly those candidate pairs. On a multi-source scope the
+floor is the minimum over every source's reference and counts are summed, so a pair
+that is slow in one source and fast in another is judged against the fast one.
+
+**Score = 1 − observed / reference**, in `[0, 1]`: 1.0 is an instantaneous transition,
+0.5 is exactly twice as fast as the floor, and nothing under `1 − 1/min_ratio` is
+reported. The representative event is the **arriving** event of the fastest transition
+(the `b` side), and `first_seen` is its timestamp. Findings carry `observed_seconds`,
+`reference_seconds`, `reference_kind` (`next-fastest` / `baseline-min`), `speedup`
+(reference ÷ observed; `null` when the observation is instant), `count` (the pair's
+transitions in the window, or in the scope), `baseline_count` (the transitions the
+floor was learned from) and, when a partition field was set, `partition_field` /
+`partition_value` — the stream that made the move, which is how the analyst finds the
+actor. The baseline frame adds `window_label`/`window_start`/`window_end`; the self
+frame adds `scope_transitions` and no window keys.
+
+**Parameters.**
+
+- `series_field` (request, default `artifact`) — the field whose consecutive values
+  form transitions. Shared with the frequency and sequence detectors' group-by; any
+  field token works, including `attr:<key>` and mapped canonical fields. As with event
+  sequences, a source whose every row carries one artifact value has no transitions
+  under the default — pick the field that moves (`attr:computer_name`, a state field).
+- `partition_field` (request, default unset) — the stream key. Rows without a value
+  for it are left out rather than lumped into one anonymous stream. Snapshotted into
+  the persisted `DetectorRun` as `partition_field`.
+- `min_ratio` (request) / `VESTIGO_STAT_TRANSITION_MIN_RATIO` (server default 2.0,
+  must exceed 1) — the speed-up floor. Snapshotted as `min_ratio`.
+- `VESTIGO_STAT_TRANSITION_MIN_TRANSITIONS` (default 3) — the learning floor.
+  Snapshotted as `min_transitions`.
+- `VESTIGO_STAT_TRANSITION_MAX_CANDIDATES` (default 2000) — the per-source candidate
+  cap; hitting it attaches a warning.
+
+**Allowlist key:** `(series_field, "a → b")` — the same shape as event sequences, in
+both frames, so one **Normal** verdict on a pair covers it wherever it recurs.
+
+### Caveats
+
+- **The floor is only as good as the reference.** A baseline in which a pair occurred
+  three times has a floor that is the fastest of three draws; the learning floor keeps
+  one-off pairs out, and `min_ratio` keeps "a bit faster" out, but on a thin baseline
+  the flagged speed-ups are as much about the baseline's poverty as about the suspect
+  window. Prefer longer baselines, or the self frame, which learns from everything.
+- **Interleaved streams manufacture speed.** Without a partition field, a multi-writer
+  source (one Windows log carrying every account) times the gap between *any* two
+  consecutive events with different values, whoever produced them — and two accounts
+  on two hosts in the same second reads as an impossible move. Set the partition field
+  to the identifier whose moves are meant, as the demo case does with `attr:user`.
+- **Timestamp resolution bounds the question.** Second-resolution sources produce
+  zero-length transitions routinely; a pair whose floor is zero is skipped with a
+  warning rather than scored, and a floor of one second is compared against
+  observations that are themselves rounded. Millisecond sources make the detector far
+  sharper.
+- **Only the fastest transition per pair is reported** (per window in the baseline
+  frame). `count` says how many transitions of the pair the window held; it does not
+  say how many undercut the floor. The Explorer drill on the pair shows all of them.
+- A fast transition is **not malicious by itself** — a scripted deployment legitimately
+  touches ten hosts in ten seconds. Rank for triage; mark the routine pair Normal once.
+
+---
+
 ## Dispositions and normality (implementation notes)
 
 Analyst verdicts on findings live in one `finding_dispositions` table with the
@@ -2567,7 +2675,8 @@ Every successful scan (`GET .../anomalies` with the default `persist=true`, and
 always for `tag_anomalies`) writes a `DetectorRun` row: the request params it
 ran with — fields, `series_field`, thresholds, `baseline_id`, resolved windows,
 `windows_hash`, `dispositions_hash`, the per-source clock-skew offsets in
-effect, entropy's `variant`, and for a self-frame run of the slice methods the
+effect, entropy's `variant`, transition speed's `partition_field` and
+`min_transitions`, and for a self-frame run of the slice methods the
 `slices` payload, its `slices_hash` and the resolved self settings
 (`self_slices`, `pause_ratio`, `min_span_seconds`, `sequence_rarity_floor`)
 — plus the serialized result, and returns its id as `run_id`. Rows

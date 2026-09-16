@@ -22,6 +22,7 @@
 import {
   Activity,
   FileText,
+  Gauge,
   Hash,
   Layers,
   ListOrdered,
@@ -46,6 +47,7 @@ export type MethodId =
   | "interval_periodicity"
   | "timestamp_order"
   | "sequence_novelty"
+  | "transition_time"
   | "log_template";
 
 export type EvidenceClass = "named" | "statistical" | "exploration";
@@ -110,7 +112,7 @@ export interface MethodMeta {
   hint: string;
   /**
    * When to configure it, in one sentence for the wizard's card. Starts with
-   * "Use this when" — a test enforces it — so the twelve cards read as one list.
+   * "Use this when" — a test enforces it — so the thirteen cards read as one list.
    */
   useWhen: string;
   icon: React.ElementType;
@@ -382,6 +384,33 @@ export const METHODS: MethodMeta[] = [
       SERIES_KNOB,
       { param: "ngram_size", label: "n", kind: "number", placeholder: "3" },
       { param: "max_gap_seconds", label: "Max gap", kind: "number", placeholder: "300" },
+    ],
+  },
+  {
+    id: "transition_time",
+    label: "Transition speed",
+    hint: "Value-to-value moves faster than ever seen",
+    useWhen:
+      "Use this when one actor should not be able to reach the next value that fast — an account on two hosts seconds apart, a session skipping states. Pick the stream field.",
+    icon: Gauge,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "1 − obs/ref",
+    what: "Times each step between consecutive different values of the series field within one stream (per source, and per value of the stream field when set), learns the fastest each ordered pair was ever reached, and reports a transition that undercuts that floor by the speed-up factor. With a baseline the floor is the baseline window's fastest transition of the pair; without one it is the pair's next-fastest transition anywhere on the timeline, so a single outlier is judged against everything else that pair ever did.",
+    querySketch: `SELECT [prev, val] AS pair, min(dur) AS fastest FROM (\n  SELECT <series_field> AS val,\n         lagInFrame(val) OVER w AS prev,\n         dateDiff('millisecond', lagInFrame(<effective_ts>) OVER w, <effective_ts>) AS dur\n  FROM events WHERE case_id = {case}\n  WINDOW w AS (PARTITION BY source_id, <partition_field> ORDER BY <effective_ts>)\n) WHERE prev != val\nGROUP BY pair\n-- baseline: reported when fastest < baseline min(dur) / {min_ratio}\n-- self: reported when fastest < the pair's next-fastest dur / {min_ratio}`,
+    knobs: [
+      SERIES_KNOB,
+      {
+        param: "partition_field",
+        label: "Stream",
+        kind: "field",
+        placeholder: "(per source)",
+        // Which identifier's moves are timed. Without it every source is one
+        // stream, and two users' interleaved logons read as one actor moving.
+        fieldOptions: SERIES_FIELD_OPTIONS,
+        noneLabel: "Per source",
+      },
+      RATIO_KNOB,
     ],
   },
   {
