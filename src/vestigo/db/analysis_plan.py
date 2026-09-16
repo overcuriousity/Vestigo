@@ -50,6 +50,7 @@ METHOD_IDS: tuple[str, ...] = (
     "sequence_novelty",
     "transition_time",
     "time_of_day",
+    "value_correlation",
     "log_template",
 )
 
@@ -73,6 +74,7 @@ FIELD_OVERRIDE_METHOD_IDS: frozenset[str] = frozenset(
         "value_distribution_drift",
         "interval_periodicity",
         "time_of_day",
+        "value_correlation",
     }
 )
 
@@ -94,6 +96,7 @@ COST_CLASS: dict[str, str] = {
     "sequence_novelty": "heavy",
     "transition_time": "heavy",
     "time_of_day": "heavy",
+    "value_correlation": "heavy",
     "log_template": "heavy",
 }
 
@@ -348,6 +351,7 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         "sequence_novelty",
         "transition_time",
         "time_of_day",
+        "value_correlation",
     ):
         if frame_needs_baseline:
             plans[method] = _setup(
@@ -359,7 +363,19 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
     # slices, and a span of one instant cannot be sliced. That is the one
     # structural impossibility; a short span merely yields thin slices, which
     # the run warns about rather than the gate withholding it.
-    for method in ("proportion_shift", "value_distribution_drift"):
+    # A rule needs two fields to relate, exactly as a combo does. Checked
+    # before the slice rule so a one-field timeline says why it is gated in
+    # either frame; the baseline frame's needs_setup above still outranks it.
+    if len(cats) < 2:
+        plans.setdefault(
+            "value_correlation",
+            _no(
+                "value_correlation",
+                "only one usable categorical field — a rule needs two",
+                {"categorical_fields": len(cats), "required": 2},
+            ),
+        )
+    for method in ("proportion_shift", "value_distribution_drift", "value_correlation"):
         if inputs.frame == "self" and inputs.span_seconds <= 0.0:
             plans.setdefault(
                 method,

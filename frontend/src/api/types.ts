@@ -883,6 +883,62 @@ export interface TimeOfDayFinding {
   confirmed_other_scope?: boolean;
 }
 
+/**
+ * One implication rule `A = x ⇒ B = y` broken in a window, from the
+ * value_correlation detector (D13). `fields` is [antecedent, consequent] and
+ * `values` is [x, y], the combo shape, so the allowlist key is the combo one.
+ * `details.method` is `rule-g-test` (mined from the baseline window, tested
+ * per suspect window; `window_*` keys) or `self-rule-g-test` (mined from the
+ * timeline, each leave-one-out slice tested against the rest; `slice_index`,
+ * `rest_slices`). The `baseline_*` fields hold the reference side either way.
+ */
+export interface ValueCorrelationFinding {
+  type: "value_correlation";
+  fields: string[];
+  values: string[];
+  /** "x ⇒ y" — display form. */
+  value: string;
+  /** Share of the antecedent's reference events that carried y. */
+  confidence: number;
+  /** Antecedent events the rule was mined from. */
+  support: number;
+  /** Antecedent events in the window or slice under test. */
+  count: number;
+  /** Of those, the ones whose consequent was not y. */
+  violations: number;
+  /** The reference side: antecedent events and violations in the baseline window, or the other slices. */
+  baseline_count: number;
+  baseline_violations: number;
+  violation_rate: number;
+  baseline_violation_rate: number;
+  /** violation_rate ÷ baseline_violation_rate (0.5-smoothed when the reference has none). */
+  rate_ratio: number;
+  /** The most common violating consequent value in the window, and its count. */
+  top_violator: string;
+  top_violator_count: number;
+  g_statistic: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** = g_statistic — used for ranking. */
+  score: number;
+  /** First violating occurrence in the window. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -897,7 +953,8 @@ export type AnomalyFinding =
   | SequenceMotifFinding
   | DistributionDriftFinding
   | TransitionTimeFinding
-  | TimeOfDayFinding;
+  | TimeOfDayFinding
+  | ValueCorrelationFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -1105,7 +1162,8 @@ export interface AnomalyMarker {
     | "sequence_novelty"
     | "value_distribution_drift"
     | "transition_time"
-    | "time_of_day";
+    | "time_of_day"
+    | "value_correlation";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

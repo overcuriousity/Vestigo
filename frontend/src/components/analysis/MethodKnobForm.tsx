@@ -131,6 +131,10 @@ export function knobHelp(knob: MethodKnob): string {
       return "Break a sequence when consecutive events are farther apart than this.";
     case "partition_field":
       return "Whose moves are timed: transitions are measured within one value of this field, such as one account. Without it every source is a single stream.";
+    case "rule_confidence":
+      return "How consistently one value must imply the other before it counts as a rule. 0.95 means nineteen times in twenty.";
+    case "min_support":
+      return "How many reference events a value needs before a rule is learned from it.";
     case "bucket_minutes":
       return "How finely the day is cut. One hour tells a nightly job from a daytime one; fifteen minutes tells 02:15 from 02:45.";
     case "timezone":

@@ -25,6 +25,7 @@ export const TEMPORAL_MODES: ReadonlySet<string> = new Set([
   "drift",
   "min-transition",
   "habit",
+  "rule-g-test",
 ]);
 
 /**
@@ -38,10 +39,15 @@ export const SELF_MODES: ReadonlySet<string> = new Set([
   "rare-ngram",
   "self-min-transition",
   "self-habit",
+  "self-rule-g-test",
 ]);
 
-/** The two self modes that compare leave-one-out time slices with the rest of the scope. */
-export const SLICE_MODES: ReadonlySet<string> = new Set(["self-g-test", "self-drift"]);
+/** The self modes that compare leave-one-out time slices with the rest of the scope. */
+export const SLICE_MODES: ReadonlySet<string> = new Set([
+  "self-g-test",
+  "self-drift",
+  "self-rule-g-test",
+]);
 
 export function isTemporalMode(method: string): boolean {
   return TEMPORAL_MODES.has(method);

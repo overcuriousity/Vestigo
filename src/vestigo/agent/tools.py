@@ -1970,6 +1970,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         partition_field: str | None = None,
         bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = None,
         timezone: str | None = None,
+        rule_confidence: float | None = None,
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
@@ -1977,21 +1978,21 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         numeric_range, charset, entropy, proportion_shift,
         interval_periodicity, sequence_novelty, sequence_motif,
         value_distribution_drift, transition_time (a value pair reached
-        faster than its learned floor), time_of_day (a value at an hour it
-        has no habit of). `fields`: comma-separated list for value detectors
-        (omit to auto-recommend); `series_field`: the field frequency,
-        sequence and transition detectors group by; `partition_field`
-        (transition_time): the stream timed, e.g. attr:user. Every detector
-        runs without `baseline_id` (the timeline is its own reference); pass
-        one from list_baselines to score suspect windows instead. Knobs
-        (server defaults otherwise): z_threshold (frequency),
-        min_skew_seconds (timestamp_order), fdr_q, min_ratio (effect floor),
-        ngram_size, min_support and start/end (sequence_motif), group_field
-        (charset: one alphabet per value), max_gap_seconds (sequences),
-        variant (entropy: shannon or bigram), bucket_minutes and IANA
-        timezone (time_of_day). Returns findings plus a persisted run_id;
-        each finding carries an example event_id — call get_event for the
-        full record. Virtual `time:` fields are rejected here.
+        faster than ever), time_of_day (a value at an unusual hour),
+        value_correlation (a rule A=x ⇒ B=y that breaks). `fields`:
+        comma-separated, value detectors, omit to auto-recommend;
+        `series_field`: frequency/sequence/transition group-by;
+        `partition_field`: the stream transition_time times, e.g. attr:user.
+        Every detector runs without `baseline_id` (timeline as its own
+        reference); pass one from list_baselines to score suspect windows.
+        Knobs (server defaults otherwise): z_threshold, min_skew_seconds,
+        fdr_q, min_ratio, ngram_size, start/end (sequence_motif),
+        min_support (motif or rule support), rule_confidence (0-1),
+        group_field (charset: one alphabet per value), max_gap_seconds
+        (sequences), variant (entropy: shannon|bigram), bucket_minutes and
+        IANA timezone (time_of_day). Returns findings plus a persisted
+        run_id; each finding carries an example event_id — call get_event for
+        the full record. Virtual `time:` fields are rejected.
         """
         _reject_time_fields(fields, "fields")
         _reject_time_fields(series_field, "series_field")
@@ -2019,6 +2020,7 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             partition_field=partition_field,
             bucket_minutes=bucket_minutes,
             timezone=timezone,
+            rule_confidence=rule_confidence,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )

@@ -4,8 +4,44 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-16 (1.20 in progress; sessions 239–240 — transition speed D15 and
-time-of-day habit D12, the first two of the 1.20 detector cluster).
+Last updated: 2026-09-16 (1.20 in progress; sessions 239–241 — transition speed D15,
+time-of-day habit D12 and value correlation D13, the 1.20 detector cluster).
+
+## Session 241 — 2026-09-16: value correlation (D13)
+
+The third and last cheap AMiner analog, `value_correlation`, in the same one-commit shape.
+
+**Rules, not pairs.** Value combos already find a rare `(x, y)`. What this detector adds is
+the *rule*: an antecedent value `x` with at least 20 reference events whose dominant
+consequent `y` covers at least 95 % of them, mined in both directions per field pair, and
+tested per window with the 2×2 G-test proportion shift already has — conforming against
+violating events, reference against window, one BH pool, a 2× floor on the violation-rate
+ratio. The roadmap's design problem was field-pair explosion, and the answer is three caps
+that each disclose themselves: auto mode pairs the recommender's top six categorical
+fields (15 pairs), more than 20 pairs are truncated with a warning naming the count, and
+each pair's `GROUP BY a, b` is capped at 5000 highest-volume rows with a warning that a
+tail antecedent was not tested. Identifiers never enter auto mode, which is what keeps the
+pair table small in the common case.
+
+**Only rises, only breaks.** A rule that appears in a window is a value whose share rose,
+which proportion shift owns; a rule that tightens is not a finding. And the self frame
+mines its rules over the whole scope, so a rule broken from the start is not a rule and is
+never tested — stated in the reference section as the frame's limit rather than hidden.
+The finding carries `top_violator`, the consequent value that most often took `y`'s
+place, because "where did it go instead?" is the first question an analyst asks of a
+broken rule and the data to answer it was already in the scan.
+
+**The demo needed nothing.** Every human account has one or two home workstations
+(`_home_hosts`); the contractor has one, so `m.okonkwo ⇒ WKS-004` holds over 6,500
+baseline logons at confidence ~1.0 and breaks on the jump host, the file server and two
+finance workstations. Two-home users never form a rule (confidence ~0.5), the
+administrator's hop is two events a day against 280 and keeps their rule intact, and in
+the self frame the contractor's violations sit in the last five of 24 slices. Asserted in
+both frames with `fields=["attr:user", "attr:computer_name"]`.
+
+**The agent schema budget, again.** Adding `rule_confidence` to `run_anomaly_detector` was
+absorbed by the compact docstring from session 240; the measured total is recorded in
+`AGENT.md`.
 
 ## Session 240 — 2026-09-16: time-of-day habit (D12)
 

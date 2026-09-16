@@ -194,6 +194,17 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         tail: `— ${reference} ${habit}.`,
       };
     }
+    case "value_correlation": {
+      const where =
+        findingMode(f) === "self-rule-g-test"
+          ? `in ${detailString(f.details, "window_label") ?? "this slice"} against the rest of the timeline`
+          : `in ${detailString(f.details, "window_label") ?? "the suspect window"}`;
+      return {
+        lead: `${fieldLabel(f.fields[0] ?? "")} = ${truncate(f.values[0] ?? "", 40)} normally means ${fieldLabel(f.fields[1] ?? "")} = ${truncate(f.values[1] ?? "", 40)} (${pct(f.confidence)} of ${f.support} reference events). ${where} it did not hold in`,
+        highlight: `${f.violations} of ${f.count} events`,
+        tail: `— most often ${fieldLabel(f.fields[1] ?? "")} = ${truncate(f.top_violator, 40)} (×${f.top_violator_count}), against ${f.baseline_violations} of ${f.baseline_count} in the reference (q=${f.q_value.toExponential(1)}).`,
+      };
+    }
   }
 }
 

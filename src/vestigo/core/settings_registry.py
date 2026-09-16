@@ -585,6 +585,48 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Candidate values scanned per field for a habit, highest volume first.",
     ),
     SettingSpec(
+        "stat_correlation_min_support",
+        "detectors",
+        "Correlation rule support",
+        "An antecedent value needs at least this many reference events before a rule is mined from it.",
+    ),
+    SettingSpec(
+        "stat_correlation_rule_confidence",
+        "detectors",
+        "Correlation rule confidence",
+        "Share of an antecedent's reference events one consequent value must account for to form a rule (0.95 = 19 in 20).",
+    ),
+    SettingSpec(
+        "stat_correlation_fdr_q",
+        "detectors",
+        "Correlation FDR q",
+        "Benjamini–Hochberg false-discovery ceiling for broken-rule tests.",
+    ),
+    SettingSpec(
+        "stat_correlation_min_ratio",
+        "detectors",
+        "Correlation effect floor",
+        "A rule's violation rate must rise by at least this factor to be reported.",
+    ),
+    SettingSpec(
+        "stat_correlation_auto_fields",
+        "detectors",
+        "Correlation auto fields",
+        "How many recommended fields auto mode pairs up (6 fields make 15 pairs).",
+    ),
+    SettingSpec(
+        "stat_correlation_max_pairs",
+        "detectors",
+        "Correlation pair cap",
+        "Field pairs scanned per run; the rest are dropped with a warning.",
+    ),
+    SettingSpec(
+        "stat_correlation_max_rows_per_pair",
+        "detectors",
+        "Correlation candidate rows",
+        "Value-pair rows fetched per field pair, highest volume first.",
+    ),
+    SettingSpec(
         "stat_self_slices",
         "detectors",
         "Self-frame slices",

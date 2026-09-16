@@ -7,7 +7,7 @@ This document covers every detector actually running in the codebase today. If
 a detector described here changes (formula, default, field name), update this
 file and the "Method" tab copy in the same commit.
 
-There are sixteen independent analysis tools in Vestigo:
+There are seventeen independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -25,13 +25,14 @@ There are sixteen independent analysis tools in Vestigo:
 14. [Log templates](#14-log-templates-structural-line-clustering) — structural clustering of raw lines into templates, so rare *shapes* surface without naming a field (ClickHouse, no ML)
 15. [Transition speed](#15-transition-speed-value-to-value-moves-faster-than-ever-seen) — a stream reaching the next value of a field faster than that pair was ever reached before (ClickHouse, no ML)
 16. [Time-of-day habit](#16-time-of-day-habit-values-at-an-hour-they-never-keep) — a value occurring at a wall-clock hour it has no habit of, in an explicit timezone (ClickHouse, no ML)
+17. [Value correlation](#17-value-correlation-field-to-field-rules-that-break) — an implication rule between two fields of the same event (`A = x ⇒ B = y`) whose violation rate rises in a window (ClickHouse + a real significance test, no ML)
 
 All but the eleventh are **statistical or rule-based**: pure counting,
 arithmetic and predicate matching over already-ingested events — no machine
 learning, no network calls, working the instant ingestion finishes. The
 eleventh needs an explicit embedding step first.
 
-Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14–16),
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14–17),
 `src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
 (detector 13). UI: `frontend/src/components/analysis/`.
 
@@ -65,6 +66,7 @@ teaches the tooling instead of the work. What each tool has to find:
 | 14 | Log templates | ~40 syslog templates, with an `unattended-upgrade` shape that appears only in the suspect window. |
 | 15 | Transition speed | The contractor account on `FILE-01` two seconds after its wmic call from `JUMP-01`, timed per account over `attr:computer_name`, against an administrator whose routine jump-host hop takes the same pair 20–90 s. |
 | 16 | Time-of-day habit | The nightly backup program at 03:xx and 04:xx after three weeks of 02:xx runs (benign, the same move interval cadence sees), and the contractor on `JUMP-01` at 03:00, a host whose baseline logons are an administrator's office hours. Without a baseline, the one manual afternoon backup run twelve hours from the program's nightly slot. |
+| 17 | Value correlation | The rule `user = m.okonkwo ⇒ computer_name = WKS-004`, which holds over three weeks of the contractor's logons and breaks on every host the intrusion takes the account to — the jump host, the file server, two finance workstations. Without a baseline, the same rule against the rest of the timeline, slice by slice. |
 
 `tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
 actually returns findings. If a retuned threshold silences one of them, that
@@ -356,14 +358,14 @@ checked, and the UI must never present the two the same way.
 | Method | Precondition | Setting |
 |---|---|---|
 | `value_novelty`, `timestamp_order`, `log_template`, `entropy`, `time_of_day` | none — always offered | — |
-| `value_combo` | ≥2 categorical fields | — |
+| `value_combo`, `value_correlation` | ≥2 categorical fields | — |
 | `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
 | `frequency` | span of at least the minimum number of seconds | `analysis_gate_min_frequency_buckets` |
 | `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
 | `sequence_novelty`, `transition_time` | a series field with ≥2 distinct values (one value yields no ordering and no transition) | `analysis_gate_min_series_distinct` |
-| `proportion_shift`, `value_distribution_drift` | a span of more than one instant (self frame: it is cut into slices) | `stat_self_slices` |
-| any of those five, or `time_of_day`, in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
+| `proportion_shift`, `value_distribution_drift`, `value_correlation` | a span of more than one instant (self frame: it is cut into slices) | `stat_self_slices` |
+| any of those six, or `time_of_day`, in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
 
 Three rows encode a distinction worth stating, because each was once drawn wrong:
 
@@ -2756,6 +2758,105 @@ to the baseline definition, not a verdict on a finding.
 
 ---
 
+## 17. Value correlation (field-to-field rules that break)
+
+**What it answers:** "One field used to decide another — when did that stop being true?"
+The AMiner `VariableCorrelationDetector` analog (roadmap D13), intra-record: two fields of
+the *same event*, unlike the sequence detectors, which relate consecutive events. An
+account that always logs on to its own workstation, a status code that always follows a
+given action, a service name that always runs from one path — each is an **implication
+rule** `A = x ⇒ B = y`, and the event where it fails is often the event that matters even
+when `x` and `y` are each ordinary. Value combos (§1) find a *pair* that is rare; this
+finds a *rule* that broke.
+
+**How it works.** For a field pair `(A, B)` the detector counts events per `(a, b)` value
+pair in the reference and per window. In each direction, an antecedent value `x` with at
+least `stat_correlation_min_support` (20) reference events forms a rule with its dominant
+consequent `y` when `y` accounts for at least `stat_correlation_rule_confidence` (0.95)
+of them — nineteen in twenty, so a user with two home workstations has no rule and a
+user with one has. A rule is **broken** in a window when the share of `x` events whose
+`B` is not `y` rises: a 2×2 G-test of conforming against violating events between the
+reference and the window (the same log-likelihood ratio proportion shift uses), one
+Benjamini–Hochberg pool over every (rule, window) test in the run, and an effect floor
+of `stat_correlation_min_ratio` (2) on the violation-rate ratio — 4 % to 6 % is not a
+break however significant. Only rises are reported: a rule that *appears* in a window is
+a value whose share changed, which proportion shift already owns, and a rule that
+tightens is not a finding.
+
+**Two frames.**
+
+| | Self (`self-rule-g-test`) | Baseline (`rule-g-test`) |
+|---|---|---|
+| Rules mined from | the whole scope | the baseline window |
+| Window | each of `stat_self_slices` equal time slices | each suspect window |
+| Reference | the other slices (leave-one-out) | the baseline window |
+| Catches | a rule that breaks in one stretch of the timeline | a rule that breaks after the incident start |
+
+In the self frame a rule mined from the whole scope already contains its own violations,
+so a rule broken everywhere is not a rule and is never tested — which is right, since
+nothing in the scope says it should have held. A rule broken in one stretch keeps its
+confidence over the scope and fails against the complement of that stretch.
+
+**Which pairs.** An explicit `fields` list is scanned as every pair among them; auto mode
+takes the recommender's top `stat_correlation_auto_fields` (6) categorical fields, steered
+by the timeline's [field overrides](#declaring-which-fields-a-method-reads), and pairs
+them (15 pairs). More than `stat_correlation_max_pairs` (20) pairs are truncated with a
+warning naming the count — name fewer fields to choose which. Each pair is one
+`GROUP BY a, b` scan capped at `stat_correlation_max_rows_per_pair` (5000)
+highest-volume value pairs (cap → warning: a rule whose antecedent lives in the tail is
+not tested). Fields with many distinct values (identifiers) are not recommended in the
+first place, and pairing two of them is the one way to make this detector expensive.
+
+**Score = the G statistic**, like proportion shift. The representative event is the
+**first violating occurrence** in the window, and `first_seen` is its timestamp. Findings
+carry `fields` (`[antecedent, consequent]`) and `values` (`[x, y]`), `confidence` and
+`support` (the rule as mined), `count` and `violations` (the window), `baseline_count` and
+`baseline_violations` (the reference side, whichever frame), both violation rates and
+their `rate_ratio`, `top_violator` with its count — the consequent value that most often
+took `y`'s place, usually the answer to "where did it go instead?" — and `g_statistic`,
+`p_value`, `q_value`. The baseline frame adds `window_label`/`window_start`/`window_end`;
+the self frame the slice keys (`slice_index`, `rest_slices`).
+
+**Parameters.**
+
+- `fields` (request, default auto) — two or more; every pair among them is scanned.
+- `fdr_q` (request) / `VESTIGO_STAT_CORRELATION_FDR_Q` (0.05) — the BH ceiling.
+- `min_ratio` (request) / `VESTIGO_STAT_CORRELATION_MIN_RATIO` (2.0) — the violation-rate
+  ratio floor.
+- `rule_confidence` (request) / `VESTIGO_STAT_CORRELATION_RULE_CONFIDENCE` (0.95) — the
+  consequent share that forms a rule. Snapshotted into the persisted `DetectorRun`.
+- `min_support` (request) / `VESTIGO_STAT_CORRELATION_MIN_SUPPORT` (20) — reference
+  events an antecedent value needs. Snapshotted.
+- `VESTIGO_STAT_CORRELATION_AUTO_FIELDS` (6), `VESTIGO_STAT_CORRELATION_MAX_PAIRS` (20),
+  `VESTIGO_STAT_CORRELATION_MAX_ROWS_PER_PAIR` (5000) — the pair and row caps above.
+
+**Allowlist key:** the combo one — `(A,B)` joined with `,` and `x␟y` joined with the
+combo value separator — so **Mark normal** on a broken rule suppresses that rule in both
+frames and wherever it recurs, and a rule declared normal from a combo row is the same
+key.
+
+### Caveats
+
+- **Confidence is not causation, and the direction is mined both ways.** `user ⇒ host`
+  and `host ⇒ user` are different rules with different supports; a shared workstation
+  has no `host ⇒ user` rule while each of its users may keep a `user ⇒ host` one. Read
+  `fields` to see which direction broke.
+- **A rule the reference already breaks a little is judged on the rise.** The G-test
+  compares rates, so a 2 % baseline violation rate that becomes 40 % is a strong finding
+  and one that becomes 3 % is not, whatever the counts.
+- **Thin antecedents have no rules.** Twenty reference events is the floor; a value seen
+  a dozen times cannot form a rule however consistent, and appears in no finding. Lower
+  `min_support` for a short baseline, knowing that a rule mined from twenty events has a
+  95 % confidence that is one violation wide.
+- **The self frame cannot see a rule broken from the start.** Mined over the scope, a
+  rule that never held is not a rule; the baseline frame, mined over a declared normal
+  period, is where "it held before the incident and not after" lives.
+- **Identifier pairs are the cost.** Two high-cardinality fields produce a pair table the
+  row cap truncates; the warning says so, and the recommender keeps identifiers out of
+  auto mode for this reason.
+- A broken rule is **not malicious by itself** — a new laptop, a reassigned service, a
+  migration. Rank for triage; mark the rule Normal once it is explained.
+
 ---
 
 ## Dispositions and normality (implementation notes)
@@ -2788,8 +2889,9 @@ always for `tag_anomalies`) writes a `DetectorRun` row: the request params it
 ran with — fields, `series_field`, thresholds, `baseline_id`, resolved windows,
 `windows_hash`, `dispositions_hash`, the per-source clock-skew offsets in
 effect, entropy's `variant`, transition speed's `partition_field` and
-`min_transitions`, time-of-day's `bucket_minutes` and `timezone`, and for a
-self-frame run of the slice methods the
+`min_transitions`, time-of-day's `bucket_minutes` and `timezone`, value
+correlation's `rule_confidence` and `min_support`, and for a self-frame run of
+the slice methods the
 `slices` payload, its `slices_hash` and the resolved self settings
 (`self_slices`, `pause_ratio`, `min_span_seconds`, `sequence_rarity_floor`)
 — plus the serialized result, and returns its id as `run_id`. Rows

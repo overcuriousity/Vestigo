@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Value correlation (D13).** A fifteenth statistical detector, `value_correlation`,
+  adapted from AMiner's `VariableCorrelationDetector` and intra-record: for a field pair it
+  mines implication rules `A = x ⇒ B = y` — an antecedent value with at least
+  `stat_correlation_min_support` reference events whose dominant consequent accounts for at
+  least `stat_correlation_rule_confidence` of them, both directions — and reports a window in
+  which the rule's violation rate rises: a 2×2 G-test of conforming against violating events
+  between the reference and the window, one Benjamini–Hochberg pool per run, an effect floor
+  of `stat_correlation_min_ratio` on the violation-rate ratio. Only rises are reported; a rule
+  that appears is a proportion shift. Both frames: `rule-g-test` mines from the baseline
+  window and tests each suspect window; `self-rule-g-test` mines from the timeline and tests
+  each leave-one-out slice against the rest. Pairs come from an explicit field list or the
+  recommender's top `stat_correlation_auto_fields` categorical fields, capped at
+  `stat_correlation_max_pairs` with a warning; each pair is one `GROUP BY a, b` scan capped
+  at `stat_correlation_max_rows_per_pair` rows. Findings carry the rule as mined, both
+  sides' counts and violation rates, and the consequent value that most often took the
+  rule's place; the allowlist key is the combo one. Gate entry (two categorical fields, a
+  sliceable span in the self frame), wizard card, evidence figure, agent knob
+  (`rule_confidence`), seven settings with registry specs, run snapshot and
+  `docs/ANOMALY_DETECTION.md` §17. The demo case asserts the contractor's
+  `user ⇒ home workstation` rule breaking on every host the intrusion visits, in both frames.
+
 - **Time-of-day habit (D12).** A fourteenth statistical detector, `time_of_day`, adapted
   from AMiner's `PathValueTimeIntervalDetector`: per (field, value) it cuts the day into
   `bucket_minutes`-wide wall-clock buckets (15–240 minutes, default 60) read in an explicit

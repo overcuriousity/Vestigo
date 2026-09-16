@@ -44,6 +44,7 @@ function scoredSubject(f: AnomalyFinding): SubjectPair[] {
     case "time_of_day":
       return [{ label: fieldLabel(f.field), value: String(f.value) }];
     case "value_combo":
+    case "value_correlation":
       return f.fields.map((field, i) => ({
         label: fieldLabel(field),
         value: String(f.values[i] ?? ""),

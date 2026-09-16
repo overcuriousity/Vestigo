@@ -39,6 +39,10 @@ _SERIES_FIELD = {
     # at 03:00. Named rather than auto-picked so the assertion is about the
     # detector, not the recommender's field order on this corpus.
     "find_time_of_day_habits": {"fields": ["attr:program", "attr:computer_name"]},
+    # Every human account has its home workstations; the contractor has one,
+    # and the rule "m.okonkwo ⇒ WKS-004" breaks on every host the intrusion
+    # takes the account to.
+    "find_value_correlations": {"fields": ["attr:user", "attr:computer_name"]},
 }
 
 #: Detectors that score a baseline against suspect windows.
@@ -55,6 +59,7 @@ _WINDOWED = (
     "find_sequence_novelty",
     "find_transition_times",
     "find_time_of_day_habits",
+    "find_value_correlations",
 )
 
 #: Detectors with no baseline/suspect split at all.
@@ -122,6 +127,7 @@ _SELF_FRAME = {
     "find_sequence_novelty": {"series_field": "attr:computer_name"},
     "find_transition_times": {"series_field": "attr:computer_name", "partition_field": "attr:user"},
     "find_time_of_day_habits": {"fields": ["attr:program"]},
+    "find_value_correlations": {"fields": ["attr:user", "attr:computer_name"]},
 }
 
 

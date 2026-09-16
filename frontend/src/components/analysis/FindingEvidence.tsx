@@ -377,6 +377,24 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
     case "sequence_novelty":
     case "sequence_motif":
       return <Ngram values={finding.values} />;
+    case "value_correlation": {
+      // The claim is a violation rate against a reference rate, both counted.
+      const self = findingMode(finding) === "self-rule-g-test";
+      return (
+        <TwoBars
+          reference={{
+            label: self ? "rest-of-timeline violations" : "baseline violations",
+            value: finding.baseline_violation_rate,
+            display: `${(finding.baseline_violation_rate * 100).toFixed(2)}%`,
+          }}
+          observed={{
+            label: self ? "slice violations" : "suspect violations",
+            value: finding.violation_rate,
+            display: `${(finding.violation_rate * 100).toFixed(2)}%`,
+          }}
+        />
+      );
+    }
     case "time_of_day":
       return (
         <DayStrip

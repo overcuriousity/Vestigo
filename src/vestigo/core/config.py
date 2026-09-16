@@ -211,6 +211,20 @@ class Settings(BaseSettings):
     # other per-field caps because each value returns one row per occupied
     # bucket and window.
     stat_habit_max_candidates_per_field: int = 500
+    # Value-correlation detector (D13): an antecedent value needs this many
+    # reference events, and one consequent value must account for at least
+    # this share of them, before "A = x ⇒ B = y" counts as a rule.
+    stat_correlation_min_support: int = Field(default=20, ge=2)
+    stat_correlation_rule_confidence: float = Field(default=0.95, gt=0, le=1)
+    # BH false-discovery ceiling and the violation-rate ratio floor for a
+    # broken rule — same meaning as the proportion-shift pair.
+    stat_correlation_fdr_q: float = 0.05
+    stat_correlation_min_ratio: float = 2.0
+    # How many recommended fields auto mode pairs up (6 → 15 pairs), the cap
+    # on pairs scanned per run, and the per-pair cap on (a, b) value rows.
+    stat_correlation_auto_fields: int = Field(default=6, ge=2)
+    stat_correlation_max_pairs: int = Field(default=20, ge=1)
+    stat_correlation_max_rows_per_pair: int = 5000
     # ── Self frame for the slice-based detectors (D18) ──────────────────────
     # How many equal-width time slices proportion_shift and
     # value_distribution_drift cut the scope into when no baseline is declared;

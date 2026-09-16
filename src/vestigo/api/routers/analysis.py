@@ -389,6 +389,13 @@ class _TimeOfDayParams(_FieldsParams):
         return None if v == "" else v
 
 
+class _ValueCorrelationParams(_FieldsParams):
+    fdr_q: float | None = Field(default=None, gt=0, le=1)
+    min_ratio: float | None = Field(default=None, gt=1)
+    rule_confidence: float | None = Field(default=None, gt=0, le=1)
+    min_support: int | None = Field(default=None, ge=2)
+
+
 class _LogTemplateParams(_Params):
     #: Not a `_run_stat_detector` detector — log templating is a browser with
     #: its own service call (see :func:`_run_log_templates`). Routing it through
@@ -412,6 +419,7 @@ METHOD_MODELS: dict[str, type[_Params]] = {
     "sequence_novelty": _SequenceNoveltyParams,
     "transition_time": _TransitionTimeParams,
     "time_of_day": _TimeOfDayParams,
+    "value_correlation": _ValueCorrelationParams,
     "log_template": _LogTemplateParams,
 }
 
@@ -745,6 +753,8 @@ async def get_analysis_findings(
             partition_field=kwargs.get("partition_field"),
             bucket_minutes=kwargs.get("bucket_minutes"),
             timezone=kwargs.get("timezone"),
+            min_support=kwargs.get("min_support"),
+            rule_confidence=kwargs.get("rule_confidence"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

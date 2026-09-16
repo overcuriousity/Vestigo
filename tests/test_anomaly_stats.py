@@ -7100,3 +7100,254 @@ def test_habit_allowlist_suppresses_the_value():
     )
     assert result.status == "ok"
     assert result.results == []
+
+
+# ---------------------------------------------------------------------------
+# value_correlation — detector (D13)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then one scan per field
+# pair. Row layout: a, b, ref (baseline count), then per suspect window
+# (cnt, first_ts, first_evt). Self frame: count, timestamp range, slice
+# totals, then one scan per pair whose rows are a, b, ref (scope total), then
+# per slice (cnt, first_ts, first_evt).
+
+_CORR_COLS = ["a", "b", "ref", "f0_cnt", "f0_first", "f0_evt"]
+
+
+def _corr_responses(
+    total: int, window_totals: tuple[int, int], pair_rows: list[list[tuple]]
+) -> list[FakeQueryResult]:
+    out = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+    ]
+    out += [FakeQueryResult(result_rows=rows, column_names=_CORR_COLS) for rows in pair_rows]
+    return out
+
+
+_USER_HOST = ["attr:user", "attr:computer_name"]
+
+
+def test_correlation_parameter_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="two fields"):
+        svc.find_value_correlations("c1", ["s1"], fields=["attr:user"], windows=_seq_windows())
+    with pytest.raises(ValueError, match="rule_confidence"):
+        svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, rule_confidence=1.5)
+    with pytest.raises(ValueError, match="min_ratio"):
+        svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, min_ratio=1.0)
+    assert svc.ch.client._calls == []
+
+
+def test_correlation_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "no_data"
+    assert result.detector == "value_correlation"
+
+
+def test_correlation_baseline_reports_a_broken_rule():
+    """m.okonkwo ⇒ WKS-004 holds over 6000 baseline logons and breaks in the
+    suspect window; b.moreau splits two homes and never forms a rule."""
+    t_jump = datetime(2024, 1, 17, 6, 0, tzinfo=UTC)
+    t_file = datetime(2024, 1, 17, 3, 0, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 5, datetime(2024, 1, 16, tzinfo=UTC), "e-home"),
+        ("m.okonkwo", "JUMP-01", 0, 8, t_jump, "e-jump"),
+        ("m.okonkwo", "FILE-01", 0, 4, t_file, "e-file"),
+        ("b.moreau", "WKS-002", 3000, 200, datetime(2024, 1, 16, tzinfo=UTC), "e-b2"),
+        ("b.moreau", "WKS-003", 2900, 190, datetime(2024, 1, 16, tzinfo=UTC), "e-b3"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    assert result.method == "rule-g-test"
+    assert result.baseline_size == 12_000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.fields == ["attr:user", "attr:computer_name"]
+    assert r.values == ["m.okonkwo", "WKS-004"]
+    assert r.value == "m.okonkwo ⇒ WKS-004"
+    assert r.confidence == 1.0
+    assert r.support == 6000
+    assert r.count == 17
+    assert r.violations == 12
+    assert r.baseline_violations == 0
+    assert r.baseline_count == 6000
+    assert abs(r.violation_rate - 12 / 17) < 1e-6
+    assert r.top_violator == "JUMP-01"
+    assert r.top_violator_count == 8
+    assert r.q_value <= 0.05
+    assert r.score == r.g_statistic > 0
+    # The earliest violating occurrence is the representative event.
+    assert r.event_id == "e-file"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T03:00")
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "attr:user,attr:computer_name"
+    assert r.details["allowlist_value"] == "m.okonkwo\x1fWKS-004"
+    # count, window totals, one pair scan.
+    assert len(svc.ch.client._calls) == 3
+    params = svc.ch.client._all_parameters[2]
+    assert params["fk0"] == "user" and params["fk1"] == "computer_name"
+    assert params["cap"] == 5000
+
+
+def test_correlation_mines_both_directions():
+    """The reverse rule WKS-004 ⇒ m.okonkwo also holds and also breaks when a
+    second account appears on that host in the window."""
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 300, t, "e1"),
+        ("c.nakamura", "WKS-004", 0, 40, t, "e2"),
+        ("c.nakamura", "WKS-009", 5000, 250, t, "e3"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    rules = {(tuple(r.fields), r.value) for r in result.results}
+    assert (("attr:computer_name", "attr:user"), "WKS-004 ⇒ m.okonkwo") in rules
+    # c.nakamura ⇒ WKS-009 is broken too (40 of 290 window events elsewhere).
+    assert (("attr:user", "attr:computer_name"), "c.nakamura ⇒ WKS-009") in rules
+    # m.okonkwo ⇒ WKS-004 is intact: no violations in the window.
+    assert (("attr:user", "attr:computer_name"), "m.okonkwo ⇒ WKS-004") not in rules
+
+
+def test_correlation_floors_support_confidence_and_effect():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        # Support 10 < 20: no rule however clean.
+        ("thin", "H1", 10, 2, t, "e1"),
+        ("thin", "H2", 0, 5, t, "e2"),
+        # Confidence 0.9 < 0.95: no rule.
+        ("split", "H1", 900, 50, t, "e3"),
+        ("split", "H2", 100, 50, t, "e4"),
+        # A real rule whose violation rate merely creeps from 4% to 6%: under
+        # the 2x effect floor even where the G-test would pass.
+        ("creep", "H1", 9600, 940, t, "e5"),
+        ("creep", "H2", 400, 60, t, "e6"),
+        # A real rule with no window violations: nothing to report.
+        ("steady", "H1", 5000, 400, t, "e7"),
+    ]
+    svc = _svc(_corr_responses(50_000, (30_000, 20_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results if r.fields[0] == "attr:user"] == []
+
+
+def test_correlation_pair_cap_and_auto_fields():
+    """Six auto-picked fields make fifteen pairs; the cap scans the first
+    three and says so."""
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    inventory = [(f"attr:f{i}", 10, 1000) for i in range(6)] + [("attr:pid", 990, 1000)]
+    pair_rows = [[("x", "y", 100, 5, t, "e")] for _ in range(3)]
+    svc = _svc(_corr_responses(1000, (700, 300), pair_rows))
+    result = svc.find_value_correlations(
+        "c1",
+        ["s1"],
+        windows=_seq_windows(),
+        inventory=inventory,
+        inventory_total=1000,
+        max_pairs=3,
+    )
+    assert result.status == "ok"
+    assert len(svc.ch.client._calls) == 5
+    assert any("15 field pairs" in w and "first 3" in w for w in result.warnings)
+    # An explicit two-field list is exactly one pair, no cap warning.
+    svc = _svc(_corr_responses(1000, (700, 300), [[("x", "y", 100, 5, t, "e")]]))
+    result = svc.find_value_correlations(
+        "c1", ["s1"], fields=_USER_HOST, windows=_seq_windows(), max_pairs=3
+    )
+    assert not any("pair cap" in w for w in result.warnings)
+
+
+def test_correlation_sql_shape():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _corr_responses(20_000, (12_000, 8_000), [[("u", "h", 6000, 5, t, "e")]])
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    sql = client.full_queries[2]
+    assert "attributes[{fk0:String}]" in sql and "attributes[{fk1:String}]" in sql
+    assert "GROUP BY a, b" in sql
+    assert "LIMIT {cap:UInt32}" in sql
+    assert "countIf(" in sql and "argMinIf(event_id" in sql
+    params = client._all_parameters[2]
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-16 00:00:00.000"
+
+
+def test_correlation_self_frame_tests_each_slice_against_the_rest():
+    """Without a baseline: rules over the whole scope, one leave-one-out
+    G-test per (rule, slice)."""
+    k = 4
+    span = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 5, tzinfo=UTC))
+    t = datetime(2024, 1, 4, 3, 0, tzinfo=UTC)
+    cols = ["a", "b", "ref"] + [f"f{i}_{c}" for i in range(k) for c in ("cnt", "first", "evt")]
+    # m.okonkwo: 6000 home logons spread over four slices; 12 stray logons,
+    # all in slice 3 → the rule breaks in slice 3 against slices 0–2.
+    rows = [
+        (
+            "m.okonkwo",
+            "WKS-004",
+            6000,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+        ),
+        ("m.okonkwo", "JUMP-01", 12, 0, None, None, 0, None, None, 0, None, None, 12, t, "e-j"),
+    ]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(6012,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[span], column_names=["min_ts", "max_ts"]),
+            FakeQueryResult(result_rows=[(i, 1503) for i in range(k)], column_names=["slice", "n"]),
+            FakeQueryResult(result_rows=rows, column_names=cols),
+        ]
+    )
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, self_slices=k)
+    assert result.status == "ok", result.warnings
+    assert result.method == "self-rule-g-test"
+    assert result.windows is None and result.slices is not None
+    assert result.slices["k"] == k
+    assert [r.value for r in result.results] == ["m.okonkwo ⇒ WKS-004"]
+    r = result.results[0]
+    assert r.count == 1512
+    assert r.violations == 12
+    # The complement: the other three slices, with no violations at all.
+    assert r.baseline_count == 4500
+    assert r.baseline_violations == 0
+    assert r.details["slice_index"] == 3
+    assert r.details["rest_slices"] == k - 1
+    assert r.event_id == "e-j"
+    assert "baseline_size" not in r.details
+    assert len(svc.ch.client._calls) == 4
+
+
+def test_correlation_allowlist_suppresses_the_rule():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 5, t, "e1"),
+        ("m.okonkwo", "JUMP-01", 0, 8, t, "e2"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations(
+        "c1",
+        ["s1"],
+        fields=_USER_HOST,
+        windows=_seq_windows(),
+        allowlist={("attr:user,attr:computer_name", "m.okonkwo\x1fWKS-004")},
+    )
+    assert result.status == "ok"
+    assert result.results == []

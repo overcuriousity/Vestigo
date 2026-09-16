@@ -148,6 +148,13 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       }${findingMode(f) === "self-habit" ? " across the timeline" : ""}`;
       ts = ts ?? f.first_seen;
       break;
+    case "value_correlation":
+      title = `${pair(f.fields[0] ?? "", f.values[0] ?? "")} ⇒ ${pair(f.fields[1] ?? "", f.values[1] ?? "")}`;
+      subtitle = `broken ${f.violations}× of ${f.count} in ${String(f.details["window_label"] ?? "the suspect window")}${
+        findingMode(f) === "self-rule-g-test" ? " vs the rest" : ""
+      } · mostly ${truncate(f.top_violator, 30)} (q=${f.q_value.toExponential(1)})`;
+      ts = ts ?? f.first_seen;
+      break;
   }
   return {
     detectorId: meta.id,

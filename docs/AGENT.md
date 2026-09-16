@@ -720,7 +720,9 @@ The 1.20 detectors (2026-09-16: `transition_time`'s `partition_field`, `time_of_
 `bucket_minutes` and `timezone`) took the first draft to 44,421 and the rule was applied
 again: the docstring now names each detector once and each knob in a few words, and the
 `timezone` length constraints came off the schema (the runner validates the zone anyway) —
-**43,832 over 35 tools**, ceiling unchanged, below the D11 figure.
+**43,832 over 35 tools**, ceiling unchanged, below the D11 figure. `value_correlation`'s
+`rule_confidence` (D13) pushed it over once more; the same treatment (no schema-level
+bounds, a terser docstring) lands it at **43,845 over 35 tools**.
 
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`

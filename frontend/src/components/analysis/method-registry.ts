@@ -26,6 +26,7 @@ import {
   Gauge,
   Hash,
   Layers,
+  Link2,
   ListOrdered,
   Percent,
   Replace,
@@ -50,6 +51,7 @@ export type MethodId =
   | "sequence_novelty"
   | "transition_time"
   | "time_of_day"
+  | "value_correlation"
   | "log_template";
 
 export type EvidenceClass = "named" | "statistical" | "exploration";
@@ -114,7 +116,7 @@ export interface MethodMeta {
   hint: string;
   /**
    * When to configure it, in one sentence for the wizard's card. Starts with
-   * "Use this when" — a test enforces it — so the fourteen cards read as one list.
+   * "Use this when" — a test enforces it — so the fifteen cards read as one list.
    */
   useWhen: string;
   icon: React.ElementType;
@@ -228,6 +230,26 @@ export const METHODS: MethodMeta[] = [
     querySketch: `SELECT <field_a>, <field_b>, count() AS n\nFROM events\nWHERE case_id = {case} AND source_id IN {sources}\nGROUP BY 1, 2\nORDER BY n ASC\nLIMIT {limit}\n-- score = -log(n / total)`,
     // Two to four fields, of which auto combines the top two.
     knobs: [fieldsKnob({ minSelected: 2, maxSelected: 4, autoCount: 2, autoLabel: "top 2" })],
+  },
+  {
+    id: "value_correlation",
+    label: "Value correlation",
+    hint: "Field-to-field rules that break",
+    useWhen:
+      "Use this when one field normally decides another — an account always on its own host, a status that follows an action — and you want the moment that stopped being true.",
+    icon: Link2,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "G",
+    what: "Mines implication rules between two fields within the same event — for an antecedent value with enough reference events, the consequent value it carries at least 95% of the time, in both directions — and reports a window in which the rule's violation rate rose: a G-test of conforming against violating events, one false-discovery pool per run, an effect floor on the rate ratio. With a baseline the rules come from the baseline window; without one from the whole timeline, each slice tested against the rest. A rule that appears is a proportion shift; this reports rules that break.",
+    querySketch: `SELECT <field_a> AS a, <field_b> AS b,\n       countIf(<in reference>) AS ref_n,\n       countIf(<in window>) AS win_n\nFROM events\nWHERE case_id = {case}\nGROUP BY a, b\n-- rule a=x => b=y when y holds >= {rule_confidence} of x's reference events (support >= {min_support})\n-- G-test of conforming vs violating events, reference vs window; Benjamini-Hochberg across the run`,
+    knobs: [
+      fieldsKnob({ minSelected: 2, autoCount: 6, autoLabel: "top 6, all pairs" }),
+      FDR_KNOB,
+      RATIO_KNOB,
+      { param: "rule_confidence", label: "Rule confidence", kind: "number", placeholder: "0.95" },
+      { param: "min_support", label: "Min support", kind: "number", placeholder: "20" },
+    ],
   },
   {
     id: "numeric_range",

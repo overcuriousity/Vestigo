@@ -21,7 +21,7 @@ export interface LogTemplatesParams {
 }
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day" | "value_correlation";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series / build event sequences by */
@@ -52,6 +52,8 @@ export interface AnomalyParams {
   bucket_minutes?: number;
   /** time_of_day only: IANA zone the clock is read in (e.g. "Europe/Berlin"). Omit for the server default. */
   timezone?: string;
+  /** value_correlation only: share of an antecedent's reference events one consequent value must account for to form a rule. */
+  rule_confidence?: number;
   /** ID of a saved baseline definition (baseline range + suspect windows). Omit for self-baseline. */
   baseline_id?: string;
   limit?: number;
@@ -108,7 +110,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day" | "value_correlation";
       content: string;
       details: Record<string, unknown>;
       /**

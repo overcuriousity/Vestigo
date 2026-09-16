@@ -15,6 +15,7 @@ import {
   Gauge,
   Hash,
   Layers,
+  Link2,
   ListOrdered,
   Percent,
   Replace,
@@ -36,6 +37,7 @@ export type DetectorId =
   | "sequence"
   | "transition"
   | "habit"
+  | "correlation"
   | "order"
   | "range"
   | "charset"
@@ -63,6 +65,7 @@ export const DETECTOR_CATEGORIES: { id: DetectorCategory; label: string }[] = [
 export const DETECTORS: DetectorMeta[] = [
   { id: "novelty", detector: "value_novelty", icon: Hash, label: "Rare values", hint: "Rare or first-seen field values", category: "values", scoreUnit: "surprise" },
   { id: "combo", detector: "value_combo", icon: Layers, label: "Value combos", hint: "Rare combinations of fields", category: "values", scoreUnit: "surprise" },
+  { id: "correlation", detector: "value_correlation", icon: Link2, label: "Value correlation", hint: "Field-to-field rules that break", category: "values", scoreUnit: "G" },
   { id: "range", detector: "numeric_range", icon: Ruler, label: "Numeric range", hint: "Values outside a learned band", category: "values", scoreUnit: "× band" },
   { id: "charset", detector: "charset", icon: Type, label: "Charset novelty", hint: "Never-seen characters", category: "values", scoreUnit: "surprise" },
   { id: "entropy", detector: "entropy", icon: Shuffle, label: "Entropy outliers", hint: "Random or degenerate strings", category: "values", scoreUnit: "× band" },

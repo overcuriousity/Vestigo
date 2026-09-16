@@ -218,6 +218,22 @@ already-ingested data.
     the value's busy buckets across the scope as its habit and scores every
     thin bucket against them.
 
+**value_correlation** (``detector="value_correlation"``)
+    Per field pair, mine implication rules ``A = x ⇒ B = y`` within the same
+    event — an antecedent value with at least ``min_support`` reference
+    events whose consequent is one value at least ``rule_confidence`` of the
+    time, both directions — and flag a window in which the rule's violation
+    rate rises: a 2×2 G-test of conforming against violating events between
+    the reference and the window, one Benjamini–Hochberg pool per run, an
+    effect floor of ``min_ratio`` on the violation-rate ratio. Adapted from
+    AMiner's ``VariableCorrelationDetector`` (roadmap D13); intra-record,
+    unlike the sequence detectors. Two frames: *baseline*
+    (``method="rule-g-test"``) mines from the baseline window and tests each
+    suspect window; *self* (``method="self-rule-g-test"``, D18) mines from the
+    scope and tests each leave-one-out slice against its complement. Pairs
+    come from an explicit field list or the recommender's top categorical
+    fields, capped at ``max_pairs``. Score = the G statistic.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -1382,6 +1398,47 @@ class HabitFinding:
 
 
 @dataclass
+class CorrelationFinding:
+    """One implication rule ``A = x ⇒ B = y`` broken in a window (value_correlation, D13)."""
+
+    # [antecedent field, consequent field] and [x, y] — the combo shape.
+    fields: list[str]
+    values: list[str]
+    # "x ⇒ y" — display form.
+    value: str
+    # Share of the antecedent's reference events that carried y (≥ rule_confidence).
+    confidence: float
+    # Antecedent events the rule was mined from (baseline window, or the scope).
+    support: int
+    # Antecedent events in the window (or slice) under test.
+    count: int
+    # Of those, the ones whose consequent was not y.
+    violations: int
+    # The reference side of the test: antecedent events and violations in the
+    # baseline window (baseline frame) or in the other slices (self frame).
+    baseline_count: int
+    baseline_violations: int
+    violation_rate: float
+    baseline_violation_rate: float
+    # violation_rate / baseline_violation_rate (0.5-smoothed when the reference has none).
+    rate_ratio: float
+    # The most common violating consequent value in the window, and its count.
+    top_violator: str
+    top_violator_count: int
+    g_statistic: float
+    p_value: float
+    # Benjamini–Hochberg adjusted p-value across every test in this run.
+    q_value: float
+    # = g_statistic; used for ranking.
+    score: float
+    # First violating occurrence in the window.
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class MotifFinding:
     """One recurring event-order n-gram surfaced by the sequence-motif miner."""
 
@@ -1423,12 +1480,13 @@ class StatAnomalyResult:
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
     #  | "sequence_novelty" | "sequence_motif" | "value_distribution_drift"
-    #  | "transition_time" | "time_of_day"
+    #  | "transition_time" | "time_of_day" | "value_correlation"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
     #  | "g-test" | "cadence" | "ngram" | "motif" | "drift" | "min-transition"
-    #  | "self-min-transition" | "habit" | "self-habit"
+    #  | "self-min-transition" | "habit" | "self-habit" | "rule-g-test"
+    #  | "self-rule-g-test"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -1446,6 +1504,7 @@ class StatAnomalyResult:
         | DistributionDriftFinding
         | TransitionFinding
         | HabitFinding
+        | CorrelationFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -9397,6 +9456,417 @@ class StatisticalAnomalyService:
             allowlist=allowlist,
             warnings=run_warnings,
             windows=windows,
+        )
+
+    # ------------------------------------------------------------------
+    # Value correlation (D13)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_value_correlations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        fdr_q: float = 0.05,
+        min_ratio: float = 2.0,
+        rule_confidence: float = 0.95,
+        min_support: int = 20,
+        max_pairs: int = 20,
+        max_rows_per_pair: int = 5000,
+        auto_fields: int = 6,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
+        self_slices: int = 24,
+    ) -> StatAnomalyResult:
+        """Return implication rules between two fields that break in a window.
+
+        AMiner ``VariableCorrelationDetector`` analog (D13), intra-record: for
+        a field pair ``(A, B)`` and an antecedent value ``x`` of ``A`` with at
+        least *min_support* reference events, the rule ``A = x ⇒ B = y`` holds
+        when ``y`` accounts for at least *rule_confidence* of those events.
+        Both directions are mined. A rule is **broken** in a window when the
+        share of ``x`` events whose ``B`` is not ``y`` rises: a 2×2 G-test of
+        conforming against violating events between the reference and the
+        window, one Benjamini–Hochberg pool per run, and an effect floor of
+        *min_ratio* on the violation-rate ratio. Only rises are reported — a
+        rule that appears in a window is a proportion shift, which owns it.
+
+        Two frames. *Baseline* (``method="rule-g-test"``): rules are mined from
+        the baseline window and each suspect window is tested against it.
+        *Self* (``method="self-rule-g-test"``, D18): rules are mined from the
+        whole scope and each of *self_slices* leave-one-out time slices is
+        tested against its complement — a slice of violations against every
+        other slice.
+
+        Pairs come from an explicit *fields* list (every pair among them) or
+        from the recommender's top *auto_fields* categorical fields, steered by
+        *field_overrides*; more than *max_pairs* pairs are truncated with a
+        warning. One ``GROUP BY a, b`` scan per pair, capped at
+        *max_rows_per_pair* highest-volume value pairs (cap → warning). Score
+        = the G statistic, like proportion shift. The allowlist key is the
+        combo one: ``(A,B)`` and ``x␟y`` joined with the combo separators, so
+        one Normal verdict covers the rule in both frames.
+        """
+        detector = "value_correlation"
+        if not 0.0 < rule_confidence <= 1.0:
+            raise ValueError("rule_confidence must be in (0, 1]")
+        if min_ratio <= 1.0:
+            raise ValueError("min_ratio must be greater than 1")
+        if fields is not None and len(fields) < 2:
+            raise ValueError("value_correlation requires at least two fields")
+        method = "rule-g-test" if windows is not None else "self-rule-g-test"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload() if windows is not None else None,
+            )
+
+        run_warnings: list[str] = []
+        slices: SelfSlices | None = None
+        slice_totals: list[int] = []
+        if windows is not None:
+            reference_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
+            run_warnings += _window_size_warnings(windows, suspect_totals)
+            if reference_size == 0:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=0,
+                    warnings=[*run_warnings, "The baseline window contains no events."],
+                    windows=windows.payload(),
+                )
+            n_frames = len(windows.suspects)
+        else:
+            slices = self._self_slices(case_id, source_ids, self_slices, source_offsets)
+            if slices is None:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=total_events,
+                    warnings=["The scope holds a single timestamp, so it cannot be sliced."],
+                )
+            slice_totals = self._slice_totals(case_id, source_ids, slices, source_offsets)
+            reference_size = sum(slice_totals)
+            run_warnings += self._small_slice_warning(slices, slice_totals)
+            n_frames = slices.k
+
+        # Pair selection.
+        if fields is not None:
+            pool = list(dict.fromkeys(fields))
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            pool, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended], field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            pool = pool[:auto_fields]
+        if len(pool) < 2:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=reference_size,
+                warnings=[
+                    *run_warnings,
+                    "Fewer than two categorical fields to correlate — name two with `fields`.",
+                ],
+                windows=windows.payload() if windows is not None else None,
+                slices=slices.payload() if slices is not None else None,
+            )
+        pairs = [(pool[i], pool[j]) for i in range(len(pool)) for j in range(i + 1, len(pool))]
+        if len(pairs) > max_pairs:
+            run_warnings.append(
+                f"{len(pairs)} field pairs were eligible; only the first {max_pairs} were "
+                f"scanned (the pair cap). Name fewer fields to choose which."
+            )
+            pairs = pairs[:max_pairs]
+
+        # Phase 1: one scan per pair. Row layout: a, b, reference count (the
+        # baseline window's, or the scope total), then per frame
+        # (count, first_ts, first_evt).
+        # cand = (a_field, b_field, a, b, ref, [(cnt, first, evt) per frame])
+        cands: list[tuple[str, str, str, str, int, list[tuple[int, Any, Any]]]] = []
+        evaluated_pairs = 0
+        for a_field, b_field in pairs:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            a_expr = _col_expr(a_field, params, field_mappings, prefix="fk0")
+            b_expr = _col_expr(b_field, params, field_mappings, prefix="fk1")
+            params["cap"] = max_rows_per_pair
+            if windows is not None:
+                bp, sps = _window_preds(windows, params, source_offsets)
+                frame_blocks = ",\n                    ".join(
+                    f"countIf({sp}) AS f{i}_cnt,"
+                    f" minIf({eff}, {sp}) AS f{i}_first,"
+                    f" toString(argMinIf(event_id, {eff}, {sp})) AS f{i}_evt"
+                    for i, sp in enumerate(sps)
+                )
+                f_sum = " + ".join(f"f{i}_cnt" for i in range(n_frames))
+                sql = f"""
+                    SELECT
+                        {a_expr} AS a,
+                        {b_expr} AS b,
+                        countIf({bp}) AS ref,
+                        {frame_blocks}
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {a_expr} != '' AND {b_expr} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({" OR ".join([bp, *sps])})
+                    GROUP BY a, b
+                    ORDER BY (ref + {f_sum}) DESC, a ASC, b ASC
+                    LIMIT {{cap:UInt32}}
+                    {heavy_scan_settings()}
+                """
+            elif slices is not None:
+                slice_expr = slices.index_sql(eff, params)
+                frame_blocks = ",\n                    ".join(
+                    f"countIf(slice = {i}) AS f{i}_cnt,"
+                    f" minIf(ts, slice = {i}) AS f{i}_first,"
+                    f" toString(argMinIf(event_id, ts, slice = {i})) AS f{i}_evt"
+                    for i in range(n_frames)
+                )
+                sql = f"""
+                    SELECT
+                        a,
+                        b,
+                        count() AS ref,
+                        {frame_blocks}
+                    FROM (
+                        SELECT {a_expr} AS a, {b_expr} AS b, {eff} AS ts, event_id,
+                               {slice_expr} AS slice
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {a_expr} != '' AND {b_expr} != ''
+                          AND {VESTIGO_NOT_SENTINEL_SQL}
+                    )
+                    GROUP BY a, b
+                    ORDER BY ref DESC, a ASC, b ASC
+                    LIMIT {{cap:UInt32}}
+                    {heavy_scan_settings()}
+                """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_pairs += 1
+            if len(rows) >= max_rows_per_pair:
+                run_warnings.append(
+                    f"Pair ({a_field}, {b_field}) hit the {max_rows_per_pair}-row candidate "
+                    f"cap — rules are mined over its {max_rows_per_pair} highest-volume value "
+                    f"pairs only; a rule whose antecedent lives in the tail is not tested."
+                )
+            for row in rows:
+                a, b = row[0], row[1]
+                if not a or not b:
+                    continue
+                per_frame = [
+                    (int(row[3 + i * 3]), row[4 + i * 3], row[5 + i * 3]) for i in range(n_frames)
+                ]
+                cands.append((a_field, b_field, str(a), str(b), int(row[2]), per_frame))
+
+        # Phase 2: mine rules in both directions and test each (rule, frame).
+        # tests: (rule, frame, g, p, n_x, v, n_ref, v_ref, top_violator, top_count, first_ts, evt)
+        tests: list[tuple[Any, ...]] = []
+        by_pair: dict[tuple[str, str], list[tuple[str, str, int, list[tuple[int, Any, Any]]]]] = (
+            defaultdict(list)
+        )
+        for a_field, b_field, a, b, ref, per_frame in cands:
+            by_pair[(a_field, b_field)].append((a, b, ref, per_frame))
+        for (a_field, b_field), rows in by_pair.items():
+            for ante_field, cons_field, oriented in (
+                (a_field, b_field, [(a, b, ref, pf) for a, b, ref, pf in rows]),
+                (b_field, a_field, [(b, a, ref, pf) for a, b, ref, pf in rows]),
+            ):
+                table: dict[str, dict[str, tuple[int, list[tuple[int, Any, Any]]]]] = defaultdict(
+                    dict
+                )
+                for x, y, ref, pf in oriented:
+                    table[x][y] = (ref, pf)
+                for x, outcomes in table.items():
+                    support = sum(ref for ref, _pf in outcomes.values())
+                    if support < min_support:
+                        continue
+                    y_star, (conforming, _pf) = max(
+                        outcomes.items(), key=lambda kv: (kv[1][0], kv[0])
+                    )
+                    confidence = conforming / support
+                    if confidence < rule_confidence:
+                        continue
+                    v_ref_total = support - conforming
+                    for fi in range(n_frames):
+                        n_x = sum(pf[fi][0] for _ref, pf in outcomes.values())
+                        if n_x <= 0:
+                            continue
+                        conf_f = outcomes[y_star][1][fi][0]
+                        v_f = n_x - conf_f
+                        if windows is not None:
+                            n_ref, v_ref = support, v_ref_total
+                        else:
+                            # Leave-one-out: the complement is every other slice.
+                            n_ref, v_ref = support - n_x, v_ref_total - v_f
+                            if n_ref <= 0:
+                                continue
+                        if v_f <= 0:
+                            continue
+                        violators = [
+                            (y, pf[fi])
+                            for y, (_ref, pf) in outcomes.items()
+                            if y != y_star and pf[fi][0] > 0
+                        ]
+                        top_y, (top_cnt, _t, _e) = max(violators, key=lambda kv: (kv[1][0], kv[0]))
+                        first_ts, evt = min(
+                            ((pf[1], pf[2]) for _y, pf in violators if pf[1] is not None),
+                            default=(None, None),
+                        )
+                        g = _g_statistic(v_ref, n_ref - v_ref, v_f, n_x - v_f)
+                        tests.append(
+                            (
+                                (ante_field, cons_field, x, y_star, support, confidence),
+                                fi,
+                                g,
+                                _chi2_sf_df1(g),
+                                n_x,
+                                v_f,
+                                n_ref,
+                                v_ref,
+                                top_y,
+                                top_cnt,
+                                first_ts,
+                                evt,
+                            )
+                        )
+        qvals = _bh_qvalues([t[3] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: FDR + effect floor, build findings.
+        findings: list[CorrelationFinding] = []
+        for test, q in zip(tests, qvals, strict=True):
+            (rule, fi, g, p, n_x, v_f, n_ref, v_ref, top_y, top_cnt, first_ts, evt) = test
+            if q > fdr_q:
+                continue
+            ante_field, cons_field, x, y_star, support, confidence = rule
+            rate_f = v_f / n_x
+            rate_ref = v_ref / n_ref if v_ref > 0 else 0.5 / n_ref
+            ratio = rate_f / rate_ref
+            if ratio < min_ratio:
+                continue
+            first_seen = _present_ts(first_ts)
+            evt_id = str(evt) if evt else None
+            details: dict[str, Any] = {
+                "detector": detector,
+                "method": method,
+                "fields": [ante_field, cons_field],
+                "values": [x, y_star],
+                "value": f"{x} ⇒ {y_star}",
+                "antecedent_field": ante_field,
+                "antecedent_value": x,
+                "consequent_field": cons_field,
+                "consequent_value": y_star,
+                "confidence": round(confidence, 4),
+                "support": support,
+                "count": n_x,
+                "violations": v_f,
+                "violation_rate": round(rate_f, 6),
+                "reference_count": n_ref,
+                "reference_violations": v_ref,
+                "reference_violation_rate": round(v_ref / n_ref, 6),
+                "rate_ratio": round(ratio, 4),
+                "top_violator": top_y,
+                "top_violator_count": top_cnt,
+                "g_statistic": round(g, 4),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "min_ratio": min_ratio,
+                "rule_confidence": rule_confidence,
+                "min_support": min_support,
+                "first_seen": first_seen,
+                "allowlist_field": COMBO_FIELD_SEP.join([ante_field, cons_field]),
+                "allowlist_value": COMBO_VALUE_SEP.join([x, y_star]),
+            }
+            if windows is not None:
+                window = windows.suspects[fi]
+                details.update(
+                    {
+                        "baseline_size": reference_size,
+                        "window_label": window.label,
+                        "window_start": ensure_utc(window.start).isoformat(),
+                        "window_end": ensure_utc(window.end).isoformat(),
+                    }
+                )
+            elif slices is not None:
+                details.update(self._slice_details(slices, fi))
+                details["rest_slices"] = slices.k - 1
+            findings.append(
+                CorrelationFinding(
+                    fields=[ante_field, cons_field],
+                    values=[x, y_star],
+                    value=f"{x} ⇒ {y_star}",
+                    confidence=round(confidence, 4),
+                    support=support,
+                    count=n_x,
+                    violations=v_f,
+                    baseline_count=n_ref,
+                    baseline_violations=v_ref,
+                    violation_rate=round(rate_f, 6),
+                    baseline_violation_rate=round(v_ref / n_ref, 6),
+                    rate_ratio=round(ratio, 4),
+                    top_violator=top_y,
+                    top_violator_count=top_cnt,
+                    g_statistic=round(g, 4),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=round(g, 4),
+                    first_seen=first_seen,
+                    event_id=evt_id,
+                    event=_stub_event(evt_id, case_id, first_seen),
+                    details=details,
+                )
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=reference_size,
+            evaluated_fields=evaluated_pairs,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+            slices=slices,
         )
 
     @gated_heavy_scan

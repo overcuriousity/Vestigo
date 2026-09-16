@@ -37,6 +37,7 @@ from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
     ComboFinding,
+    CorrelationFinding,
     DistributionDriftFinding,
     EntropyFinding,
     FreqFinding,
@@ -2257,6 +2258,7 @@ async def _run_stat_detector(
     partition_field: str | None = None,
     bucket_minutes: int | None = None,
     timezone: str | None = None,
+    rule_confidence: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2586,6 +2588,50 @@ async def _run_stat_detector(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
+    if detector == "value_correlation":
+        # The rule floors and the test thresholds all shape what a "rule" and
+        # a "break" are, so every effective value is snapshotted (D13).
+        resolution["correlation_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_correlation_fdr_q
+        resolution["correlation_min_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_correlation_min_ratio
+        )
+        resolution["correlation_rule_confidence"] = (
+            rule_confidence if rule_confidence is not None else cfg.stat_correlation_rule_confidence
+        )
+        resolution["correlation_min_support"] = (
+            min_support if min_support is not None else cfg.stat_correlation_min_support
+        )
+        if windows is None:
+            resolution["self_slices"] = cfg.stat_self_slices
+        try:
+            result = await run_scan(
+                svc.find_value_correlations,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                windows=windows,
+                fdr_q=resolution["correlation_fdr_q"],
+                min_ratio=resolution["correlation_min_ratio"],
+                rule_confidence=resolution["correlation_rule_confidence"],
+                min_support=resolution["correlation_min_support"],
+                max_pairs=cfg.stat_correlation_max_pairs,
+                max_rows_per_pair=cfg.stat_correlation_max_rows_per_pair,
+                auto_fields=cfg.stat_correlation_auto_fields,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+                self_slices=cfg.stat_self_slices,
+            )
+            _snapshot_slices(result, resolution)
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     if detector == "time_of_day":
         # The resolution and the zone decide what "03:40" means, so both are
         # resolved here (request, else server default) and snapshotted (D12).
@@ -2833,13 +2879,16 @@ def _serialize_finding(
     | MotifFinding
     | DistributionDriftFinding
     | TransitionFinding
-    | HabitFinding,
+    | HabitFinding
+    | CorrelationFinding,
 ) -> dict[str, Any]:
     """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit finding to a JSON-safe dict."""
     # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit
     # finding dataclass fields are exactly the wire keys, so asdict() avoids a
     # hand-maintained field-by-field transcription that would silently drop
     # any newly added field.
+    if isinstance(r, CorrelationFinding):
+        return {"type": "value_correlation", **asdict(r)}
     if isinstance(r, HabitFinding):
         return {"type": "time_of_day", **asdict(r)}
     if isinstance(r, TransitionFinding):
@@ -3222,10 +3271,15 @@ async def _persist_detector_run(
             # per detector, None for every other one.
             "fdr_q": resolution.get("shift_fdr_q")
             or resolution.get("interval_fdr_q")
-            or resolution.get("drift_fdr_q"),
+            or resolution.get("drift_fdr_q")
+            or resolution.get("correlation_fdr_q"),
             "min_ratio": resolution.get("shift_min_ratio")
             or resolution.get("interval_min_rate_ratio")
-            or resolution.get("transition_min_ratio"),
+            or resolution.get("transition_min_ratio")
+            or resolution.get("correlation_min_ratio"),
+            # value_correlation: what counted as a rule (D13). `min_support` is
+            # shared with sequence_motif's key by the same disjointness rule.
+            "rule_confidence": resolution.get("correlation_rule_confidence"),
             # transition_time: the stream key transitions were timed within
             # (None = per source) and the learning floor the run used (D15).
             "partition_field": resolution.get("transition_partition_field"),
@@ -3235,6 +3289,11 @@ async def _persist_detector_run(
             # reproducible, which is why it is recorded rather than implied.
             "bucket_minutes": resolution.get("habit_bucket_minutes"),
             "timezone": resolution.get("habit_timezone"),
+            "min_support": (
+                resolution["correlation_min_support"]
+                if "correlation_min_support" in resolution
+                else resolution.get("motif_min_support")
+            ),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
@@ -3309,7 +3368,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', or 'time_of_day'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', 'time_of_day', or 'value_correlation'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -3423,6 +3482,15 @@ async def list_anomalies(
             "stamped into the persisted run. Omit to use the server default."
         ),
     ),
+    rule_confidence: float | None = Query(
+        default=None,
+        gt=0,
+        le=1,
+        description=(
+            "value_correlation only: share of an antecedent's reference events one "
+            "consequent value must account for to form a rule. Omit to use the server default."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3500,6 +3568,11 @@ async def list_anomalies(
     spacing test, beaconing). Without: whole-scope Greenwood beaconing with
     pauses excluded, and a robust-Gamma silence test. BH-FDR across the run.
 
+    **value_correlation**: per field pair, mines implication rules
+    `A = x ⇒ B = y` within the same event from the reference (support and
+    confidence floors, both directions) and flags a window in which a rule's
+    violation rate rises — G-test, BH pool, effect floor (D13).
+
     **time_of_day**: per (field, value), learns which wall-clock buckets of
     the day (in an explicit IANA `timezone`) the value habitually occurs in
     and flags occurrences outside that habit, scored by the hours to the
@@ -3554,6 +3627,7 @@ async def list_anomalies(
         partition_field=partition_field,
         bucket_minutes=bucket_minutes,
         timezone=timezone,
+        rule_confidence=rule_confidence,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3686,7 +3760,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', or 'time_of_day'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', 'time_of_day', or 'value_correlation'.",
     )
     fields: str | None = Field(
         default=None,
@@ -3758,6 +3832,12 @@ class TagAnomaliesRequest(BaseModel):
         max_length=64,
         description="time_of_day only: IANA zone the clock is read in; stamped into the run.",
     )
+    rule_confidence: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="value_correlation only: consequent share that forms a rule.",
+    )
     start: datetime | None = Field(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time.",
@@ -3828,6 +3908,7 @@ async def tag_anomalies(
         partition_field=body.partition_field,
         bucket_minutes=body.bucket_minutes,
         timezone=body.timezone,
+        rule_confidence=body.rule_confidence,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
