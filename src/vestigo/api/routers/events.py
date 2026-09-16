@@ -40,6 +40,7 @@ from vestigo.db.anomaly_stats import (
     DistributionDriftFinding,
     EntropyFinding,
     FreqFinding,
+    HabitFinding,
     IntervalFinding,
     MotifFinding,
     NoveltyFieldInfo,
@@ -2254,6 +2255,8 @@ async def _run_stat_detector(
     max_gap_seconds: int | None = None,
     variant: str | None = None,
     partition_field: str | None = None,
+    bucket_minutes: int | None = None,
+    timezone: str | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2583,6 +2586,38 @@ async def _run_stat_detector(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
 
+    if detector == "time_of_day":
+        # The resolution and the zone decide what "03:40" means, so both are
+        # resolved here (request, else server default) and snapshotted (D12).
+        resolution["habit_bucket_minutes"] = (
+            bucket_minutes if bucket_minutes is not None else cfg.stat_habit_bucket_minutes
+        )
+        resolution["habit_timezone"] = timezone or cfg.stat_habit_timezone
+        try:
+            result = await run_scan(
+                svc.find_time_of_day_habits,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                windows=windows,
+                bucket_minutes=resolution["habit_bucket_minutes"],
+                timezone=resolution["habit_timezone"],
+                min_baseline=cfg.stat_habit_min_baseline,
+                min_bucket_count=cfg.stat_habit_min_bucket_count,
+                max_candidates_per_field=cfg.stat_habit_max_candidates_per_field,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     if detector == "proportion_shift":
         # Snapshot the *effective* thresholds (request override or server
         # default) so the persisted run stays self-describing.
@@ -2797,13 +2832,16 @@ def _serialize_finding(
     | SequenceFinding
     | MotifFinding
     | DistributionDriftFinding
-    | TransitionFinding,
+    | TransitionFinding
+    | HabitFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition finding
-    # dataclass fields are exactly the wire keys, so asdict() avoids a
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit
+    # finding dataclass fields are exactly the wire keys, so asdict() avoids a
     # hand-maintained field-by-field transcription that would silently drop
     # any newly added field.
+    if isinstance(r, HabitFinding):
+        return {"type": "time_of_day", **asdict(r)}
     if isinstance(r, TransitionFinding):
         return {"type": "transition_time", **asdict(r)}
     if isinstance(r, DistributionDriftFinding):
@@ -3192,6 +3230,11 @@ async def _persist_detector_run(
             # (None = per source) and the learning floor the run used (D15).
             "partition_field": resolution.get("transition_partition_field"),
             "min_transitions": resolution.get("transition_min_transitions"),
+            # time_of_day: the wall-clock resolution and the IANA zone the run
+            # read the clock in (D12) — without the zone the run is not
+            # reproducible, which is why it is recorded rather than implied.
+            "bucket_minutes": resolution.get("habit_bucket_minutes"),
+            "timezone": resolution.get("habit_timezone"),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
@@ -3266,7 +3309,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', or 'transition_time'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', or 'time_of_day'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -3364,6 +3407,22 @@ async def list_anomalies(
             "one stream per source."
         ),
     ),
+    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = Query(
+        default=None,
+        description=(
+            "time_of_day only: width of the wall-clock buckets the day is cut into. "
+            "Omit to use the server default."
+        ),
+    ),
+    timezone: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "time_of_day only: IANA zone the clock is read in (e.g. 'Europe/Berlin'); "
+            "stamped into the persisted run. Omit to use the server default."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3441,6 +3500,11 @@ async def list_anomalies(
     spacing test, beaconing). Without: whole-scope Greenwood beaconing with
     pauses excluded, and a robust-Gamma silence test. BH-FDR across the run.
 
+    **time_of_day**: per (field, value), learns which wall-clock buckets of
+    the day (in an explicit IANA `timezone`) the value habitually occurs in
+    and flags occurrences outside that habit, scored by the hours to the
+    nearest habitual bucket (D12).
+
     **transition_time**: per ordered value pair of `series_field`, learns the
     fastest a stream (per source, per `partition_field` value) ever moved from
     one value to the next and flags transitions faster than that floor by
@@ -3488,6 +3552,8 @@ async def list_anomalies(
         max_gap_seconds=max_gap_seconds,
         variant=variant,
         partition_field=partition_field,
+        bucket_minutes=bucket_minutes,
+        timezone=timezone,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3620,7 +3686,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', or 'transition_time'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', or 'time_of_day'.",
     )
     fields: str | None = Field(
         default=None,
@@ -3681,6 +3747,16 @@ class TagAnomaliesRequest(BaseModel):
     partition_field: str | None = Field(
         default=None,
         description="transition_time only: the stream whose transitions are timed (e.g. 'attr:user').",
+    )
+    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = Field(
+        default=None,
+        description="time_of_day only: width of the wall-clock buckets the day is cut into.",
+    )
+    timezone: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="time_of_day only: IANA zone the clock is read in; stamped into the run.",
     )
     start: datetime | None = Field(
         default=None,
@@ -3750,6 +3826,8 @@ async def tag_anomalies(
         max_gap_seconds=body.max_gap_seconds,
         variant=body.variant,
         partition_field=body.partition_field,
+        bucket_minutes=body.bucket_minutes,
+        timezone=body.timezone,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )

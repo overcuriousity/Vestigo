@@ -376,6 +376,19 @@ class _TransitionTimeParams(_Params):
         return None if v == "" else v
 
 
+class _TimeOfDayParams(_FieldsParams):
+    #: Wall-clock resolution; each option divides the day. None = server default.
+    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = None
+    #: IANA zone the clock is read in; validated by the runner. None = server default.
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: Any) -> Any:
+        """A cleared text box and an omitted knob ask the same question."""
+        return None if v == "" else v
+
+
 class _LogTemplateParams(_Params):
     #: Not a `_run_stat_detector` detector — log templating is a browser with
     #: its own service call (see :func:`_run_log_templates`). Routing it through
@@ -398,6 +411,7 @@ METHOD_MODELS: dict[str, type[_Params]] = {
     "timestamp_order": _TimestampOrderParams,
     "sequence_novelty": _SequenceNoveltyParams,
     "transition_time": _TransitionTimeParams,
+    "time_of_day": _TimeOfDayParams,
     "log_template": _LogTemplateParams,
 }
 
@@ -729,6 +743,8 @@ async def get_analysis_findings(
             max_gap_seconds=kwargs.get("max_gap_seconds"),
             variant=kwargs.get("variant"),
             partition_field=kwargs.get("partition_field"),
+            bucket_minutes=kwargs.get("bucket_minutes"),
+            timezone=kwargs.get("timezone"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

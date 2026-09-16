@@ -201,6 +201,23 @@ already-ingested data.
     transition anywhere in the scope as the leave-one-out floor. Score =
     ``1 − observed / reference``.
 
+**time_of_day** (``detector="time_of_day"``)
+    Per (field, value), learn which wall-clock buckets of the day the value
+    habitually occurs in and flag occurrences outside that habit, scored by
+    the circular distance in hours to the nearest habitual bucket. Adapted
+    from AMiner's ``PathValueTimeIntervalDetector`` (roadmap D12); distinct
+    from ``interval_periodicity``, which measures inter-arrival gaps — a
+    backup moved from 02:15 to 03:40 keeps its cadence and breaks its habit.
+    Buckets are ``bucket_minutes`` wide in an explicit IANA ``timezone``
+    (validated, inlined, stamped into every finding — the run is not
+    reproducible without it). A bucket is habitual when it holds at least
+    ``min_bucket_count`` reference occurrences; a value needs
+    ``min_baseline`` of them to have a habit at all. Two frames: *baseline*
+    (``method="habit"``) learns from the baseline window and scores each
+    suspect window's occurrences; *self* (``method="self-habit"``, D18) takes
+    the value's busy buckets across the scope as its habit and scores every
+    thin bucket against them.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -217,6 +234,8 @@ already-ingested data.
 from __future__ import annotations
 
 import math
+import re
+import zoneinfo
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -472,6 +491,40 @@ _SELF_RCV_FLOOR = 0.05
 # normal approximation is trusted for a motif's regularity (same floor as the
 # interval detector's beaconing gate).
 _MOTIF_GREENWOOD_MIN_INTERVALS = 10
+
+# Time-of-day habit (D12): the bucket resolutions the day can be cut into.
+# Each divides 1440, so the last bucket ends exactly at midnight and the
+# circular distance is well defined.
+_HABIT_BUCKET_MINUTES = (15, 30, 60, 120, 180, 240)
+# What an IANA zone name may look like before zoneinfo is asked about it. The
+# name is inlined into SQL (ClickHouse takes a timezone as a constant), so the
+# token pattern is the first line of defence and zoneinfo the second.
+_TZ_TOKEN = re.compile(r"^[A-Za-z0-9_+\-/]{1,64}$")
+
+
+def _validate_timezone(name: str) -> str:
+    """Return *name* if it is an IANA zone this host knows; raise ``ValueError`` otherwise."""
+    if not isinstance(name, str) or not _TZ_TOKEN.match(name):
+        raise ValueError("timezone must be an IANA zone name such as 'UTC' or 'Europe/Berlin'")
+    try:
+        zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"timezone {name!r} is not a known IANA zone name") from exc
+    return name
+
+
+def _circular_bucket_distance(a: int, b: int, n: int) -> int:
+    """Distance between two of *n* buckets around the clock (23:xx is one hour from 00:xx)."""
+    d = abs(a - b) % n
+    return min(d, n - d)
+
+
+def _habit_bucket_label(bucket: int, bucket_minutes: int) -> str:
+    """``"HH:MM–HH:MM"`` for one bucket; the last one ends at ``00:00``."""
+    start = bucket * bucket_minutes
+    end = start + bucket_minutes
+    return f"{start // 60:02d}:{start % 60:02d}–{(end // 60) % 24:02d}:{end % 60:02d}"
+
 
 # Separators used to flatten a value_combo finding's field/value tuples into
 # the single (field, value) key the detector allowlist stores. The fields are
@@ -1298,6 +1351,37 @@ class TransitionFinding:
 
 
 @dataclass
+class HabitFinding:
+    """One value occurring at a time of day it has no habit of (time_of_day, D12)."""
+
+    field: str
+    value: str
+    # The offending wall-clock bucket: index, "HH:MM–HH:MM" label, width and zone.
+    bucket: int
+    bucket_label: str
+    bucket_minutes: int
+    timezone: str
+    # Occurrences of the value in this bucket (in the suspect window, or the scope).
+    count: int
+    # Reference occurrences of the value the habit was learned from: the
+    # baseline window's (baseline frame) or the whole scope's (self frame).
+    baseline_count: int
+    # The habitual buckets, ascending; the nearest one and its label.
+    habit_buckets: list[int]
+    nearest_habit: int
+    nearest_habit_label: str
+    # Circular distance to the nearest habitual bucket, in hours.
+    distance_hours: float
+    # = distance_hours; used for ranking.
+    score: float
+    # First occurrence in the bucket (within the window, or the scope).
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class MotifFinding:
     """One recurring event-order n-gram surfaced by the sequence-motif miner."""
 
@@ -1339,12 +1423,12 @@ class StatAnomalyResult:
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
     #  | "sequence_novelty" | "sequence_motif" | "value_distribution_drift"
-    #  | "transition_time"
+    #  | "transition_time" | "time_of_day"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
     #  | "g-test" | "cadence" | "ngram" | "motif" | "drift" | "min-transition"
-    #  | "self-min-transition"
+    #  | "self-min-transition" | "habit" | "self-habit"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -1361,6 +1445,7 @@ class StatAnomalyResult:
         | MotifFinding
         | DistributionDriftFinding
         | TransitionFinding
+        | HabitFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -9022,6 +9107,296 @@ class StatisticalAnomalyService:
             event_id=evt_id,
             event=_stub_event(evt_id, case_id, first_seen),
             details=details,
+        )
+
+    # ------------------------------------------------------------------
+    # Time-of-day habit (D12)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_time_of_day_habits(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        bucket_minutes: int = 60,
+        timezone: str = "UTC",
+        min_baseline: int = 20,
+        min_bucket_count: int = 3,
+        max_candidates_per_field: int = 500,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
+    ) -> StatAnomalyResult:
+        """Return value occurrences at a time of day the value has no habit of.
+
+        AMiner ``PathValueTimeIntervalDetector`` analog (D12). Per (field,
+        value) the day is cut into ``1440 / bucket_minutes`` wall-clock
+        buckets in *timezone* (an IANA name, validated here and stamped into
+        every finding — without it the run is not reproducible, since the
+        server's zone can change under it). The value's **habit** is the set
+        of buckets holding at least *min_bucket_count* reference occurrences,
+        learned only for values with at least *min_baseline* of them; an
+        occurrence in any other bucket is flagged, scored by the circular
+        distance to the nearest habitual bucket in hours. Distinct from
+        :meth:`find_interval_periodicity`, which measures inter-arrival gaps:
+        a backup that runs at 02:15 and then at 03:40 keeps its cadence and
+        breaks its habit.
+
+        Two frames. *Baseline* (``method="habit"``, *windows* given): the
+        habit is learned from the baseline window and each suspect window's
+        occurrences are scored against it, one finding per (value, window,
+        bucket) with the bucket's count. *Self* (``method="self-habit"``, D18):
+        the habit is the value's own busy buckets across the scope, and every
+        thin bucket — under *min_bucket_count*, so not habitual by definition —
+        is scored against them; a value that occurs in one thin bucket is
+        judged by its busy ones, which is what leave-one-out means here.
+
+        One scan per field: per (value, bucket, window) counts with the first
+        occurrence, restricted to the *max_candidates_per_field* highest-volume
+        values (cap → warning). Auto field selection is the novelty
+        recommender's categorical set, steered by *field_overrides*. The
+        allowlist key is ``(field, value)``: a value declared Normal is normal
+        at any hour.
+        """
+        detector = "time_of_day"
+        if bucket_minutes not in _HABIT_BUCKET_MINUTES:
+            raise ValueError(
+                f"bucket_minutes must be one of {', '.join(str(b) for b in _HABIT_BUCKET_MINUTES)}"
+            )
+        tz = _validate_timezone(timezone)
+        method = "habit" if windows is not None else "self-habit"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+        n_buckets = 1440 // bucket_minutes
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload() if windows is not None else None,
+            )
+        run_warnings: list[str] = []
+        if windows is not None:
+            baseline_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
+            run_warnings += _window_size_warnings(windows, suspect_totals)
+            if baseline_size == 0:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=0,
+                    warnings=[*run_warnings, "The baseline window contains no events."],
+                    windows=windows.payload(),
+                )
+            reference_size = baseline_size
+        else:
+            reference_size = total_events
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        findings: list[HabitFinding] = []
+        evaluated_fields = 0
+        thin_values = 0
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            if windows is not None:
+                bp, sps = _window_preds(windows, params, source_offsets)
+                w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
+                w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
+                scope_pred = " OR ".join([bp, *sps])
+            else:
+                w_idx_expr, scope_pred = "0", "1"
+            params["bm"] = bucket_minutes
+            params["cap"] = max_candidates_per_field
+            where = f"""
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({scope_pred})
+            """
+            # The zone is inlined, not bound: ClickHouse takes a timezone as a
+            # constant expression, and the name was validated against the
+            # zoneinfo database and a strict token pattern above.
+            sql = f"""
+                SELECT
+                    val,
+                    bucket,
+                    w_idx,
+                    count() AS cnt,
+                    min(ts) AS first_ts,
+                    toString(argMin(event_id, ts)) AS first_evt
+                FROM (
+                    SELECT
+                        {col} AS val,
+                        {eff} AS ts,
+                        event_id,
+                        toUInt16(intDiv(toHour(ts, '{tz}') * 60 + toMinute(ts, '{tz}'), {{bm:UInt16}})) AS bucket,
+                        {w_idx_expr} AS w_idx
+                    FROM {db}.events
+                    {where}
+                )
+                WHERE val IN (
+                    SELECT {col} AS val
+                    FROM {db}.events
+                    {where}
+                    GROUP BY val
+                    ORDER BY count() DESC, val ASC
+                    LIMIT {{cap:UInt32}}
+                )
+                GROUP BY val, bucket, w_idx
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            # value -> {bucket: reference count}; value -> [(w_idx, bucket, cnt, first_ts, evt)]
+            reference: dict[str, dict[int, int]] = defaultdict(dict)
+            observed: dict[str, list[tuple[int, int, int, Any, Any]]] = defaultdict(list)
+            for val, bucket, w_idx, cnt, first_ts, first_evt in rows:
+                key, b, w, n = str(val), int(bucket), int(w_idx), int(cnt)
+                if not key or not 0 <= b < n_buckets:
+                    continue
+                if windows is None:
+                    reference[key][b] = reference[key].get(b, 0) + n
+                    observed[key].append((0, b, n, first_ts, first_evt))
+                elif w == -1:
+                    reference[key][b] = reference[key].get(b, 0) + n
+                elif w >= 0:
+                    observed[key].append((w, b, n, first_ts, first_evt))
+            if len({r[0] for r in rows}) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — only its {max_candidates_per_field} highest-volume "
+                    f"values were scanned for a habit."
+                )
+            learned_any = False
+            for val, occupancy in reference.items():
+                ref_total = sum(occupancy.values())
+                habit = sorted(b for b, n in occupancy.items() if n >= min_bucket_count)
+                if ref_total < min_baseline or not habit:
+                    thin_values += 1
+                    continue
+                learned_any = True
+                for w, b, n, first_ts, evt in observed.get(val, []):
+                    if b in habit:
+                        continue
+                    nearest = min(
+                        habit,
+                        key=lambda h: (_circular_bucket_distance(b, h, n_buckets), h),
+                    )
+                    distance_hours = (
+                        _circular_bucket_distance(b, nearest, n_buckets) * bucket_minutes / 60
+                    )
+                    first_seen = _present_ts(first_ts)
+                    evt_id = str(evt) if evt else None
+                    details: dict[str, Any] = {
+                        "detector": detector,
+                        "method": method,
+                        "field": field_token,
+                        "value": val,
+                        "bucket": b,
+                        "bucket_label": _habit_bucket_label(b, bucket_minutes),
+                        "bucket_minutes": bucket_minutes,
+                        "timezone": tz,
+                        "count": n,
+                        "habit_buckets": habit,
+                        "habit_labels": [_habit_bucket_label(h, bucket_minutes) for h in habit],
+                        "nearest_habit": nearest,
+                        "nearest_habit_label": _habit_bucket_label(nearest, bucket_minutes),
+                        "distance_hours": distance_hours,
+                        "min_baseline": min_baseline,
+                        "min_bucket_count": min_bucket_count,
+                        "first_seen": first_seen,
+                        "allowlist_field": field_token,
+                        "allowlist_value": val,
+                    }
+                    if windows is not None:
+                        window = windows.suspects[w]
+                        details.update(
+                            {
+                                "baseline_count": ref_total,
+                                "baseline_size": reference_size,
+                                "window_label": window.label,
+                                "window_start": ensure_utc(window.start).isoformat(),
+                                "window_end": ensure_utc(window.end).isoformat(),
+                            }
+                        )
+                    else:
+                        details["scope_occurrences"] = ref_total
+                    findings.append(
+                        HabitFinding(
+                            field=field_token,
+                            value=val,
+                            bucket=b,
+                            bucket_label=details["bucket_label"],
+                            bucket_minutes=bucket_minutes,
+                            timezone=tz,
+                            count=n,
+                            baseline_count=ref_total,
+                            habit_buckets=habit,
+                            nearest_habit=nearest,
+                            nearest_habit_label=details["nearest_habit_label"],
+                            distance_hours=distance_hours,
+                            score=distance_hours,
+                            first_seen=first_seen,
+                            event_id=evt_id,
+                            event=_stub_event(evt_id, case_id, first_seen),
+                            details=details,
+                        )
+                    )
+            if learned_any:
+                evaluated_fields += 1
+        if thin_values:
+            run_warnings.append(
+                f"{thin_values} value{'s' if thin_values != 1 else ''} skipped: fewer than "
+                f"{min_baseline} reference occurrences, or none in any bucket at least "
+                f"{min_bucket_count} times — too thin to learn a daily habit from."
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=reference_size,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
         )
 
     @gated_heavy_scan

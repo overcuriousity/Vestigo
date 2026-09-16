@@ -49,6 +49,7 @@ METHOD_IDS: tuple[str, ...] = (
     "timestamp_order",
     "sequence_novelty",
     "transition_time",
+    "time_of_day",
     "log_template",
 )
 
@@ -71,6 +72,7 @@ FIELD_OVERRIDE_METHOD_IDS: frozenset[str] = frozenset(
         "proportion_shift",
         "value_distribution_drift",
         "interval_periodicity",
+        "time_of_day",
     }
 )
 
@@ -91,6 +93,7 @@ COST_CLASS: dict[str, str] = {
     "interval_periodicity": "heavy",
     "sequence_novelty": "heavy",
     "transition_time": "heavy",
+    "time_of_day": "heavy",
     "log_template": "heavy",
 }
 
@@ -344,6 +347,7 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
         "interval_periodicity",
         "sequence_novelty",
         "transition_time",
+        "time_of_day",
     ):
         if frame_needs_baseline:
             plans[method] = _setup(
@@ -417,6 +421,11 @@ def build_plan(inputs: PlanInputs, cfg: Settings) -> list[MethodPlan]:
             },
         ),
     )
+
+    # A time-of-day habit needs nothing structural beyond dated events: a
+    # value's busy buckets are learned from whatever the scope holds, and too
+    # few occurrences is a per-value floor the run reports, not a gate.
+    plans.setdefault("time_of_day", _ok("time_of_day"))
 
     # Log templating clusters the `message` materialized column, which is part
     # of the events schema and therefore always present. There is no data shape

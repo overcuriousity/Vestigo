@@ -34,6 +34,11 @@ _SERIES_FIELD = {
     # Host-to-host moves timed per account: the contractor reaches hosts in
     # minutes that the baseline population moved between over hours.
     "find_transition_times": {"series_field": "attr:computer_name", "partition_field": "attr:user"},
+    # The nightly backup program keeps a 02:xx slot and moves to 03:40; the
+    # jump host keeps an administrator's office hours and sees the contractor
+    # at 03:00. Named rather than auto-picked so the assertion is about the
+    # detector, not the recommender's field order on this corpus.
+    "find_time_of_day_habits": {"fields": ["attr:program", "attr:computer_name"]},
 }
 
 #: Detectors that score a baseline against suspect windows.
@@ -49,6 +54,7 @@ _WINDOWED = (
     "find_distribution_drift",
     "find_sequence_novelty",
     "find_transition_times",
+    "find_time_of_day_habits",
 )
 
 #: Detectors with no baseline/suspect split at all.
@@ -115,6 +121,7 @@ _SELF_FRAME = {
     "find_distribution_drift": {"fields": ["attr:bytes_out"]},
     "find_sequence_novelty": {"series_field": "attr:computer_name"},
     "find_transition_times": {"series_field": "attr:computer_name", "partition_field": "attr:user"},
+    "find_time_of_day_habits": {"fields": ["attr:program"]},
 }
 
 

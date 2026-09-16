@@ -21,6 +21,7 @@
  */
 import {
   Activity,
+  Clock,
   FileText,
   Gauge,
   Hash,
@@ -48,6 +49,7 @@ export type MethodId =
   | "timestamp_order"
   | "sequence_novelty"
   | "transition_time"
+  | "time_of_day"
   | "log_template";
 
 export type EvidenceClass = "named" | "statistical" | "exploration";
@@ -112,7 +114,7 @@ export interface MethodMeta {
   hint: string;
   /**
    * When to configure it, in one sentence for the wizard's card. Starts with
-   * "Use this when" — a test enforces it — so the thirteen cards read as one list.
+   * "Use this when" — a test enforces it — so the fourteen cards read as one list.
    */
   useWhen: string;
   icon: React.ElementType;
@@ -353,6 +355,37 @@ export const METHODS: MethodMeta[] = [
     what: "Fits an inter-arrival distribution per series value and tests whether the spacing is more regular than chance allows, and whether a regular value fell silent. With a baseline the rhythm is learned there and tested in the suspect windows; without one each value is judged over all its arrivals across the timeline, with long pauses left out of the regularity test. Nothing filters legitimate clocks: a high-volume heartbeat gets the smallest p and ranks first, and marking it Normal is the remedy.",
     querySketch: `SELECT series, gap FROM (\n  SELECT <series_field> AS series,\n         dateDiff('second', lagInFrame(<effective_ts>) OVER w, <effective_ts>) AS gap\n  FROM events WHERE case_id = {case}\n  WINDOW w AS (PARTITION BY series ORDER BY <effective_ts>)\n)\n-- baseline: Poisson-rate G (cadence break) or Greenwood G (new regularity)\n-- self: Greenwood G over retained gaps; Gamma tail over the longest gap`,
     knobs: [SERIES_KNOB, FDR_KNOB, RATIO_KNOB],
+  },
+  {
+    id: "time_of_day",
+    label: "Time-of-day habit",
+    hint: "Values at an hour they never keep",
+    useWhen:
+      "Use this when a value keeps office hours or a nightly slot and showing up at another hour would matter — a job that moved, an account active at 03:00.",
+    icon: Clock,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "h off habit",
+    what: "Cuts the day into wall-clock buckets in the zone you name and learns, per value, which buckets it habitually occurs in. An occurrence in any other bucket is reported, scored by how many hours it sits from the nearest habitual bucket, around the clock. With a baseline the habit is the baseline window's; without one it is the value's own busy buckets across the timeline, and its thin buckets are judged against them. Cadence measures the gap between arrivals; this measures the hour on the wall.",
+    querySketch: `SELECT <field> AS value,\n       intDiv(toHour(<effective_ts>, '<timezone>') * 60 + toMinute(<effective_ts>, '<timezone>'), {bucket_minutes}) AS bucket,\n       count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value, bucket\n-- habit = buckets with n >= {min_bucket_count} in the reference\n-- reported when an occurrence falls outside it; score = hours to the nearest habitual bucket`,
+    knobs: [
+      FIELDS_KNOB,
+      {
+        param: "bucket_minutes",
+        label: "Bucket",
+        kind: "choice",
+        placeholder: "60",
+        options: [
+          { value: "60", label: "1 hour" },
+          { value: "15", label: "15 minutes" },
+          { value: "30", label: "30 minutes" },
+          { value: "120", label: "2 hours" },
+          { value: "180", label: "3 hours" },
+          { value: "240", label: "4 hours" },
+        ],
+      },
+      { param: "timezone", label: "Zone", kind: "text", placeholder: "UTC" },
+    ],
   },
   {
     id: "timestamp_order",

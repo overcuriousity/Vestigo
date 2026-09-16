@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Time-of-day habit (D12).** A fourteenth statistical detector, `time_of_day`, adapted
+  from AMiner's `PathValueTimeIntervalDetector`: per (field, value) it cuts the day into
+  `bucket_minutes`-wide wall-clock buckets (15–240 minutes, default 60) read in an explicit
+  IANA `timezone` (default `UTC`, `stat_habit_timezone` for the site), learns the value's
+  habit — the buckets holding at least `stat_habit_min_bucket_count` reference occurrences,
+  for values with at least `stat_habit_min_baseline` of them — and reports an occurrence in
+  any other bucket, scored by the circular distance in hours to the nearest habitual one.
+  Interval cadence measures the gap between arrivals; this reads the hour on the wall, and
+  the two are independent (a nightly job that moves keeps its cadence and breaks its
+  habit). Both frames: `habit` learns from the baseline window and scores each suspect
+  window; `self-habit` takes the value's own busy buckets across the timeline and scores
+  its thin ones. The zone and resolution are snapshotted into the persisted run and carried
+  on every finding, since the same instant is a different hour elsewhere. Auto field
+  selection follows the novelty recommender and the timeline's field overrides; the
+  allowlist key is `(field, value)`. Gate entry (always offered in the self frame), wizard
+  card with a bucket choice and a zone box, a day-strip evidence figure, agent knobs, five
+  settings with registry specs and `docs/ANOMALY_DETECTION.md` §16 ship with it. The demo
+  case gains a one-off manual afternoon backup run (the self-frame signal) and moves the
+  contractor's lateral movement onto the jump host at 03:00, a host whose baseline logons
+  are an administrator's office hours; the nightly backup's move to 03:40 is the benign hit.
+
 - **Transition speed (D15).** A thirteenth statistical detector, `transition_time`, adapted
   from AMiner's `MinimalTransitionTimeDetector`: per ordered value pair of a series field
   it learns the fastest a stream ever moved from one value to the next and reports a

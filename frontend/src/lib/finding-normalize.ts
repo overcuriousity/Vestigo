@@ -141,6 +141,13 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       })${f.partition_value ? ` · ${truncate(f.partition_value, 30)}` : ""}`;
       ts = ts ?? f.first_seen;
       break;
+    case "time_of_day":
+      title = pair(f.field, f.value);
+      subtitle = `×${f.count} at ${f.bucket_label} ${f.timezone} · habit ${f.nearest_habit_label}${
+        f.habit_buckets.length > 1 ? ` +${f.habit_buckets.length - 1}` : ""
+      }${findingMode(f) === "self-habit" ? " across the timeline" : ""}`;
+      ts = ts ?? f.first_seen;
+      break;
   }
   return {
     detectorId: meta.id,

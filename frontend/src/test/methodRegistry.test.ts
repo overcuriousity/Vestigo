@@ -48,6 +48,7 @@ describe("method registry", () => {
       timestamp_order: ["min_skew_seconds"],
       sequence_novelty: ["series_field", "ngram_size", "max_gap_seconds"],
       transition_time: ["series_field", "partition_field", "min_ratio"],
+      time_of_day: ["fields", "bucket_minutes", "timezone"],
       log_template: ["field", "order", "only_new"],
     };
     for (const m of METHODS) {
@@ -57,7 +58,7 @@ describe("method registry", () => {
     }
   });
 
-  it("covers exactly the thirteen methods the gate plans for", () => {
+  it("covers exactly the fourteen methods the gate plans for", () => {
     // METHOD_IDS in db/analysis_plan.py. A method here that the plan never
     // reports would render with no status; one there that is missing here
     // would never be shown at all.
@@ -71,6 +72,7 @@ describe("method registry", () => {
         "numeric_range",
         "proportion_shift",
         "sequence_novelty",
+        "time_of_day",
         "timestamp_order",
         "transition_time",
         "value_combo",

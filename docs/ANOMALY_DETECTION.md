@@ -7,7 +7,7 @@ This document covers every detector actually running in the codebase today. If
 a detector described here changes (formula, default, field name), update this
 file and the "Method" tab copy in the same commit.
 
-There are fifteen independent analysis tools in Vestigo:
+There are sixteen independent analysis tools in Vestigo:
 
 1. [Value novelty](#1-value-novelty-rare--first-seen-values) — rare/new field values, single field or [combinations](#value-combinations-the-value_combo-variant) (ClickHouse, no ML)
 2. [Frequency anomalies](#2-frequency-anomalies-volume-spikes--silences) — volume spikes/silences (ClickHouse, no ML)
@@ -24,13 +24,14 @@ There are fifteen independent analysis tools in Vestigo:
 13. [Sigma rule runner](#13-sigma-rule-runner-signature-matching) — signature matching: community/custom Sigma rules compiled to ClickHouse predicates (ClickHouse, no ML)
 14. [Log templates](#14-log-templates-structural-line-clustering) — structural clustering of raw lines into templates, so rare *shapes* surface without naming a field (ClickHouse, no ML)
 15. [Transition speed](#15-transition-speed-value-to-value-moves-faster-than-ever-seen) — a stream reaching the next value of a field faster than that pair was ever reached before (ClickHouse, no ML)
+16. [Time-of-day habit](#16-time-of-day-habit-values-at-an-hour-they-never-keep) — a value occurring at a wall-clock hour it has no habit of, in an explicit timezone (ClickHouse, no ML)
 
 All but the eleventh are **statistical or rule-based**: pure counting,
 arithmetic and predicate matching over already-ingested events — no machine
 learning, no network calls, working the instant ingestion finishes. The
 eleventh needs an explicit embedding step first.
 
-Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14, 15),
+Code: `src/vestigo/db/anomaly_stats.py` (detectors 1–10, 12, 14–16),
 `src/vestigo/db/similarity.py` (detector 11), `src/vestigo/sigma/`
 (detector 13). UI: `frontend/src/components/analysis/`.
 
@@ -63,6 +64,7 @@ teaches the tooling instead of the work. What each tool has to find:
 | 13 | Sigma | Four case-scoped rules ship inside the case: encoded PowerShell, suspicious service install, wmic remote process creation, failed-logon burst. |
 | 14 | Log templates | ~40 syslog templates, with an `unattended-upgrade` shape that appears only in the suspect window. |
 | 15 | Transition speed | The contractor account on `FILE-01` two seconds after its wmic call from `JUMP-01`, timed per account over `attr:computer_name`, against an administrator whose routine jump-host hop takes the same pair 20–90 s. |
+| 16 | Time-of-day habit | The nightly backup program at 03:xx and 04:xx after three weeks of 02:xx runs (benign, the same move interval cadence sees), and the contractor on `JUMP-01` at 03:00, a host whose baseline logons are an administrator's office hours. Without a baseline, the one manual afternoon backup run twelve hours from the program's nightly slot. |
 
 `tests/test_demo_detector_coverage_clickhouse.py` asserts that each of these
 actually returns findings. If a retuned threshold silences one of them, that
@@ -353,7 +355,7 @@ checked, and the UI must never present the two the same way.
 
 | Method | Precondition | Setting |
 |---|---|---|
-| `value_novelty`, `timestamp_order`, `log_template`, `entropy` | none — always offered | — |
+| `value_novelty`, `timestamp_order`, `log_template`, `entropy`, `time_of_day` | none — always offered | — |
 | `value_combo` | ≥2 categorical fields | — |
 | `numeric_range` | ≥1 field whose sampled values are ≥90 % numeric | `analysis_gate_min_numeric_ratio` |
 | `charset` | ≥1 field above the enum-like ceiling | `analysis_gate_max_enum_distinct` |
@@ -361,7 +363,7 @@ checked, and the UI must never present the two the same way.
 | `interval_periodicity` | enough events per series value to fit a cadence | `analysis_gate_min_interval_periods` |
 | `sequence_novelty`, `transition_time` | a series field with ≥2 distinct values (one value yields no ordering and no transition) | `analysis_gate_min_series_distinct` |
 | `proportion_shift`, `value_distribution_drift` | a span of more than one instant (self frame: it is cut into slices) | `stat_self_slices` |
-| any of those five in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
+| any of those five, or `time_of_day`, in the **baseline frame** | an active baseline definition | — (reported as `needs_setup`) |
 
 Three rows encode a distinction worth stating, because each was once drawn wrong:
 
@@ -2644,6 +2646,116 @@ both frames, so one **Normal** verdict on a pair covers it wherever it recurs.
 - A fast transition is **not malicious by itself** — a scripted deployment legitimately
   touches ten hosts in ten seconds. Rank for triage; mark the routine pair Normal once.
 
+## 16. Time-of-day habit (values at an hour they never keep)
+
+**What it answers:** "Does this value keep hours — and did it break them?" The AMiner
+`PathValueTimeIntervalDetector` analog (roadmap D12). A backup job that runs at 02:15,
+a service account that works office hours, a user who has never logged on after
+eight: each has a daily *habit*, and an occurrence outside it is worth a look whatever
+the value itself is. Interval cadence (§8) measures the gap between arrivals; this
+detector reads the hour on the wall. The two are independent: the demo's backup keeps
+its once-a-day cadence perfectly when it moves from 02:15 to 03:40, and breaks its
+habit.
+
+**How it works.** The day is cut into `1440 / bucket_minutes` wall-clock buckets
+(default 60, so 24 hourly buckets) read in an explicit **IANA timezone** (default
+`UTC`; `stat_habit_timezone` sets a site's zone once). The zone is not a
+presentation choice: the same instant is 03:40 in Berlin and 01:40 in London, so the
+run records it in `DetectorRun.params` and every finding carries it, or the run could
+not be reproduced. Per (field, value) the detector counts occurrences per bucket in
+the reference, and the value's **habit** is the set of buckets holding at least
+`stat_habit_min_bucket_count` (3) of them — learned only for values with at least
+`stat_habit_min_baseline` (20) reference occurrences, since a handful of events say
+nothing about hours kept. An occurrence in any other bucket is flagged, one finding
+per (value, bucket) — per suspect window in the baseline frame — with the bucket's
+count, and scored by the **circular distance in hours** to the nearest habitual
+bucket: 23:xx is one hour from a 00:xx habit, not twenty-three.
+
+**Two frames.**
+
+| | Self (`self-habit`) | Baseline (`habit`) |
+|---|---|---|
+| Reference | the value's own occurrences across the whole scope | the value's occurrences in the baseline window |
+| Habit | its buckets holding ≥ `min_bucket_count` scope occurrences | its buckets holding ≥ `min_bucket_count` baseline occurrences |
+| Flags | every *thin* bucket — under the floor, hence not habitual — against the busy ones | each suspect window's occurrences outside the baseline habit, habitual or not |
+| Catches | one manual afternoon run of a nightly job | a nightly job that moved; an account active at 03:00 for the first time |
+
+The self frame is leave-one-out in the only sense that matters here: a value that
+occurs once at 15:00 and fifty times at 02:00 is judged by the fifty. What it cannot
+see is a *repeated* new hour — a bucket that fills past the floor becomes habitual by
+definition — which is what a baseline is for: the same fifty-plus-eight becomes "eight
+occurrences at 03:xx against a baseline habit of 02:xx" once the analyst declares the
+window.
+
+One scan per field: per (value, bucket, window) counts with the first occurrence,
+restricted to the `stat_habit_max_candidates_per_field` (500) highest-volume values
+(cap → warning; lower than the other per-field caps because each value returns one
+row per occupied bucket and window). Auto field selection is the novelty
+recommender's categorical set, steered by the timeline's
+[field overrides](#declaring-which-fields-a-method-reads). Values below the learning
+floor are counted in a warning rather than silently skipped.
+
+**Score = hours to the nearest habitual bucket**, in whole multiples of the bucket
+width: a 60-minute resolution scores 1, 2 … 12; a 15-minute one 0.25 upward. The
+representative event is the first occurrence in the bucket (within the window, or the
+scope), and `first_seen` is its timestamp. Findings carry `bucket`, `bucket_label`
+(`"03:00–04:00"`), `bucket_minutes`, `timezone`, `count`, `baseline_count` (the
+reference occurrences the habit was learned from), `habit_buckets` with their labels,
+`nearest_habit` / `nearest_habit_label` and `distance_hours`; the baseline frame adds
+`window_label`/`window_start`/`window_end`, the self frame `scope_occurrences`.
+
+**Parameters.**
+
+- `fields` (request, default auto) — the recommender's categorical fields, as for
+  value novelty; steered by field overrides, bypassed by an explicit list.
+- `bucket_minutes` (request) / `VESTIGO_STAT_HABIT_BUCKET_MINUTES` (server default
+  60) — one of 15, 30, 60, 120, 180, 240; each divides the day so the last bucket ends
+  at midnight. Snapshotted as `bucket_minutes`.
+- `timezone` (request) / `VESTIGO_STAT_HABIT_TIMEZONE` (server default `UTC`) — an
+  IANA zone name, validated against the host's zoneinfo database and a strict token
+  pattern before it is inlined into SQL (ClickHouse takes a zone as a constant).
+  Snapshotted as `timezone`.
+- `VESTIGO_STAT_HABIT_MIN_BASELINE` (default 20) — reference occurrences a value
+  needs before it has a habit.
+- `VESTIGO_STAT_HABIT_MIN_BUCKET_COUNT` (default 3) — reference occurrences a bucket
+  needs to be habitual.
+- `VESTIGO_STAT_HABIT_MAX_CANDIDATES_PER_FIELD` (default 500) — the per-field
+  candidate cap; hitting it attaches a warning.
+
+**Allowlist key:** `(field, value)` — a value declared Normal is normal at any hour.
+There is no per-bucket key on purpose: "the backup may run at 03:40 now" is a change
+to the baseline definition, not a verdict on a finding.
+
+### Caveats
+
+- **The zone is the claim.** A run in `UTC` over a site that works in `Asia/Tokyo`
+  reports office hours as a night-time habit and a 03:00 logon as ordinary. Set
+  `stat_habit_timezone` for the site, or the knob per run; the finding says which zone
+  it read, so a reader can tell.
+- **Habits need volume.** Twenty occurrences over a three-week baseline is the floor,
+  not a comfortable sample; a value with thirty occurrences spread thinly across the
+  day has a patchy habit, and the empty buckets between its busy ones will flag. The
+  bucket floor (3) is what keeps one stray reference occurrence from becoming a habit,
+  and it also means a bucket with two reference occurrences is *not* habit — read
+  `habit_buckets` before reading the distance.
+- **Round-the-clock values have no habit to break.** A value present in every bucket
+  is never flagged, which is correct: an all-hours process has no hour it does not
+  keep. High-volume fields (a busy user, a chatty host) mostly look like this, and the
+  detector earns its keep on the low-volume, scheduled and role-bound values around
+  them.
+- **Weekends and holidays are not modelled.** A weekday-only habit is still a
+  time-of-day habit, and a Saturday occurrence at 10:00 is inside it. Day-of-week is
+  a different question (`time:day_of_week` in Visualize answers it), deliberately not
+  folded in here.
+- **Clock skew moves the hour.** Occurrences are bucketed on the corrected timestamp
+  (W2), so a source with a declared offset is read at its corrected wall-clock hour,
+  as every other time-derived query reads it.
+- An off-hours occurrence is **not malicious by itself** — a manual run, a time-zone
+  traveller, a shifted maintenance window. Rank for triage; mark the value Normal, or
+  move the baseline, once it is explained.
+
+---
+
 ---
 
 ## Dispositions and normality (implementation notes)
@@ -2676,7 +2788,8 @@ always for `tag_anomalies`) writes a `DetectorRun` row: the request params it
 ran with — fields, `series_field`, thresholds, `baseline_id`, resolved windows,
 `windows_hash`, `dispositions_hash`, the per-source clock-skew offsets in
 effect, entropy's `variant`, transition speed's `partition_field` and
-`min_transitions`, and for a self-frame run of the slice methods the
+`min_transitions`, time-of-day's `bucket_minutes` and `timezone`, and for a
+self-frame run of the slice methods the
 `slices` payload, its `slices_hash` and the resolved self settings
 (`self_slices`, `pause_ratio`, `min_span_seconds`, `sequence_rarity_floor`)
 — plus the serialized result, and returns its id as `run_id`. Rows

@@ -74,9 +74,10 @@ FORMERLY_TWO_WINDOW_METHODS = (
     "value_distribution_drift",
     "interval_periodicity",
     "sequence_novelty",
-    # Born with both frames (D15), gated the same way: a baseline comparison
-    # with no baseline is the one thing an analyst action repairs.
+    # Born with both frames (D15, D12), gated the same way: a baseline
+    # comparison with no baseline is the one thing an analyst action repairs.
     "transition_time",
+    "time_of_day",
 )
 
 

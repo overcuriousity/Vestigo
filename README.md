@@ -69,7 +69,7 @@ resolved on the machine you deploy to.
   ClickHouse, time histogram with anomaly overlays, keyset pagination with jump-to-time,
   tag/comment annotations with bulk apply, saved views, and streaming CSV/JSONL export that
   keeps the forensic columns.
-- **Anomaly detection** — fifteen analysis tools: thirteen statistical detectors over
+- **Anomaly detection** — sixteen analysis tools: fourteen statistical detectors over
   ClickHouse needing no embeddings, a Sigma rule runner, and semantic similarity search
   over local embeddings. Each is documented method by method, scores against explicit
   baseline-vs-suspect windows, and yields findings whose confirm/dismiss disposition
@@ -109,7 +109,7 @@ feel like, and the Case/Timeline model here is descended from it. That is the co
 invite, and three axes are where we think we are already the better place to run an
 investigation:
 
-- **Detection is the workflow, not an add-on** — fifteen analysis tools in the box, each
+- **Detection is the workflow, not an add-on** — sixteen analysis tools in the box, each
   scoring against an analyst-declared baseline and carrying a verdict that survives
   re-scans, so triage accumulates instead of being redone.
 - **Provenance goes all the way down** — not just "this file was imported": a finding is

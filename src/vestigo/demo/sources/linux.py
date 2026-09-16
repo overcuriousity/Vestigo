@@ -7,7 +7,8 @@ shapes ride along with the ordinary churn:
 * ``APP-01`` drifts against NTP, emitting records slightly out of order. It is
   benign, and being able to see that quickly is the point.
 * the nightly backup on ``BACKUP-01`` moves from 02:15 to 03:40 mid-month —
-  also benign, and a useful counterweight to the malicious beacon.
+  also benign, and a useful counterweight to the malicious beacon — and runs
+  once by hand on a baseline afternoon, the program's one daytime appearance.
 * sudo on the file server shifts toward archiving commands as the intruder
   stages data.
 
@@ -183,6 +184,29 @@ def _backup_job() -> Iterator[dict[str, str]]:
             f"bytes={r.randrange(10**9, 9 * 10**9)}",
         )
         day += timedelta(days=1)
+    # One manual run in the middle of a baseline afternoon — an administrator
+    # taking a copy before a migration. Benign, and the one time the backup
+    # program is seen twelve hours from its habit (§15's time-of-day detector
+    # in the self frame, where the nightly slot is the program's own habit).
+    manual = scenario.SCENARIO_START + timedelta(days=9, hours=15, minutes=2, seconds=17)
+    pid = r.randrange(400, 65_000)
+    yield _row(
+        manual,
+        scenario.BACKUP_HOST,
+        "backup",
+        pid,
+        "svc_backup",
+        "manual backup run started target=/srv/shares retention=7d requested_by=a.lindqvist",
+    )
+    yield _row(
+        manual + timedelta(minutes=19),
+        scenario.BACKUP_HOST,
+        "backup",
+        pid,
+        "svc_backup",
+        f"manual backup run completed files={r.randrange(9000, 41000)} "
+        f"bytes={r.randrange(10**9, 9 * 10**9)}",
+    )
 
 
 def _intrusion() -> Iterator[dict[str, str]]:

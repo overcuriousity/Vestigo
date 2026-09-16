@@ -836,6 +836,53 @@ export interface TransitionTimeFinding {
   confirmed_other_scope?: boolean;
 }
 
+/**
+ * One value occurring at a time of day it has no habit of, from the
+ * time_of_day detector (D12). `details.method` is `habit` (the habit was
+ * learned from the baseline window; `details` carries `window_*` keys) or
+ * `self-habit` (the value's own busy buckets across the timeline, with
+ * `scope_occurrences` and no window keys). The bucket resolution and the
+ * IANA zone the clock was read in are on every finding — the same wall-clock
+ * hour in two zones is two different claims.
+ */
+export interface TimeOfDayFinding {
+  type: "time_of_day";
+  field: string;
+  value: string;
+  /** The offending wall-clock bucket: index, "HH:MM–HH:MM" label, width and zone. */
+  bucket: number;
+  bucket_label: string;
+  bucket_minutes: number;
+  timezone: string;
+  /** Occurrences of the value in this bucket (in the suspect window, or the timeline). */
+  count: number;
+  /** Reference occurrences the habit was learned from. */
+  baseline_count: number;
+  /** The habitual bucket indexes, ascending; the nearest one and its label. */
+  habit_buckets: number[];
+  nearest_habit: number;
+  nearest_habit_label: string;
+  /** Circular distance to the nearest habitual bucket, in hours. */
+  distance_hours: number;
+  /** = distance_hours — used for ranking. */
+  score: number;
+  /** First occurrence in the bucket. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -849,7 +896,8 @@ export type AnomalyFinding =
   | SequenceNoveltyFinding
   | SequenceMotifFinding
   | DistributionDriftFinding
-  | TransitionTimeFinding;
+  | TransitionTimeFinding
+  | TimeOfDayFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -1056,7 +1104,8 @@ export interface AnomalyMarker {
     | "interval_periodicity"
     | "sequence_novelty"
     | "value_distribution_drift"
-    | "transition_time";
+    | "transition_time"
+    | "time_of_day";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */

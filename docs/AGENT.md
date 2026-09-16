@@ -716,6 +716,12 @@ detector runs without a baseline (D18) took it to **43,891 over 35 tools**, ceil
 unchanged — the first draft landed at 44,197 and the rule was applied: the tool's
 docstring was rewritten compact (−306 chars net) rather than the ceiling moved.
 
+The 1.20 detectors (2026-09-16: `transition_time`'s `partition_field`, `time_of_day`'s
+`bucket_minutes` and `timezone`) took the first draft to 44,421 and the rule was applied
+again: the docstring now names each detector once and each knob in a few words, and the
+`timezone` length constraints came off the schema (the runner validates the zone anyway) —
+**43,832 over 35 tools**, ceiling unchanged, below the D11 figure.
+
 Detector findings additionally reduce their inline example event in the
 **model's copy** to `event_id` + truncated `message`
 (`_deflate_findings` — on the turn that motivated it: 33.7k → 15.7k tokens);

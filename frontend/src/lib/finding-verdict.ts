@@ -179,6 +179,21 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         tail: `— ${floor}${f.speedup === null ? "" : `, ${f.speedup.toFixed(1)}× faster`}.`,
       };
     }
+    case "time_of_day": {
+      const reference =
+        findingMode(f) === "self-habit"
+          ? `across the timeline its ${f.baseline_count} occurrences keep to`
+          : `in the baseline its ${f.baseline_count} occurrences keep to`;
+      const habit =
+        f.habit_buckets.length === 1
+          ? f.nearest_habit_label
+          : `${f.habit_buckets.length} buckets, the nearest ${f.nearest_habit_label}`;
+      return {
+        lead: `${fieldLabel(f.field)} = ${truncate(String(f.value), 40)} occurs ${f.count} time${f.count === 1 ? "" : "s"} at ${f.bucket_label} (${f.timezone}),`,
+        highlight: `${f.distance_hours % 1 === 0 ? f.distance_hours.toFixed(0) : f.distance_hours.toFixed(1)} h off its habit`,
+        tail: `— ${reference} ${habit}.`,
+      };
+    }
   }
 }
 

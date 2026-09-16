@@ -6825,3 +6825,278 @@ def test_transition_allowlist_suppresses_the_pair_in_both_frames():
     assert result.status == "ok"
     assert result.results == []
     assert result.total_findings == 0
+
+
+# ---------------------------------------------------------------------------
+# time_of_day — detector (D12)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then one occupancy scan
+# per field. Occupancy row layout: val, bucket, w_idx, cnt, first_ts,
+# first_evt — one row per (value, time-of-day bucket, window), baseline rows
+# under w_idx = -1. Self frame: count, then one scan per field with every row
+# under w_idx = 0.
+
+_HABIT_COLS = ["val", "bucket", "w_idx", "cnt", "first_ts", "first_evt"]
+
+
+def _habit_responses(
+    total: int, window_totals: tuple[int, int], rows: list[tuple]
+) -> list[FakeQueryResult]:
+    return [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(result_rows=rows, column_names=_HABIT_COLS),
+    ]
+
+
+def _habit_baseline_rows(val: str, buckets: dict[int, int]) -> list[tuple]:
+    return [(val, b, -1, n, None, None) for b, n in buckets.items()]
+
+
+def test_habit_parameter_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="bucket_minutes"):
+        svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"], bucket_minutes=7)
+    with pytest.raises(ValueError, match="timezone"):
+        svc.find_time_of_day_habits(
+            "c1", ["s1"], fields=["attr:program"], timezone="Mars/Olympus_Mons"
+        )
+    with pytest.raises(ValueError, match="timezone"):
+        svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"], timezone="UTC'; --")
+    assert svc.ch.client._calls == []
+
+
+def test_habit_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "no_data"
+    assert result.detector == "time_of_day"
+
+
+def test_habit_baseline_flags_an_occurrence_outside_the_learned_hours():
+    at = datetime(2024, 1, 17, 3, 41, tzinfo=UTC)
+    rows = [
+        # The nightly backup: 48 baseline runs, all in the 02:00 bucket.
+        *_habit_baseline_rows("backup", {2: 48}),
+        # Suspect window: eight runs at 03:xx and two at 04:xx.
+        ("backup", 3, 0, 8, at, "evt-3"),
+        ("backup", 4, 0, 2, at + timedelta(hours=1), "evt-4"),
+        # Still at 02:xx in the suspect window — inside the habit, no finding.
+        ("backup", 2, 0, 2, at, "evt-2"),
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "ok"
+    assert result.method == "habit"
+    assert result.baseline_size == 8000
+    by_bucket = {r.bucket: r for r in result.results}
+    assert sorted(by_bucket) == [3, 4]
+    r = by_bucket[4]
+    assert r.field == "attr:program"
+    assert r.value == "backup"
+    assert r.count == 2
+    assert r.baseline_count == 48
+    assert r.bucket_minutes == 60
+    assert r.timezone == "UTC"
+    assert r.bucket_label == "04:00–05:00"
+    assert r.habit_buckets == [2]
+    assert r.nearest_habit_label == "02:00–03:00"
+    assert r.distance_hours == 2.0
+    assert r.score == 2.0
+    assert r.event_id == "evt-4"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T04:41")
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "attr:program"
+    assert r.details["allowlist_value"] == "backup"
+    # Ranked farthest-from-habit first.
+    assert [f.bucket for f in result.results] == [4, 3]
+    assert by_bucket[3].distance_hours == 1.0
+    assert len(svc.ch.client._calls) == 3
+
+
+def test_habit_distance_is_circular_and_buckets_follow_the_resolution():
+    """23:xx is one hour from a 00:xx habit, not twenty-three; and a 30-minute
+    resolution labels half-hour buckets and measures in half hours."""
+    at = datetime(2024, 1, 17, 23, 10, tzinfo=UTC)
+    rows = [
+        *_habit_baseline_rows("cron", {0: 30, 1: 25}),
+        ("cron", 47, 0, 1, at, "e1"),  # 23:30–00:00 at 30-min buckets
+        ("cron", 24, 0, 1, at, "e2"),  # 12:00–12:30
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows(), bucket_minutes=30
+    )
+    assert result.status == "ok"
+    by_bucket = {r.bucket: r for r in result.results}
+    assert by_bucket[47].bucket_label == "23:30–00:00"
+    assert by_bucket[47].distance_hours == 0.5
+    assert by_bucket[47].nearest_habit_label == "00:00–00:30"
+    assert by_bucket[24].distance_hours == 11.5
+    assert by_bucket[24].habit_buckets == [0, 1]
+
+
+def test_habit_learning_floors_skip_thin_values_and_thin_buckets():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        # Too few baseline occurrences to call anything a habit (floor 20).
+        *_habit_baseline_rows("rare", {9: 10}),
+        ("rare", 22, 0, 1, at, "e1"),
+        # A bucket with fewer than min_bucket_count baseline hits is not habit:
+        # 09:xx is habitual, 21:xx (2 hits) is not, so a 21:xx occurrence is a
+        # finding measured from 09:xx — and so is the 22:xx one.
+        *_habit_baseline_rows("job", {9: 40, 21: 2}),
+        ("job", 21, 0, 3, at, "e2"),
+        ("job", 22, 0, 1, at, "e3"),
+        # Every bucket habitual: nothing can be outside.
+        *_habit_baseline_rows("chatty", dict.fromkeys(range(24), 5)),
+        ("chatty", 3, 0, 1, at, "e4"),
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "ok"
+    assert sorted((r.value, r.bucket) for r in result.results) == [("job", 21), ("job", 22)]
+    assert {r.distance_hours for r in result.results} == {12.0, 11.0}
+    assert any("fewer than 20" in w for w in result.warnings)
+
+
+def test_habit_baseline_without_learnable_values_is_insufficient():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [*_habit_baseline_rows("rare", {9: 3}), ("rare", 22, 0, 1, at, "e1")]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "insufficient_data"
+
+
+def test_habit_sql_shape_binds_resolution_and_inlines_a_validated_timezone():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _habit_responses(
+            10_000,
+            (8000, 2000),
+            # Two-hour buckets: 02:00–04:00 is the habit, 04:00–06:00 the finding.
+            [*_habit_baseline_rows("backup", {1: 48}), ("backup", 2, 0, 1, at, "e1")],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_time_of_day_habits(
+        "c1",
+        ["s1"],
+        fields=["attr:program"],
+        windows=_seq_windows(),
+        timezone="Europe/Berlin",
+        bucket_minutes=120,
+        max_candidates_per_field=7,
+    )
+    assert result.status == "ok"
+    sql = client.full_queries[2]
+    # The wall-clock minute in the analyst's zone, cut into the resolution.
+    assert "toHour(ts, 'Europe/Berlin') * 60 + toMinute(ts, 'Europe/Berlin')" in sql
+    assert "intDiv(" in sql and "{bm:UInt16}" in sql
+    assert "GROUP BY val, bucket, w_idx" in sql
+    # Candidate values are the highest-volume ones, capped.
+    assert "LIMIT {cap:UInt32}" in sql
+    params = client._all_parameters[2]
+    assert params["bm"] == 120
+    assert params["cap"] == 7
+    assert params["fk"] == "program"
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    r = result.results[0]
+    assert r.timezone == "Europe/Berlin"
+    assert r.bucket_minutes == 120
+    assert r.bucket_label == "04:00–06:00"
+    assert r.details["timezone"] == "Europe/Berlin"
+
+
+def test_habit_self_frame_measures_each_value_against_its_own_hours():
+    """Without a baseline the habit is the value's own busy buckets across the
+    scope, and a thin bucket away from them is the finding."""
+    at = datetime(2024, 1, 17, 15, 2, tzinfo=UTC)
+    rows = [
+        ("backup", 2, 0, 50, None, None),
+        ("backup", 3, 0, 8, None, None),
+        # One manual run mid-afternoon: 12 h from the nearest habitual bucket.
+        ("backup", 15, 0, 1, at, "e1"),
+        # Two runs spilling past 04:00 — thin, one hour from 03:xx.
+        ("backup", 4, 0, 2, at, "e2"),
+        # A value below the learning floor is skipped.
+        ("rare", 9, 0, 10, None, None),
+        ("rare", 22, 0, 1, at, "e3"),
+    ]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=rows, column_names=_HABIT_COLS),
+        ]
+    )
+    result = svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"])
+    assert result.status == "ok"
+    assert result.method == "self-habit"
+    assert result.windows is None
+    assert [(r.value, r.bucket, r.distance_hours) for r in result.results] == [
+        ("backup", 15, 11.0),
+        ("backup", 4, 1.0),
+    ]
+    r = result.results[0]
+    assert r.habit_buckets == [2, 3]
+    assert r.count == 1
+    assert r.baseline_count == 61
+    assert r.details["scope_occurrences"] == 61
+    assert "window_label" not in r.details
+    assert len(svc.ch.client._calls) == 2
+
+
+def test_habit_auto_fields_run_through_the_recommender_and_overrides():
+    """Auto mode scans the recommended categorical fields, minus any the
+    timeline declared off, and says so."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    inventory = [("attr:host", 8, 950), ("attr:program", 12, 900), ("attr:pid", 950, 1000)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("backup", 2, 0, 48, None, None), ("backup", 14, 0, 1, at, "e1")],
+                column_names=_HABIT_COLS,
+            ),
+        ]
+    )
+    result = svc.find_time_of_day_habits(
+        "c1",
+        ["s1"],
+        inventory=inventory,
+        inventory_total=1000,
+        field_overrides={"attr:host": False},
+    )
+    assert result.status == "ok"
+    # One scan for the one field left after the override; pid is an identifier.
+    assert len(svc.ch.client._calls) == 2
+    assert svc.ch.client._all_parameters[1]["fk"] == "program"
+    assert any("attr:host" in w for w in result.warnings)
+
+
+def test_habit_allowlist_suppresses_the_value():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("backup", 2, 0, 48, None, None), ("backup", 14, 0, 1, at, "e1")],
+                column_names=_HABIT_COLS,
+            ),
+        ]
+    )
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], allowlist={("attr:program", "backup")}
+    )
+    assert result.status == "ok"
+    assert result.results == []

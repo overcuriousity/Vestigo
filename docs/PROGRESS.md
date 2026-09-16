@@ -4,8 +4,57 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-16 (1.20 in progress; session 239 — the transition-speed detector,
-D15, first of the 1.20 detector cluster).
+Last updated: 2026-09-16 (1.20 in progress; sessions 239–240 — transition speed D15 and
+time-of-day habit D12, the first two of the 1.20 detector cluster).
+
+## Session 240 — 2026-09-16: time-of-day habit (D12)
+
+The second 1.20 detector, `time_of_day`, in the same shape as D15: one commit with its
+gate entry, params model, agent knobs, run snapshot, settings, method card, finding type,
+evidence figure, reference section and demo signal.
+
+**The timezone is the design decision, and it is a knob plus a setting, not a timeline
+attribute.** The roadmap's one requirement was an explicit zone stamped into
+`DetectorRun.params`. Inventing a per-timeline zone would be a data-model change
+(`MODEL_REFINEMENT.md` territory) for a single detector, so the zone is `stat_habit_timezone`
+(server default `UTC`, set once for a site) overridable per run, validated against zoneinfo
+and a strict token pattern, then inlined into SQL — ClickHouse takes a zone as a constant,
+so it cannot be bound — and recorded on the run and on every finding. `_time_fields.py`
+already pins its `toHour` to `'UTC'` for the same reason this detector cannot leave the
+zone implicit: the server's zone can change under a stored run.
+
+**Habit = buckets with enough reference mass; distance is circular.** A bucket is habitual
+when it holds at least `stat_habit_min_bucket_count` (3) reference occurrences, and only a
+value with at least `stat_habit_min_baseline` (20) of them has a habit at all. Score is
+the circular distance in hours to the nearest habitual bucket, in multiples of the bucket
+width, so 23:xx sits one hour from a 00:xx habit. The self frame is the same rule over the
+whole scope: every thin bucket is, by definition, not habitual, and is scored against the
+busy ones — which catches a one-off manual run and cannot catch a *repeated* new hour, and
+the reference section says so rather than pretending otherwise; that is what the baseline
+frame is for.
+
+**One scan per field, bounded by value.** Rows are per (value, bucket, window), so the
+per-field cap is 500 values rather than the usual 2000: at a 15-minute resolution with
+four suspect windows a value can return 480 rows. The candidate set is the highest-volume
+values, selected in a subquery over the same predicate.
+
+**The demo's habits.** `walk()` gives every hour of the day a non-zero weight, so every
+high-volume value (any human account, any home workstation) is habitual round the clock —
+correct behaviour, and it means the demo signals had to come from low-volume scheduled or
+role-bound streams. Baseline frame: the nightly backup program at 03:xx/04:xx against
+three weeks of 02:xx (benign, deliberately the same move interval cadence already sees),
+and the contractor on `JUMP-01` at 03:00 — the lateral-movement leg now visits the jump
+host first, at night, and the jump host's baseline logons are the administrator's hop from
+session 239, all office hours. Self frame: one manual backup run on a baseline afternoon,
+twelve hours from the program's nightly slot; without it the self frame's only hit was two
+runs that happened to spill past 04:00, which is the kind of RNG accident this file's
+demo-coverage rule exists to replace with a fabricated signal.
+
+**Environment note.** This machine cannot run rootless podman, so PostgreSQL 16 and the
+pinned ClickHouse 26.6.1.1193 run user-space from `~/.local/share/vestigo-devstack/`; the
+`embeddings` extra was installed to match CI's `--all-extras`. Qdrant is still absent, so
+five case-delete tests (`test_stories_api`, `test_rbac_api`, `test_demo_api`) 502 here and
+only here; they are unrelated to this work and pass in CI.
 
 ## Session 239 — 2026-09-16: transition speed (D15), the first 1.20 detector
 

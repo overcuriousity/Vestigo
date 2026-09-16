@@ -21,7 +21,7 @@ export interface LogTemplatesParams {
 }
 
 export interface AnomalyParams {
-  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time";
+  detector?: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day";
   /** Comma-separated field tokens for value_novelty, e.g. "artifact,display_name,attr:user_agent" */
   fields?: string;
   /** Field to group frequency series / build event sequences by */
@@ -48,6 +48,10 @@ export interface AnomalyParams {
   max_gap_seconds?: number;
   /** transition_time only: the stream whose transitions are timed (e.g. "attr:user"). Omit for one stream per source. */
   partition_field?: string;
+  /** time_of_day only: width of the wall-clock buckets (15, 30, 60, 120, 180 or 240 minutes). Omit for the server default. */
+  bucket_minutes?: number;
+  /** time_of_day only: IANA zone the clock is read in (e.g. "Europe/Berlin"). Omit for the server default. */
+  timezone?: string;
   /** ID of a saved baseline definition (baseline range + suspect windows). Omit for self-baseline. */
   baseline_id?: string;
   limit?: number;
@@ -104,7 +108,7 @@ export const anomaliesApi = {
     sourceId: string,
     eventId: string,
     body: {
-      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time";
+      detector: "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range" | "charset" | "entropy" | "proportion_shift" | "interval_periodicity" | "sequence_novelty" | "sequence_motif" | "value_distribution_drift" | "transition_time" | "time_of_day";
       content: string;
       details: Record<string, unknown>;
       /**

@@ -555,6 +555,36 @@ _SPECS: tuple[SettingSpec, ...] = (
         "Candidate value pairs fetched per source, fastest first.",
     ),
     SettingSpec(
+        "stat_habit_bucket_minutes",
+        "detectors",
+        "Time-of-day bucket width",
+        "Minutes per wall-clock bucket for the time-of-day habit detector: 15, 30, 60, 120, 180 or 240.",
+    ),
+    SettingSpec(
+        "stat_habit_timezone",
+        "detectors",
+        "Time-of-day zone",
+        "IANA zone the time-of-day habit detector reads the clock in (e.g. Europe/Berlin); stamped into every run.",
+    ),
+    SettingSpec(
+        "stat_habit_min_baseline",
+        "detectors",
+        "Habit learning floor",
+        "A value needs at least this many reference occurrences before it has a time-of-day habit.",
+    ),
+    SettingSpec(
+        "stat_habit_min_bucket_count",
+        "detectors",
+        "Habitual bucket floor",
+        "A wall-clock bucket counts as habitual for a value when it holds at least this many reference occurrences.",
+    ),
+    SettingSpec(
+        "stat_habit_max_candidates_per_field",
+        "detectors",
+        "Time-of-day candidate cap",
+        "Candidate values scanned per field for a habit, highest volume first.",
+    ),
+    SettingSpec(
         "stat_self_slices",
         "detectors",
         "Self-frame slices",

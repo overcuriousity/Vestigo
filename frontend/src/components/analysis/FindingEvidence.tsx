@@ -172,6 +172,57 @@ function NovelChars({ value, novel }: { value: string; novel: string[] }) {
   );
 }
 
+/**
+ * The day as a strip of buckets: the habitual ones in the reference neutral,
+ * the offending one in the anomaly accent, the rest empty. Every cell comes
+ * from the finding (`habit_buckets`, `bucket`, `bucket_minutes`); nothing is
+ * drawn for buckets the payload says nothing about.
+ */
+function DayStrip({
+  bucket,
+  habit,
+  bucketMinutes,
+  bucketLabel,
+  timezone,
+}: {
+  bucket: number;
+  habit: number[];
+  bucketMinutes: number;
+  bucketLabel: string;
+  timezone: string;
+}) {
+  const n = Math.max(1, Math.floor(1440 / bucketMinutes));
+  const habitual = new Set(habit);
+  const caption = `${bucketLabel} ${timezone}; habitual buckets ${habit.length}`;
+  return (
+    <div role="img" aria-label={caption} title={caption}>
+      <div className="flex gap-px">
+        {Array.from({ length: n }, (_, i) => (
+          <span
+            key={i}
+            className="h-3 min-w-0 flex-1 rounded-[1px]"
+            style={{
+              background:
+                i === bucket
+                  ? OBSERVED
+                  : habitual.has(i)
+                    ? REFERENCE
+                    : "var(--color-bg-base)",
+            }}
+          />
+        ))}
+      </div>
+      <div className="flex justify-between font-mono text-xs text-[var(--color-fg-muted)]">
+        <span>00:00</span>
+        <span>
+          {bucketLabel} {timezone}
+        </span>
+        <span>24:00</span>
+      </div>
+    </div>
+  );
+}
+
 /** The n-gram, oldest → newest, so the *order* is what the eye reads. */
 function Ngram({ values }: { values: string[] }) {
   return (
@@ -326,6 +377,16 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
     case "sequence_novelty":
     case "sequence_motif":
       return <Ngram values={finding.values} />;
+    case "time_of_day":
+      return (
+        <DayStrip
+          bucket={finding.bucket}
+          habit={finding.habit_buckets}
+          bucketMinutes={finding.bucket_minutes}
+          bucketLabel={finding.bucket_label}
+          timezone={finding.timezone}
+        />
+      );
     case "transition_time":
       // The claim is one duration against one floor, both measured; which
       // floor is in the label, since the two answer different questions.

@@ -11,6 +11,7 @@
  */
 import {
   Activity,
+  Clock,
   Gauge,
   Hash,
   Layers,
@@ -34,6 +35,7 @@ export type DetectorId =
   | "drift"
   | "sequence"
   | "transition"
+  | "habit"
   | "order"
   | "range"
   | "charset"
@@ -68,6 +70,7 @@ export const DETECTORS: DetectorMeta[] = [
   { id: "shift", detector: "proportion_shift", icon: Percent, label: "Proportion shift", hint: "Value shares that change between windows", category: "volume", scoreUnit: "G" },
   { id: "interval", detector: "interval_periodicity", icon: Timer, label: "Interval cadence", hint: "Broken heartbeats and new beaconing", category: "volume", scoreUnit: "−log₁₀ p" },
   { id: "drift", detector: "value_distribution_drift", icon: Replace, label: "Distribution drift", hint: "Whole-field value-mix changes between windows", category: "volume", scoreUnit: "−log₁₀ p" },
+  { id: "habit", detector: "time_of_day", icon: Clock, label: "Time-of-day habit", hint: "Values at an hour they never keep", category: "volume", scoreUnit: "h off habit" },
   { id: "order", detector: "timestamp_order", icon: Rewind, label: "Timestamp order", hint: "Timestamps running backwards", category: "volume", scoreUnit: "s skew" },
   { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen or rare event orderings (n-grams)", category: "sequences", scoreUnit: "surprise" },
   { id: "transition", detector: "transition_time", icon: Gauge, label: "Transition speed", hint: "Value-to-value moves faster than ever seen", category: "sequences", scoreUnit: "1 − obs/ref" },

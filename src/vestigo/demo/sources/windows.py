@@ -306,7 +306,9 @@ def _lateral() -> Iterator[dict[str, str]]:
     """Movement onto hosts the contractor has never touched, then staging."""
     r = scenario.rng("windows-lateral")
     phase = scenario.PHASES[2]
-    new_hosts = (scenario.FILE_SERVER, "WKS-007", "WKS-009", scenario.JUMP_HOST)
+    # The jump host first, at three in the morning: its baseline logons are an
+    # administrator's office hours, so the hour itself is a finding (§16).
+    new_hosts = (scenario.JUMP_HOST, scenario.FILE_SERVER, "WKS-007", "WKS-009")
     moment = phase.start + timedelta(hours=3)
     for host in new_hosts:
         for _ in range(r.randint(3, 7)):

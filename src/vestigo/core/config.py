@@ -196,6 +196,21 @@ class Settings(BaseSettings):
     # Cap on candidate pairs fetched per source, fastest first; hitting it
     # carries a warning.
     stat_transition_max_candidates: int = 2000
+    # Time-of-day habit detector (D12): the day is cut into buckets this many
+    # minutes wide (15, 30, 60, 120, 180 or 240 — each divides the day) in
+    # stat_habit_timezone, an IANA zone stamped into every run. UTC by default
+    # because that is the only zone every source agrees on; set the site's
+    # zone here once so "03:40" means what the analyst reads on the wall.
+    stat_habit_bucket_minutes: int = Field(default=60, ge=15, le=240)
+    stat_habit_timezone: str = "UTC"
+    # A value needs at least this many reference occurrences to have a habit,
+    # and a bucket needs at least this many of them to be habitual.
+    stat_habit_min_baseline: int = Field(default=20, ge=2)
+    stat_habit_min_bucket_count: int = Field(default=3, ge=1)
+    # Per-field cap on candidate values (highest volume first). Lower than the
+    # other per-field caps because each value returns one row per occupied
+    # bucket and window.
+    stat_habit_max_candidates_per_field: int = 500
     # ── Self frame for the slice-based detectors (D18) ──────────────────────
     # How many equal-width time slices proportion_shift and
     # value_distribution_drift cut the scope into when no baseline is declared;
