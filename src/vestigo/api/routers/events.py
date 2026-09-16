@@ -3466,11 +3466,12 @@ async def list_anomalies(
             "one stream per source."
         ),
     ),
-    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = Query(
+    bucket_minutes: int | None = Query(
         default=None,
         description=(
-            "time_of_day only: width of the wall-clock buckets the day is cut into. "
-            "Omit to use the server default."
+            "time_of_day only: width of the wall-clock buckets the day is cut into — "
+            "15, 30, 60, 120, 180 or 240 (the runner rejects anything else with 422; a "
+            "query string cannot carry an int literal). Omit to use the server default."
         ),
     ),
     timezone: str | None = Query(
@@ -3822,9 +3823,9 @@ class TagAnomaliesRequest(BaseModel):
         default=None,
         description="transition_time only: the stream whose transitions are timed (e.g. 'attr:user').",
     )
-    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = Field(
+    bucket_minutes: int | None = Field(
         default=None,
-        description="time_of_day only: width of the wall-clock buckets the day is cut into.",
+        description="time_of_day only: width of the wall-clock buckets (15, 30, 60, 120, 180 or 240).",
     )
     timezone: str | None = Field(
         default=None,
