@@ -4,8 +4,40 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-16 (1.20 in progress; sessions 239–241 — transition speed D15,
+Last updated: 2026-09-21 (1.20.0 released; sessions 239–242 — transition speed D15,
 time-of-day habit D12 and value correlation D13, the 1.20 detector cluster).
+
+## Session 242 — 2026-09-21: review fixes, dependency sweep, 1.20.0
+
+A review of #378 found four defects in the new detectors; all were fixed before merge.
+
+**Tagging.** `tag_anomalies` formats annotation text with one branch per finding type and
+sends anything it does not recognise to the frequency-spike branch. The three new types
+had no branch of their own, so tagging any of them raised `AttributeError`.
+`_serialize_finding` had been updated and this function had not. Each type now has its own
+branch, and a parametrized test covers all three.
+
+**Zero-length transitions.** A transition's duration is the difference between two
+timestamps, so it is only as precise as they are. `0 × min_ratio` undercuts every
+positive floor, so a 0 s observation ranked first at score 1.0 even where the timestamps
+are whole seconds and 0 s only means "under a second". It is now judged by the source's
+resolution. A per-source probe, run only when a zero-length candidate exists, stops at the
+first sub-second timestamp. Where one exists, 0 ms is instant. Where none does, the
+observation is judged and scored at a one-second bound, and any pair this holds back is
+counted in a warning. We considered skipping zero-length observations altogether, as zero
+floors are skipped, and rejected it: that would lose genuine millisecond hops in precise
+logs, which are exactly what the detector exists to find.
+
+**Knob and setting validation.** The Bucket `choice` was sent as a string to an int
+`Literal`. Numeric choices now send numbers, and the model also accepts the string form,
+since a stored detector keeps the client's shape. The settings accepted bucket widths,
+zones and correlation ratios that the runner refuses. The accepted bucket widths and the
+zone check now live in `core/time_of_day.py`, where both sides read them.
+
+**Dependencies.** All 14 open Dependabot PRs were merged at once. Two of them only pass
+together with a partner: `react` needs `react-dom` at the same version, and `vitest` needs
+`@vitest/ui` pinned to it, or `npm ci` stops on ERESOLVE. The frontend lockfile was
+regenerated once over the merged result.
 
 ## Session 241 — 2026-09-16: value correlation (D13)
 

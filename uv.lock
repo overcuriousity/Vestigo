@@ -2304,7 +2304,7 @@ wheels = [
 
 [[package]]
 name = "vestigo"
-version = "1.19.7"
+version = "1.20.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

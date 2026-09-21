@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] — 2026-09-21
+
 ### Added
 
 - **Value correlation (D13).** A fifteenth statistical detector, `value_correlation`,
@@ -72,7 +74,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/ANOMALY_DETECTION.md` §15 ship with it; the analysis cache moves to version 5. The
   demo case gains an administrator's routine jump-host hop as the floor and the
   contractor's wmic call landing on `FILE-01` two seconds later as the signal, asserted in
-  both frames.
+  both frames. A zero-length observation is judged by its source's timestamp resolution:
+  instant where the source records sub-second timestamps, but in a whole-second source
+  (Plaso CSV, syslog) it only means "under a second", so it is judged and scored at that
+  one-second bound rather than undercutting every floor at score 1.0. Pairs the bound holds
+  back are counted in a warning, and the finding records `timestamp_resolution` and
+  `observed_upper_bound_seconds`.
+
+### Fixed
+
+Review findings on the three new detectors, fixed before release (#378):
+
+- Tagging `transition_time`, `time_of_day` or `value_correlation` findings as annotations
+  returned a 500; each now gets its own annotation text.
+- Choosing any Bucket other than the default on the time-of-day card returned a 422: the
+  form sent the choice as a string. It now sends a number, and the API also accepts the
+  string form a stored detector may hold.
+- The instance settings accepted detector defaults the detectors then refuse — a habit
+  bucket width that does not divide the day (45, 90), an unknown timezone name, a
+  correlation `min_ratio` of 1 or less, an `fdr_q` outside (0, 1] — which turned every
+  default run of that detector, the sweep included, into a 422. They are refused when
+  saved. The accepted bucket widths and the zone check are one definition
+  (`core/time_of_day.py`), shared by the settings and the detector.
+
+### Changed
+
+- Dependencies: `alembic` 1.19.2 → 1.20.0 (#381), `numpy` 2.5.2 → 2.5.3 (#379), `ruff`
+  0.16.6 → 0.16.7 (#385), `torch` 2.13.0 → 2.14.0 (#383); `react` and `react-dom` 19.2.8 →
+  19.3.0 with their types (#380, #390, landed together — either alone fails the frontend
+  tests), `react-router-dom` 7.18.3 → 7.18.4 (#382), `@tanstack/react-virtual` 3.14.11 →
+  3.14.13 (#391), `lucide-react` 1.43.0 → 1.46.0 (#389), `tailwind-merge` 3.6.0 → 3.7.0
+  (#388), `vite` 8.2.2 → 8.3.0 (#384), `vitest` 5.0.0 → 5.0.1 with `@vitest/ui` (#386, which
+  bumped `vitest` alone and failed `npm ci`), `oxlint` 1.82.0 → 1.83.0 (#392), `@types/node`
+  26.5.0 → 26.5.1 (#387).
 
 ## [1.19.7] — 2026-09-15
 
