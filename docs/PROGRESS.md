@@ -4,8 +4,149 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-15 (v1.19.7; session 238 — review findings on the D18/D19/D11
-branch: the self frame's complement, the per-slice scan budget, three disclosure gaps).
+Last updated: 2026-09-16 (1.20 in progress; sessions 239–241 — transition speed D15,
+time-of-day habit D12 and value correlation D13, the 1.20 detector cluster).
+
+## Session 241 — 2026-09-16: value correlation (D13)
+
+The third and last cheap AMiner analog, `value_correlation`, in the same one-commit shape.
+
+**Rules, not pairs.** Value combos already find a rare `(x, y)`. What this detector adds is
+the *rule*: an antecedent value `x` with at least 20 reference events whose dominant
+consequent `y` covers at least 95 % of them, mined in both directions per field pair, and
+tested per window with the 2×2 G-test proportion shift already has — conforming against
+violating events, reference against window, one BH pool, a 2× floor on the violation-rate
+ratio. The roadmap's design problem was field-pair explosion, and the answer is three caps
+that each disclose themselves: auto mode pairs the recommender's top six categorical
+fields (15 pairs), more than 20 pairs are truncated with a warning naming the count, and
+each pair's `GROUP BY a, b` is capped at 5000 highest-volume rows with a warning that a
+tail antecedent was not tested. Identifiers never enter auto mode, which is what keeps the
+pair table small in the common case.
+
+**Only rises, only breaks.** A rule that appears in a window is a value whose share rose,
+which proportion shift owns; a rule that tightens is not a finding. And the self frame
+mines its rules over the whole scope, so a rule broken from the start is not a rule and is
+never tested — stated in the reference section as the frame's limit rather than hidden.
+The finding carries `top_violator`, the consequent value that most often took `y`'s
+place, because "where did it go instead?" is the first question an analyst asks of a
+broken rule and the data to answer it was already in the scan.
+
+**The demo needed nothing.** Every human account has one or two home workstations
+(`_home_hosts`); the contractor has one, so `m.okonkwo ⇒ WKS-004` holds over 6,500
+baseline logons at confidence ~1.0 and breaks on the jump host, the file server and two
+finance workstations. Two-home users never form a rule (confidence ~0.5), the
+administrator's hop is two events a day against 280 and keeps their rule intact, and in
+the self frame the contractor's violations sit in the last five of 24 slices. Asserted in
+both frames with `fields=["attr:user", "attr:computer_name"]`.
+
+**The agent schema budget, again.** Adding `rule_confidence` to `run_anomaly_detector` was
+absorbed by the compact docstring from session 240; the measured total is recorded in
+`AGENT.md`.
+
+## Session 240 — 2026-09-16: time-of-day habit (D12)
+
+The second 1.20 detector, `time_of_day`, in the same shape as D15: one commit with its
+gate entry, params model, agent knobs, run snapshot, settings, method card, finding type,
+evidence figure, reference section and demo signal.
+
+**The timezone is the design decision, and it is a knob plus a setting, not a timeline
+attribute.** The roadmap's one requirement was an explicit zone stamped into
+`DetectorRun.params`. Inventing a per-timeline zone would be a data-model change
+(`MODEL_REFINEMENT.md` territory) for a single detector, so the zone is `stat_habit_timezone`
+(server default `UTC`, set once for a site) overridable per run, validated against zoneinfo
+and a strict token pattern, then inlined into SQL — ClickHouse takes a zone as a constant,
+so it cannot be bound — and recorded on the run and on every finding. `_time_fields.py`
+already pins its `toHour` to `'UTC'` for the same reason this detector cannot leave the
+zone implicit: the server's zone can change under a stored run.
+
+**Habit = buckets with enough reference mass; distance is circular.** A bucket is habitual
+when it holds at least `stat_habit_min_bucket_count` (3) reference occurrences, and only a
+value with at least `stat_habit_min_baseline` (20) of them has a habit at all. Score is
+the circular distance in hours to the nearest habitual bucket, in multiples of the bucket
+width, so 23:xx sits one hour from a 00:xx habit. The self frame is the same rule over the
+whole scope: every thin bucket is, by definition, not habitual, and is scored against the
+busy ones — which catches a one-off manual run and cannot catch a *repeated* new hour, and
+the reference section says so rather than pretending otherwise; that is what the baseline
+frame is for.
+
+**One scan per field, bounded by value.** Rows are per (value, bucket, window), so the
+per-field cap is 500 values rather than the usual 2000: at a 15-minute resolution with
+four suspect windows a value can return 480 rows. The candidate set is the highest-volume
+values, selected in a subquery over the same predicate.
+
+**The demo's habits.** `walk()` gives every hour of the day a non-zero weight, so every
+high-volume value (any human account, any home workstation) is habitual round the clock —
+correct behaviour, and it means the demo signals had to come from low-volume scheduled or
+role-bound streams. Baseline frame: the nightly backup program at 03:xx/04:xx against
+three weeks of 02:xx (benign, deliberately the same move interval cadence already sees),
+and the contractor on `JUMP-01` at 03:00 — the lateral-movement leg now visits the jump
+host first, at night, and the jump host's baseline logons are the administrator's hop from
+session 239, all office hours. Self frame: one manual backup run on a baseline afternoon,
+twelve hours from the program's nightly slot; without it the self frame's only hit was two
+runs that happened to spill past 04:00, which is the kind of RNG accident this file's
+demo-coverage rule exists to replace with a fabricated signal.
+
+**Environment note.** This machine cannot run rootless podman, so PostgreSQL 16 and the
+pinned ClickHouse 26.6.1.1193 run user-space from `~/.local/share/vestigo-devstack/`; the
+`embeddings` extra was installed to match CI's `--all-extras`. Qdrant is still absent, so
+five case-delete tests (`test_stories_api`, `test_rbac_api`, `test_demo_api`) 502 here and
+only here; they are unrelated to this work and pass in CI.
+
+## Session 239 — 2026-09-16: transition speed (D15), the first 1.20 detector
+
+The 1.20 cluster is the three cheap AMiner analogs left on the roadmap — D15, D12, D13 —
+landed one commit each on `feat/1.20`, in that order because each reuses machinery the
+previous fortnight touched. This session is D15, `transition_time`.
+
+**What it is.** A transition is one step `a → b` between consecutive events of one stream
+whose series-field values differ; the detector learns each pair's fastest transition and
+reports one that undercuts it by `min_ratio`×. The stream is the source, split by a new
+`partition_field` (the identifier whose moves are timed), which is the knob that makes
+the question meaningful: without it a Windows log carrying every account times the gap
+between *any* two consecutive logons, and two users on two hosts in the same second reads
+as an impossible move. Rows without a partition value are left out rather than pooled
+into one anonymous stream, for the same reason.
+
+**Built on `_ngram_inner_sql`, not beside it.** A transition is an n-gram of length two
+with `gram[1] != gram[2]`, so the assembly, the per-source scan discipline, the
+record-order tie-breaks and the window-boundary guarantee are the sequence detectors'.
+The helper gained an optional `partition_col` (added to every `PARTITION BY`, `None`
+keeps the sequence detectors' SQL shape) and now emits `pkey` and the arriving event's
+`last_eid` — the representative event is the `b` side, the one that arrived too soon.
+Adding columns to a shared subquery is what moved `CACHE_VERSION` to 5, not the new
+method id, which could not collide with an old key on its own.
+
+**Both frames from day one (D18 is a rule now, not a migration).** Baseline:
+`min-transition`, the floor is the pair's fastest baseline-window transition over at
+least `min_transitions` of them, learned only for the candidate pairs the suspect scan
+surfaced (Query B is bound to Query A's grams). Self: `self-min-transition`, the floor is
+the pair's *next-fastest* transition anywhere in the scope — `groupArraySorted(2)` per
+source, the two smallest merged across sources — which is leave-one-out by construction,
+and two equally fast transitions vouch for each other. A zero floor is skipped in both
+frames and counted in a warning: with second-resolution timestamps zero-length
+transitions are routine, and "faster than instant" is not a claim. The self mode was
+first named `loo-min-transition`; the demo coverage test's `self-`/`rare-` prefix
+convention is the right one, so it is `self-min-transition` like its siblings.
+
+**The demo had no such signal.** The baseline frame found nothing on the demo case: the
+contractor's lateral moves are minutes apart while every account's random alternation
+between its own home hosts produces baseline floors of seconds. Per this file's own rule
+the fabricated signal was strengthened rather than the assertion: one administrator now
+has a routine jump-host hop (JUMP-01 by RDP, FILE-01 by network logon 20–90 s later,
+twice a working day, kept tight so their own workstation logons rarely fall between), and
+each wmic remote process creation during lateral movement now logs the contractor on to
+FILE-01 two seconds later — which from JUMP-01 is the administrator's pair at a tenth of
+the time. Both frames assert on it.
+
+**Surface.** Gate entry (same `series_distinct ≥ 2` floor as sequences: one value has no
+transition; `needs_setup` in the baseline frame without a baseline), `_TransitionTimeParams`
+(`series_field`, `partition_field`, `min_ratio`), the `/anomalies` and tag endpoints and
+the agent tool gain `partition_field`, the persisted run snapshots `partition_field` and
+`min_transitions`, three settings with registry specs. Frontend: the thirteenth method
+card (`Gauge` icon, a "Stream" field knob), `TransitionTimeFinding`, a two-bar evidence
+figure labelled by `reference_kind`, verdict/normalize/subject cases, and the mode sets in
+`finding-frame.ts`. Docs: `ANOMALY_DETECTION.md` §15, the tool list, demo table and gate
+table; README and CLAUDE.md counts.
 
 ## Session 238 — 2026-09-15: review of the D18/D19/D11 branch (PR #377)
 

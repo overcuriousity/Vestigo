@@ -131,13 +131,22 @@ def test_backup_cadence_shifts_after_the_foothold():
     runs = [
         _dt.fromisoformat(r["timestamp"])
         for r in linux.linux_rows()
-        if r["hostname"] == scenario.BACKUP_HOST and "backup run started" in r["message"]
+        if r["hostname"] == scenario.BACKUP_HOST and "nightly backup run started" in r["message"]
     ]
     early = [r for r in runs if r < scenario.PHASES[1].start]
     late = [r for r in runs if r >= scenario.PHASES[1].start]
     assert early and late
     assert {r.hour for r in early} == {2}
     assert {r.hour for r in late} == {3}
+    # The one manual run is a baseline-afternoon event, twelve hours from the
+    # nightly slot: the time-of-day detector's self-frame signal.
+    manual = [
+        _dt.fromisoformat(r["timestamp"])
+        for r in linux.linux_rows()
+        if r["hostname"] == scenario.BACKUP_HOST and "manual backup run started" in r["message"]
+    ]
+    assert len(manual) == 1
+    assert manual[0] < scenario.BASELINE_END and manual[0].hour == 15
 
 
 def test_file_server_sudo_mix_shifts_during_the_intrusion():

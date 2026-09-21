@@ -11,8 +11,11 @@
  */
 import {
   Activity,
+  Clock,
+  Gauge,
   Hash,
   Layers,
+  Link2,
   ListOrdered,
   Percent,
   Replace,
@@ -32,6 +35,9 @@ export type DetectorId =
   | "interval"
   | "drift"
   | "sequence"
+  | "transition"
+  | "habit"
+  | "correlation"
   | "order"
   | "range"
   | "charset"
@@ -59,6 +65,7 @@ export const DETECTOR_CATEGORIES: { id: DetectorCategory; label: string }[] = [
 export const DETECTORS: DetectorMeta[] = [
   { id: "novelty", detector: "value_novelty", icon: Hash, label: "Rare values", hint: "Rare or first-seen field values", category: "values", scoreUnit: "surprise" },
   { id: "combo", detector: "value_combo", icon: Layers, label: "Value combos", hint: "Rare combinations of fields", category: "values", scoreUnit: "surprise" },
+  { id: "correlation", detector: "value_correlation", icon: Link2, label: "Value correlation", hint: "Field-to-field rules that break", category: "values", scoreUnit: "G" },
   { id: "range", detector: "numeric_range", icon: Ruler, label: "Numeric range", hint: "Values outside a learned band", category: "values", scoreUnit: "× band" },
   { id: "charset", detector: "charset", icon: Type, label: "Charset novelty", hint: "Never-seen characters", category: "values", scoreUnit: "surprise" },
   { id: "entropy", detector: "entropy", icon: Shuffle, label: "Entropy outliers", hint: "Random or degenerate strings", category: "values", scoreUnit: "× band" },
@@ -66,8 +73,10 @@ export const DETECTORS: DetectorMeta[] = [
   { id: "shift", detector: "proportion_shift", icon: Percent, label: "Proportion shift", hint: "Value shares that change between windows", category: "volume", scoreUnit: "G" },
   { id: "interval", detector: "interval_periodicity", icon: Timer, label: "Interval cadence", hint: "Broken heartbeats and new beaconing", category: "volume", scoreUnit: "−log₁₀ p" },
   { id: "drift", detector: "value_distribution_drift", icon: Replace, label: "Distribution drift", hint: "Whole-field value-mix changes between windows", category: "volume", scoreUnit: "−log₁₀ p" },
+  { id: "habit", detector: "time_of_day", icon: Clock, label: "Time-of-day habit", hint: "Values at an hour they never keep", category: "volume", scoreUnit: "h off habit" },
   { id: "order", detector: "timestamp_order", icon: Rewind, label: "Timestamp order", hint: "Timestamps running backwards", category: "volume", scoreUnit: "s skew" },
   { id: "sequence", detector: "sequence_novelty", icon: ListOrdered, label: "Event sequences", hint: "Never-seen or rare event orderings (n-grams)", category: "sequences", scoreUnit: "surprise" },
+  { id: "transition", detector: "transition_time", icon: Gauge, label: "Transition speed", hint: "Value-to-value moves faster than ever seen", category: "sequences", scoreUnit: "1 − obs/ref" },
 ];
 
 export const DETECTORS_BY_ID = Object.fromEntries(DETECTORS.map((d) => [d.id, d])) as Record<

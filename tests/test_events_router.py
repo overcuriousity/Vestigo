@@ -2322,6 +2322,155 @@ async def test_tag_anomalies_always_persists_a_run(
     assert run is not None
 
 
+def _transition_finding(**overrides):
+    from vestigo.db.anomaly_stats import TransitionFinding
+
+    fields = {
+        "field": "attr:computer_name",
+        "values": ["JUMP-01", "FILE-01"],
+        "value": "JUMP-01 → FILE-01",
+        "partition_field": "attr:user",
+        "partition_value": "m.okonkwo",
+        "observed_seconds": 3.0,
+        "reference_seconds": 2460.0,
+        "reference_kind": "baseline-min",
+        "speedup": 820.0,
+        "count": 4,
+        "baseline_count": 12,
+        "score": 0.9988,
+        "first_seen": None,
+        "event_id": "evt-1",
+        "event": {"source_id": "s1"},
+        "details": {"window_label": "incident"},
+    }
+    return TransitionFinding(**{**fields, **overrides})
+
+
+def _habit_finding():
+    from vestigo.db.anomaly_stats import HabitFinding
+
+    return HabitFinding(
+        field="attr:program",
+        value="psexec.exe",
+        bucket=3,
+        bucket_label="03:00–04:00",
+        bucket_minutes=60,
+        timezone="Europe/Berlin",
+        count=2,
+        baseline_count=40,
+        habit_buckets=[9, 10, 11],
+        nearest_habit=9,
+        nearest_habit_label="09:00–10:00",
+        distance_hours=6.0,
+        score=6.0,
+        first_seen=None,
+        event_id="evt-1",
+        event={"source_id": "s1"},
+        details={"method": "self-habit"},
+    )
+
+
+def _correlation_finding():
+    from vestigo.db.anomaly_stats import CorrelationFinding
+
+    return CorrelationFinding(
+        fields=["attr:user", "attr:computer_name"],
+        values=["svc_backup", "BACKUP-01"],
+        value="svc_backup ⇒ BACKUP-01",
+        confidence=0.99,
+        support=300,
+        count=20,
+        violations=9,
+        baseline_count=300,
+        baseline_violations=3,
+        violation_rate=0.45,
+        baseline_violation_rate=0.01,
+        rate_ratio=45.0,
+        top_violator="DC-01",
+        top_violator_count=7,
+        g_statistic=38.2,
+        p_value=0.0001,
+        q_value=0.0004,
+        score=38.2,
+        first_seen=None,
+        event_id="evt-1",
+        event={"source_id": "s1"},
+        details={"method": "rule-g-test", "window_label": "incident"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("detector", "finding", "expected"),
+    [
+        (
+            "transition_time",
+            _transition_finding,
+            "Transition speed — attr:computer_name: JUMP-01 → FILE-01 by "
+            "attr:user='m.okonkwo' took 3s in suspect window 'incident'",
+        ),
+        (
+            "transition_time",
+            lambda: _transition_finding(
+                observed_seconds=0.0,
+                reference_kind="next-fastest",
+                details={"timestamp_resolution": "second"},
+            ),
+            "took under 1s (whole-second timestamps) in the timeline, against the "
+            "pair's next-fastest",
+        ),
+        (
+            "time_of_day",
+            _habit_finding,
+            "Time-of-day habit — attr:program='psexec.exe': 2× at 03:00–04:00 "
+            "(Europe/Berlin) in the timeline, 6h from its nearest habitual time 09:00–10:00",
+        ),
+        (
+            "value_correlation",
+            _correlation_finding,
+            "Broken correlation — attr:user='svc_backup' ⇒ attr:computer_name='BACKUP-01' "
+            "(held 99% of 300): violated 9/20 in suspect window 'incident'",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tag_anomalies_writes_a_reason_for_every_new_finding_type(
+    timeline_setup, monkeypatch, stub_field_stats_cache, detector, finding, expected
+):
+    """Each of the 1.20 finding types gets its own annotation text — none of
+    them falls through to the frequency-spike branch, whose fields they lack."""
+    from vestigo.db.anomaly_stats import StatAnomalyResult
+
+    result = StatAnomalyResult(
+        status="ok",
+        detector=detector,
+        method="x",
+        baseline_size=100,
+        results=[finding()],
+        z_threshold=None,
+    )
+
+    class _Svc(_FakeStatAnomalyServiceWithResult):
+        def find_transition_times(self, *args, **kwargs):
+            return self._result
+
+        def find_time_of_day_habits(self, *args, **kwargs):
+            return self._result
+
+        def find_value_correlations(self, *args, **kwargs):
+            return self._result
+
+    monkeypatch.setattr(events, "_get_stat_anomaly_service", lambda: _Svc(result))
+    body = events.TagAnomaliesRequest(detector=detector)
+    response = await events.tag_anomalies("c1", "t1", body, case=Case(id="c1"), user=_fake_user())
+    assert response["tagged"] == 1
+    [ann] = [
+        a
+        for a in await timeline_setup.list_annotations("c1", "s1", "evt-1")
+        if a.origin == "system"
+    ]
+    assert expected in ann.content
+
+
 # ---------------------------------------------------------------------------
 # Dispositions: dismissed filtering + confirmed survival
 # ---------------------------------------------------------------------------

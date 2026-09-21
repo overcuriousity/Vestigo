@@ -1967,34 +1967,36 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
         group_field: str | None = None,
         max_gap_seconds: int | None = Field(default=None, ge=1),
         variant: Literal["shannon", "bigram"] | None = None,
+        partition_field: str | None = None,
+        bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = None,
+        timezone: str | None = None,
+        rule_confidence: float | None = None,
     ) -> dict[str, Any]:
         """Run a statistical anomaly detector over the timeline.
 
-        Detectors: value_novelty (rare/first-seen values), value_combo,
-        frequency (volume spikes/silences), timestamp_order, numeric_range,
-        charset, entropy, proportion_shift, interval_periodicity,
-        sequence_novelty, sequence_motif, value_distribution_drift.
-        `fields` is a comma-separated field list for value detectors (omit to
-        auto-recommend); `series_field` groups frequency/sequence detectors.
-        Every detector runs without a `baseline_id` (the timeline is its own
-        reference); pass one from list_baselines to score suspect windows
-        against a baseline instead. Optional knobs (server defaults
-        otherwise): z_threshold (frequency), min_skew_seconds
-        (timestamp_order), fdr_q (BH false-discovery ceiling), min_ratio
-        (effect floor), ngram_size (2-5), min_support and start/end
-        (sequence_motif), group_field (charset: one alphabet per value of
-        this field, e.g. per host), max_gap_seconds (sequence_novelty/
-        sequence_motif: break a sequence at longer gaps), variant (entropy:
-        "shannon" = character entropy, default; "bigram" = character-pair
-        surprisal, catches ordinary letters in an unusual order, e.g. a DGA
-        domain). Returns findings plus a persisted run_id. Each finding
-        carries an example `event_id`; the result's `fidelity`/`note` say how
-        much of that event came with it — call get_event for the full record.
-        The virtual `time:` fields from list_fields are rejected here; they
-        are for charting and filtering only.
+        Detectors: value_novelty, value_combo, frequency, timestamp_order,
+        numeric_range, charset, entropy, proportion_shift,
+        interval_periodicity, sequence_novelty, sequence_motif,
+        value_distribution_drift, transition_time (a value pair reached
+        faster than ever), time_of_day (a value at an unusual hour),
+        value_correlation (a rule A=x ⇒ B=y that breaks). `fields`:
+        comma-separated, value detectors, omit to auto-recommend;
+        `series_field`: frequency/sequence/transition group-by;
+        `partition_field`: the stream transition_time times, e.g. attr:user.
+        Every detector runs without `baseline_id` (timeline as its own
+        reference); pass one from list_baselines to score suspect windows.
+        Knobs (server defaults otherwise): z_threshold, min_skew_seconds,
+        fdr_q, min_ratio, ngram_size, start/end (sequence_motif),
+        min_support (motif or rule support), rule_confidence (0-1),
+        group_field (charset: one alphabet per value), max_gap_seconds
+        (sequences), variant (entropy: shannon|bigram), bucket_minutes and
+        IANA timezone (time_of_day). Returns findings plus a persisted
+        run_id; each finding carries an example event_id — call get_event for
+        the full record. Virtual `time:` fields are rejected.
         """
         _reject_time_fields(fields, "fields")
         _reject_time_fields(series_field, "series_field")
+        _reject_time_fields(partition_field, "partition_field")
         result, resolution = await _run_stat_detector(
             scope.case_id,
             scope.timeline_id,
@@ -2015,6 +2017,10 @@ def build_tool_server(scope: AgentScope) -> FastMCP:
             group_field=group_field,
             max_gap_seconds=max_gap_seconds,
             variant=variant,
+            partition_field=partition_field,
+            bucket_minutes=bucket_minutes,
+            timezone=timezone,
+            rule_confidence=rule_confidence,
             field_mappings=scope.field_mappings,
             source_offsets=scope.source_offsets,
         )

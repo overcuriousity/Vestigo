@@ -357,6 +357,58 @@ class _SequenceNoveltyParams(_Params):
     max_gap_seconds: int | None = Field(default=None, ge=1)
 
 
+class _TransitionTimeParams(_Params):
+    series_field: str = DEFAULT_SERIES_FIELD
+    #: The stream whose transitions are timed (a user, a session); None =
+    #: one stream per source.
+    partition_field: str | None = None
+    min_ratio: float | None = Field(default=None, gt=1)
+
+    @field_validator("partition_field", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: Any) -> Any:
+        """A cleared field select and an omitted knob ask the same question.
+
+        The form spells "per source" as ``""``; the runner spells it ``None``.
+        Normalizing here keeps the two from fingerprinting as different cache
+        keys for one answer.
+        """
+        return None if v == "" else v
+
+
+class _TimeOfDayParams(_FieldsParams):
+    #: Wall-clock resolution; each option divides the day. None = server default.
+    bucket_minutes: Literal[15, 30, 60, 120, 180, 240] | None = None
+    #: IANA zone the clock is read in; validated by the runner. None = server default.
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _empty_is_none(cls, v: Any) -> Any:
+        """A cleared text box and an omitted knob ask the same question."""
+        return None if v == "" else v
+
+    @field_validator("bucket_minutes", mode="before")
+    @classmethod
+    def _choice_string_is_int(cls, v: Any) -> Any:
+        """A form's ``choice`` value is a string; an int ``Literal`` refuses ``"15"``.
+
+        ``params`` arrives as JSON from a query string and is stored verbatim
+        on a configured detector, so ``"15"`` and ``15`` both reach this model
+        and must mean the same bucket rather than one of them being a 422.
+        """
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v)
+        return None if v == "" else v
+
+
+class _ValueCorrelationParams(_FieldsParams):
+    fdr_q: float | None = Field(default=None, gt=0, le=1)
+    min_ratio: float | None = Field(default=None, gt=1)
+    rule_confidence: float | None = Field(default=None, gt=0, le=1)
+    min_support: int | None = Field(default=None, ge=2)
+
+
 class _LogTemplateParams(_Params):
     #: Not a `_run_stat_detector` detector — log templating is a browser with
     #: its own service call (see :func:`_run_log_templates`). Routing it through
@@ -378,6 +430,9 @@ METHOD_MODELS: dict[str, type[_Params]] = {
     "interval_periodicity": _IntervalPeriodicityParams,
     "timestamp_order": _TimestampOrderParams,
     "sequence_novelty": _SequenceNoveltyParams,
+    "transition_time": _TransitionTimeParams,
+    "time_of_day": _TimeOfDayParams,
+    "value_correlation": _ValueCorrelationParams,
     "log_template": _LogTemplateParams,
 }
 
@@ -708,6 +763,11 @@ async def get_analysis_findings(
             group_field=kwargs.get("group_field"),
             max_gap_seconds=kwargs.get("max_gap_seconds"),
             variant=kwargs.get("variant"),
+            partition_field=kwargs.get("partition_field"),
+            bucket_minutes=kwargs.get("bucket_minutes"),
+            timezone=kwargs.get("timezone"),
+            min_support=kwargs.get("min_support"),
+            rule_confidence=kwargs.get("rule_confidence"),
             # Both come from _resolve_timeline_scope and are not optional
             # niceties: without field_mappings a canonical field alias is
             # ignored, and without source_offsets a declared per-source

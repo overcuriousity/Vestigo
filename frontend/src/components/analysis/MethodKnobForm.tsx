@@ -44,7 +44,8 @@ export function buildParams(
     }
     const value = (raw[knob.param] ?? "").trim();
     if (!value) continue;
-    out[knob.param] = knob.kind === "number" ? Number(value) : value;
+    const numeric = knob.kind === "number" || (knob.kind === "choice" && knob.numeric);
+    out[knob.param] = numeric ? Number(value) : value;
   }
   return out;
 }
@@ -129,6 +130,16 @@ export function knobHelp(knob: MethodKnob): string {
       return "How many consecutive events form one sequence. Three is a good default.";
     case "max_gap_seconds":
       return "Break a sequence when consecutive events are farther apart than this.";
+    case "partition_field":
+      return "Whose moves are timed: transitions are measured within one value of this field, such as one account. Without it every source is a single stream.";
+    case "rule_confidence":
+      return "How consistently one value must imply the other before it counts as a rule. 0.95 means nineteen times in twenty.";
+    case "min_support":
+      return "How many reference events a value needs before a rule is learned from it.";
+    case "bucket_minutes":
+      return "How finely the day is cut. One hour tells a nightly job from a daytime one; fifteen minutes tells 02:15 from 02:45.";
+    case "timezone":
+      return "The zone the clock is read in, as an IANA name such as Europe/Berlin. Recorded on the run, since the same instant is a different hour elsewhere.";
     case "field":
       return "The text field to cluster into templates. Usually the message.";
     case "order":

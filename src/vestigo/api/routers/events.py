@@ -37,9 +37,11 @@ from vestigo.db.anomaly_stats import (
     AnalysisWindows,
     CharsetFinding,
     ComboFinding,
+    CorrelationFinding,
     DistributionDriftFinding,
     EntropyFinding,
     FreqFinding,
+    HabitFinding,
     IntervalFinding,
     MotifFinding,
     NoveltyFieldInfo,
@@ -49,6 +51,7 @@ from vestigo.db.anomaly_stats import (
     ShiftFinding,
     StatisticalAnomalyService,
     TimeWindow,
+    TransitionFinding,
     ValueFinding,
     _canonical_hash,
 )
@@ -2252,6 +2255,10 @@ async def _run_stat_detector(
     group_field: str | None = None,
     max_gap_seconds: int | None = None,
     variant: str | None = None,
+    partition_field: str | None = None,
+    bucket_minutes: int | None = None,
+    timezone: str | None = None,
+    rule_confidence: float | None = None,
     field_mappings: dict[str, list[str]] | None = None,
     source_offsets: dict[str, int] | None = None,
     field_overrides: dict[str, bool] | None = _RESOLVE_OVERRIDES,
@@ -2392,6 +2399,37 @@ async def _run_stat_detector(
                 field_mappings=field_mappings,
                 max_gap_seconds=max_gap_seconds,
                 rarity_floor=cfg.stat_sequence_rarity_floor,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if detector == "transition_time":
+        # Transitions are steps between consecutive values of the single
+        # series_field, timed per source and per partition_field stream (D15).
+        # Snapshot the effective floors so the persisted run stays
+        # self-describing after a default changes.
+        resolution["transition_min_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_transition_min_ratio
+        )
+        resolution["transition_min_transitions"] = cfg.stat_transition_min_transitions
+        resolution["transition_partition_field"] = partition_field or None
+        try:
+            result = await run_scan(
+                svc.find_transition_times,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                series_field=series_field,
+                partition_field=partition_field or None,
+                limit=limit,
+                windows=windows,
+                min_ratio=resolution["transition_min_ratio"],
+                min_transitions=cfg.stat_transition_min_transitions,
+                max_candidates=cfg.stat_transition_max_candidates,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
             )
             return result, resolution
         except ValueError as exc:
@@ -2549,6 +2587,82 @@ async def _run_stat_detector(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result, resolution
+
+    if detector == "value_correlation":
+        # The rule floors and the test thresholds all shape what a "rule" and
+        # a "break" are, so every effective value is snapshotted (D13).
+        resolution["correlation_fdr_q"] = fdr_q if fdr_q is not None else cfg.stat_correlation_fdr_q
+        resolution["correlation_min_ratio"] = (
+            min_ratio if min_ratio is not None else cfg.stat_correlation_min_ratio
+        )
+        resolution["correlation_rule_confidence"] = (
+            rule_confidence if rule_confidence is not None else cfg.stat_correlation_rule_confidence
+        )
+        resolution["correlation_min_support"] = (
+            min_support if min_support is not None else cfg.stat_correlation_min_support
+        )
+        if windows is None:
+            resolution["self_slices"] = cfg.stat_self_slices
+        try:
+            result = await run_scan(
+                svc.find_value_correlations,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                windows=windows,
+                fdr_q=resolution["correlation_fdr_q"],
+                min_ratio=resolution["correlation_min_ratio"],
+                rule_confidence=resolution["correlation_rule_confidence"],
+                min_support=resolution["correlation_min_support"],
+                max_pairs=cfg.stat_correlation_max_pairs,
+                max_rows_per_pair=cfg.stat_correlation_max_rows_per_pair,
+                auto_fields=cfg.stat_correlation_auto_fields,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+                self_slices=cfg.stat_self_slices,
+            )
+            _snapshot_slices(result, resolution)
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if detector == "time_of_day":
+        # The resolution and the zone decide what "03:40" means, so both are
+        # resolved here (request, else server default) and snapshotted (D12).
+        resolution["habit_bucket_minutes"] = (
+            bucket_minutes if bucket_minutes is not None else cfg.stat_habit_bucket_minutes
+        )
+        resolution["habit_timezone"] = timezone or cfg.stat_habit_timezone
+        try:
+            result = await run_scan(
+                svc.find_time_of_day_habits,
+                case_id=case_id,
+                source_ids=source_ids,
+                source_offsets=source_offsets,
+                fields=parsed_fields,
+                limit=limit,
+                windows=windows,
+                bucket_minutes=resolution["habit_bucket_minutes"],
+                timezone=resolution["habit_timezone"],
+                min_baseline=cfg.stat_habit_min_baseline,
+                min_bucket_count=cfg.stat_habit_min_bucket_count,
+                max_candidates_per_field=cfg.stat_habit_max_candidates_per_field,
+                exclude_event_ids=exclude_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                inventory=inventory,
+                inventory_total=inventory_total,
+                field_overrides=field_overrides,
+            )
+            return result, resolution
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if detector == "proportion_shift":
         # Snapshot the *effective* thresholds (request override or server
@@ -2763,13 +2877,22 @@ def _serialize_finding(
     | IntervalFinding
     | SequenceFinding
     | MotifFinding
-    | DistributionDriftFinding,
+    | DistributionDriftFinding
+    | TransitionFinding
+    | HabitFinding
+    | CorrelationFinding,
 ) -> dict[str, Any]:
-    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding to a JSON-safe dict."""
-    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift finding dataclass
-    # fields are exactly the wire keys, so asdict() avoids a hand-maintained
-    # field-by-field transcription that would silently drop any newly added
-    # field.
+    """Serialise a Value/Freq/Order/Combo/Range/Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit finding to a JSON-safe dict."""
+    # Charset/Entropy/Shift/Interval/Sequence/Motif/Drift/Transition/Habit
+    # finding dataclass fields are exactly the wire keys, so asdict() avoids a
+    # hand-maintained field-by-field transcription that would silently drop
+    # any newly added field.
+    if isinstance(r, CorrelationFinding):
+        return {"type": "value_correlation", **asdict(r)}
+    if isinstance(r, HabitFinding):
+        return {"type": "time_of_day", **asdict(r)}
+    if isinstance(r, TransitionFinding):
+        return {"type": "transition_time", **asdict(r)}
     if isinstance(r, DistributionDriftFinding):
         return {"type": "value_distribution_drift", **asdict(r)}
     if isinstance(r, MotifFinding):
@@ -3148,9 +3271,29 @@ async def _persist_detector_run(
             # per detector, None for every other one.
             "fdr_q": resolution.get("shift_fdr_q")
             or resolution.get("interval_fdr_q")
-            or resolution.get("drift_fdr_q"),
+            or resolution.get("drift_fdr_q")
+            or resolution.get("correlation_fdr_q"),
             "min_ratio": resolution.get("shift_min_ratio")
-            or resolution.get("interval_min_rate_ratio"),
+            or resolution.get("interval_min_rate_ratio")
+            or resolution.get("transition_min_ratio")
+            or resolution.get("correlation_min_ratio"),
+            # value_correlation: what counted as a rule (D13). `min_support` is
+            # shared with sequence_motif's key by the same disjointness rule.
+            "rule_confidence": resolution.get("correlation_rule_confidence"),
+            # transition_time: the stream key transitions were timed within
+            # (None = per source) and the learning floor the run used (D15).
+            "partition_field": resolution.get("transition_partition_field"),
+            "min_transitions": resolution.get("transition_min_transitions"),
+            # time_of_day: the wall-clock resolution and the IANA zone the run
+            # read the clock in (D12) — without the zone the run is not
+            # reproducible, which is why it is recorded rather than implied.
+            "bucket_minutes": resolution.get("habit_bucket_minutes"),
+            "timezone": resolution.get("habit_timezone"),
+            "min_support": (
+                resolution["correlation_min_support"]
+                if "correlation_min_support" in resolution
+                else resolution.get("motif_min_support")
+            ),
             # sequence_novelty: effective (request-or-default) n-gram length.
             "ngram_size": resolution.get("sequence_ngram"),
             # charset: per-identifier scoping (None = one alphabet per field).
@@ -3225,7 +3368,7 @@ async def list_anomalies(
     timeline_id: str,
     detector: str = Query(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', 'time_of_day', or 'value_correlation'.",
     ),
     fields: str | None = Query(
         default=None,
@@ -3315,6 +3458,40 @@ async def list_anomalies(
             "the reference values; catches ordinary characters in an unusual order)."
         ),
     ),
+    partition_field: str | None = Query(
+        default=None,
+        description=(
+            "transition_time only: the stream whose transitions are timed (e.g. "
+            "'attr:user' to time each account's moves between hosts). Omit for "
+            "one stream per source."
+        ),
+    ),
+    bucket_minutes: int | None = Query(
+        default=None,
+        description=(
+            "time_of_day only: width of the wall-clock buckets the day is cut into — "
+            "15, 30, 60, 120, 180 or 240 (the runner rejects anything else with 422; a "
+            "query string cannot carry an int literal). Omit to use the server default."
+        ),
+    ),
+    timezone: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "time_of_day only: IANA zone the clock is read in (e.g. 'Europe/Berlin'); "
+            "stamped into the persisted run. Omit to use the server default."
+        ),
+    ),
+    rule_confidence: float | None = Query(
+        default=None,
+        gt=0,
+        le=1,
+        description=(
+            "value_correlation only: share of an antecedent's reference events one "
+            "consequent value must account for to form a rule. Omit to use the server default."
+        ),
+    ),
     start: datetime | None = Query(
         default=None,
         description="sequence_motif only: scope mining to events at/after this time (ISO, UTC).",
@@ -3392,6 +3569,21 @@ async def list_anomalies(
     spacing test, beaconing). Without: whole-scope Greenwood beaconing with
     pauses excluded, and a robust-Gamma silence test. BH-FDR across the run.
 
+    **value_correlation**: per field pair, mines implication rules
+    `A = x ⇒ B = y` within the same event from the reference (support and
+    confidence floors, both directions) and flags a window in which a rule's
+    violation rate rises — G-test, BH pool, effect floor (D13).
+
+    **time_of_day**: per (field, value), learns which wall-clock buckets of
+    the day (in an explicit IANA `timezone`) the value habitually occurs in
+    and flags occurrences outside that habit, scored by the hours to the
+    nearest habitual bucket (D12).
+
+    **transition_time**: per ordered value pair of `series_field`, learns the
+    fastest a stream (per source, per `partition_field` value) ever moved from
+    one value to the next and flags transitions faster than that floor by
+    `min_ratio`x — the impossible-speed question (D15).
+
     **sequence_novelty**: per source, builds time-ordered n-grams of
     `series_field` values and flags orderings that occur in a suspect window
     but never in the baseline window (AMiner EventSequenceDetector analog),
@@ -3433,6 +3625,10 @@ async def list_anomalies(
         group_field=group_field,
         max_gap_seconds=max_gap_seconds,
         variant=variant,
+        partition_field=partition_field,
+        bucket_minutes=bucket_minutes,
+        timezone=timezone,
+        rule_confidence=rule_confidence,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3565,7 +3761,7 @@ class TagAnomaliesRequest(BaseModel):
 
     detector: str = Field(
         default="value_novelty",
-        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', or 'value_distribution_drift'.",
+        description="Detector to run: 'value_novelty', 'value_combo', 'frequency', 'timestamp_order', 'numeric_range', 'charset', 'entropy', 'proportion_shift', 'interval_periodicity', 'sequence_novelty', 'sequence_motif', 'value_distribution_drift', 'transition_time', 'time_of_day', or 'value_correlation'.",
     )
     fields: str | None = Field(
         default=None,
@@ -3622,6 +3818,26 @@ class TagAnomaliesRequest(BaseModel):
     variant: Literal["shannon", "bigram"] | None = Field(
         default=None,
         description="entropy only: 'shannon' (default) or 'bigram' — the statistic the band is learned over.",
+    )
+    partition_field: str | None = Field(
+        default=None,
+        description="transition_time only: the stream whose transitions are timed (e.g. 'attr:user').",
+    )
+    bucket_minutes: int | None = Field(
+        default=None,
+        description="time_of_day only: width of the wall-clock buckets (15, 30, 60, 120, 180 or 240).",
+    )
+    timezone: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="time_of_day only: IANA zone the clock is read in; stamped into the run.",
+    )
+    rule_confidence: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="value_correlation only: consequent share that forms a rule.",
     )
     start: datetime | None = Field(
         default=None,
@@ -3690,6 +3906,10 @@ async def tag_anomalies(
         group_field=body.group_field,
         max_gap_seconds=body.max_gap_seconds,
         variant=body.variant,
+        partition_field=body.partition_field,
+        bucket_minutes=body.bucket_minutes,
+        timezone=body.timezone,
+        rule_confidence=body.rule_confidence,
         field_mappings=field_mappings,
         source_offsets=source_offsets,
     )
@@ -3953,6 +4173,52 @@ async def tag_anomalies(
                     f"{where} across {r.details.get('k_categories')} categories "
                     f"(G={r.statistic:.1f}, TVD={r.effect:.2f}, q={r.q_value:.3g})"
                 )
+        elif isinstance(r, TransitionFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the timeline"
+            actor = f" by {r.partition_field}={r.partition_value!r}" if r.partition_value else ""
+            if r.details.get("timestamp_resolution") == "second":
+                took = "under 1s (whole-second timestamps)"
+            else:
+                took = f"{r.observed_seconds:g}s"
+            floor = (
+                "the pair's next-fastest on the timeline"
+                if r.reference_kind == "next-fastest"
+                else "the baseline window's fastest"
+            )
+            content = (
+                f"Transition speed — {r.field}: {r.value}{actor} took {took} in {where}, "
+                f"against {floor} of {r.reference_seconds:g}s over {r.baseline_count} "
+                f"transitions (score {r.score:.2f})"
+            )
+        elif isinstance(r, HabitFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the timeline"
+            content = (
+                f"Time-of-day habit — {r.field}={r.value!r}: {r.count}× at "
+                f"{r.bucket_label} ({r.timezone}) in {where}, {r.distance_hours:g}h from its "
+                f"nearest habitual time {r.nearest_habit_label}, learned from "
+                f"{r.baseline_count} occurrences"
+            )
+        elif isinstance(r, CorrelationFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            ante, cons = r.fields
+            where = (
+                _window_phrase(r.details)
+                if r.details.get("method") == "rule-g-test"
+                else _window_phrase(r.details, prefix="slice")
+            ) or "the window"
+            content = (
+                f"Broken correlation — {ante}={r.values[0]!r} ⇒ {cons}={r.values[1]!r} "
+                f"(held {r.confidence * 100:.3g}% of {r.support}): violated "
+                f"{r.violations}/{r.count} in {where} vs "
+                f"{r.baseline_violations}/{r.baseline_count} in the reference "
+                f"({r.rate_ratio:.1f}×; mostly {cons}={r.top_violator!r}; "
+                f"G={r.g_statistic:.1f}, q={r.q_value:.3g})"
+            )
         elif isinstance(r, OrderFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""

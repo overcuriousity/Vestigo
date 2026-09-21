@@ -134,6 +134,27 @@ export function normalizeFinding(meta: DetectorMeta, f: AnomalyFinding, rank: nu
       subtitle = `×${f.support}${f.period_seconds !== null ? ` every ~${f.period_seconds}s` : ""}`;
       ts = ts ?? f.first_seen;
       break;
+    case "transition_time":
+      title = `${fieldLabel(f.field)}: ${truncate(f.value, 70)}`;
+      subtitle = `${f.observed_seconds}s against a floor of ${f.reference_seconds}s (${
+        f.reference_kind === "next-fastest" ? "next-fastest on the timeline" : "baseline minimum"
+      })${f.partition_value ? ` · ${truncate(f.partition_value, 30)}` : ""}`;
+      ts = ts ?? f.first_seen;
+      break;
+    case "time_of_day":
+      title = pair(f.field, f.value);
+      subtitle = `×${f.count} at ${f.bucket_label} ${f.timezone} · habit ${f.nearest_habit_label}${
+        f.habit_buckets.length > 1 ? ` +${f.habit_buckets.length - 1}` : ""
+      }${findingMode(f) === "self-habit" ? " across the timeline" : ""}`;
+      ts = ts ?? f.first_seen;
+      break;
+    case "value_correlation":
+      title = `${pair(f.fields[0] ?? "", f.values[0] ?? "")} ⇒ ${pair(f.fields[1] ?? "", f.values[1] ?? "")}`;
+      subtitle = `broken ${f.violations}× of ${f.count} in ${String(f.details["window_label"] ?? "the suspect window")}${
+        findingMode(f) === "self-rule-g-test" ? " vs the rest" : ""
+      } · mostly ${truncate(f.top_violator, 30)} (q=${f.q_value.toExponential(1)})`;
+      ts = ts ?? f.first_seen;
+      break;
   }
   return {
     detectorId: meta.id,

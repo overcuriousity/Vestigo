@@ -182,6 +182,58 @@ already-ingested data.
     window occurrence of the most-shifted category (categorical). Score =
     ``-log10(p)`` so the two statistics rank on one scale.
 
+**transition_time** (``detector="transition_time"``)
+    Per ordered value pair ``a → b`` of a series field, learn the fastest a
+    stream ever moved from ``a`` to ``b`` and flag a transition faster than
+    that floor by at least ``min_ratio``×. Adapted from AMiner's
+    ``MinimalTransitionTimeDetector`` (roadmap D15): the "impossible speed"
+    question — one account on two hosts three seconds apart when the
+    baseline never saw it under forty minutes. Transitions are one step of
+    the sequence detectors' n-gram assembly (:func:`_ngram_inner_sql`,
+    ``n = 2``), per source and optionally per *partition field* (the
+    identifier whose stream is timed — a user, a session), so consecutive
+    events of different identifiers never form one transition; same-value
+    repeats are not transitions. Two frames: *baseline*
+    (``method="min-transition"``) learns each pair's minimum over the baseline
+    window (at least ``min_transitions`` of them, floor > 0) and scores each
+    suspect window's fastest transition of the pair against it; *self*
+    (``method="self-min-transition"``, D18) takes the pair's **next-fastest**
+    transition anywhere in the scope as the leave-one-out floor. Score =
+    ``1 − observed / reference``.
+
+**time_of_day** (``detector="time_of_day"``)
+    Per (field, value), learn which wall-clock buckets of the day the value
+    habitually occurs in and flag occurrences outside that habit, scored by
+    the circular distance in hours to the nearest habitual bucket. Adapted
+    from AMiner's ``PathValueTimeIntervalDetector`` (roadmap D12); distinct
+    from ``interval_periodicity``, which measures inter-arrival gaps — a
+    backup moved from 02:15 to 03:40 keeps its cadence and breaks its habit.
+    Buckets are ``bucket_minutes`` wide in an explicit IANA ``timezone``
+    (validated, inlined, stamped into every finding — the run is not
+    reproducible without it). A bucket is habitual when it holds at least
+    ``min_bucket_count`` reference occurrences; a value needs
+    ``min_baseline`` of them to have a habit at all. Two frames: *baseline*
+    (``method="habit"``) learns from the baseline window and scores each
+    suspect window's occurrences; *self* (``method="self-habit"``, D18) takes
+    the value's busy buckets across the scope as its habit and scores every
+    thin bucket against them.
+
+**value_correlation** (``detector="value_correlation"``)
+    Per field pair, mine implication rules ``A = x ⇒ B = y`` within the same
+    event — an antecedent value with at least ``min_support`` reference
+    events whose consequent is one value at least ``rule_confidence`` of the
+    time, both directions — and flag a window in which the rule's violation
+    rate rises: a 2×2 G-test of conforming against violating events between
+    the reference and the window, one Benjamini–Hochberg pool per run, an
+    effect floor of ``min_ratio`` on the violation-rate ratio. Adapted from
+    AMiner's ``VariableCorrelationDetector`` (roadmap D13); intra-record,
+    unlike the sequence detectors. Two frames: *baseline*
+    (``method="rule-g-test"``) mines from the baseline window and tests each
+    suspect window; *self* (``method="self-rule-g-test"``, D18) mines from the
+    scope and tests each leave-one-out slice against its complement. Pairs
+    come from an explicit field list or the recommender's top categorical
+    fields, capped at ``max_pairs``. Score = the G statistic.
+
 **timestamp_order** (``detector="timestamp_order"``)
     Flag events whose parsed timestamp jumps *backwards* relative to the
     previous record in the source file (record order = ``byte_offset``, then
@@ -208,6 +260,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from vestigo.core.time_of_day import validate_bucket_minutes, validate_timezone
 from vestigo.db._buckets import (
     aligned_bucket_starts,
     bucket_interval_seconds,
@@ -453,6 +506,20 @@ _SELF_RCV_FLOOR = 0.05
 # normal approximation is trusted for a motif's regularity (same floor as the
 # interval detector's beaconing gate).
 _MOTIF_GREENWOOD_MIN_INTERVALS = 10
+
+
+def _circular_bucket_distance(a: int, b: int, n: int) -> int:
+    """Distance between two of *n* buckets around the clock (23:xx is one hour from 00:xx)."""
+    d = abs(a - b) % n
+    return min(d, n - d)
+
+
+def _habit_bucket_label(bucket: int, bucket_minutes: int) -> str:
+    """``"HH:MM–HH:MM"`` for one bucket; the last one ends at ``00:00``."""
+    start = bucket * bucket_minutes
+    end = start + bucket_minutes
+    return f"{start // 60:02d}:{start % 60:02d}–{(end // 60) % 24:02d}:{end % 60:02d}"
+
 
 # Separators used to flatten a value_combo finding's field/value tuples into
 # the single (field, value) key the detector allowlist stores. The fields are
@@ -1241,6 +1308,185 @@ class SequenceFinding:
 
 
 @dataclass
+class TransitionFinding:
+    """One value-to-value transition faster than its learned floor (transition_time, D15)."""
+
+    # Field token whose consecutive values form the transition (e.g. "attr:computer_name").
+    field: str
+    # [from, to].
+    values: list[str]
+    # "from → to" — display form and the allowlist key.
+    value: str
+    # The stream key the transition was timed within (e.g. "attr:user"); None = per source.
+    partition_field: str | None
+    # That key's value on the flagged transition; None when unpartitioned.
+    partition_value: str | None
+    # The fastest transition of this pair in the window (baseline frame) or
+    # the scope (self frame), in seconds.
+    observed_seconds: float
+    # The floor it undercut: the baseline's fastest (baseline frame) or the
+    # pair's next-fastest transition anywhere in the scope (self frame).
+    reference_seconds: float
+    reference_kind: str  # "baseline-min" | "next-fastest"
+    # reference_seconds / observed_seconds; None when the observation is instant.
+    speedup: float | None
+    # Transitions of this pair in the window (baseline frame) or the scope (self).
+    count: int
+    # Transitions the floor was learned from: the baseline's (baseline frame)
+    # or, in the self frame, the same scope count as `count`.
+    baseline_count: int
+    # 1 − observed / reference; 1.0 = instantaneous.
+    score: float
+    # Timestamp of the arriving event of the fastest transition.
+    first_seen: str | None
+    # The arriving event.
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+class _ZeroGapBounds:
+    """What a zero-length transition may really have taken, per source (D15).
+
+    A transition's duration is the difference of two recorded timestamps, so
+    it is only as precise as they are. A source whose timestamps carry a
+    sub-second part records milliseconds, and a 0 ms gap there is instant. A
+    source whose every timestamp is a whole second (Plaso CSV, syslog) says
+    only that the gap was *under a second*: judging that as instant lets it
+    undercut any positive floor — ``0 × min_ratio`` beats everything — and
+    rank first as a score-1.0 finding. In such a source a zero-length
+    observation is judged and scored as the one second it may have taken.
+
+    The resolution probe runs once per source, and only for a source that
+    produced a zero-length candidate; it stops at the first sub-second
+    timestamp. Pairs held back by the bound are counted for a warning.
+    """
+
+    SECOND_MS = 1000
+
+    def __init__(self, ch: ClickHouseStore, case_id: str) -> None:
+        self._ch = ch
+        self._case_id = case_id
+        self._subsecond: dict[str, bool] = {}
+        self._held_back = 0
+
+    def _records_subsecond(self, source_id: str) -> bool:
+        known = self._subsecond.get(source_id)
+        if known is None:
+            ch = self._ch
+            rows = ch.client.query(
+                f"""
+                SELECT 1 FROM {ch.database}.events
+                WHERE case_id = {{cid:String}} AND source_id = {{sid:String}}
+                  AND toUnixTimestamp64Milli(timestamp) % 1000 != 0
+                LIMIT 1
+                {heavy_scan_settings()}
+                """,
+                parameters={"cid": self._case_id, "sid": source_id},
+            ).result_rows
+            known = self._subsecond[source_id] = bool(rows)
+        return known
+
+    def bound_ms(self, fastest_ms: int, source_id: str) -> int:
+        """The duration the observation is judged and scored as."""
+        if fastest_ms > 0 or self._records_subsecond(source_id):
+            return fastest_ms
+        return self.SECOND_MS
+
+    def undercuts(self, fastest_ms: int, floor_ms: int, min_ratio: float, source_id: str) -> bool:
+        """Whether the observation undercuts *floor_ms* by *min_ratio*× at its bound."""
+        if fastest_ms * min_ratio >= floor_ms:
+            return False
+        if self.bound_ms(fastest_ms, source_id) * min_ratio >= floor_ms:
+            self._held_back += 1
+            return False
+        return True
+
+    def warnings(self, min_ratio: float) -> list[str]:
+        """The disclosure for pairs the one-second bound held back, if any."""
+        if not self._held_back:
+            return []
+        n = self._held_back
+        return [
+            f"{n} pair{'s' if n != 1 else ''} not flagged: a zero-length transition in a "
+            f"source whose timestamps are whole seconds may have taken up to one second, "
+            f"which does not undercut the pair's floor by {min_ratio:g}×."
+        ]
+
+
+@dataclass
+class HabitFinding:
+    """One value occurring at a time of day it has no habit of (time_of_day, D12)."""
+
+    field: str
+    value: str
+    # The offending wall-clock bucket: index, "HH:MM–HH:MM" label, width and zone.
+    bucket: int
+    bucket_label: str
+    bucket_minutes: int
+    timezone: str
+    # Occurrences of the value in this bucket (in the suspect window, or the scope).
+    count: int
+    # Reference occurrences of the value the habit was learned from: the
+    # baseline window's (baseline frame) or the whole scope's (self frame).
+    baseline_count: int
+    # The habitual buckets, ascending; the nearest one and its label.
+    habit_buckets: list[int]
+    nearest_habit: int
+    nearest_habit_label: str
+    # Circular distance to the nearest habitual bucket, in hours.
+    distance_hours: float
+    # = distance_hours; used for ranking.
+    score: float
+    # First occurrence in the bucket (within the window, or the scope).
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
+class CorrelationFinding:
+    """One implication rule ``A = x ⇒ B = y`` broken in a window (value_correlation, D13)."""
+
+    # [antecedent field, consequent field] and [x, y] — the combo shape.
+    fields: list[str]
+    values: list[str]
+    # "x ⇒ y" — display form.
+    value: str
+    # Share of the antecedent's reference events that carried y (≥ rule_confidence).
+    confidence: float
+    # Antecedent events the rule was mined from (baseline window, or the scope).
+    support: int
+    # Antecedent events in the window (or slice) under test.
+    count: int
+    # Of those, the ones whose consequent was not y.
+    violations: int
+    # The reference side of the test: antecedent events and violations in the
+    # baseline window (baseline frame) or in the other slices (self frame).
+    baseline_count: int
+    baseline_violations: int
+    violation_rate: float
+    baseline_violation_rate: float
+    # violation_rate / baseline_violation_rate (0.5-smoothed when the reference has none).
+    rate_ratio: float
+    # The most common violating consequent value in the window, and its count.
+    top_violator: str
+    top_violator_count: int
+    g_statistic: float
+    p_value: float
+    # Benjamini–Hochberg adjusted p-value across every test in this run.
+    q_value: float
+    # = g_statistic; used for ranking.
+    score: float
+    # First violating occurrence in the window.
+    first_seen: str | None
+    event_id: str | None
+    event: dict[str, Any] | None
+    details: dict[str, Any]
+
+
+@dataclass
 class MotifFinding:
     """One recurring event-order n-gram surfaced by the sequence-motif miner."""
 
@@ -1282,10 +1528,13 @@ class StatAnomalyResult:
     # "value_novelty" | "value_combo" | "frequency" | "timestamp_order" | "numeric_range"
     #  | "charset" | "entropy" | "proportion_shift" | "interval_periodicity"
     #  | "sequence_novelty" | "sequence_motif" | "value_distribution_drift"
+    #  | "transition_time" | "time_of_day" | "value_correlation"
     detector: str
     # "self-baseline" | "temporal" | "z-score" | "temporal-z-score" | "sequential"
     #  | "iqr" | "temporal-range" | "rare-chars" | "temporal-charset" | "temporal-iqr"
-    #  | "g-test" | "cadence" | "ngram" | "motif" | "drift"
+    #  | "g-test" | "cadence" | "ngram" | "motif" | "drift" | "min-transition"
+    #  | "self-min-transition" | "habit" | "self-habit" | "rule-g-test"
+    #  | "self-rule-g-test"
     method: str
     baseline_size: int  # total events (value_novelty) or event-count used for z-score
     results: list[
@@ -1301,6 +1550,9 @@ class StatAnomalyResult:
         | SequenceFinding
         | MotifFinding
         | DistributionDriftFinding
+        | TransitionFinding
+        | HabitFinding
+        | CorrelationFinding
     ] = field(default_factory=list)
     # Effective |z| cutoff used by the frequency detector; None for value_novelty.
     z_threshold: float | None = None
@@ -1746,6 +1998,7 @@ def _ngram_inner_sql(
     w_idx_expr: str,
     scope_pred: str,
     max_gap: int | None = None,
+    partition_col: str | None = None,
 ) -> str:
     """Two-level n-gram assembly subquery shared by the sequence detectors.
 
@@ -1765,6 +2018,13 @@ def _ngram_inner_sql(
     form. ``None`` keeps the pre-D14 shape bit-identical. The value is an
     int inlined as a literal, same convention as the ``ngram - 1`` frame.
 
+    *partition_col* (D15) names a second stream key — an identifier such as
+    the user whose host transitions are being timed. Rows are additionally
+    partitioned by it (``pkey``), so consecutive events of *different*
+    identifiers never form one n-gram, and rows without a value for it are
+    left out rather than lumped into one anonymous stream. ``None`` keeps the
+    per-source partition and emits an empty ``pkey``.
+
     Callers must run the enclosing query **once per source** (it bounds the
     window sort — see the query-cost discipline in docs/ANOMALY_DETECTION.md)
     and filter on ``guard IS NOT NULL`` to keep only complete n-grams.
@@ -1772,10 +2032,13 @@ def _ngram_inner_sql(
     gram_lags = ", ".join(
         [f"lagInFrame(val, {ngram - 1 - j}) OVER w" for j in range(ngram - 1)] + ["val"]
     )
+    pkey_expr = f"toString({partition_col})" if partition_col is not None else "''"
+    pkey_pred = f"AND {partition_col} != ''" if partition_col is not None else ""
     level1 = f"""
                 SELECT
                     source_id,
                     {col} AS val,
+                    {pkey_expr} AS pkey,
                     toString(event_id) AS eid,
                     {eff} AS ets,
                     byte_offset,
@@ -1786,9 +2049,11 @@ def _ngram_inner_sql(
                 WHERE case_id = {{cid:String}}
                   AND has({{src:Array(String)}}, source_id)
                   AND {col} != ''
+                  {pkey_pred}
                   AND {VESTIGO_NOT_SENTINEL_SQL}
                   AND ({scope_pred})
             """
+    stream = "source_id, w_idx, pkey" if partition_col is not None else "source_id, w_idx"
     if max_gap is not None:
         gap = int(max_gap)
         # gap_s is NULL on each partition's first row; ClickHouse's `if` takes
@@ -1814,19 +2079,21 @@ def _ngram_inner_sql(
                         age('second', lagInFrame(ets, 1) OVER ord, ets) AS gap_s
                     FROM ({level1})
                     WINDOW ord AS (
-                        PARTITION BY source_id, w_idx
+                        PARTITION BY {stream}
                         ORDER BY ets, byte_offset, line_number, event_id
                     )
                 )
                 WINDOW ord AS (
-                    PARTITION BY source_id, w_idx
+                    PARTITION BY {stream}
                     ORDER BY ets, byte_offset, line_number, event_id
                 )
             """
-    partition = "source_id, w_idx, seg" if max_gap is not None else "source_id, w_idx"
+    partition = f"{stream}, seg" if max_gap is not None else stream
     return f"""
             SELECT
                 val,
+                pkey,
+                eid AS last_eid,
                 ets,
                 w_idx,
                 [{gram_lags}] AS gram,
@@ -8458,6 +8725,1222 @@ class StatisticalAnomalyService:
             source_ids=source_ids,
             allowlist=allowlist,
             warnings=run_warnings,
+        )
+
+    # ------------------------------------------------------------------
+    # Transition time (D15)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_transition_times(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        series_field: str = "artifact",
+        partition_field: str | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        min_ratio: float = 2.0,
+        min_transitions: int = 3,
+        max_candidates: int = 2000,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        source_offsets: dict[str, int] | None = None,
+    ) -> StatAnomalyResult:
+        """Return value-to-value transitions faster than the pair's learned floor.
+
+        AMiner ``MinimalTransitionTimeDetector`` analog (D15). A *transition*
+        is one step ``a → b`` between consecutive events of one stream whose
+        *series_field* values differ; the stream is the source, further split
+        by *partition_field* when given (the identifier whose movements are
+        timed — a user across hosts, a session across states). Transitions are
+        assembled by :func:`_ngram_inner_sql` with ``n = 2``, so they inherit
+        the sequence detectors' ordering, the per-source scan discipline and
+        the guarantee that a pair never spans a window boundary. The duration
+        is ``dateDiff('millisecond', first_ts, ets)``.
+
+        *Baseline frame* (``method="min-transition"``, *windows* given): per
+        pair the floor is the minimum baseline-window transition, learned from
+        at least *min_transitions* of them; each suspect window's fastest
+        transition of the pair is flagged when it undercuts the floor by at
+        least *min_ratio*×. A learned floor of zero cannot be undercut — with
+        second-resolution timestamps zero-length transitions are routine — so
+        such pairs are skipped and counted in a warning. *Self frame*
+        (``method="self-min-transition"``, no *windows*, D18): the floor is the
+        pair's **next-fastest** transition anywhere in the scope
+        (``groupArraySorted(2)``, the leave-one-out minimum), over at least
+        *min_transitions* transitions; two equally fastest transitions vouch
+        for each other and nothing is flagged. In both frames a zero-length
+        observation in a source whose timestamps are whole seconds is judged
+        at its one-second bound (:class:`_ZeroGapBounds`).
+
+        Candidates are the *max_candidates* fastest pairs per source (cap →
+        warning). On a multi-source scope the floor is the minimum over every
+        source's reference and counts are summed. Score =
+        ``1 − observed / reference``; the representative event is the arriving
+        event of the fastest transition. The allowlist key is
+        ``(series_field, "a → b")`` in both frames.
+        """
+        detector = "transition_time"
+        if min_ratio <= 1.0:
+            raise ValueError("min_ratio must be greater than 1")
+        if windows is None:
+            return self._find_transition_times_self(
+                case_id,
+                source_ids,
+                series_field=series_field,
+                partition_field=partition_field,
+                limit=limit,
+                min_ratio=min_ratio,
+                min_transitions=min_transitions,
+                max_candidates=max_candidates,
+                exclude_event_ids=exclude_event_ids,
+                allowlist=allowlist,
+                field_mappings=field_mappings,
+                source_offsets=source_offsets,
+            )
+        method = "min-transition"
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload(),
+            )
+        baseline_size, suspect_totals = self._window_totals(
+            case_id, source_ids, windows, source_offsets
+        )
+        run_warnings = _window_size_warnings(windows, suspect_totals)
+        if baseline_size == 0:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                warnings=[*run_warnings, "The baseline window contains no events."],
+                windows=windows.payload(),
+            )
+
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        col = _col_expr(series_field, params, field_mappings)
+        pcol = (
+            _col_expr(partition_field, params, field_mappings, prefix="pk")
+            if partition_field
+            else None
+        )
+        bp, sps = _window_preds(windows, params, source_offsets)
+        eff = effective_ts_sql(source_offsets)
+        w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
+        inner = _ngram_inner_sql(
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=2,
+            w_idx_expr=f"multiIf({bp}, -1, {w_branches}, -2)",
+            scope_pred=" OR ".join([bp, *sps]),
+            partition_col=pcol,
+        )
+        dur = "toInt64(dateDiff('millisecond', first_ts, ets))"
+
+        # Query A (once per source): each suspect window's fastest transition
+        # per pair, fastest first — the candidates. The cap keeps the fastest,
+        # which are the ones the question is about; hitting it is disclosed.
+        params["cap"] = max_candidates
+        cand_sql = f"""
+            SELECT
+                gram,
+                w_idx,
+                min({dur}) AS fastest_ms,
+                argMin(last_eid, {dur}) AS evt,
+                argMin(ets, {dur}) AS at,
+                argMin(pkey, {dur}) AS pval,
+                count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2] AND w_idx >= 0
+            GROUP BY gram, w_idx
+            ORDER BY fastest_ms ASC, gram ASC, w_idx ASC
+            LIMIT {{cap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        # (gram, w_idx) -> [fastest_ms, evt, at, pval, n, source of the fastest]
+        cands: dict[tuple[tuple[str, ...], int], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(cand_sql, parameters={**params, "src": [sid]}).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-pair candidate cap — only its "
+                    f"{max_candidates} fastest suspect transitions were fetched; slower "
+                    f"pairs that still undercut their floor may be missing."
+                )
+            for row in rows:
+                key = (tuple(str(v) for v in row[0]), int(row[1]))
+                fastest = int(row[2])
+                slot = cands.get(key)
+                if slot is None:
+                    cands[key] = [fastest, row[3], row[4], row[5], int(row[6]), sid]
+                    continue
+                slot[4] += int(row[6])
+                if fastest < slot[0]:
+                    slot[0], slot[1], slot[2], slot[3], slot[5] = (
+                        fastest,
+                        row[3],
+                        row[4],
+                        row[5],
+                        sid,
+                    )
+        if not cands:
+            return self._finalize_findings(
+                [],
+                detector=detector,
+                method=method,
+                total_events=baseline_size,
+                evaluated_fields=1,
+                exclude_event_ids=exclude_event_ids,
+                limit=limit,
+                case_id=case_id,
+                source_ids=source_ids,
+                allowlist=allowlist,
+                warnings=run_warnings,
+                windows=windows,
+            )
+
+        # Query B (once per source): the baseline floor for the candidate pairs.
+        pairs = sorted({g for g, _w in cands})
+        learn_sql = f"""
+            SELECT gram, min({dur}) AS min_ms, count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2] AND w_idx = -1
+              AND has({{cands:Array(Array(String))}}, gram)
+            GROUP BY gram
+            {heavy_scan_settings()}
+        """
+        learned: dict[tuple[str, ...], list[int]] = {}  # gram -> [min_ms, n]
+        for sid in source_ids:
+            rows = self.ch.client.query(
+                learn_sql, parameters={**params, "src": [sid], "cands": [list(g) for g in pairs]}
+            ).result_rows
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                slot = learned.setdefault(gram, [int(row[1]), 0])
+                slot[0] = min(slot[0], int(row[1]))
+                slot[1] += int(row[2])
+        if not learned:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=baseline_size,
+                warnings=[
+                    *run_warnings,
+                    "No suspect-window transition has a counterpart in the baseline window, "
+                    "so there is no floor to compare against.",
+                ],
+                windows=windows.payload(),
+            )
+
+        zero_floors = 0
+        gaps = _ZeroGapBounds(self.ch, case_id)
+        findings: list[TransitionFinding] = []
+        for (gram, wi), (fastest, evt, at, pval, n, sid) in cands.items():
+            ref = learned.get(gram)
+            if ref is None or ref[1] < min_transitions:
+                continue
+            floor_ms, n_baseline = ref
+            if floor_ms <= 0:
+                zero_floors += 1
+                continue
+            if not gaps.undercuts(fastest, floor_ms, min_ratio, sid):
+                continue
+            window = windows.suspects[wi]
+            findings.append(
+                self._transition_finding(
+                    case_id=case_id,
+                    detector=detector,
+                    method=method,
+                    series_field=series_field,
+                    partition_field=partition_field,
+                    gram=gram,
+                    fastest_ms=fastest,
+                    reference_ms=floor_ms,
+                    reference_kind="baseline-min",
+                    evt=evt,
+                    at=at,
+                    pval=pval,
+                    count=n,
+                    baseline_count=n_baseline,
+                    min_ratio=min_ratio,
+                    min_transitions=min_transitions,
+                    bound_ms=gaps.bound_ms(fastest, sid),
+                    extra={
+                        "window_label": window.label,
+                        "window_start": ensure_utc(window.start).isoformat(),
+                        "window_end": ensure_utc(window.end).isoformat(),
+                        "window_transitions": n,
+                        "baseline_transitions": n_baseline,
+                        "baseline_size": baseline_size,
+                    },
+                )
+            )
+        if zero_floors:
+            run_warnings.append(
+                f"{zero_floors} pair{'s' if zero_floors != 1 else ''} skipped: the baseline's "
+                f"fastest transition is zero seconds (same-timestamp records), and nothing "
+                f"can be faster than instant."
+            )
+        run_warnings.extend(gaps.warnings(min_ratio))
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=baseline_size,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
+
+    def _find_transition_times_self(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        *,
+        series_field: str,
+        partition_field: str | None,
+        limit: int,
+        min_ratio: float,
+        min_transitions: int,
+        max_candidates: int,
+        exclude_event_ids: set[str] | None,
+        allowlist: set[tuple[str, str]] | None,
+        field_mappings: dict[str, list[str]] | None,
+        source_offsets: dict[str, int] | None,
+    ) -> StatAnomalyResult:
+        """Self frame of :meth:`find_transition_times` (``method="self-min-transition"``).
+
+        One pseudo-window over every scope event; per source and pair the two
+        fastest transitions (``groupArraySorted(2)``), the arriving event of
+        the fastest, and the pair's transition count. Merged across sources
+        by taking the two smallest durations overall. The floor is the second
+        of them — every other transition of the pair is at least that slow —
+        and the fastest is flagged when it undercuts the floor by *min_ratio*×
+        over at least *min_transitions* transitions. A zero floor (two
+        instantaneous transitions) is skipped and counted in a warning, as in
+        the baseline frame.
+        """
+        detector = "transition_time"
+        method = "self-min-transition"
+        self.ch.init_schema()
+        db = self.ch.database
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data", detector=detector, method=method, baseline_size=0
+            )
+        params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        bind_offset_params(source_offsets, params)
+        col = _col_expr(series_field, params, field_mappings)
+        pcol = (
+            _col_expr(partition_field, params, field_mappings, prefix="pk")
+            if partition_field
+            else None
+        )
+        eff = effective_ts_sql(source_offsets)
+        inner = _ngram_inner_sql(
+            db=db,
+            col=col,
+            eff=eff,
+            ngram=2,
+            w_idx_expr="0",
+            scope_pred="1",
+            partition_col=pcol,
+        )
+        dur = "toInt64(dateDiff('millisecond', first_ts, ets))"
+        params["cap"] = max_candidates
+        sql = f"""
+            SELECT
+                gram,
+                groupArraySorted(2)({dur}) AS two_fastest_ms,
+                argMin(last_eid, {dur}) AS evt,
+                argMin(ets, {dur}) AS at,
+                argMin(pkey, {dur}) AS pval,
+                count() AS n
+            FROM ({inner})
+            WHERE guard IS NOT NULL AND gram[1] != gram[2]
+            GROUP BY gram
+            ORDER BY two_fastest_ms[1] ASC, gram ASC
+            LIMIT {{cap:UInt32}}
+            {heavy_scan_settings()}
+        """
+        run_warnings: list[str] = []
+        # gram -> [two_fastest_ms (sorted, ≤ 2), evt, at, pval, n, source of the fastest]
+        merged: dict[tuple[str, ...], list[Any]] = {}
+        for sid in source_ids:
+            rows = self.ch.client.query(sql, parameters={**params, "src": [sid]}).result_rows
+            if len(rows) >= max_candidates:
+                run_warnings.append(
+                    f"Source {sid}: hit the {max_candidates}-pair candidate cap — only its "
+                    f"{max_candidates} fastest pairs were fetched; slower pairs that still "
+                    f"undercut their floor may be missing."
+                )
+            for row in rows:
+                gram = tuple(str(v) for v in row[0])
+                fastest = [int(v) for v in row[1]]
+                slot = merged.get(gram)
+                if slot is None:
+                    merged[gram] = [fastest[:2], row[2], row[3], row[4], int(row[5]), sid]
+                    continue
+                if fastest and fastest[0] < slot[0][0]:
+                    slot[1], slot[2], slot[3], slot[5] = row[2], row[3], row[4], sid
+                slot[0] = sorted(slot[0] + fastest)[:2]
+                slot[4] += int(row[5])
+
+        zero_floors = 0
+        gaps = _ZeroGapBounds(self.ch, case_id)
+        findings: list[TransitionFinding] = []
+        for gram, (two, evt, at, pval, n, sid) in merged.items():
+            if n < min_transitions or len(two) < 2:
+                continue
+            fastest, floor_ms = two[0], two[1]
+            if floor_ms <= 0:
+                zero_floors += 1
+                continue
+            if not gaps.undercuts(fastest, floor_ms, min_ratio, sid):
+                continue
+            findings.append(
+                self._transition_finding(
+                    case_id=case_id,
+                    detector=detector,
+                    method=method,
+                    series_field=series_field,
+                    partition_field=partition_field,
+                    gram=gram,
+                    fastest_ms=fastest,
+                    reference_ms=floor_ms,
+                    reference_kind="next-fastest",
+                    evt=evt,
+                    at=at,
+                    pval=pval,
+                    count=n,
+                    baseline_count=n,
+                    min_ratio=min_ratio,
+                    min_transitions=min_transitions,
+                    bound_ms=gaps.bound_ms(fastest, sid),
+                    extra={"scope_transitions": n},
+                )
+            )
+        if zero_floors:
+            run_warnings.append(
+                f"{zero_floors} pair{'s' if zero_floors != 1 else ''} skipped: the pair's two "
+                f"fastest transitions are both zero seconds (same-timestamp records), and "
+                f"nothing can be faster than instant."
+            )
+        run_warnings.extend(gaps.warnings(min_ratio))
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=total_events,
+            evaluated_fields=1,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+        )
+
+    @staticmethod
+    def _transition_finding(
+        *,
+        case_id: str,
+        detector: str,
+        method: str,
+        series_field: str,
+        partition_field: str | None,
+        gram: tuple[str, ...],
+        fastest_ms: int,
+        reference_ms: int,
+        reference_kind: str,
+        evt: Any,
+        at: Any,
+        pval: Any,
+        count: int,
+        baseline_count: int,
+        min_ratio: float,
+        min_transitions: int,
+        bound_ms: int,
+        extra: dict[str, Any],
+    ) -> TransitionFinding:
+        """Build one :class:`TransitionFinding`; shared by both frames.
+
+        *bound_ms* is what the observation is scored as: the observation
+        itself, or — for a zero-length transition in a source whose
+        timestamps are whole seconds — the one second it may have taken
+        (:class:`_ZeroGapBounds`). The finding then says so, and its speed-up
+        is a lower bound.
+        """
+        values = list(gram)
+        joined = " → ".join(values)
+        observed = fastest_ms / 1000.0
+        reference = reference_ms / 1000.0
+        score = 1.0 - bound_ms / reference_ms
+        speedup = reference_ms / bound_ms if bound_ms > 0 else None
+        if fastest_ms == 0:
+            resolution = "second" if bound_ms > 0 else "sub-second"
+            extra = {
+                **extra,
+                "timestamp_resolution": resolution,
+                "observed_upper_bound_seconds": bound_ms / 1000.0 if bound_ms else None,
+            }
+        first_seen = _present_ts(at)
+        evt_id = str(evt) if evt else None
+        partition_value = str(pval) if partition_field and pval else None
+        details: dict[str, Any] = {
+            "detector": detector,
+            "method": method,
+            "field": series_field,
+            "values": values,
+            "value": joined,
+            "partition_field": partition_field,
+            "partition_value": partition_value,
+            "observed_seconds": observed,
+            "reference_seconds": reference,
+            "reference_kind": reference_kind,
+            "speedup": round(speedup, 4) if speedup is not None else None,
+            "count": count,
+            "min_ratio": min_ratio,
+            "min_transitions": min_transitions,
+            "first_seen": first_seen,
+            **extra,
+            "allowlist_field": series_field,
+            "allowlist_value": joined,
+        }
+        return TransitionFinding(
+            field=series_field,
+            values=values,
+            value=joined,
+            partition_field=partition_field,
+            partition_value=partition_value,
+            observed_seconds=observed,
+            reference_seconds=reference,
+            reference_kind=reference_kind,
+            speedup=round(speedup, 4) if speedup is not None else None,
+            count=count,
+            baseline_count=baseline_count,
+            score=round(score, 6),
+            first_seen=first_seen,
+            event_id=evt_id,
+            event=_stub_event(evt_id, case_id, first_seen),
+            details=details,
+        )
+
+    # ------------------------------------------------------------------
+    # Time-of-day habit (D12)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_time_of_day_habits(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        bucket_minutes: int = 60,
+        timezone: str = "UTC",
+        min_baseline: int = 20,
+        min_bucket_count: int = 3,
+        max_candidates_per_field: int = 500,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
+    ) -> StatAnomalyResult:
+        """Return value occurrences at a time of day the value has no habit of.
+
+        AMiner ``PathValueTimeIntervalDetector`` analog (D12). Per (field,
+        value) the day is cut into ``1440 / bucket_minutes`` wall-clock
+        buckets in *timezone* (an IANA name, validated here and stamped into
+        every finding — without it the run is not reproducible, since the
+        server's zone can change under it). The value's **habit** is the set
+        of buckets holding at least *min_bucket_count* reference occurrences,
+        learned only for values with at least *min_baseline* of them; an
+        occurrence in any other bucket is flagged, scored by the circular
+        distance to the nearest habitual bucket in hours. Distinct from
+        :meth:`find_interval_periodicity`, which measures inter-arrival gaps:
+        a backup that runs at 02:15 and then at 03:40 keeps its cadence and
+        breaks its habit.
+
+        Two frames. *Baseline* (``method="habit"``, *windows* given): the
+        habit is learned from the baseline window and each suspect window's
+        occurrences are scored against it, one finding per (value, window,
+        bucket) with the bucket's count. *Self* (``method="self-habit"``, D18):
+        the habit is the value's own busy buckets across the scope, and every
+        thin bucket — under *min_bucket_count*, so not habitual by definition —
+        is scored against them; a value that occurs in one thin bucket is
+        judged by its busy ones, which is what leave-one-out means here.
+
+        One scan per field: per (value, bucket, window) counts with the first
+        occurrence, restricted to the *max_candidates_per_field* highest-volume
+        values (cap → warning). Auto field selection is the novelty
+        recommender's categorical set, steered by *field_overrides*. The
+        allowlist key is ``(field, value)``: a value declared Normal is normal
+        at any hour.
+        """
+        detector = "time_of_day"
+        validate_bucket_minutes(bucket_minutes)
+        tz = validate_timezone(timezone)
+        method = "habit" if windows is not None else "self-habit"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+        n_buckets = 1440 // bucket_minutes
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload() if windows is not None else None,
+            )
+        run_warnings: list[str] = []
+        if windows is not None:
+            baseline_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
+            run_warnings += _window_size_warnings(windows, suspect_totals)
+            if baseline_size == 0:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=0,
+                    warnings=[*run_warnings, "The baseline window contains no events."],
+                    windows=windows.payload(),
+                )
+            reference_size = baseline_size
+        else:
+            reference_size = total_events
+
+        if fields is not None:
+            scan_fields = fields
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            scan_fields = [f.token for f in rec if f.recommended] or _DEFAULT_NOVELTY_FIELDS
+            scan_fields, override_notes = apply_field_overrides(
+                scan_fields, field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            scan_fields = scan_fields[:_MAX_AUTO_SCAN_FIELDS]
+
+        findings: list[HabitFinding] = []
+        evaluated_fields = 0
+        thin_values = 0
+        for field_token in scan_fields:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            col = _col_expr(field_token, params, field_mappings)
+            if windows is not None:
+                bp, sps = _window_preds(windows, params, source_offsets)
+                w_branches = ", ".join(f"{sp}, {i}" for i, sp in enumerate(sps))
+                w_idx_expr = f"multiIf({bp}, -1, {w_branches}, -2)"
+                scope_pred = " OR ".join([bp, *sps])
+            else:
+                w_idx_expr, scope_pred = "0", "1"
+            params["bm"] = bucket_minutes
+            params["cap"] = max_candidates_per_field
+            where = f"""
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {col} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({scope_pred})
+            """
+            # The zone is inlined, not bound: ClickHouse takes a timezone as a
+            # constant expression, and the name was validated against the
+            # zoneinfo database and a strict token pattern above.
+            sql = f"""
+                SELECT
+                    val,
+                    bucket,
+                    w_idx,
+                    count() AS cnt,
+                    min(ts) AS first_ts,
+                    toString(argMin(event_id, ts)) AS first_evt
+                FROM (
+                    SELECT
+                        {col} AS val,
+                        {eff} AS ts,
+                        event_id,
+                        toUInt16(intDiv(toHour(ts, '{tz}') * 60 + toMinute(ts, '{tz}'), {{bm:UInt16}})) AS bucket,
+                        {w_idx_expr} AS w_idx
+                    FROM {db}.events
+                    {where}
+                )
+                WHERE val IN (
+                    SELECT {col} AS val
+                    FROM {db}.events
+                    {where}
+                    GROUP BY val
+                    ORDER BY count() DESC, val ASC
+                    LIMIT {{cap:UInt32}}
+                )
+                GROUP BY val, bucket, w_idx
+                {heavy_scan_settings()}
+            """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            # value -> {bucket: reference count}; value -> [(w_idx, bucket, cnt, first_ts, evt)]
+            reference: dict[str, dict[int, int]] = defaultdict(dict)
+            observed: dict[str, list[tuple[int, int, int, Any, Any]]] = defaultdict(list)
+            for val, bucket, w_idx, cnt, first_ts, first_evt in rows:
+                key, b, w, n = str(val), int(bucket), int(w_idx), int(cnt)
+                if not key or not 0 <= b < n_buckets:
+                    continue
+                if windows is None:
+                    reference[key][b] = reference[key].get(b, 0) + n
+                    observed[key].append((0, b, n, first_ts, first_evt))
+                elif w == -1:
+                    reference[key][b] = reference[key].get(b, 0) + n
+                elif w >= 0:
+                    observed[key].append((w, b, n, first_ts, first_evt))
+            if len({r[0] for r in rows}) >= max_candidates_per_field:
+                run_warnings.append(
+                    f"Field {field_token!r} hit the {max_candidates_per_field}-value "
+                    f"candidate cap — only its {max_candidates_per_field} highest-volume "
+                    f"values were scanned for a habit."
+                )
+            learned_any = False
+            for val, occupancy in reference.items():
+                ref_total = sum(occupancy.values())
+                habit = sorted(b for b, n in occupancy.items() if n >= min_bucket_count)
+                if ref_total < min_baseline or not habit:
+                    thin_values += 1
+                    continue
+                learned_any = True
+                for w, b, n, first_ts, evt in observed.get(val, []):
+                    if b in habit:
+                        continue
+                    nearest = min(
+                        habit,
+                        key=lambda h: (_circular_bucket_distance(b, h, n_buckets), h),
+                    )
+                    distance_hours = (
+                        _circular_bucket_distance(b, nearest, n_buckets) * bucket_minutes / 60
+                    )
+                    first_seen = _present_ts(first_ts)
+                    evt_id = str(evt) if evt else None
+                    details: dict[str, Any] = {
+                        "detector": detector,
+                        "method": method,
+                        "field": field_token,
+                        "value": val,
+                        "bucket": b,
+                        "bucket_label": _habit_bucket_label(b, bucket_minutes),
+                        "bucket_minutes": bucket_minutes,
+                        "timezone": tz,
+                        "count": n,
+                        "habit_buckets": habit,
+                        "habit_labels": [_habit_bucket_label(h, bucket_minutes) for h in habit],
+                        "nearest_habit": nearest,
+                        "nearest_habit_label": _habit_bucket_label(nearest, bucket_minutes),
+                        "distance_hours": distance_hours,
+                        "min_baseline": min_baseline,
+                        "min_bucket_count": min_bucket_count,
+                        "first_seen": first_seen,
+                        "allowlist_field": field_token,
+                        "allowlist_value": val,
+                    }
+                    if windows is not None:
+                        window = windows.suspects[w]
+                        details.update(
+                            {
+                                "baseline_count": ref_total,
+                                "baseline_size": reference_size,
+                                "window_label": window.label,
+                                "window_start": ensure_utc(window.start).isoformat(),
+                                "window_end": ensure_utc(window.end).isoformat(),
+                            }
+                        )
+                    else:
+                        details["scope_occurrences"] = ref_total
+                    findings.append(
+                        HabitFinding(
+                            field=field_token,
+                            value=val,
+                            bucket=b,
+                            bucket_label=details["bucket_label"],
+                            bucket_minutes=bucket_minutes,
+                            timezone=tz,
+                            count=n,
+                            baseline_count=ref_total,
+                            habit_buckets=habit,
+                            nearest_habit=nearest,
+                            nearest_habit_label=details["nearest_habit_label"],
+                            distance_hours=distance_hours,
+                            score=distance_hours,
+                            first_seen=first_seen,
+                            event_id=evt_id,
+                            event=_stub_event(evt_id, case_id, first_seen),
+                            details=details,
+                        )
+                    )
+            if learned_any:
+                evaluated_fields += 1
+        if thin_values:
+            run_warnings.append(
+                f"{thin_values} value{'s' if thin_values != 1 else ''} skipped: fewer than "
+                f"{min_baseline} reference occurrences, or none in any bucket at least "
+                f"{min_bucket_count} times — too thin to learn a daily habit from."
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=reference_size,
+            evaluated_fields=evaluated_fields,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+        )
+
+    # ------------------------------------------------------------------
+    # Value correlation (D13)
+    # ------------------------------------------------------------------
+
+    @gated_heavy_scan
+    def find_value_correlations(
+        self,
+        case_id: str,
+        source_ids: list[str],
+        fields: list[str] | None = None,
+        limit: int = 50,
+        windows: AnalysisWindows | None = None,
+        fdr_q: float = 0.05,
+        min_ratio: float = 2.0,
+        rule_confidence: float = 0.95,
+        min_support: int = 20,
+        max_pairs: int = 20,
+        max_rows_per_pair: int = 5000,
+        auto_fields: int = 6,
+        exclude_event_ids: set[str] | None = None,
+        allowlist: set[tuple[str, str]] | None = None,
+        field_mappings: dict[str, list[str]] | None = None,
+        inventory: list[tuple[str, int, int]] | None = None,
+        inventory_total: int | None = None,
+        source_offsets: dict[str, int] | None = None,
+        field_overrides: dict[str, bool] | None = None,
+        self_slices: int = 24,
+    ) -> StatAnomalyResult:
+        """Return implication rules between two fields that break in a window.
+
+        AMiner ``VariableCorrelationDetector`` analog (D13), intra-record: for
+        a field pair ``(A, B)`` and an antecedent value ``x`` of ``A`` with at
+        least *min_support* reference events, the rule ``A = x ⇒ B = y`` holds
+        when ``y`` accounts for at least *rule_confidence* of those events.
+        Both directions are mined. A rule is **broken** in a window when the
+        share of ``x`` events whose ``B`` is not ``y`` rises: a 2×2 G-test of
+        conforming against violating events between the reference and the
+        window, one Benjamini–Hochberg pool per run, and an effect floor of
+        *min_ratio* on the violation-rate ratio. Only rises are reported — a
+        rule that appears in a window is a proportion shift, which owns it.
+
+        Two frames. *Baseline* (``method="rule-g-test"``): rules are mined from
+        the baseline window and each suspect window is tested against it.
+        *Self* (``method="self-rule-g-test"``, D18): rules are mined from the
+        whole scope and each of *self_slices* leave-one-out time slices is
+        tested against its complement — a slice of violations against every
+        other slice.
+
+        Pairs come from an explicit *fields* list (every pair among them) or
+        from the recommender's top *auto_fields* categorical fields, steered by
+        *field_overrides*; more than *max_pairs* pairs are truncated with a
+        warning. One ``GROUP BY a, b`` scan per pair, capped at
+        *max_rows_per_pair* highest-volume value pairs (cap → warning). Score
+        = the G statistic, like proportion shift. The allowlist key is the
+        combo one: ``(A,B)`` and ``x␟y`` joined with the combo separators, so
+        one Normal verdict covers the rule in both frames.
+        """
+        detector = "value_correlation"
+        if not 0.0 < rule_confidence <= 1.0:
+            raise ValueError("rule_confidence must be in (0, 1]")
+        if min_ratio <= 1.0:
+            raise ValueError("min_ratio must be greater than 1")
+        if fields is not None and len(fields) < 2:
+            raise ValueError("value_correlation requires at least two fields")
+        method = "rule-g-test" if windows is not None else "self-rule-g-test"
+        self.ch.init_schema()
+        db = self.ch.database
+        base_params: dict[str, Any] = {"cid": case_id, "src": source_ids}
+        eff = effective_ts_sql(source_offsets)
+
+        total_events = self._count_events(case_id, source_ids)
+        if total_events == 0:
+            return StatAnomalyResult(
+                status="no_data",
+                detector=detector,
+                method=method,
+                baseline_size=0,
+                windows=windows.payload() if windows is not None else None,
+            )
+
+        run_warnings: list[str] = []
+        slices: SelfSlices | None = None
+        slice_totals: list[int] = []
+        if windows is not None:
+            reference_size, suspect_totals = self._window_totals(
+                case_id, source_ids, windows, source_offsets
+            )
+            run_warnings += _window_size_warnings(windows, suspect_totals)
+            if reference_size == 0:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=0,
+                    warnings=[*run_warnings, "The baseline window contains no events."],
+                    windows=windows.payload(),
+                )
+            n_frames = len(windows.suspects)
+        else:
+            slices = self._self_slices(case_id, source_ids, self_slices, source_offsets)
+            if slices is None:
+                return StatAnomalyResult(
+                    status="insufficient_data",
+                    detector=detector,
+                    method=method,
+                    baseline_size=total_events,
+                    warnings=["The scope holds a single timestamp, so it cannot be sliced."],
+                )
+            slice_totals = self._slice_totals(case_id, source_ids, slices, source_offsets)
+            reference_size = sum(slice_totals)
+            run_warnings += self._small_slice_warning(slices, slice_totals)
+            n_frames = slices.k
+
+        # Pair selection.
+        if fields is not None:
+            pool = list(dict.fromkeys(fields))
+        else:
+            rec = self.recommend_novelty_fields(
+                case_id,
+                source_ids,
+                total=inventory_total if inventory is not None else total_events,
+                field_mappings=field_mappings,
+                inventory=inventory,
+            )
+            pool, override_notes = apply_field_overrides(
+                [f.token for f in rec if f.recommended], field_overrides, [f.token for f in rec]
+            )
+            run_warnings += override_notes
+            pool = pool[:auto_fields]
+        if len(pool) < 2:
+            return StatAnomalyResult(
+                status="insufficient_data",
+                detector=detector,
+                method=method,
+                baseline_size=reference_size,
+                warnings=[
+                    *run_warnings,
+                    "Fewer than two categorical fields to correlate — name two with `fields`.",
+                ],
+                windows=windows.payload() if windows is not None else None,
+                slices=slices.payload() if slices is not None else None,
+            )
+        pairs = [(pool[i], pool[j]) for i in range(len(pool)) for j in range(i + 1, len(pool))]
+        if len(pairs) > max_pairs:
+            run_warnings.append(
+                f"{len(pairs)} field pairs were eligible; only the first {max_pairs} were "
+                f"scanned (the pair cap). Name fewer fields to choose which."
+            )
+            pairs = pairs[:max_pairs]
+
+        # Phase 1: one scan per pair. Row layout: a, b, reference count (the
+        # baseline window's, or the scope total), then per frame
+        # (count, first_ts, first_evt).
+        # cand = (a_field, b_field, a, b, ref, [(cnt, first, evt) per frame])
+        cands: list[tuple[str, str, str, str, int, list[tuple[int, Any, Any]]]] = []
+        evaluated_pairs = 0
+        for a_field, b_field in pairs:
+            params: dict[str, Any] = {**base_params}
+            bind_offset_params(source_offsets, params)
+            a_expr = _col_expr(a_field, params, field_mappings, prefix="fk0")
+            b_expr = _col_expr(b_field, params, field_mappings, prefix="fk1")
+            params["cap"] = max_rows_per_pair
+            if windows is not None:
+                bp, sps = _window_preds(windows, params, source_offsets)
+                frame_blocks = ",\n                    ".join(
+                    f"countIf({sp}) AS f{i}_cnt,"
+                    f" minIf({eff}, {sp}) AS f{i}_first,"
+                    f" toString(argMinIf(event_id, {eff}, {sp})) AS f{i}_evt"
+                    for i, sp in enumerate(sps)
+                )
+                f_sum = " + ".join(f"f{i}_cnt" for i in range(n_frames))
+                sql = f"""
+                    SELECT
+                        {a_expr} AS a,
+                        {b_expr} AS b,
+                        countIf({bp}) AS ref,
+                        {frame_blocks}
+                    FROM {db}.events
+                    WHERE case_id = {{cid:String}}
+                      AND has({{src:Array(String)}}, source_id)
+                      AND {a_expr} != '' AND {b_expr} != ''
+                      AND {VESTIGO_NOT_SENTINEL_SQL}
+                      AND ({" OR ".join([bp, *sps])})
+                    GROUP BY a, b
+                    ORDER BY (ref + {f_sum}) DESC, a ASC, b ASC
+                    LIMIT {{cap:UInt32}}
+                    {heavy_scan_settings()}
+                """
+            elif slices is not None:
+                slice_expr = slices.index_sql(eff, params)
+                frame_blocks = ",\n                    ".join(
+                    f"countIf(slice = {i}) AS f{i}_cnt,"
+                    f" minIf(ts, slice = {i}) AS f{i}_first,"
+                    f" toString(argMinIf(event_id, ts, slice = {i})) AS f{i}_evt"
+                    for i in range(n_frames)
+                )
+                sql = f"""
+                    SELECT
+                        a,
+                        b,
+                        count() AS ref,
+                        {frame_blocks}
+                    FROM (
+                        SELECT {a_expr} AS a, {b_expr} AS b, {eff} AS ts, event_id,
+                               {slice_expr} AS slice
+                        FROM {db}.events
+                        WHERE case_id = {{cid:String}}
+                          AND has({{src:Array(String)}}, source_id)
+                          AND {a_expr} != '' AND {b_expr} != ''
+                          AND {VESTIGO_NOT_SENTINEL_SQL}
+                    )
+                    GROUP BY a, b
+                    ORDER BY ref DESC, a ASC, b ASC
+                    LIMIT {{cap:UInt32}}
+                    {heavy_scan_settings()}
+                """
+            rows = self.ch.client.query(sql, parameters=params).result_rows
+            if not rows:
+                continue
+            evaluated_pairs += 1
+            if len(rows) >= max_rows_per_pair:
+                run_warnings.append(
+                    f"Pair ({a_field}, {b_field}) hit the {max_rows_per_pair}-row candidate "
+                    f"cap — rules are mined over its {max_rows_per_pair} highest-volume value "
+                    f"pairs only; a rule whose antecedent lives in the tail is not tested."
+                )
+            for row in rows:
+                a, b = row[0], row[1]
+                if not a or not b:
+                    continue
+                per_frame = [
+                    (int(row[3 + i * 3]), row[4 + i * 3], row[5 + i * 3]) for i in range(n_frames)
+                ]
+                cands.append((a_field, b_field, str(a), str(b), int(row[2]), per_frame))
+
+        # Phase 2: mine rules in both directions and test each (rule, frame).
+        # tests: (rule, frame, g, p, n_x, v, n_ref, v_ref, top_violator, top_count, first_ts, evt)
+        tests: list[tuple[Any, ...]] = []
+        by_pair: dict[tuple[str, str], list[tuple[str, str, int, list[tuple[int, Any, Any]]]]] = (
+            defaultdict(list)
+        )
+        for a_field, b_field, a, b, ref, per_frame in cands:
+            by_pair[(a_field, b_field)].append((a, b, ref, per_frame))
+        for (a_field, b_field), rows in by_pair.items():
+            for ante_field, cons_field, oriented in (
+                (a_field, b_field, [(a, b, ref, pf) for a, b, ref, pf in rows]),
+                (b_field, a_field, [(b, a, ref, pf) for a, b, ref, pf in rows]),
+            ):
+                table: dict[str, dict[str, tuple[int, list[tuple[int, Any, Any]]]]] = defaultdict(
+                    dict
+                )
+                for x, y, ref, pf in oriented:
+                    table[x][y] = (ref, pf)
+                for x, outcomes in table.items():
+                    support = sum(ref for ref, _pf in outcomes.values())
+                    if support < min_support:
+                        continue
+                    y_star, (conforming, _pf) = max(
+                        outcomes.items(), key=lambda kv: (kv[1][0], kv[0])
+                    )
+                    confidence = conforming / support
+                    if confidence < rule_confidence:
+                        continue
+                    v_ref_total = support - conforming
+                    for fi in range(n_frames):
+                        n_x = sum(pf[fi][0] for _ref, pf in outcomes.values())
+                        if n_x <= 0:
+                            continue
+                        conf_f = outcomes[y_star][1][fi][0]
+                        v_f = n_x - conf_f
+                        if windows is not None:
+                            n_ref, v_ref = support, v_ref_total
+                        else:
+                            # Leave-one-out: the complement is every other slice.
+                            n_ref, v_ref = support - n_x, v_ref_total - v_f
+                            if n_ref <= 0:
+                                continue
+                        if v_f <= 0:
+                            continue
+                        violators = [
+                            (y, pf[fi])
+                            for y, (_ref, pf) in outcomes.items()
+                            if y != y_star and pf[fi][0] > 0
+                        ]
+                        top_y, (top_cnt, _t, _e) = max(violators, key=lambda kv: (kv[1][0], kv[0]))
+                        first_ts, evt = min(
+                            ((pf[1], pf[2]) for _y, pf in violators if pf[1] is not None),
+                            default=(None, None),
+                        )
+                        g = _g_statistic(v_ref, n_ref - v_ref, v_f, n_x - v_f)
+                        tests.append(
+                            (
+                                (ante_field, cons_field, x, y_star, support, confidence),
+                                fi,
+                                g,
+                                _chi2_sf_df1(g),
+                                n_x,
+                                v_f,
+                                n_ref,
+                                v_ref,
+                                top_y,
+                                top_cnt,
+                                first_ts,
+                                evt,
+                            )
+                        )
+        qvals = _bh_qvalues([t[3] for t in tests])
+        m_tests = len(tests)
+
+        # Phase 3: FDR + effect floor, build findings.
+        findings: list[CorrelationFinding] = []
+        for test, q in zip(tests, qvals, strict=True):
+            (rule, fi, g, p, n_x, v_f, n_ref, v_ref, top_y, top_cnt, first_ts, evt) = test
+            if q > fdr_q:
+                continue
+            ante_field, cons_field, x, y_star, support, confidence = rule
+            rate_f = v_f / n_x
+            rate_ref = v_ref / n_ref if v_ref > 0 else 0.5 / n_ref
+            ratio = rate_f / rate_ref
+            if ratio < min_ratio:
+                continue
+            first_seen = _present_ts(first_ts)
+            evt_id = str(evt) if evt else None
+            details: dict[str, Any] = {
+                "detector": detector,
+                "method": method,
+                "fields": [ante_field, cons_field],
+                "values": [x, y_star],
+                "value": f"{x} ⇒ {y_star}",
+                "antecedent_field": ante_field,
+                "antecedent_value": x,
+                "consequent_field": cons_field,
+                "consequent_value": y_star,
+                "confidence": round(confidence, 4),
+                "support": support,
+                "count": n_x,
+                "violations": v_f,
+                "violation_rate": round(rate_f, 6),
+                "reference_count": n_ref,
+                "reference_violations": v_ref,
+                "reference_violation_rate": round(v_ref / n_ref, 6),
+                "rate_ratio": round(ratio, 4),
+                "top_violator": top_y,
+                "top_violator_count": top_cnt,
+                "g_statistic": round(g, 4),
+                "p_value": round(p, 6),
+                "q_value": round(q, 6),
+                "m_tests": m_tests,
+                "q_threshold": fdr_q,
+                "min_ratio": min_ratio,
+                "rule_confidence": rule_confidence,
+                "min_support": min_support,
+                "first_seen": first_seen,
+                "allowlist_field": COMBO_FIELD_SEP.join([ante_field, cons_field]),
+                "allowlist_value": COMBO_VALUE_SEP.join([x, y_star]),
+            }
+            if windows is not None:
+                window = windows.suspects[fi]
+                details.update(
+                    {
+                        "baseline_size": reference_size,
+                        "window_label": window.label,
+                        "window_start": ensure_utc(window.start).isoformat(),
+                        "window_end": ensure_utc(window.end).isoformat(),
+                    }
+                )
+            elif slices is not None:
+                details.update(self._slice_details(slices, fi))
+                details["rest_slices"] = slices.k - 1
+            findings.append(
+                CorrelationFinding(
+                    fields=[ante_field, cons_field],
+                    values=[x, y_star],
+                    value=f"{x} ⇒ {y_star}",
+                    confidence=round(confidence, 4),
+                    support=support,
+                    count=n_x,
+                    violations=v_f,
+                    baseline_count=n_ref,
+                    baseline_violations=v_ref,
+                    violation_rate=round(rate_f, 6),
+                    baseline_violation_rate=round(v_ref / n_ref, 6),
+                    rate_ratio=round(ratio, 4),
+                    top_violator=top_y,
+                    top_violator_count=top_cnt,
+                    g_statistic=round(g, 4),
+                    p_value=round(p, 6),
+                    q_value=round(q, 6),
+                    score=round(g, 4),
+                    first_seen=first_seen,
+                    event_id=evt_id,
+                    event=_stub_event(evt_id, case_id, first_seen),
+                    details=details,
+                )
+            )
+        return self._finalize_findings(
+            findings,
+            detector=detector,
+            method=method,
+            total_events=reference_size,
+            evaluated_fields=evaluated_pairs,
+            exclude_event_ids=exclude_event_ids,
+            limit=limit,
+            case_id=case_id,
+            source_ids=source_ids,
+            allowlist=allowlist,
+            warnings=run_warnings,
+            windows=windows,
+            slices=slices,
         )
 
     @gated_heavy_scan

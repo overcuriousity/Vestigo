@@ -21,9 +21,12 @@
  */
 import {
   Activity,
+  Clock,
   FileText,
+  Gauge,
   Hash,
   Layers,
+  Link2,
   ListOrdered,
   Percent,
   Replace,
@@ -46,6 +49,9 @@ export type MethodId =
   | "interval_periodicity"
   | "timestamp_order"
   | "sequence_novelty"
+  | "transition_time"
+  | "time_of_day"
+  | "value_correlation"
   | "log_template";
 
 export type EvidenceClass = "named" | "statistical" | "exploration";
@@ -96,6 +102,11 @@ export interface MethodKnob {
   placeholder: string;
   /** `kind: "choice"` only — the options, first one the default. */
   options?: { value: string; label: string }[];
+  /**
+   * `kind: "choice"` only — the option values are numbers, sent as such. The
+   * API's int `Literal` for them refuses the string a `<select>` yields.
+   */
+  numeric?: boolean;
   /** `kind: "fields"` only. */
   picker?: FieldPickerConfig;
   /** `kind: "field"` only — the standard (non-attribute) choices, in order. */
@@ -110,7 +121,7 @@ export interface MethodMeta {
   hint: string;
   /**
    * When to configure it, in one sentence for the wizard's card. Starts with
-   * "Use this when" — a test enforces it — so the twelve cards read as one list.
+   * "Use this when" — a test enforces it — so the fifteen cards read as one list.
    */
   useWhen: string;
   icon: React.ElementType;
@@ -224,6 +235,26 @@ export const METHODS: MethodMeta[] = [
     querySketch: `SELECT <field_a>, <field_b>, count() AS n\nFROM events\nWHERE case_id = {case} AND source_id IN {sources}\nGROUP BY 1, 2\nORDER BY n ASC\nLIMIT {limit}\n-- score = -log(n / total)`,
     // Two to four fields, of which auto combines the top two.
     knobs: [fieldsKnob({ minSelected: 2, maxSelected: 4, autoCount: 2, autoLabel: "top 2" })],
+  },
+  {
+    id: "value_correlation",
+    label: "Value correlation",
+    hint: "Field-to-field rules that break",
+    useWhen:
+      "Use this when one field normally decides another — an account always on its own host, a status that follows an action — and you want the moment that stopped being true.",
+    icon: Link2,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "G",
+    what: "Mines implication rules between two fields within the same event — for an antecedent value with enough reference events, the consequent value it carries at least 95% of the time, in both directions — and reports a window in which the rule's violation rate rose: a G-test of conforming against violating events, one false-discovery pool per run, an effect floor on the rate ratio. With a baseline the rules come from the baseline window; without one from the whole timeline, each slice tested against the rest. A rule that appears is a proportion shift; this reports rules that break.",
+    querySketch: `SELECT <field_a> AS a, <field_b> AS b,\n       countIf(<in reference>) AS ref_n,\n       countIf(<in window>) AS win_n\nFROM events\nWHERE case_id = {case}\nGROUP BY a, b\n-- rule a=x => b=y when y holds >= {rule_confidence} of x's reference events (support >= {min_support})\n-- G-test of conforming vs violating events, reference vs window; Benjamini-Hochberg across the run`,
+    knobs: [
+      fieldsKnob({ minSelected: 2, autoCount: 6, autoLabel: "top 6, all pairs" }),
+      FDR_KNOB,
+      RATIO_KNOB,
+      { param: "rule_confidence", label: "Rule confidence", kind: "number", placeholder: "0.95" },
+      { param: "min_support", label: "Min support", kind: "number", placeholder: "20" },
+    ],
   },
   {
     id: "numeric_range",
@@ -353,6 +384,38 @@ export const METHODS: MethodMeta[] = [
     knobs: [SERIES_KNOB, FDR_KNOB, RATIO_KNOB],
   },
   {
+    id: "time_of_day",
+    label: "Time-of-day habit",
+    hint: "Values at an hour they never keep",
+    useWhen:
+      "Use this when a value keeps office hours or a nightly slot and showing up at another hour would matter — a job that moved, an account active at 03:00.",
+    icon: Clock,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "h off habit",
+    what: "Cuts the day into wall-clock buckets in the zone you name and learns, per value, which buckets it habitually occurs in. An occurrence in any other bucket is reported, scored by how many hours it sits from the nearest habitual bucket, around the clock. With a baseline the habit is the baseline window's; without one it is the value's own busy buckets across the timeline, and its thin buckets are judged against them. Cadence measures the gap between arrivals; this measures the hour on the wall.",
+    querySketch: `SELECT <field> AS value,\n       intDiv(toHour(<effective_ts>, '<timezone>') * 60 + toMinute(<effective_ts>, '<timezone>'), {bucket_minutes}) AS bucket,\n       count() AS n\nFROM events\nWHERE case_id = {case}\nGROUP BY value, bucket\n-- habit = buckets with n >= {min_bucket_count} in the reference\n-- reported when an occurrence falls outside it; score = hours to the nearest habitual bucket`,
+    knobs: [
+      FIELDS_KNOB,
+      {
+        param: "bucket_minutes",
+        label: "Bucket",
+        kind: "choice",
+        numeric: true,
+        placeholder: "60",
+        options: [
+          { value: "60", label: "1 hour" },
+          { value: "15", label: "15 minutes" },
+          { value: "30", label: "30 minutes" },
+          { value: "120", label: "2 hours" },
+          { value: "180", label: "3 hours" },
+          { value: "240", label: "4 hours" },
+        ],
+      },
+      { param: "timezone", label: "Zone", kind: "text", placeholder: "UTC" },
+    ],
+  },
+  {
     id: "timestamp_order",
     label: "Timestamp order",
     hint: "Timestamps running backwards",
@@ -382,6 +445,33 @@ export const METHODS: MethodMeta[] = [
       SERIES_KNOB,
       { param: "ngram_size", label: "n", kind: "number", placeholder: "3" },
       { param: "max_gap_seconds", label: "Max gap", kind: "number", placeholder: "300" },
+    ],
+  },
+  {
+    id: "transition_time",
+    label: "Transition speed",
+    hint: "Value-to-value moves faster than ever seen",
+    useWhen:
+      "Use this when one actor should not be able to reach the next value that fast — an account on two hosts seconds apart, a session skipping states. Pick the stream field.",
+    icon: Gauge,
+    evidenceClass: "statistical",
+    costClass: "heavy",
+    scoreUnit: "1 − obs/ref",
+    what: "Times each step between consecutive different values of the series field within one stream (per source, and per value of the stream field when set), learns the fastest each ordered pair was ever reached, and reports a transition that undercuts that floor by the speed-up factor. With a baseline the floor is the baseline window's fastest transition of the pair; without one it is the pair's next-fastest transition anywhere on the timeline, so a single outlier is judged against everything else that pair ever did.",
+    querySketch: `SELECT [prev, val] AS pair, min(dur) AS fastest FROM (\n  SELECT <series_field> AS val,\n         lagInFrame(val) OVER w AS prev,\n         dateDiff('millisecond', lagInFrame(<effective_ts>) OVER w, <effective_ts>) AS dur\n  FROM events WHERE case_id = {case}\n  WINDOW w AS (PARTITION BY source_id, <partition_field> ORDER BY <effective_ts>)\n) WHERE prev != val\nGROUP BY pair\n-- baseline: reported when fastest < baseline min(dur) / {min_ratio}\n-- self: reported when fastest < the pair's next-fastest dur / {min_ratio}`,
+    knobs: [
+      SERIES_KNOB,
+      {
+        param: "partition_field",
+        label: "Stream",
+        kind: "field",
+        placeholder: "(per source)",
+        // Which identifier's moves are timed. Without it every source is one
+        // stream, and two users' interleaved logons read as one actor moving.
+        fieldOptions: SERIES_FIELD_OPTIONS,
+        noneLabel: "Per source",
+      },
+      RATIO_KNOB,
     ],
   },
   {
