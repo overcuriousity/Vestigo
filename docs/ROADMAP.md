@@ -12,11 +12,11 @@ from that day. **Milestone 10 — AI agent log investigation — is the 2.0 thru
 everything below**; the numbered list orders the remaining 1.x work by payoff-per-effort:
 
 1. **A12** local transform tools — no design round, no OPSEC gate.
-2. **D12** / **D13** / **D15** — cheap detectors reusing existing SQL machinery.
-3. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
-4. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
-5. **D10** / **D16** — heaviest lifts, last of the detector line.
-6. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
+2. **W8** query-time field extraction — makes bespoke unstructured logs first-class.
+3. **A8** external MCP toolsets — needs its own design round (policy, not plumbing).
+4. **D10** / **D16** — heaviest lifts, last of the detector line (the cheap three, D15, D12
+   and D13, shipped in 1.20).
+5. **Milestone 11** external processors — P1 (the protocol doc) gates the rest; the
    Hayabusa engine half lives in `overcuriousity/hayabusa-processor`.
 
 Milestones 2–3 are polish, picked up opportunistically. Milestone 9 is additive work on
@@ -141,30 +141,12 @@ burns its numbers out of that file**; the migration is done when the file is `{}
 
 Detectors adapted from [ait-aecid/logdata-anomaly-miner](https://github.com/ait-aecid/logdata-anomaly-miner),
 constrained to be **field-agnostic** and SQL-explainable per the forensic-reproducibility
-requirement. D1–D9, `proportion_shift` and `sequence_motif` shipped — `ANOMALY_DETECTION.md`
+requirement. D1–D9, D12, D13, D15, `proportion_shift` and `sequence_motif` shipped — `ANOMALY_DETECTION.md`
 is each detector's contract, updated in the same commit as any detector change.
 
 Every item below is incomplete until the frontend half lands with it: a plain-language
 method explanation, the SQL/params visible on the finding, disposition + allowlist wiring.
 A detector whose reasoning an analyst cannot read does not count as shipped.
-
-**Low effort, high value:**
-
-- [ ] **D12 — Time-of-day habit** (`PathValueTimeIntervalDetector`): per value, learn which
-  times of day it occurs at in the baseline, flag suspect-window occurrences outside that
-  habit. Distinct from `interval_periodicity`, which measures inter-arrival gaps. Bucket by
-  `toHour`/`toMinute`, score by distance to the nearest occupied bucket. Needs an explicit
-  **timezone** decision stamped into `DetectorRun.params`, or the run is not reproducible.
-- [ ] **D13 — Cross-field value correlation** (`VariableCorrelationDetector`): learn which
-  field-value pairs co-occur *within the same event*, flag violations. Intra-record, unlike
-  D10. Reuses `GROUP BY a, b` plus the G-test and Benjamini–Hochberg pool that
-  `proportion_shift` has. Field-pair explosion is the design problem: needs a preselection
-  rule and a candidate cap in the `HEAVY_SCAN_SETTINGS` family, honestly reported.
-- [ ] **D15 — Impossible-speed transitions** (`MinimalTransitionTimeDetector`): learn the
-  minimum observed time between consecutive values of a field per identifier, flag a
-  suspect-window transition faster than the baseline ever saw. `find_sequence_novelty`'s
-  `lagInFrame` partitions already produce the pairs; this is a `min(dateDiff)` over the
-  same shape. Score = `1 − (observed / learned_min)`.
 
 **High effort, high value:**
 

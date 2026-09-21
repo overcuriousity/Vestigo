@@ -114,6 +114,9 @@ def test_unknown_method_is_rejected(client, admin_bootstrap):
         ("frequency", {"z_threshold": -1}),  # gt=0
         ("sequence_novelty", {"ngram_size": 9}),  # le=5
         ("log_template", {"order": "sideways"}),  # not in the Literal
+        ("time_of_day", {"bucket_minutes": 7}),  # does not divide the day
+        ("value_correlation", {"rule_confidence": 1.5}),  # le=1
+        ("transition_time", {"min_ratio": 1.0}),  # gt=1
     ],
 )
 def test_params_the_findings_endpoint_rejects_are_not_storable(

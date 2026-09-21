@@ -27,6 +27,8 @@ from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from vestigo.core.time_of_day import validate_bucket_minutes, validate_timezone
+
 
 class Settings(BaseSettings):
     """Vestigo settings."""
@@ -185,6 +187,59 @@ class Settings(BaseSettings):
     # occurrences, not value occurrences — the charset floor is separate for
     # the same reason.
     stat_sequence_rarity_floor: int = Field(default=3, ge=1)
+    # Transition-time detector (D15): a suspect transition must undercut the
+    # pair's learned floor by at least this factor to be reported — a floor
+    # learned from a handful of transitions is not precise to the second.
+    stat_transition_min_ratio: float = Field(default=2.0, gt=1)
+    # A pair's floor is learned from at least this many transitions (baseline
+    # window, or the whole scope in the self frame); fewer and the pair is
+    # skipped rather than scored against one or two observations.
+    stat_transition_min_transitions: int = Field(default=3, ge=2)
+    # Cap on candidate pairs fetched per source, fastest first; hitting it
+    # carries a warning.
+    stat_transition_max_candidates: int = 2000
+    # Time-of-day habit detector (D12): the day is cut into buckets this many
+    # minutes wide (15, 30, 60, 120, 180 or 240 — each divides the day) in
+    # stat_habit_timezone, an IANA zone stamped into every run. UTC by default
+    # because that is the only zone every source agrees on; set the site's
+    # zone here once so "03:40" means what the analyst reads on the wall.
+    stat_habit_bucket_minutes: int = Field(default=60, ge=15, le=240)
+    stat_habit_timezone: str = "UTC"
+
+    @field_validator("stat_habit_bucket_minutes")
+    @classmethod
+    def _habit_bucket_divides_the_day(cls, value: int) -> int:
+        """Refuse a width the detector refuses (45 is in range but not a divisor of the day)."""
+        return validate_bucket_minutes(value)
+
+    @field_validator("stat_habit_timezone")
+    @classmethod
+    def _habit_timezone_is_a_zone(cls, value: str) -> str:
+        """Refuse a zone the detector refuses, at set-time rather than on every run."""
+        return validate_timezone(value)
+
+    # A value needs at least this many reference occurrences to have a habit,
+    # and a bucket needs at least this many of them to be habitual.
+    stat_habit_min_baseline: int = Field(default=20, ge=2)
+    stat_habit_min_bucket_count: int = Field(default=3, ge=1)
+    # Per-field cap on candidate values (highest volume first). Lower than the
+    # other per-field caps because each value returns one row per occupied
+    # bucket and window.
+    stat_habit_max_candidates_per_field: int = 500
+    # Value-correlation detector (D13): an antecedent value needs this many
+    # reference events, and one consequent value must account for at least
+    # this share of them, before "A = x ⇒ B = y" counts as a rule.
+    stat_correlation_min_support: int = Field(default=20, ge=2)
+    stat_correlation_rule_confidence: float = Field(default=0.95, gt=0, le=1)
+    # BH false-discovery ceiling and the violation-rate ratio floor for a
+    # broken rule — same meaning as the proportion-shift pair.
+    stat_correlation_fdr_q: float = Field(default=0.05, gt=0, le=1)
+    stat_correlation_min_ratio: float = Field(default=2.0, gt=1)
+    # How many recommended fields auto mode pairs up (6 → 15 pairs), the cap
+    # on pairs scanned per run, and the per-pair cap on (a, b) value rows.
+    stat_correlation_auto_fields: int = Field(default=6, ge=2)
+    stat_correlation_max_pairs: int = Field(default=20, ge=1)
+    stat_correlation_max_rows_per_pair: int = 5000
     # ── Self frame for the slice-based detectors (D18) ──────────────────────
     # How many equal-width time slices proportion_shift and
     # value_distribution_drift cut the scope into when no baseline is declared;

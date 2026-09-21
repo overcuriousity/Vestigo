@@ -6501,3 +6501,931 @@ def test_gamma_from_median_recovers_the_median():
         else:
             hi = mid
     assert abs(lo * theta - median) / median < 0.01
+
+
+# ---------------------------------------------------------------------------
+# transition_time — detector (D15)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then per source one
+# suspect-candidate scan (Query A) and, when candidates exist, one baseline
+# learn scan (Query B). Query A row layout: gram ([from, to]), w_idx,
+# fastest_ms, evt, at, pval, n. Query B row layout: gram, min_ms, n.
+# Self frame: count, then per source one scan whose rows are gram,
+# two_fastest_ms ([m1, m2]), evt, at, pval, n.
+
+_TRANS_CAND_COLS = ["gram", "w_idx", "fastest_ms", "evt", "at", "pval", "n"]
+_TRANS_LEARN_COLS = ["gram", "min_ms", "n"]
+_TRANS_SELF_COLS = ["gram", "two_fastest_ms", "evt", "at", "pval", "n"]
+
+
+def _trans_responses(
+    total: int,
+    window_totals: tuple[int, int],
+    cand_rows: list[tuple],
+    learn_rows: list[tuple] | None,
+) -> list[FakeQueryResult]:
+    out = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(result_rows=cand_rows, column_names=_TRANS_CAND_COLS),
+    ]
+    if learn_rows is not None:
+        out.append(FakeQueryResult(result_rows=learn_rows, column_names=_TRANS_LEARN_COLS))
+    return out
+
+
+def test_transition_min_ratio_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="min_ratio"):
+        svc.find_transition_times("c1", ["s1"], min_ratio=1.0, windows=_seq_windows())
+    assert svc.ch.client._calls == []
+
+
+def test_transition_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "no_data"
+    assert result.detector == "transition_time"
+    assert result.windows is not None
+
+
+def test_transition_baseline_flags_a_transition_faster_than_the_learned_floor():
+    at = datetime(2024, 1, 17, 12, 0, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            # JUMP-01 → FILE-01 in 3 s during the incident; 4 such transitions.
+            cand_rows=[(["JUMP-01", "FILE-01"], 0, 3_000, "evt-1", at, "m.okonkwo", 4)],
+            # The baseline never saw it faster than 41 minutes, over 12 transitions.
+            learn_rows=[(["JUMP-01", "FILE-01"], 2_460_000, 12)],
+        )
+    )
+    result = svc.find_transition_times(
+        "c1",
+        ["s1"],
+        series_field="attr:computer_name",
+        partition_field="attr:user",
+        windows=_seq_windows(),
+    )
+    assert result.status == "ok"
+    assert result.method == "min-transition"
+    assert result.baseline_size == 8000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.field == "attr:computer_name"
+    assert r.values == ["JUMP-01", "FILE-01"]
+    assert r.value == "JUMP-01 → FILE-01"
+    assert r.partition_field == "attr:user"
+    assert r.partition_value == "m.okonkwo"
+    assert r.observed_seconds == 3.0
+    assert r.reference_seconds == 2460.0
+    assert r.reference_kind == "baseline-min"
+    assert r.count == 4
+    assert r.baseline_count == 12
+    assert abs(r.score - (1 - 3 / 2460)) < 1e-5
+    assert abs(r.speedup - 820.0) < 1e-9
+    assert r.event_id == "evt-1"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T12:00")
+    assert r.details["window_label"] == "incident"
+    assert r.details["min_ratio"] == 2.0
+    assert r.details["min_transitions"] == 3
+    assert r.details["allowlist_field"] == "attr:computer_name"
+    assert r.details["allowlist_value"] == "JUMP-01 → FILE-01"
+    # Both scans ran once for the single source: count, totals, A, B.
+    assert len(svc.ch.client._calls) == 4
+    # The learn scan is bound to the candidate pairs.
+    assert svc.ch.client._all_parameters[3]["cands"] == [["JUMP-01", "FILE-01"]]
+
+
+def test_transition_baseline_effect_floor_and_learning_floor():
+    """A transition merely faster than the floor is not flagged; neither is one
+    whose pair the baseline saw too few times, nor one whose learned floor is
+    zero (second-resolution logs make zero-length transitions routine)."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[
+                # 1.5x faster than the learned floor — under min_ratio 2.
+                (["a", "b"], 0, 20_000, "e1", at, "", 5),
+                # 100x faster, but the baseline holds only 2 transitions.
+                (["b", "c"], 0, 100, "e2", at, "", 5),
+                # Learned floor is 0 — nothing can be faster than instant.
+                (["c", "d"], 0, 0, "e3", at, "", 5),
+                # 10x faster over a well-learned pair: the one finding.
+                (["d", "e"], 0, 1_000, "e4", at, "", 2),
+            ],
+            learn_rows=[
+                (["a", "b"], 30_000, 40),
+                (["b", "c"], 10_000, 2),
+                (["c", "d"], 0, 40),
+                (["d", "e"], 10_000, 40),
+            ],
+        )
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results] == ["d → e"]
+    assert result.results[0].partition_field is None
+    assert result.results[0].partition_value is None
+    assert any("zero" in w for w in result.warnings)
+
+
+def test_transition_baseline_without_learned_pairs_is_insufficient():
+    """No candidate pair has a baseline floor: nothing to compare against."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[(["x", "y"], 0, 100, "e1", at, "", 3)],
+            learn_rows=[],
+        )
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "insufficient_data"
+    assert any("baseline" in w for w in result.warnings)
+
+
+def test_transition_baseline_multi_source_merges_floor_and_fastest():
+    """Per-source scans: the learned floor is the minimum over every source's
+    baseline, counts are summed, and the fastest suspect transition across
+    sources supplies the representative event."""
+    at_fast = datetime(2024, 1, 16, 8, 0, tzinfo=UTC)
+    at_slow = datetime(2024, 1, 17, 8, 0, tzinfo=UTC)
+    responses = [
+        FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[(8000, 2000)], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(
+            result_rows=[(["a", "b"], 0, 5_000, "e-s1", at_slow, "", 2)],
+            column_names=_TRANS_CAND_COLS,
+        ),
+        FakeQueryResult(
+            result_rows=[(["a", "b"], 0, 2_000, "e-s2", at_fast, "", 3)],
+            column_names=_TRANS_CAND_COLS,
+        ),
+        FakeQueryResult(result_rows=[(["a", "b"], 60_000, 4)], column_names=_TRANS_LEARN_COLS),
+        FakeQueryResult(result_rows=[(["a", "b"], 30_000, 6)], column_names=_TRANS_LEARN_COLS),
+    ]
+    svc = _svc(responses)
+    result = svc.find_transition_times("c1", ["s1", "s2"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.observed_seconds == 2.0
+    assert r.reference_seconds == 30.0
+    assert r.count == 5
+    assert r.baseline_count == 10
+    assert r.event_id == "e-s2"
+    assert len(svc.ch.client._calls) == 6
+    for p in svc.ch.client._all_parameters[2:]:
+        assert p["src"] in (["s1"], ["s2"])
+
+
+def test_transition_sql_shape_and_partition_field():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _trans_responses(
+            total=10_000,
+            window_totals=(8000, 2000),
+            cand_rows=[(["a", "b"], 0, 1_000, "e1", at, "u1", 3)],
+            learn_rows=[(["a", "b"], 10_000, 9)],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_transition_times(
+        "c1",
+        ["s1"],
+        series_field="attr:computer_name",
+        partition_field="attr:user",
+        windows=_seq_windows(),
+    )
+    assert result.status == "ok"
+    cand_sql, learn_sql = client.full_queries[2], client.full_queries[3]
+    for sql in (cand_sql, learn_sql):
+        # A transition is one step of the shared n-gram assembly, per stream.
+        assert "PARTITION BY source_id, w_idx, pkey" in sql
+        assert "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW" in sql
+        assert "guard IS NOT NULL" in sql
+        # Same-value repeats are not transitions.
+        assert "gram[1] != gram[2]" in sql
+        assert "dateDiff('millisecond', first_ts, ets)" in sql
+    assert "w_idx >= 0" in cand_sql
+    assert "w_idx = -1" in learn_sql
+    assert "has({cands:Array(Array(String))}, gram)" in learn_sql
+    params = client._all_parameters[2]
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-16 00:00:00.000"
+    # Both fields are bound as attribute keys, never inlined.
+    assert "attributes[{fk:String}]" in cand_sql
+    assert "attributes[{pk:String}]" in cand_sql
+    assert params["fk"] == "computer_name"
+    assert params["pk"] == "user"
+
+
+def test_transition_self_frame_uses_the_next_fastest_transition():
+    """Without a baseline the reference is leave-one-out: the pair's second
+    fastest transition anywhere in the scope."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[
+                    # 2 s against a next-fastest of 600 s: flagged.
+                    (["JUMP-01", "FILE-01"], [2_000, 600_000], "e1", at, "m.okonkwo", 7),
+                    # Two equally fast transitions: leave-one-out floor equals
+                    # the observation, nothing is faster than its own twin.
+                    (["a", "b"], [1_000, 1_000], "e2", at, "", 9),
+                    # Below the transition floor of 3.
+                    (["b", "c"], [1, 900_000], "e3", at, "", 2),
+                    # 1.5x — under min_ratio.
+                    (["c", "d"], [4_000, 6_000], "e4", at, "", 30),
+                ],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times(
+        "c1", ["s1"], series_field="attr:computer_name", partition_field="attr:user"
+    )
+    assert result.status == "ok"
+    assert result.method == "self-min-transition"
+    assert result.windows is None
+    assert [r.value for r in result.results] == ["JUMP-01 → FILE-01"]
+    r = result.results[0]
+    assert r.observed_seconds == 2.0
+    assert r.reference_seconds == 600.0
+    assert r.reference_kind == "next-fastest"
+    assert r.count == 7
+    assert r.baseline_count == 7
+    assert r.partition_value == "m.okonkwo"
+    assert abs(r.score - (1 - 2 / 600)) < 1e-5
+    assert r.details["scope_transitions"] == 7
+    assert "window_label" not in r.details
+    assert len(svc.ch.client._calls) == 2
+
+
+def test_transition_self_frame_multi_source_takes_the_two_fastest_overall():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [50_000, 70_000], "e-s1", at, "", 4)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1_000, 90_000], "e-s2", at, "", 3)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1", "s2"])
+    assert result.status == "ok"
+    r = result.results[0]
+    # Next-fastest is s1's 50 s, not s2's own 90 s.
+    assert r.observed_seconds == 1.0
+    assert r.reference_seconds == 50.0
+    assert r.count == 7
+    assert r.event_id == "e-s2"
+
+
+def test_transition_self_frame_candidate_cap_warns():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [([f"h{i}", f"h{i + 1}"], [1_000, 90_000], f"e{i}", at, "", 5) for i in range(3)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=rows, column_names=_TRANS_SELF_COLS),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], max_candidates=3)
+    assert result.status == "ok"
+    assert any("candidate cap" in w for w in result.warnings)
+    assert svc.ch.client._all_parameters[1]["cap"] == 3
+
+
+def test_transition_allowlist_suppresses_the_pair_in_both_frames():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1_000, 90_000], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], allowlist={("artifact", "a → b")})
+    assert result.status == "ok"
+    assert result.results == []
+    assert result.total_findings == 0
+
+
+def test_transition_zero_gap_in_whole_second_timestamps_is_bounded_at_a_second():
+    """0 s between two whole-second timestamps means "under a second", not
+    instant: it is judged and scored as the one second it may have taken, so
+    it cannot undercut a floor that one second does not, and the pairs held
+    back are disclosed. The resolution probe runs once per source."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            *_trans_responses(
+                total=10_000,
+                window_totals=(8000, 2000),
+                cand_rows=[
+                    # 0 s against a 1.5 s floor: up to 1 s is not 2x faster.
+                    (["a", "b"], 0, 0, "e1", at, "", 5),
+                    # 0 s against a 60 s floor: faster even at its bound.
+                    (["c", "d"], 0, 0, "e2", at, "", 5),
+                ],
+                learn_rows=[(["a", "b"], 1_500, 40), (["c", "d"], 60_000, 40)],
+            ),
+            # Resolution probe: no timestamp with a sub-second part.
+            FakeQueryResult(result_rows=[], column_names=["1"]),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results] == ["c → d"]
+    r = result.results[0]
+    assert r.observed_seconds == 0.0
+    assert abs(r.score - (1 - 1 / 60)) < 1e-5
+    assert r.speedup == 60.0
+    assert r.details["timestamp_resolution"] == "second"
+    assert r.details["observed_upper_bound_seconds"] == 1.0
+    assert any("whole seconds" in w and "1 pair " in w for w in result.warnings)
+    # One probe for the source, though two of its candidates were zero-length.
+    assert len(svc.ch.client._calls) == 5
+    assert svc.ch.client._all_parameters[-1]["sid"] == "s1"
+
+
+def test_transition_zero_gap_in_subsecond_timestamps_is_instant():
+    """A source that records milliseconds makes a 0 ms gap genuinely instant."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [0, 1_500], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+            FakeQueryResult(result_rows=[(1,)], column_names=["1"]),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"])
+    assert result.status == "ok"
+    r = result.results[0]
+    assert r.score == 1.0
+    assert r.speedup is None
+    assert r.details["timestamp_resolution"] == "sub-second"
+    assert r.details["observed_upper_bound_seconds"] is None
+    assert not any("whole seconds" in w for w in result.warnings)
+
+
+def test_transition_nonzero_gap_never_probes_resolution():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1, 1_500], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"])
+    assert len(result.results) == 1
+    assert "timestamp_resolution" not in result.results[0].details
+    assert len(svc.ch.client._calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# time_of_day — detector (D12)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then one occupancy scan
+# per field. Occupancy row layout: val, bucket, w_idx, cnt, first_ts,
+# first_evt — one row per (value, time-of-day bucket, window), baseline rows
+# under w_idx = -1. Self frame: count, then one scan per field with every row
+# under w_idx = 0.
+
+_HABIT_COLS = ["val", "bucket", "w_idx", "cnt", "first_ts", "first_evt"]
+
+
+def _habit_responses(
+    total: int, window_totals: tuple[int, int], rows: list[tuple]
+) -> list[FakeQueryResult]:
+    return [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+        FakeQueryResult(result_rows=rows, column_names=_HABIT_COLS),
+    ]
+
+
+def _habit_baseline_rows(val: str, buckets: dict[int, int]) -> list[tuple]:
+    return [(val, b, -1, n, None, None) for b, n in buckets.items()]
+
+
+def test_habit_parameter_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="bucket_minutes"):
+        svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"], bucket_minutes=7)
+    with pytest.raises(ValueError, match="timezone"):
+        svc.find_time_of_day_habits(
+            "c1", ["s1"], fields=["attr:program"], timezone="Mars/Olympus_Mons"
+        )
+    with pytest.raises(ValueError, match="timezone"):
+        svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"], timezone="UTC'; --")
+    assert svc.ch.client._calls == []
+
+
+def test_habit_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "no_data"
+    assert result.detector == "time_of_day"
+
+
+def test_habit_baseline_flags_an_occurrence_outside_the_learned_hours():
+    at = datetime(2024, 1, 17, 3, 41, tzinfo=UTC)
+    rows = [
+        # The nightly backup: 48 baseline runs, all in the 02:00 bucket.
+        *_habit_baseline_rows("backup", {2: 48}),
+        # Suspect window: eight runs at 03:xx and two at 04:xx.
+        ("backup", 3, 0, 8, at, "evt-3"),
+        ("backup", 4, 0, 2, at + timedelta(hours=1), "evt-4"),
+        # Still at 02:xx in the suspect window — inside the habit, no finding.
+        ("backup", 2, 0, 2, at, "evt-2"),
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "ok"
+    assert result.method == "habit"
+    assert result.baseline_size == 8000
+    by_bucket = {r.bucket: r for r in result.results}
+    assert sorted(by_bucket) == [3, 4]
+    r = by_bucket[4]
+    assert r.field == "attr:program"
+    assert r.value == "backup"
+    assert r.count == 2
+    assert r.baseline_count == 48
+    assert r.bucket_minutes == 60
+    assert r.timezone == "UTC"
+    assert r.bucket_label == "04:00–05:00"
+    assert r.habit_buckets == [2]
+    assert r.nearest_habit_label == "02:00–03:00"
+    assert r.distance_hours == 2.0
+    assert r.score == 2.0
+    assert r.event_id == "evt-4"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T04:41")
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "attr:program"
+    assert r.details["allowlist_value"] == "backup"
+    # Ranked farthest-from-habit first.
+    assert [f.bucket for f in result.results] == [4, 3]
+    assert by_bucket[3].distance_hours == 1.0
+    assert len(svc.ch.client._calls) == 3
+
+
+def test_habit_distance_is_circular_and_buckets_follow_the_resolution():
+    """23:xx is one hour from a 00:xx habit, not twenty-three; and a 30-minute
+    resolution labels half-hour buckets and measures in half hours."""
+    at = datetime(2024, 1, 17, 23, 10, tzinfo=UTC)
+    rows = [
+        *_habit_baseline_rows("cron", {0: 30, 1: 25}),
+        ("cron", 47, 0, 1, at, "e1"),  # 23:30–00:00 at 30-min buckets
+        ("cron", 24, 0, 1, at, "e2"),  # 12:00–12:30
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows(), bucket_minutes=30
+    )
+    assert result.status == "ok"
+    by_bucket = {r.bucket: r for r in result.results}
+    assert by_bucket[47].bucket_label == "23:30–00:00"
+    assert by_bucket[47].distance_hours == 0.5
+    assert by_bucket[47].nearest_habit_label == "00:00–00:30"
+    assert by_bucket[24].distance_hours == 11.5
+    assert by_bucket[24].habit_buckets == [0, 1]
+
+
+def test_habit_learning_floors_skip_thin_values_and_thin_buckets():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        # Too few baseline occurrences to call anything a habit (floor 20).
+        *_habit_baseline_rows("rare", {9: 10}),
+        ("rare", 22, 0, 1, at, "e1"),
+        # A bucket with fewer than min_bucket_count baseline hits is not habit:
+        # 09:xx is habitual, 21:xx (2 hits) is not, so a 21:xx occurrence is a
+        # finding measured from 09:xx — and so is the 22:xx one.
+        *_habit_baseline_rows("job", {9: 40, 21: 2}),
+        ("job", 21, 0, 3, at, "e2"),
+        ("job", 22, 0, 1, at, "e3"),
+        # Every bucket habitual: nothing can be outside.
+        *_habit_baseline_rows("chatty", dict.fromkeys(range(24), 5)),
+        ("chatty", 3, 0, 1, at, "e4"),
+    ]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "ok"
+    assert sorted((r.value, r.bucket) for r in result.results) == [("job", 21), ("job", 22)]
+    assert {r.distance_hours for r in result.results} == {12.0, 11.0}
+    assert any("fewer than 20" in w for w in result.warnings)
+
+
+def test_habit_baseline_without_learnable_values_is_insufficient():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [*_habit_baseline_rows("rare", {9: 3}), ("rare", 22, 0, 1, at, "e1")]
+    svc = _svc(_habit_responses(10_000, (8000, 2000), rows))
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], windows=_seq_windows()
+    )
+    assert result.status == "insufficient_data"
+
+
+def test_habit_sql_shape_binds_resolution_and_inlines_a_validated_timezone():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _habit_responses(
+            10_000,
+            (8000, 2000),
+            # Two-hour buckets: 02:00–04:00 is the habit, 04:00–06:00 the finding.
+            [*_habit_baseline_rows("backup", {1: 48}), ("backup", 2, 0, 1, at, "e1")],
+        )
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    result = svc.find_time_of_day_habits(
+        "c1",
+        ["s1"],
+        fields=["attr:program"],
+        windows=_seq_windows(),
+        timezone="Europe/Berlin",
+        bucket_minutes=120,
+        max_candidates_per_field=7,
+    )
+    assert result.status == "ok"
+    sql = client.full_queries[2]
+    # The wall-clock minute in the analyst's zone, cut into the resolution.
+    assert "toHour(ts, 'Europe/Berlin') * 60 + toMinute(ts, 'Europe/Berlin')" in sql
+    assert "intDiv(" in sql and "{bm:UInt16}" in sql
+    assert "GROUP BY val, bucket, w_idx" in sql
+    # Candidate values are the highest-volume ones, capped.
+    assert "LIMIT {cap:UInt32}" in sql
+    params = client._all_parameters[2]
+    assert params["bm"] == 120
+    assert params["cap"] == 7
+    assert params["fk"] == "program"
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    r = result.results[0]
+    assert r.timezone == "Europe/Berlin"
+    assert r.bucket_minutes == 120
+    assert r.bucket_label == "04:00–06:00"
+    assert r.details["timezone"] == "Europe/Berlin"
+
+
+def test_habit_self_frame_measures_each_value_against_its_own_hours():
+    """Without a baseline the habit is the value's own busy buckets across the
+    scope, and a thin bucket away from them is the finding."""
+    at = datetime(2024, 1, 17, 15, 2, tzinfo=UTC)
+    rows = [
+        ("backup", 2, 0, 50, None, None),
+        ("backup", 3, 0, 8, None, None),
+        # One manual run mid-afternoon: 12 h from the nearest habitual bucket.
+        ("backup", 15, 0, 1, at, "e1"),
+        # Two runs spilling past 04:00 — thin, one hour from 03:xx.
+        ("backup", 4, 0, 2, at, "e2"),
+        # A value below the learning floor is skipped.
+        ("rare", 9, 0, 10, None, None),
+        ("rare", 22, 0, 1, at, "e3"),
+    ]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=rows, column_names=_HABIT_COLS),
+        ]
+    )
+    result = svc.find_time_of_day_habits("c1", ["s1"], fields=["attr:program"])
+    assert result.status == "ok"
+    assert result.method == "self-habit"
+    assert result.windows is None
+    assert [(r.value, r.bucket, r.distance_hours) for r in result.results] == [
+        ("backup", 15, 11.0),
+        ("backup", 4, 1.0),
+    ]
+    r = result.results[0]
+    assert r.habit_buckets == [2, 3]
+    assert r.count == 1
+    assert r.baseline_count == 61
+    assert r.details["scope_occurrences"] == 61
+    assert "window_label" not in r.details
+    assert len(svc.ch.client._calls) == 2
+
+
+def test_habit_auto_fields_run_through_the_recommender_and_overrides():
+    """Auto mode scans the recommended categorical fields, minus any the
+    timeline declared off, and says so."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    inventory = [("attr:host", 8, 950), ("attr:program", 12, 900), ("attr:pid", 950, 1000)]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("backup", 2, 0, 48, None, None), ("backup", 14, 0, 1, at, "e1")],
+                column_names=_HABIT_COLS,
+            ),
+        ]
+    )
+    result = svc.find_time_of_day_habits(
+        "c1",
+        ["s1"],
+        inventory=inventory,
+        inventory_total=1000,
+        field_overrides={"attr:host": False},
+    )
+    assert result.status == "ok"
+    # One scan for the one field left after the override; pid is an identifier.
+    assert len(svc.ch.client._calls) == 2
+    assert svc.ch.client._all_parameters[1]["fk"] == "program"
+    assert any("attr:host" in w for w in result.warnings)
+
+
+def test_habit_allowlist_suppresses_the_value():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(1000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[("backup", 2, 0, 48, None, None), ("backup", 14, 0, 1, at, "e1")],
+                column_names=_HABIT_COLS,
+            ),
+        ]
+    )
+    result = svc.find_time_of_day_habits(
+        "c1", ["s1"], fields=["attr:program"], allowlist={("attr:program", "backup")}
+    )
+    assert result.status == "ok"
+    assert result.results == []
+
+
+# ---------------------------------------------------------------------------
+# value_correlation — detector (D13)
+# ---------------------------------------------------------------------------
+
+# Baseline frame query order: count, window totals, then one scan per field
+# pair. Row layout: a, b, ref (baseline count), then per suspect window
+# (cnt, first_ts, first_evt). Self frame: count, timestamp range, slice
+# totals, then one scan per pair whose rows are a, b, ref (scope total), then
+# per slice (cnt, first_ts, first_evt).
+
+_CORR_COLS = ["a", "b", "ref", "f0_cnt", "f0_first", "f0_evt"]
+
+
+def _corr_responses(
+    total: int, window_totals: tuple[int, int], pair_rows: list[list[tuple]]
+) -> list[FakeQueryResult]:
+    out = [
+        FakeQueryResult(result_rows=[(total,)], column_names=["count()"]),
+        FakeQueryResult(result_rows=[window_totals], column_names=["bl_total", "w0_total"]),
+    ]
+    out += [FakeQueryResult(result_rows=rows, column_names=_CORR_COLS) for rows in pair_rows]
+    return out
+
+
+_USER_HOST = ["attr:user", "attr:computer_name"]
+
+
+def test_correlation_parameter_validation():
+    svc = _svc([])
+    with pytest.raises(ValueError, match="two fields"):
+        svc.find_value_correlations("c1", ["s1"], fields=["attr:user"], windows=_seq_windows())
+    with pytest.raises(ValueError, match="rule_confidence"):
+        svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, rule_confidence=1.5)
+    with pytest.raises(ValueError, match="min_ratio"):
+        svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, min_ratio=1.0)
+    assert svc.ch.client._calls == []
+
+
+def test_correlation_no_data():
+    svc = _svc([FakeQueryResult(result_rows=[(0,)], column_names=["count()"])])
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "no_data"
+    assert result.detector == "value_correlation"
+
+
+def test_correlation_baseline_reports_a_broken_rule():
+    """m.okonkwo ⇒ WKS-004 holds over 6000 baseline logons and breaks in the
+    suspect window; b.moreau splits two homes and never forms a rule."""
+    t_jump = datetime(2024, 1, 17, 6, 0, tzinfo=UTC)
+    t_file = datetime(2024, 1, 17, 3, 0, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 5, datetime(2024, 1, 16, tzinfo=UTC), "e-home"),
+        ("m.okonkwo", "JUMP-01", 0, 8, t_jump, "e-jump"),
+        ("m.okonkwo", "FILE-01", 0, 4, t_file, "e-file"),
+        ("b.moreau", "WKS-002", 3000, 200, datetime(2024, 1, 16, tzinfo=UTC), "e-b2"),
+        ("b.moreau", "WKS-003", 2900, 190, datetime(2024, 1, 16, tzinfo=UTC), "e-b3"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    assert result.method == "rule-g-test"
+    assert result.baseline_size == 12_000
+    assert len(result.results) == 1
+    r = result.results[0]
+    assert r.fields == ["attr:user", "attr:computer_name"]
+    assert r.values == ["m.okonkwo", "WKS-004"]
+    assert r.value == "m.okonkwo ⇒ WKS-004"
+    assert r.confidence == 1.0
+    assert r.support == 6000
+    assert r.count == 17
+    assert r.violations == 12
+    assert r.baseline_violations == 0
+    assert r.baseline_count == 6000
+    assert abs(r.violation_rate - 12 / 17) < 1e-6
+    assert r.top_violator == "JUMP-01"
+    assert r.top_violator_count == 8
+    assert r.q_value <= 0.05
+    assert r.score == r.g_statistic > 0
+    # The earliest violating occurrence is the representative event.
+    assert r.event_id == "e-file"
+    assert r.first_seen is not None and r.first_seen.startswith("2024-01-17T03:00")
+    assert r.details["window_label"] == "incident"
+    assert r.details["allowlist_field"] == "attr:user,attr:computer_name"
+    assert r.details["allowlist_value"] == "m.okonkwo\x1fWKS-004"
+    # count, window totals, one pair scan.
+    assert len(svc.ch.client._calls) == 3
+    params = svc.ch.client._all_parameters[2]
+    assert params["fk0"] == "user" and params["fk1"] == "computer_name"
+    assert params["cap"] == 5000
+
+
+def test_correlation_mines_both_directions():
+    """The reverse rule WKS-004 ⇒ m.okonkwo also holds and also breaks when a
+    second account appears on that host in the window."""
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 300, t, "e1"),
+        ("c.nakamura", "WKS-004", 0, 40, t, "e2"),
+        ("c.nakamura", "WKS-009", 5000, 250, t, "e3"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    rules = {(tuple(r.fields), r.value) for r in result.results}
+    assert (("attr:computer_name", "attr:user"), "WKS-004 ⇒ m.okonkwo") in rules
+    # c.nakamura ⇒ WKS-009 is broken too (40 of 290 window events elsewhere).
+    assert (("attr:user", "attr:computer_name"), "c.nakamura ⇒ WKS-009") in rules
+    # m.okonkwo ⇒ WKS-004 is intact: no violations in the window.
+    assert (("attr:user", "attr:computer_name"), "m.okonkwo ⇒ WKS-004") not in rules
+
+
+def test_correlation_floors_support_confidence_and_effect():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        # Support 10 < 20: no rule however clean.
+        ("thin", "H1", 10, 2, t, "e1"),
+        ("thin", "H2", 0, 5, t, "e2"),
+        # Confidence 0.9 < 0.95: no rule.
+        ("split", "H1", 900, 50, t, "e3"),
+        ("split", "H2", 100, 50, t, "e4"),
+        # A real rule whose violation rate merely creeps from 4% to 6%: under
+        # the 2x effect floor even where the G-test would pass.
+        ("creep", "H1", 9600, 940, t, "e5"),
+        ("creep", "H2", 400, 60, t, "e6"),
+        # A real rule with no window violations: nothing to report.
+        ("steady", "H1", 5000, 400, t, "e7"),
+    ]
+    svc = _svc(_corr_responses(50_000, (30_000, 20_000), [rows]))
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results if r.fields[0] == "attr:user"] == []
+
+
+def test_correlation_pair_cap_and_auto_fields():
+    """Six auto-picked fields make fifteen pairs; the cap scans the first
+    three and says so."""
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    inventory = [(f"attr:f{i}", 10, 1000) for i in range(6)] + [("attr:pid", 990, 1000)]
+    pair_rows = [[("x", "y", 100, 5, t, "e")] for _ in range(3)]
+    svc = _svc(_corr_responses(1000, (700, 300), pair_rows))
+    result = svc.find_value_correlations(
+        "c1",
+        ["s1"],
+        windows=_seq_windows(),
+        inventory=inventory,
+        inventory_total=1000,
+        max_pairs=3,
+    )
+    assert result.status == "ok"
+    assert len(svc.ch.client._calls) == 5
+    assert any("15 field pairs" in w and "first 3" in w for w in result.warnings)
+    # An explicit two-field list is exactly one pair, no cap warning.
+    svc = _svc(_corr_responses(1000, (700, 300), [[("x", "y", 100, 5, t, "e")]]))
+    result = svc.find_value_correlations(
+        "c1", ["s1"], fields=_USER_HOST, windows=_seq_windows(), max_pairs=3
+    )
+    assert not any("pair cap" in w for w in result.warnings)
+
+
+def test_correlation_sql_shape():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    client = RecordingClient(
+        _corr_responses(20_000, (12_000, 8_000), [[("u", "h", 6000, 5, t, "e")]])
+    )
+    svc = StatisticalAnomalyService.__new__(StatisticalAnomalyService)
+    svc.ch = FakeClickHouseStore(client)
+    svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, windows=_seq_windows())
+    sql = client.full_queries[2]
+    assert "attributes[{fk0:String}]" in sql and "attributes[{fk1:String}]" in sql
+    assert "GROUP BY a, b" in sql
+    assert "LIMIT {cap:UInt32}" in sql
+    assert "countIf(" in sql and "argMinIf(event_id" in sql
+    params = client._all_parameters[2]
+    assert params["b0"] == "2024-01-01 00:00:00.000"
+    assert params["w0s"] == "2024-01-16 00:00:00.000"
+
+
+def test_correlation_self_frame_tests_each_slice_against_the_rest():
+    """Without a baseline: rules over the whole scope, one leave-one-out
+    G-test per (rule, slice)."""
+    k = 4
+    span = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 5, tzinfo=UTC))
+    t = datetime(2024, 1, 4, 3, 0, tzinfo=UTC)
+    cols = ["a", "b", "ref"] + [f"f{i}_{c}" for i in range(k) for c in ("cnt", "first", "evt")]
+    # m.okonkwo: 6000 home logons spread over four slices; 12 stray logons,
+    # all in slice 3 → the rule breaks in slice 3 against slices 0–2.
+    rows = [
+        (
+            "m.okonkwo",
+            "WKS-004",
+            6000,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+            1500,
+            None,
+            None,
+        ),
+        ("m.okonkwo", "JUMP-01", 12, 0, None, None, 0, None, None, 0, None, None, 12, t, "e-j"),
+    ]
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(6012,)], column_names=["count()"]),
+            FakeQueryResult(result_rows=[span], column_names=["min_ts", "max_ts"]),
+            FakeQueryResult(result_rows=[(i, 1503) for i in range(k)], column_names=["slice", "n"]),
+            FakeQueryResult(result_rows=rows, column_names=cols),
+        ]
+    )
+    result = svc.find_value_correlations("c1", ["s1"], fields=_USER_HOST, self_slices=k)
+    assert result.status == "ok", result.warnings
+    assert result.method == "self-rule-g-test"
+    assert result.windows is None and result.slices is not None
+    assert result.slices["k"] == k
+    assert [r.value for r in result.results] == ["m.okonkwo ⇒ WKS-004"]
+    r = result.results[0]
+    assert r.count == 1512
+    assert r.violations == 12
+    # The complement: the other three slices, with no violations at all.
+    assert r.baseline_count == 4500
+    assert r.baseline_violations == 0
+    assert r.details["slice_index"] == 3
+    assert r.details["rest_slices"] == k - 1
+    assert r.event_id == "e-j"
+    assert "baseline_size" not in r.details
+    assert len(svc.ch.client._calls) == 4
+
+
+def test_correlation_allowlist_suppresses_the_rule():
+    t = datetime(2024, 1, 17, tzinfo=UTC)
+    rows = [
+        ("m.okonkwo", "WKS-004", 6000, 5, t, "e1"),
+        ("m.okonkwo", "JUMP-01", 0, 8, t, "e2"),
+    ]
+    svc = _svc(_corr_responses(20_000, (12_000, 8_000), [rows]))
+    result = svc.find_value_correlations(
+        "c1",
+        ["s1"],
+        fields=_USER_HOST,
+        windows=_seq_windows(),
+        allowlist={("attr:user,attr:computer_name", "m.okonkwo\x1fWKS-004")},
+    )
+    assert result.status == "ok"
+    assert result.results == []

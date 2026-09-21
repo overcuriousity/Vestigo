@@ -172,6 +172,57 @@ function NovelChars({ value, novel }: { value: string; novel: string[] }) {
   );
 }
 
+/**
+ * The day as a strip of buckets: the habitual ones in the reference neutral,
+ * the offending one in the anomaly accent, the rest empty. Every cell comes
+ * from the finding (`habit_buckets`, `bucket`, `bucket_minutes`); nothing is
+ * drawn for buckets the payload says nothing about.
+ */
+function DayStrip({
+  bucket,
+  habit,
+  bucketMinutes,
+  bucketLabel,
+  timezone,
+}: {
+  bucket: number;
+  habit: number[];
+  bucketMinutes: number;
+  bucketLabel: string;
+  timezone: string;
+}) {
+  const n = Math.max(1, Math.floor(1440 / bucketMinutes));
+  const habitual = new Set(habit);
+  const caption = `${bucketLabel} ${timezone}; habitual buckets ${habit.length}`;
+  return (
+    <div role="img" aria-label={caption} title={caption}>
+      <div className="flex gap-px">
+        {Array.from({ length: n }, (_, i) => (
+          <span
+            key={i}
+            className="h-3 min-w-0 flex-1 rounded-[1px]"
+            style={{
+              background:
+                i === bucket
+                  ? OBSERVED
+                  : habitual.has(i)
+                    ? REFERENCE
+                    : "var(--color-bg-base)",
+            }}
+          />
+        ))}
+      </div>
+      <div className="flex justify-between font-mono text-xs text-[var(--color-fg-muted)]">
+        <span>00:00</span>
+        <span>
+          {bucketLabel} {timezone}
+        </span>
+        <span>24:00</span>
+      </div>
+    </div>
+  );
+}
+
 /** The n-gram, oldest → newest, so the *order* is what the eye reads. */
 function Ngram({ values }: { values: string[] }) {
   return (
@@ -326,6 +377,62 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
     case "sequence_novelty":
     case "sequence_motif":
       return <Ngram values={finding.values} />;
+    case "value_correlation": {
+      // The claim is a violation rate against a reference rate, both counted.
+      const self = findingMode(finding) === "self-rule-g-test";
+      return (
+        <TwoBars
+          reference={{
+            label: self ? "rest-of-timeline violations" : "baseline violations",
+            value: finding.baseline_violation_rate,
+            display: `${(finding.baseline_violation_rate * 100).toFixed(2)}%`,
+          }}
+          observed={{
+            label: self ? "slice violations" : "suspect violations",
+            value: finding.violation_rate,
+            display: `${(finding.violation_rate * 100).toFixed(2)}%`,
+          }}
+        />
+      );
+    }
+    case "time_of_day":
+      return (
+        <DayStrip
+          bucket={finding.bucket}
+          habit={finding.habit_buckets}
+          bucketMinutes={finding.bucket_minutes}
+          bucketLabel={finding.bucket_label}
+          timezone={finding.timezone}
+        />
+      );
+    case "transition_time": {
+      // The claim is one duration against one floor, both measured; which
+      // floor is in the label, since the two answer different questions. A
+      // zero gap between whole-second timestamps means "under a second", and
+      // was judged at that bound — the figure shows the bound, not an instant.
+      const bounded = finding.details.timestamp_resolution === "second";
+      return (
+        <TwoBars
+          reference={{
+            label:
+              finding.reference_kind === "next-fastest"
+                ? "next-fastest on the timeline"
+                : "baseline minimum",
+            value: finding.reference_seconds,
+            display: `${finding.reference_seconds.toFixed(1)}s`,
+          }}
+          observed={
+            bounded
+              ? { label: "this transition (whole-second timestamps)", value: 1, display: "< 1s" }
+              : {
+                  label: "this transition",
+                  value: finding.observed_seconds,
+                  display: `${finding.observed_seconds.toFixed(1)}s`,
+                }
+          }
+        />
+      );
+    }
     case "timestamp_order":
       return (
         <div className="flex flex-wrap items-center gap-2 font-mono text-xs">

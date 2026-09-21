@@ -165,7 +165,55 @@ function scoredVerdict(f: AnomalyFinding): Verdict {
         highlight: `${f.support} times`,
         tail: `across ${f.sources_count} source${f.sources_count === 1 ? "" : "s"} — a routine pattern, not a finding.`,
       };
+    case "transition_time": {
+      const stream = f.partition_value
+        ? `${fieldLabel(f.partition_field ?? "")} = ${truncate(f.partition_value, 40)} moved `
+        : "A stream moved ";
+      const floor =
+        f.reference_kind === "next-fastest"
+          ? `its next-fastest such move anywhere on the timeline took ${fmtSeconds(f.reference_seconds)} (${f.count} transitions)`
+          : `the baseline never saw it under ${fmtSeconds(f.reference_seconds)} across ${f.baseline_count} transitions`;
+      return {
+        lead: `${stream}${truncate(f.values[0] ?? "", 30)} → ${truncate(f.values[1] ?? "", 30)} in`,
+        highlight: fmtSeconds(f.observed_seconds),
+        tail: `— ${floor}${f.speedup === null ? "" : `, ${f.speedup.toFixed(1)}× faster`}.`,
+      };
+    }
+    case "time_of_day": {
+      const reference =
+        findingMode(f) === "self-habit"
+          ? `across the timeline its ${f.baseline_count} occurrences keep to`
+          : `in the baseline its ${f.baseline_count} occurrences keep to`;
+      const habit =
+        f.habit_buckets.length === 1
+          ? f.nearest_habit_label
+          : `${f.habit_buckets.length} buckets, the nearest ${f.nearest_habit_label}`;
+      return {
+        lead: `${fieldLabel(f.field)} = ${truncate(String(f.value), 40)} occurs ${f.count} time${f.count === 1 ? "" : "s"} at ${f.bucket_label} (${f.timezone}),`,
+        highlight: `${f.distance_hours % 1 === 0 ? f.distance_hours.toFixed(0) : f.distance_hours.toFixed(1)} h off its habit`,
+        tail: `— ${reference} ${habit}.`,
+      };
+    }
+    case "value_correlation": {
+      const where =
+        findingMode(f) === "self-rule-g-test"
+          ? `in ${detailString(f.details, "window_label") ?? "this slice"} against the rest of the timeline`
+          : `in ${detailString(f.details, "window_label") ?? "the suspect window"}`;
+      return {
+        lead: `${fieldLabel(f.fields[0] ?? "")} = ${truncate(f.values[0] ?? "", 40)} normally means ${fieldLabel(f.fields[1] ?? "")} = ${truncate(f.values[1] ?? "", 40)} (${pct(f.confidence)} of ${f.support} reference events). ${where} it did not hold in`,
+        highlight: `${f.violations} of ${f.count} events`,
+        tail: `— most often ${fieldLabel(f.fields[1] ?? "")} = ${truncate(f.top_violator, 40)} (×${f.top_violator_count}), against ${f.baseline_violations} of ${f.baseline_count} in the reference (q=${f.q_value.toExponential(1)}).`,
+      };
+    }
   }
+}
+
+/** Seconds as a short human duration; every figure comes from the finding. */
+function fmtSeconds(s: number): string {
+  if (s < 60) return `${s % 1 === 0 ? s.toFixed(0) : s.toFixed(1)} s`;
+  if (s < 3600) return `${(s / 60).toFixed(1)} min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
+  return `${(s / 86400).toFixed(1)} d`;
 }
 
 export function findingVerdict(finding: MethodResult): Verdict {

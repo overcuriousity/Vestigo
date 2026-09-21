@@ -23,18 +23,31 @@ export const TEMPORAL_MODES: ReadonlySet<string> = new Set([
   "cadence",
   "ngram",
   "drift",
+  "min-transition",
+  "habit",
+  "rule-g-test",
 ]);
 
-/** The self modes of the four formerly baseline-only methods. */
+/**
+ * The self modes of the four formerly baseline-only methods, plus those of
+ * the transition and time-of-day detectors, which were born with both frames.
+ */
 export const SELF_MODES: ReadonlySet<string> = new Set([
   "self-g-test",
   "self-drift",
   "self-cadence",
   "rare-ngram",
+  "self-min-transition",
+  "self-habit",
+  "self-rule-g-test",
 ]);
 
-/** The two self modes that compare leave-one-out time slices with the rest of the scope. */
-export const SLICE_MODES: ReadonlySet<string> = new Set(["self-g-test", "self-drift"]);
+/** The self modes that compare leave-one-out time slices with the rest of the scope. */
+export const SLICE_MODES: ReadonlySet<string> = new Set([
+  "self-g-test",
+  "self-drift",
+  "self-rule-g-test",
+]);
 
 export function isTemporalMode(method: string): boolean {
   return TEMPORAL_MODES.has(method);

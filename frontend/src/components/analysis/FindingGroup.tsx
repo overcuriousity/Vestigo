@@ -50,9 +50,9 @@ interface Props {
    * Rows this group holds that no sweep method produces — today, Sigma hits in
    * the Named-techniques group.
    *
-   * A slot rather than a thirteenth entry in `METHODS`: that registry is pinned
-   * by tests to exactly the twelve ids `db/analysis_plan.py` plans for and the
-   * twelve param sets `api/routers/analysis.py` accepts, and Sigma is neither
+   * A slot rather than a sixteenth entry in `METHODS`: that registry is pinned
+   * by tests to exactly the fifteen ids `db/analysis_plan.py` plans for and the
+   * fifteen param sets `api/routers/analysis.py` accepts, and Sigma is neither
    * planned nor run through the findings endpoint.
    */
   extraRows?: React.ReactNode;

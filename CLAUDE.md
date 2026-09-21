@@ -26,7 +26,7 @@ trail (`api/routers/auth.py`, `admin.py`, `deps.py`).
 - `CONCEPT.md` / `MODEL_REFINEMENT.md` — product vision and the Case/Source/Timeline/Event/
   Artifact data model. Read before touching the model; rarely changes.
 - `TECH_STACK.md` — backing-service decision record (*why*, not *what's shipped*).
-- `ANOMALY_DETECTION.md` — reference for all fourteen analysis tools actually running
+- `ANOMALY_DETECTION.md` — reference for all seventeen analysis tools actually running
   (statistical detectors, Sigma runner, log templates, semantic similarity), plus the
   baseline/disposition model. Update alongside any detector change in the same commit.
 - `AGENT.md` — the optional AI investigation agent (design invariants, MCP tools, provider
@@ -253,7 +253,7 @@ instead of rebuilding.
   does not strand its verdict bar a screen below the claim; `ToolsSheet` is four tabs (Scope,
   Methods, Signatures, Explore) rather than one scroll, so a thousand-row template list cannot
   bury the baseline picker; `method-registry.ts` is the
-  single description of all twelve methods, including the prose that used to live in a
+  single description of all fifteen methods, including the prose that used to live in a
   Method tab and each method's optional `railFloor`, a presentation-only bar on the ranked
   feed whose held-back count is always disclosed; the sheet's method
   mode runs a method with the analyst's own knob values, which is what keeps the analysis

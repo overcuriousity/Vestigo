@@ -5,6 +5,75 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Value correlation (D13).** A fifteenth statistical detector, `value_correlation`,
+  adapted from AMiner's `VariableCorrelationDetector` and intra-record: for a field pair it
+  mines implication rules `A = x ⇒ B = y` — an antecedent value with at least
+  `stat_correlation_min_support` reference events whose dominant consequent accounts for at
+  least `stat_correlation_rule_confidence` of them, both directions — and reports a window in
+  which the rule's violation rate rises: a 2×2 G-test of conforming against violating events
+  between the reference and the window, one Benjamini–Hochberg pool per run, an effect floor
+  of `stat_correlation_min_ratio` on the violation-rate ratio. Only rises are reported; a rule
+  that appears is a proportion shift. Both frames: `rule-g-test` mines from the baseline
+  window and tests each suspect window; `self-rule-g-test` mines from the timeline and tests
+  each leave-one-out slice against the rest. Pairs come from an explicit field list or the
+  recommender's top `stat_correlation_auto_fields` categorical fields, capped at
+  `stat_correlation_max_pairs` with a warning; each pair is one `GROUP BY a, b` scan capped
+  at `stat_correlation_max_rows_per_pair` rows. Findings carry the rule as mined, both
+  sides' counts and violation rates, and the consequent value that most often took the
+  rule's place; the allowlist key is the combo one. Gate entry (two categorical fields, a
+  sliceable span in the self frame), wizard card, evidence figure, agent knob
+  (`rule_confidence`), seven settings with registry specs, run snapshot and
+  `docs/ANOMALY_DETECTION.md` §17. The demo case asserts the contractor's
+  `user ⇒ home workstation` rule breaking on every host the intrusion visits, in both frames.
+
+- **Time-of-day habit (D12).** A fourteenth statistical detector, `time_of_day`, adapted
+  from AMiner's `PathValueTimeIntervalDetector`: per (field, value) it cuts the day into
+  `bucket_minutes`-wide wall-clock buckets (15–240 minutes, default 60) read in an explicit
+  IANA `timezone` (default `UTC`, `stat_habit_timezone` for the site), learns the value's
+  habit — the buckets holding at least `stat_habit_min_bucket_count` reference occurrences,
+  for values with at least `stat_habit_min_baseline` of them — and reports an occurrence in
+  any other bucket, scored by the circular distance in hours to the nearest habitual one.
+  Interval cadence measures the gap between arrivals; this reads the hour on the wall, and
+  the two are independent (a nightly job that moves keeps its cadence and breaks its
+  habit). Both frames: `habit` learns from the baseline window and scores each suspect
+  window; `self-habit` takes the value's own busy buckets across the timeline and scores
+  its thin ones. The zone and resolution are snapshotted into the persisted run and carried
+  on every finding, since the same instant is a different hour elsewhere. Auto field
+  selection follows the novelty recommender and the timeline's field overrides; the
+  allowlist key is `(field, value)`. Gate entry (always offered in the self frame), wizard
+  card with a bucket choice and a zone box, a day-strip evidence figure, agent knobs, five
+  settings with registry specs and `docs/ANOMALY_DETECTION.md` §16 ship with it. The demo
+  case gains a one-off manual afternoon backup run (the self-frame signal) and moves the
+  contractor's lateral movement onto the jump host at 03:00, a host whose baseline logons
+  are an administrator's office hours; the nightly backup's move to 03:40 is the benign hit.
+
+- **Transition speed (D15).** A thirteenth statistical detector, `transition_time`, adapted
+  from AMiner's `MinimalTransitionTimeDetector`: per ordered value pair of a series field
+  it learns the fastest a stream ever moved from one value to the next and reports a
+  transition that undercuts that floor by at least `stat_transition_min_ratio` (default
+  2×) — one account on two hosts seconds apart, a session skipping states. Transitions are
+  one step of the sequence detectors' n-gram assembly, per source and per value of a new
+  `partition_field` knob (the identifier whose moves are timed; rows without it are left
+  out rather than pooled), so two users' interleaved logons never read as one actor. Both
+  frames from day one: with a baseline the floor is the baseline window's fastest
+  transition of the pair (`min-transition`); without one it is the pair's next-fastest
+  transition anywhere on the timeline (`self-min-transition`, leave-one-out by
+  construction). A floor is learned from at least `stat_transition_min_transitions` (3)
+  transitions, a zero floor is skipped and counted in a warning, the per-source candidate
+  cap `stat_transition_max_candidates` (2000) keeps the fastest pairs and discloses itself,
+  and score is `1 − observed / reference`. The finding carries the pair, the stream that
+  made the move, both durations, which floor was used and the speed-up; the allowlist key
+  is `(series_field, "a → b")` in both frames. Gate, wizard card, evidence figure, agent
+  tool, persisted-run snapshot (`partition_field`, `min_transitions`) and
+  `docs/ANOMALY_DETECTION.md` §15 ship with it; the analysis cache moves to version 5. The
+  demo case gains an administrator's routine jump-host hop as the floor and the
+  contractor's wmic call landing on `FILE-01` two seconds later as the signal, asserted in
+  both frames.
+
 ## [1.19.7] — 2026-09-15
 
 ### Added

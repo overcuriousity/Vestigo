@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildParams } from "@/components/analysis/MethodKnobForm";
 import {
   EVIDENCE_CLASSES,
   METHODS,
@@ -7,6 +8,22 @@ import {
 } from "@/components/analysis/method-registry";
 
 describe("method registry", () => {
+  it("sends a numeric choice as a number, which the API's int Literal requires", () => {
+    const meta = METHODS_BY_ID.time_of_day;
+    expect(buildParams(meta, { bucket_minutes: "15", timezone: "UTC" }, {})).toEqual({
+      bucket_minutes: 15,
+      timezone: "UTC",
+    });
+    // A string choice stays a string.
+    expect(buildParams(METHODS_BY_ID.entropy, { variant: "bigram" }, {})).toEqual({
+      variant: "bigram",
+    });
+    for (const m of METHODS)
+      for (const k of m.knobs)
+        if (k.kind === "choice" && k.numeric)
+          for (const o of k.options ?? []) expect(Number.isInteger(Number(o.value))).toBe(true);
+  });
+
   it("gives every method an evidence class the rail can group by", () => {
     const known = new Set(EVIDENCE_CLASSES.map((c) => c.id));
     for (const m of METHODS) expect(known.has(m.evidenceClass)).toBe(true);
@@ -47,6 +64,9 @@ describe("method registry", () => {
       interval_periodicity: ["series_field", "fdr_q", "min_ratio"],
       timestamp_order: ["min_skew_seconds"],
       sequence_novelty: ["series_field", "ngram_size", "max_gap_seconds"],
+      transition_time: ["series_field", "partition_field", "min_ratio"],
+      time_of_day: ["fields", "bucket_minutes", "timezone"],
+      value_correlation: ["fields", "fdr_q", "min_ratio", "rule_confidence", "min_support"],
       log_template: ["field", "order", "only_new"],
     };
     for (const m of METHODS) {
@@ -56,7 +76,7 @@ describe("method registry", () => {
     }
   });
 
-  it("covers exactly the twelve methods the gate plans for", () => {
+  it("covers exactly the fifteen methods the gate plans for", () => {
     // METHOD_IDS in db/analysis_plan.py. A method here that the plan never
     // reports would render with no status; one there that is missing here
     // would never be shown at all.
@@ -70,8 +90,11 @@ describe("method registry", () => {
         "numeric_range",
         "proportion_shift",
         "sequence_novelty",
+        "time_of_day",
         "timestamp_order",
+        "transition_time",
         "value_combo",
+        "value_correlation",
         "value_distribution_drift",
         "value_novelty",
       ].sort(),

@@ -786,6 +786,164 @@ export interface SequenceMotifFinding {
   confirmed_other_scope?: boolean;
 }
 
+/**
+ * One value-to-value transition faster than its learned floor, from the
+ * transition_time detector (D15). `details.method` is `min-transition`
+ * (the floor is the baseline window's fastest transition of the pair, and
+ * `details` carries `window_*` keys) or `self-min-transition` (the floor is
+ * the pair's next-fastest transition anywhere in the timeline, with
+ * `scope_transitions` and no window keys). `reference_kind` names which.
+ */
+export interface TransitionTimeFinding {
+  type: "transition_time";
+  /** Field token whose consecutive values form the transition (e.g. "attr:computer_name"). */
+  field: string;
+  /** [from, to]. */
+  values: string[];
+  /** "from → to" — display form and the allowlist key. */
+  value: string;
+  /** The stream the transition was timed within (e.g. "attr:user"); null = per source. */
+  partition_field: string | null;
+  /** That stream key's value on the flagged transition; null when unpartitioned. */
+  partition_value: string | null;
+  /** The fastest transition of this pair in the window (or the timeline), in seconds. */
+  observed_seconds: number;
+  /** The floor it undercut, in seconds. */
+  reference_seconds: number;
+  reference_kind: "baseline-min" | "next-fastest";
+  /**
+   * reference_seconds ÷ observed_seconds; null when the observation is instant.
+   * A zero gap between whole-second timestamps is judged at its one-second
+   * bound (`details.timestamp_resolution === "second"`), so this is then a
+   * lower bound.
+   */
+  speedup: number | null;
+  /** Transitions of this pair in the window (baseline frame) or the timeline (self). */
+  count: number;
+  /** Transitions the floor was learned from. */
+  baseline_count: number;
+  /** 1 − observed ÷ reference (observed at its bound, see `speedup`); 1.0 = instantaneous. */
+  score: number;
+  /** Timestamp of the arriving event of the fastest transition. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
+/**
+ * One value occurring at a time of day it has no habit of, from the
+ * time_of_day detector (D12). `details.method` is `habit` (the habit was
+ * learned from the baseline window; `details` carries `window_*` keys) or
+ * `self-habit` (the value's own busy buckets across the timeline, with
+ * `scope_occurrences` and no window keys). The bucket resolution and the
+ * IANA zone the clock was read in are on every finding — the same wall-clock
+ * hour in two zones is two different claims.
+ */
+export interface TimeOfDayFinding {
+  type: "time_of_day";
+  field: string;
+  value: string;
+  /** The offending wall-clock bucket: index, "HH:MM–HH:MM" label, width and zone. */
+  bucket: number;
+  bucket_label: string;
+  bucket_minutes: number;
+  timezone: string;
+  /** Occurrences of the value in this bucket (in the suspect window, or the timeline). */
+  count: number;
+  /** Reference occurrences the habit was learned from. */
+  baseline_count: number;
+  /** The habitual bucket indexes, ascending; the nearest one and its label. */
+  habit_buckets: number[];
+  nearest_habit: number;
+  nearest_habit_label: string;
+  /** Circular distance to the nearest habitual bucket, in hours. */
+  distance_hours: number;
+  /** = distance_hours — used for ranking. */
+  score: number;
+  /** First occurrence in the bucket. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
+/**
+ * One implication rule `A = x ⇒ B = y` broken in a window, from the
+ * value_correlation detector (D13). `fields` is [antecedent, consequent] and
+ * `values` is [x, y], the combo shape, so the allowlist key is the combo one.
+ * `details.method` is `rule-g-test` (mined from the baseline window, tested
+ * per suspect window; `window_*` keys) or `self-rule-g-test` (mined from the
+ * timeline, each leave-one-out slice tested against the rest; `slice_index`,
+ * `rest_slices`). The `baseline_*` fields hold the reference side either way.
+ */
+export interface ValueCorrelationFinding {
+  type: "value_correlation";
+  fields: string[];
+  values: string[];
+  /** "x ⇒ y" — display form. */
+  value: string;
+  /** Share of the antecedent's reference events that carried y. */
+  confidence: number;
+  /** Antecedent events the rule was mined from. */
+  support: number;
+  /** Antecedent events in the window or slice under test. */
+  count: number;
+  /** Of those, the ones whose consequent was not y. */
+  violations: number;
+  /** The reference side: antecedent events and violations in the baseline window, or the other slices. */
+  baseline_count: number;
+  baseline_violations: number;
+  violation_rate: number;
+  baseline_violation_rate: number;
+  /** violation_rate ÷ baseline_violation_rate (0.5-smoothed when the reference has none). */
+  rate_ratio: number;
+  /** The most common violating consequent value in the window, and its count. */
+  top_violator: string;
+  top_violator_count: number;
+  g_statistic: number;
+  p_value: number;
+  /** Benjamini–Hochberg adjusted p-value across every test in the run. */
+  q_value: number;
+  /** = g_statistic — used for ranking. */
+  score: number;
+  /** First violating occurrence in the window. */
+  first_seen: string | null;
+  event_id: string | null;
+  event: Event | null;
+  details: Record<string, unknown>;
+  /** Present (true) only when the request passed `include_dismissed`. */
+  dismissed?: boolean;
+  /** Present (true) when a confirmed disposition covers this finding's event. */
+  confirmed?: boolean;
+  /**
+   * Present (true) when the only confirmed verdict on this event was reached
+   * under a *different* comparison. The claim stands, but not for this scope —
+   * so the row is marked rather than badged, and Confirm stays live.
+   */
+  confirmed_other_scope?: boolean;
+}
+
 export type AnomalyFinding =
   | ValueNoveltyFinding
   | ValueComboFinding
@@ -798,7 +956,10 @@ export type AnomalyFinding =
   | IntervalPeriodicityFinding
   | SequenceNoveltyFinding
   | SequenceMotifFinding
-  | DistributionDriftFinding;
+  | DistributionDriftFinding
+  | TransitionTimeFinding
+  | TimeOfDayFinding
+  | ValueCorrelationFinding;
 
 export interface AnomaliesResponse {
   status: "ok" | "no_data" | "insufficient_data";
@@ -1004,7 +1165,10 @@ export interface AnomalyMarker {
     | "proportion_shift"
     | "interval_periodicity"
     | "sequence_novelty"
-    | "value_distribution_drift";
+    | "value_distribution_drift"
+    | "transition_time"
+    | "time_of_day"
+    | "value_correlation";
   /** Raw structured finding data — stored verbatim on the persisted annotation. */
   rawDetails: Record<string, unknown>;
   /** End of the anomalous window, for frequency findings — enables a range highlight. */
