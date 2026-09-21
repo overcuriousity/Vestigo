@@ -44,7 +44,8 @@ export function buildParams(
     }
     const value = (raw[knob.param] ?? "").trim();
     if (!value) continue;
-    out[knob.param] = knob.kind === "number" ? Number(value) : value;
+    const numeric = knob.kind === "number" || (knob.kind === "choice" && knob.numeric);
+    out[knob.param] = numeric ? Number(value) : value;
   }
   return out;
 }

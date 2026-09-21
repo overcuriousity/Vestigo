@@ -102,6 +102,11 @@ export interface MethodKnob {
   placeholder: string;
   /** `kind: "choice"` only — the options, first one the default. */
   options?: { value: string; label: string }[];
+  /**
+   * `kind: "choice"` only — the option values are numbers, sent as such. The
+   * API's int `Literal` for them refuses the string a `<select>` yields.
+   */
+  numeric?: boolean;
   /** `kind: "fields"` only. */
   picker?: FieldPickerConfig;
   /** `kind: "field"` only — the standard (non-attribute) choices, in order. */
@@ -396,6 +401,7 @@ export const METHODS: MethodMeta[] = [
         param: "bucket_minutes",
         label: "Bucket",
         kind: "choice",
+        numeric: true,
         placeholder: "60",
         options: [
           { value: "60", label: "1 hour" },

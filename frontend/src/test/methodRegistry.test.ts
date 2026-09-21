@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { buildParams } from "@/components/analysis/MethodKnobForm";
 import {
   EVIDENCE_CLASSES,
   METHODS,
@@ -7,6 +8,22 @@ import {
 } from "@/components/analysis/method-registry";
 
 describe("method registry", () => {
+  it("sends a numeric choice as a number, which the API's int Literal requires", () => {
+    const meta = METHODS_BY_ID.time_of_day;
+    expect(buildParams(meta, { bucket_minutes: "15", timezone: "UTC" }, {})).toEqual({
+      bucket_minutes: 15,
+      timezone: "UTC",
+    });
+    // A string choice stays a string.
+    expect(buildParams(METHODS_BY_ID.entropy, { variant: "bigram" }, {})).toEqual({
+      variant: "bigram",
+    });
+    for (const m of METHODS)
+      for (const k of m.knobs)
+        if (k.kind === "choice" && k.numeric)
+          for (const o of k.options ?? []) expect(Number.isInteger(Number(o.value))).toBe(true);
+  });
+
   it("gives every method an evidence class the rail can group by", () => {
     const known = new Set(EVIDENCE_CLASSES.map((c) => c.id));
     for (const m of METHODS) expect(known.has(m.evidenceClass)).toBe(true);

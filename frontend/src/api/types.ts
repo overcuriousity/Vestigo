@@ -811,13 +811,18 @@ export interface TransitionTimeFinding {
   /** The floor it undercut, in seconds. */
   reference_seconds: number;
   reference_kind: "baseline-min" | "next-fastest";
-  /** reference_seconds ÷ observed_seconds; null when the observation is instant. */
+  /**
+   * reference_seconds ÷ observed_seconds; null when the observation is instant.
+   * A zero gap between whole-second timestamps is judged at its one-second
+   * bound (`details.timestamp_resolution === "second"`), so this is then a
+   * lower bound.
+   */
   speedup: number | null;
   /** Transitions of this pair in the window (baseline frame) or the timeline (self). */
   count: number;
   /** Transitions the floor was learned from. */
   baseline_count: number;
-  /** 1 − observed ÷ reference; 1.0 = instantaneous. */
+  /** 1 − observed ÷ reference (observed at its bound, see `speedup`); 1.0 = instantaneous. */
   score: number;
   /** Timestamp of the arriving event of the fastest transition. */
   first_seen: string | null;

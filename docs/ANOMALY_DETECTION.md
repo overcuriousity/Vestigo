@@ -2586,6 +2586,20 @@ is flagged. A zero floor cannot be undercut — with second-resolution timestamp
 zero-length transitions are routine — so such pairs are skipped rather than scored, and
 the run says how many.
 
+A zero-length *observation* is only as precise as the timestamps it is the difference
+of. In a source that records sub-second timestamps (any event with a non-zero
+millisecond part) a 0 ms gap is genuinely instant and judged as such. In a source whose
+every timestamp is a whole second — Plaso CSV, syslog — `12:00:05 → 12:00:05` says only
+that the move took *under a second*: judged as instant it would undercut any positive
+floor (`0 × min_ratio` beats everything) and rank first, though it may have taken
+0.99 s against a 1 s floor. So there it is judged and scored at its **one-second
+bound**: flagged only when one second still undercuts the floor by `min_ratio`×, scored
+`1 − 1 / reference_seconds`, with `speedup` a lower bound. Pairs the bound holds back
+are counted in a warning. The resolution is probed per source, only for a source that
+produced a zero-length candidate, and the probe stops at its first sub-second
+timestamp. A zero-length finding carries `timestamp_resolution` (`second` /
+`sub-second`) and `observed_upper_bound_seconds` (`1.0`, or `null` when instant).
+
 Per source: the `stat_transition_max_candidates` fastest pairs (baseline frame: per
 suspect window) are fetched fastest-first, with a warning when the cap is hit — the cap
 keeps the fastest, which are the ones the question is about; in the baseline frame the
@@ -2593,7 +2607,7 @@ floor is then learned for exactly those candidate pairs. On a multi-source scope
 floor is the minimum over every source's reference and counts are summed, so a pair
 that is slow in one source and fast in another is judged against the fast one.
 
-**Score = 1 − observed / reference**, in `[0, 1]`: 1.0 is an instantaneous transition,
+**Score = 1 − observed / reference** (observed at its bound, above), in `[0, 1]`: 1.0 is an instantaneous transition,
 0.5 is exactly twice as fast as the floor, and nothing under `1 − 1/min_ratio` is
 reported. The representative event is the **arriving** event of the fastest transition
 (the `b` side), and `first_seen` is its timestamp. Findings carry `observed_seconds`,

@@ -27,6 +27,8 @@ from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from vestigo.core.time_of_day import validate_bucket_minutes, validate_timezone
+
 
 class Settings(BaseSettings):
     """Vestigo settings."""
@@ -203,6 +205,19 @@ class Settings(BaseSettings):
     # zone here once so "03:40" means what the analyst reads on the wall.
     stat_habit_bucket_minutes: int = Field(default=60, ge=15, le=240)
     stat_habit_timezone: str = "UTC"
+
+    @field_validator("stat_habit_bucket_minutes")
+    @classmethod
+    def _habit_bucket_divides_the_day(cls, value: int) -> int:
+        """Refuse a width the detector refuses (45 is in range but not a divisor of the day)."""
+        return validate_bucket_minutes(value)
+
+    @field_validator("stat_habit_timezone")
+    @classmethod
+    def _habit_timezone_is_a_zone(cls, value: str) -> str:
+        """Refuse a zone the detector refuses, at set-time rather than on every run."""
+        return validate_timezone(value)
+
     # A value needs at least this many reference occurrences to have a habit,
     # and a bucket needs at least this many of them to be habitual.
     stat_habit_min_baseline: int = Field(default=20, ge=2)
@@ -218,8 +233,8 @@ class Settings(BaseSettings):
     stat_correlation_rule_confidence: float = Field(default=0.95, gt=0, le=1)
     # BH false-discovery ceiling and the violation-rate ratio floor for a
     # broken rule — same meaning as the proportion-shift pair.
-    stat_correlation_fdr_q: float = 0.05
-    stat_correlation_min_ratio: float = 2.0
+    stat_correlation_fdr_q: float = Field(default=0.05, gt=0, le=1)
+    stat_correlation_min_ratio: float = Field(default=2.0, gt=1)
     # How many recommended fields auto mode pairs up (6 → 15 pairs), the cap
     # on pairs scanned per run, and the per-pair cap on (a, b) value rows.
     stat_correlation_auto_fields: int = Field(default=6, ge=2)

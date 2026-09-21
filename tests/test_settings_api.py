@@ -342,3 +342,45 @@ def test_put_rejects_a_scheme_less_public_base_url(client, admin_bootstrap):
     )
     assert resp.status_code == 422
     assert get_settings().public_base_url is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        # In 15..240 but not a divisor of the day: the detector refuses it.
+        ("stat_habit_bucket_minutes", 45),
+        ("stat_habit_bucket_minutes", 90),
+        ("stat_habit_timezone", "Mars/Olympus_Mons"),
+        ("stat_habit_timezone", "UTC; DROP"),
+        # The runner requires a ratio strictly above one.
+        ("stat_correlation_min_ratio", 1.0),
+        ("stat_correlation_fdr_q", 0),
+    ],
+)
+def test_put_rejects_a_detector_default_the_detector_would_refuse(
+    client, admin_bootstrap, field, value
+):
+    """Saved, each of these would turn every default run of its detector —
+    the sweep included — into a 422. Refuse it at set-time instead."""
+    as_admin(client, admin_bootstrap)
+    before = getattr(get_settings(), field)
+    resp = client.put("/api/admin/settings", json={"values": {field: value}})
+    assert resp.status_code == 422, resp.text
+    assert getattr(get_settings(), field) == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stat_habit_bucket_minutes", 15),
+        ("stat_habit_timezone", "Europe/Berlin"),
+        ("stat_correlation_min_ratio", 1.5),
+    ],
+)
+def test_put_accepts_a_detector_default_the_detector_runs_with(
+    client, admin_bootstrap, field, value
+):
+    as_admin(client, admin_bootstrap)
+    resp = client.put("/api/admin/settings", json={"values": {field: value}})
+    assert resp.status_code == 200, resp.text
+    assert getattr(get_settings(), field) == value

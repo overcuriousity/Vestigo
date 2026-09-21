@@ -4173,6 +4173,52 @@ async def tag_anomalies(
                     f"{where} across {r.details.get('k_categories')} categories "
                     f"(G={r.statistic:.1f}, TVD={r.effect:.2f}, q={r.q_value:.3g})"
                 )
+        elif isinstance(r, TransitionFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the timeline"
+            actor = f" by {r.partition_field}={r.partition_value!r}" if r.partition_value else ""
+            if r.details.get("timestamp_resolution") == "second":
+                took = "under 1s (whole-second timestamps)"
+            else:
+                took = f"{r.observed_seconds:g}s"
+            floor = (
+                "the pair's next-fastest on the timeline"
+                if r.reference_kind == "next-fastest"
+                else "the baseline window's fastest"
+            )
+            content = (
+                f"Transition speed — {r.field}: {r.value}{actor} took {took} in {where}, "
+                f"against {floor} of {r.reference_seconds:g}s over {r.baseline_count} "
+                f"transitions (score {r.score:.2f})"
+            )
+        elif isinstance(r, HabitFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            where = _window_phrase(r.details) or "the timeline"
+            content = (
+                f"Time-of-day habit — {r.field}={r.value!r}: {r.count}× at "
+                f"{r.bucket_label} ({r.timezone}) in {where}, {r.distance_hours:g}h from its "
+                f"nearest habitual time {r.nearest_habit_label}, learned from "
+                f"{r.baseline_count} occurrences"
+            )
+        elif isinstance(r, CorrelationFinding):
+            event_id = r.event_id or ""
+            src_id = r.event.get("source_id", "") if r.event else ""
+            ante, cons = r.fields
+            where = (
+                _window_phrase(r.details)
+                if r.details.get("method") == "rule-g-test"
+                else _window_phrase(r.details, prefix="slice")
+            ) or "the window"
+            content = (
+                f"Broken correlation — {ante}={r.values[0]!r} ⇒ {cons}={r.values[1]!r} "
+                f"(held {r.confidence * 100:.3g}% of {r.support}): violated "
+                f"{r.violations}/{r.count} in {where} vs "
+                f"{r.baseline_violations}/{r.baseline_count} in the reference "
+                f"({r.rate_ratio:.1f}×; mostly {cons}={r.top_violator!r}; "
+                f"G={r.g_statistic:.1f}, q={r.q_value:.3g})"
+            )
         elif isinstance(r, OrderFinding):
             event_id = r.event_id or ""
             src_id = r.event.get("source_id", "") if r.event else ""

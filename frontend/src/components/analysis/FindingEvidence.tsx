@@ -405,9 +405,12 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
           timezone={finding.timezone}
         />
       );
-    case "transition_time":
+    case "transition_time": {
       // The claim is one duration against one floor, both measured; which
-      // floor is in the label, since the two answer different questions.
+      // floor is in the label, since the two answer different questions. A
+      // zero gap between whole-second timestamps means "under a second", and
+      // was judged at that bound — the figure shows the bound, not an instant.
+      const bounded = finding.details.timestamp_resolution === "second";
       return (
         <TwoBars
           reference={{
@@ -418,13 +421,18 @@ export function FindingEvidence({ finding }: { finding: MethodResult }) {
             value: finding.reference_seconds,
             display: `${finding.reference_seconds.toFixed(1)}s`,
           }}
-          observed={{
-            label: "this transition",
-            value: finding.observed_seconds,
-            display: `${finding.observed_seconds.toFixed(1)}s`,
-          }}
+          observed={
+            bounded
+              ? { label: "this transition (whole-second timestamps)", value: 1, display: "< 1s" }
+              : {
+                  label: "this transition",
+                  value: finding.observed_seconds,
+                  display: `${finding.observed_seconds.toFixed(1)}s`,
+                }
+          }
         />
       );
+    }
     case "timestamp_order":
       return (
         <div className="flex flex-wrap items-center gap-2 font-mono text-xs">

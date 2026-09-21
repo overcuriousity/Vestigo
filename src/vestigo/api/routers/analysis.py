@@ -388,6 +388,19 @@ class _TimeOfDayParams(_FieldsParams):
         """A cleared text box and an omitted knob ask the same question."""
         return None if v == "" else v
 
+    @field_validator("bucket_minutes", mode="before")
+    @classmethod
+    def _choice_string_is_int(cls, v: Any) -> Any:
+        """A form's ``choice`` value is a string; an int ``Literal`` refuses ``"15"``.
+
+        ``params`` arrives as JSON from a query string and is stored verbatim
+        on a configured detector, so ``"15"`` and ``15`` both reach this model
+        and must mean the same bucket rather than one of them being a 422.
+        """
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v)
+        return None if v == "" else v
+
 
 class _ValueCorrelationParams(_FieldsParams):
     fdr_q: float | None = Field(default=None, gt=0, le=1)

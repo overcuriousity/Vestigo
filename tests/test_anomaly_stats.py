@@ -6827,6 +6827,84 @@ def test_transition_allowlist_suppresses_the_pair_in_both_frames():
     assert result.total_findings == 0
 
 
+def test_transition_zero_gap_in_whole_second_timestamps_is_bounded_at_a_second():
+    """0 s between two whole-second timestamps means "under a second", not
+    instant: it is judged and scored as the one second it may have taken, so
+    it cannot undercut a floor that one second does not, and the pairs held
+    back are disclosed. The resolution probe runs once per source."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            *_trans_responses(
+                total=10_000,
+                window_totals=(8000, 2000),
+                cand_rows=[
+                    # 0 s against a 1.5 s floor: up to 1 s is not 2x faster.
+                    (["a", "b"], 0, 0, "e1", at, "", 5),
+                    # 0 s against a 60 s floor: faster even at its bound.
+                    (["c", "d"], 0, 0, "e2", at, "", 5),
+                ],
+                learn_rows=[(["a", "b"], 1_500, 40), (["c", "d"], 60_000, 40)],
+            ),
+            # Resolution probe: no timestamp with a sub-second part.
+            FakeQueryResult(result_rows=[], column_names=["1"]),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"], windows=_seq_windows())
+    assert result.status == "ok"
+    assert [r.value for r in result.results] == ["c → d"]
+    r = result.results[0]
+    assert r.observed_seconds == 0.0
+    assert abs(r.score - (1 - 1 / 60)) < 1e-5
+    assert r.speedup == 60.0
+    assert r.details["timestamp_resolution"] == "second"
+    assert r.details["observed_upper_bound_seconds"] == 1.0
+    assert any("whole seconds" in w and "1 pair " in w for w in result.warnings)
+    # One probe for the source, though two of its candidates were zero-length.
+    assert len(svc.ch.client._calls) == 5
+    assert svc.ch.client._all_parameters[-1]["sid"] == "s1"
+
+
+def test_transition_zero_gap_in_subsecond_timestamps_is_instant():
+    """A source that records milliseconds makes a 0 ms gap genuinely instant."""
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [0, 1_500], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+            FakeQueryResult(result_rows=[(1,)], column_names=["1"]),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"])
+    assert result.status == "ok"
+    r = result.results[0]
+    assert r.score == 1.0
+    assert r.speedup is None
+    assert r.details["timestamp_resolution"] == "sub-second"
+    assert r.details["observed_upper_bound_seconds"] is None
+    assert not any("whole seconds" in w for w in result.warnings)
+
+
+def test_transition_nonzero_gap_never_probes_resolution():
+    at = datetime(2024, 1, 17, tzinfo=UTC)
+    svc = _svc(
+        [
+            FakeQueryResult(result_rows=[(10_000,)], column_names=["count()"]),
+            FakeQueryResult(
+                result_rows=[(["a", "b"], [1, 1_500], "e1", at, "", 5)],
+                column_names=_TRANS_SELF_COLS,
+            ),
+        ]
+    )
+    result = svc.find_transition_times("c1", ["s1"])
+    assert len(result.results) == 1
+    assert "timestamp_resolution" not in result.results[0].details
+    assert len(svc.ch.client._calls) == 2
+
+
 # ---------------------------------------------------------------------------
 # time_of_day — detector (D12)
 # ---------------------------------------------------------------------------

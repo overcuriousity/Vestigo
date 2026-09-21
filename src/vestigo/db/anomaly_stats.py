@@ -250,8 +250,6 @@ already-ingested data.
 from __future__ import annotations
 
 import math
-import re
-import zoneinfo
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -262,6 +260,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from vestigo.core.time_of_day import validate_bucket_minutes, validate_timezone
 from vestigo.db._buckets import (
     aligned_bucket_starts,
     bucket_interval_seconds,
@@ -507,26 +506,6 @@ _SELF_RCV_FLOOR = 0.05
 # normal approximation is trusted for a motif's regularity (same floor as the
 # interval detector's beaconing gate).
 _MOTIF_GREENWOOD_MIN_INTERVALS = 10
-
-# Time-of-day habit (D12): the bucket resolutions the day can be cut into.
-# Each divides 1440, so the last bucket ends exactly at midnight and the
-# circular distance is well defined.
-_HABIT_BUCKET_MINUTES = (15, 30, 60, 120, 180, 240)
-# What an IANA zone name may look like before zoneinfo is asked about it. The
-# name is inlined into SQL (ClickHouse takes a timezone as a constant), so the
-# token pattern is the first line of defence and zoneinfo the second.
-_TZ_TOKEN = re.compile(r"^[A-Za-z0-9_+\-/]{1,64}$")
-
-
-def _validate_timezone(name: str) -> str:
-    """Return *name* if it is an IANA zone this host knows; raise ``ValueError`` otherwise."""
-    if not isinstance(name, str) or not _TZ_TOKEN.match(name):
-        raise ValueError("timezone must be an IANA zone name such as 'UTC' or 'Europe/Berlin'")
-    try:
-        zoneinfo.ZoneInfo(name)
-    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"timezone {name!r} is not a known IANA zone name") from exc
-    return name
 
 
 def _circular_bucket_distance(a: int, b: int, n: int) -> int:
@@ -1364,6 +1343,75 @@ class TransitionFinding:
     event_id: str | None
     event: dict[str, Any] | None
     details: dict[str, Any]
+
+
+class _ZeroGapBounds:
+    """What a zero-length transition may really have taken, per source (D15).
+
+    A transition's duration is the difference of two recorded timestamps, so
+    it is only as precise as they are. A source whose timestamps carry a
+    sub-second part records milliseconds, and a 0 ms gap there is instant. A
+    source whose every timestamp is a whole second (Plaso CSV, syslog) says
+    only that the gap was *under a second*: judging that as instant lets it
+    undercut any positive floor — ``0 × min_ratio`` beats everything — and
+    rank first as a score-1.0 finding. In such a source a zero-length
+    observation is judged and scored as the one second it may have taken.
+
+    The resolution probe runs once per source, and only for a source that
+    produced a zero-length candidate; it stops at the first sub-second
+    timestamp. Pairs held back by the bound are counted for a warning.
+    """
+
+    SECOND_MS = 1000
+
+    def __init__(self, ch: ClickHouseStore, case_id: str) -> None:
+        self._ch = ch
+        self._case_id = case_id
+        self._subsecond: dict[str, bool] = {}
+        self._held_back = 0
+
+    def _records_subsecond(self, source_id: str) -> bool:
+        known = self._subsecond.get(source_id)
+        if known is None:
+            ch = self._ch
+            rows = ch.client.query(
+                f"""
+                SELECT 1 FROM {ch.database}.events
+                WHERE case_id = {{cid:String}} AND source_id = {{sid:String}}
+                  AND toUnixTimestamp64Milli(timestamp) % 1000 != 0
+                LIMIT 1
+                {heavy_scan_settings()}
+                """,
+                parameters={"cid": self._case_id, "sid": source_id},
+            ).result_rows
+            known = self._subsecond[source_id] = bool(rows)
+        return known
+
+    def bound_ms(self, fastest_ms: int, source_id: str) -> int:
+        """The duration the observation is judged and scored as."""
+        if fastest_ms > 0 or self._records_subsecond(source_id):
+            return fastest_ms
+        return self.SECOND_MS
+
+    def undercuts(self, fastest_ms: int, floor_ms: int, min_ratio: float, source_id: str) -> bool:
+        """Whether the observation undercuts *floor_ms* by *min_ratio*× at its bound."""
+        if fastest_ms * min_ratio >= floor_ms:
+            return False
+        if self.bound_ms(fastest_ms, source_id) * min_ratio >= floor_ms:
+            self._held_back += 1
+            return False
+        return True
+
+    def warnings(self, min_ratio: float) -> list[str]:
+        """The disclosure for pairs the one-second bound held back, if any."""
+        if not self._held_back:
+            return []
+        n = self._held_back
+        return [
+            f"{n} pair{'s' if n != 1 else ''} not flagged: a zero-length transition in a "
+            f"source whose timestamps are whole seconds may have taken up to one second, "
+            f"which does not undercut the pair's floor by {min_ratio:g}×."
+        ]
 
 
 @dataclass
@@ -8723,7 +8771,9 @@ class StatisticalAnomalyService:
         pair's **next-fastest** transition anywhere in the scope
         (``groupArraySorted(2)``, the leave-one-out minimum), over at least
         *min_transitions* transitions; two equally fastest transitions vouch
-        for each other and nothing is flagged.
+        for each other and nothing is flagged. In both frames a zero-length
+        observation in a source whose timestamps are whole seconds is judged
+        at its one-second bound (:class:`_ZeroGapBounds`).
 
         Candidates are the *max_candidates* fastest pairs per source (cap →
         warning). On a multi-source scope the floor is the minimum over every
@@ -8818,7 +8868,7 @@ class StatisticalAnomalyService:
             LIMIT {{cap:UInt32}}
             {heavy_scan_settings()}
         """
-        # (gram, w_idx) -> [fastest_ms, evt, at, pval, n]
+        # (gram, w_idx) -> [fastest_ms, evt, at, pval, n, source of the fastest]
         cands: dict[tuple[tuple[str, ...], int], list[Any]] = {}
         for sid in source_ids:
             rows = self.ch.client.query(cand_sql, parameters={**params, "src": [sid]}).result_rows
@@ -8833,11 +8883,17 @@ class StatisticalAnomalyService:
                 fastest = int(row[2])
                 slot = cands.get(key)
                 if slot is None:
-                    cands[key] = [fastest, row[3], row[4], row[5], int(row[6])]
+                    cands[key] = [fastest, row[3], row[4], row[5], int(row[6]), sid]
                     continue
                 slot[4] += int(row[6])
                 if fastest < slot[0]:
-                    slot[0], slot[1], slot[2], slot[3] = fastest, row[3], row[4], row[5]
+                    slot[0], slot[1], slot[2], slot[3], slot[5] = (
+                        fastest,
+                        row[3],
+                        row[4],
+                        row[5],
+                        sid,
+                    )
         if not cands:
             return self._finalize_findings(
                 [],
@@ -8889,8 +8945,9 @@ class StatisticalAnomalyService:
             )
 
         zero_floors = 0
+        gaps = _ZeroGapBounds(self.ch, case_id)
         findings: list[TransitionFinding] = []
-        for (gram, wi), (fastest, evt, at, pval, n) in cands.items():
+        for (gram, wi), (fastest, evt, at, pval, n, sid) in cands.items():
             ref = learned.get(gram)
             if ref is None or ref[1] < min_transitions:
                 continue
@@ -8898,7 +8955,7 @@ class StatisticalAnomalyService:
             if floor_ms <= 0:
                 zero_floors += 1
                 continue
-            if fastest * min_ratio >= floor_ms:
+            if not gaps.undercuts(fastest, floor_ms, min_ratio, sid):
                 continue
             window = windows.suspects[wi]
             findings.append(
@@ -8919,6 +8976,7 @@ class StatisticalAnomalyService:
                     baseline_count=n_baseline,
                     min_ratio=min_ratio,
                     min_transitions=min_transitions,
+                    bound_ms=gaps.bound_ms(fastest, sid),
                     extra={
                         "window_label": window.label,
                         "window_start": ensure_utc(window.start).isoformat(),
@@ -8935,6 +8993,7 @@ class StatisticalAnomalyService:
                 f"fastest transition is zero seconds (same-timestamp records), and nothing "
                 f"can be faster than instant."
             )
+        run_warnings.extend(gaps.warnings(min_ratio))
         return self._finalize_findings(
             findings,
             detector=detector,
@@ -9024,7 +9083,7 @@ class StatisticalAnomalyService:
             {heavy_scan_settings()}
         """
         run_warnings: list[str] = []
-        # gram -> [two_fastest_ms (sorted, ≤ 2), evt, at, pval, n]
+        # gram -> [two_fastest_ms (sorted, ≤ 2), evt, at, pval, n, source of the fastest]
         merged: dict[tuple[str, ...], list[Any]] = {}
         for sid in source_ids:
             rows = self.ch.client.query(sql, parameters={**params, "src": [sid]}).result_rows
@@ -9039,23 +9098,24 @@ class StatisticalAnomalyService:
                 fastest = [int(v) for v in row[1]]
                 slot = merged.get(gram)
                 if slot is None:
-                    merged[gram] = [fastest[:2], row[2], row[3], row[4], int(row[5])]
+                    merged[gram] = [fastest[:2], row[2], row[3], row[4], int(row[5]), sid]
                     continue
                 if fastest and fastest[0] < slot[0][0]:
-                    slot[1], slot[2], slot[3] = row[2], row[3], row[4]
+                    slot[1], slot[2], slot[3], slot[5] = row[2], row[3], row[4], sid
                 slot[0] = sorted(slot[0] + fastest)[:2]
                 slot[4] += int(row[5])
 
         zero_floors = 0
+        gaps = _ZeroGapBounds(self.ch, case_id)
         findings: list[TransitionFinding] = []
-        for gram, (two, evt, at, pval, n) in merged.items():
+        for gram, (two, evt, at, pval, n, sid) in merged.items():
             if n < min_transitions or len(two) < 2:
                 continue
             fastest, floor_ms = two[0], two[1]
             if floor_ms <= 0:
                 zero_floors += 1
                 continue
-            if fastest * min_ratio >= floor_ms:
+            if not gaps.undercuts(fastest, floor_ms, min_ratio, sid):
                 continue
             findings.append(
                 self._transition_finding(
@@ -9075,6 +9135,7 @@ class StatisticalAnomalyService:
                     baseline_count=n,
                     min_ratio=min_ratio,
                     min_transitions=min_transitions,
+                    bound_ms=gaps.bound_ms(fastest, sid),
                     extra={"scope_transitions": n},
                 )
             )
@@ -9084,6 +9145,7 @@ class StatisticalAnomalyService:
                 f"fastest transitions are both zero seconds (same-timestamp records), and "
                 f"nothing can be faster than instant."
             )
+        run_warnings.extend(gaps.warnings(min_ratio))
         return self._finalize_findings(
             findings,
             detector=detector,
@@ -9117,15 +9179,30 @@ class StatisticalAnomalyService:
         baseline_count: int,
         min_ratio: float,
         min_transitions: int,
+        bound_ms: int,
         extra: dict[str, Any],
     ) -> TransitionFinding:
-        """Build one :class:`TransitionFinding`; shared by both frames."""
+        """Build one :class:`TransitionFinding`; shared by both frames.
+
+        *bound_ms* is what the observation is scored as: the observation
+        itself, or — for a zero-length transition in a source whose
+        timestamps are whole seconds — the one second it may have taken
+        (:class:`_ZeroGapBounds`). The finding then says so, and its speed-up
+        is a lower bound.
+        """
         values = list(gram)
         joined = " → ".join(values)
         observed = fastest_ms / 1000.0
         reference = reference_ms / 1000.0
-        score = 1.0 - fastest_ms / reference_ms
-        speedup = reference_ms / fastest_ms if fastest_ms > 0 else None
+        score = 1.0 - bound_ms / reference_ms
+        speedup = reference_ms / bound_ms if bound_ms > 0 else None
+        if fastest_ms == 0:
+            resolution = "second" if bound_ms > 0 else "sub-second"
+            extra = {
+                **extra,
+                "timestamp_resolution": resolution,
+                "observed_upper_bound_seconds": bound_ms / 1000.0 if bound_ms else None,
+            }
         first_seen = _present_ts(at)
         evt_id = str(evt) if evt else None
         partition_value = str(pval) if partition_field and pval else None
@@ -9225,11 +9302,8 @@ class StatisticalAnomalyService:
         at any hour.
         """
         detector = "time_of_day"
-        if bucket_minutes not in _HABIT_BUCKET_MINUTES:
-            raise ValueError(
-                f"bucket_minutes must be one of {', '.join(str(b) for b in _HABIT_BUCKET_MINUTES)}"
-            )
-        tz = _validate_timezone(timezone)
+        validate_bucket_minutes(bucket_minutes)
+        tz = validate_timezone(timezone)
         method = "habit" if windows is not None else "self-habit"
         self.ch.init_schema()
         db = self.ch.database

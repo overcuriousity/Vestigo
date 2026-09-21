@@ -280,6 +280,7 @@ def test_a_list_of_fields_is_accepted(client, seeded, stub_detector):
         ("sequence_novelty", {"ngram_size": 9}),
         ("proportion_shift", {"fdr_q": 2.0}),
         ("log_template", {"order": "sideways"}),
+        ("time_of_day", {"bucket_minutes": "45"}),
     ],
 )
 def test_out_of_contract_param_values_are_422_not_500(
@@ -290,6 +291,15 @@ def test_out_of_contract_param_values_are_422_not_500(
     r = client.get(_url(case_id, timeline_id, method, params))
     assert r.status_code == 422, r.text
     assert stub_detector["detector"] == []
+
+
+@pytest.mark.parametrize("bucket", ["15", 15])
+def test_a_choice_knob_value_reaches_the_runner_as_its_int(client, seeded, stub_detector, bucket):
+    """A form's choice is a string; the Bucket knob's "15" is the int bucket 15."""
+    case_id, timeline_id = seeded
+    r = client.get(_url(case_id, timeline_id, "time_of_day", {"bucket_minutes": bucket}))
+    assert r.status_code == 200, r.text
+    assert stub_detector["detector"][0]["bucket_minutes"] == 15
 
 
 def test_detector_receives_field_mappings_and_offsets(client, seeded, stub_detector):
