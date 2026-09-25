@@ -499,16 +499,16 @@ wheels = [
 
 [[package]]
 name = "evtx"
-version = "0.12.1"
+version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/10/8cdb3afe0f1ba5344978a550fca1d9dcbc3f9093f429bca2209552af03ee/evtx-0.12.1-cp310-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:230c7b2dd0395d6b3cdd954d66423a6ed1fabcea3bf0f151cb53cd9c3a115154", size = 2124872, upload-time = "2026-06-13T15:10:09.721Z" },
-    { url = "https://files.pythonhosted.org/packages/d8/b6/fd36daccd36b740b233ececf89a76dbaa1979f39ca228f3caa4874c05fd5/evtx-0.12.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:6dc78b1fe6e9193e56ae00797bdd7cb79a94f10642292855ed9f696917783e31", size = 1113799, upload-time = "2026-06-13T15:10:08.62Z" },
-    { url = "https://files.pythonhosted.org/packages/0d/cf/b0bb5dbbe746fca1135cca11b2b63ea1fe7d3a4c94447aebe1cab8b977b0/evtx-0.12.1-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1ee835a4eee6513956b37162f6ae96dbc475d361d91b6bcc89f215f89f5f94d4", size = 1055244, upload-time = "2026-06-13T15:10:07.641Z" },
-    { url = "https://files.pythonhosted.org/packages/71/71/3989029f9c82233cde390ed39f320dc6268c03f4034c74e0f171026e60e6/evtx-0.12.1-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:826ff391772566b1fb2605b92f3c2e66e9597e5731e8176713c60dcc91ed70b1", size = 1239910, upload-time = "2026-06-13T15:10:11.171Z" },
-    { url = "https://files.pythonhosted.org/packages/8c/00/9ff5286ff0c8fd52ef832dfecfabefd89b4d45a3dde7b8294646fe7a0d05/evtx-0.12.1-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:4074ae24a4f8f84aaed16c54990eb0f7d4da998a1bb3b998e14bb27d4f34eca1", size = 1054146, upload-time = "2026-06-13T15:10:06.609Z" },
-    { url = "https://files.pythonhosted.org/packages/e5/05/b488927ccbd1460e44ce5d6453b6ac611b9d935ec2c6e6a25986604a67fa/evtx-0.12.1-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:c891c83c328c17ae9f2128976bddec9e0d19a2d82b49c2e2a20568ba2a014b7d", size = 1084129, upload-time = "2026-06-13T15:10:12.477Z" },
-    { url = "https://files.pythonhosted.org/packages/60/52/a0a7de46fa0f71705a5d8622325855ef64ec7401f048a00f9d255f2ff03c/evtx-0.12.1-cp310-abi3-win_amd64.whl", hash = "sha256:ee0e40f0f09d10af779bafa5b058358cdd7f23e00d730afd0520dc3e4c2bfe04", size = 921736, upload-time = "2026-06-13T15:10:05.135Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/aa/b8972f8dee4a8cfd54c2568f084ecbe13327e6ed86c173a3a55a69a640f0/evtx-0.13.0-cp310-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:afaed18529fba714ebb0135d017c763286f2b8ef4274dd4cf3428be34da88c2c", size = 2099220, upload-time = "2026-09-22T06:33:22.425Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/e2/144ecc8b095ba46ebf88bd75f93e9089e920c6d87138c208180ad76b6ee3/evtx-0.13.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:d7bacb9d03f0dc5327512e1a86d29c420b715fc441f0a473184c75006429b0eb", size = 1090985, upload-time = "2026-09-22T06:33:23.836Z" },
+    { url = "https://files.pythonhosted.org/packages/57/3b/4a1a63a865f2b93a70a5d9570297dda9c44fed3f2b64b85f4322b5ab94ef/evtx-0.13.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f311c697e6df73131053e196e3359dfb646f29c4c542d9db7def91ffed11e9d9", size = 1057517, upload-time = "2026-09-22T06:33:25.043Z" },
+    { url = "https://files.pythonhosted.org/packages/93/95/45b8933fecb7235d69a54e3675163805ab507863dd371db617a851435529/evtx-0.13.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5ac4f615a079d8f88cf497457890dae158b0d51e3b8966b2fcd578476cead5a2", size = 1216698, upload-time = "2026-09-22T06:33:26.65Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/93/b67ddaff45f75301c11a49ed6b516670769a8aebe222cdcbec4b8eaffdb8/evtx-0.13.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:9b18625c4ed79506f32d75406d4c5b46fddb3d17aaaa7b7ead4ae85485fa0bf5", size = 1056310, upload-time = "2026-09-22T06:33:27.933Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/90/aea860a3e83e0e600c18bb8a2b5d9fefe211751a875145155c8ba8806961/evtx-0.13.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:431e8efaf50f13bf74d599d525cd6a105590c611dfe1d6c2a6ce29fea0e8d2d4", size = 1086710, upload-time = "2026-09-22T06:33:29.359Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/cb/d7a12e5822f33fe022188b0670a4ba8a3db6cc2a86847a45f8be4793d777/evtx-0.13.0-cp310-abi3-win_amd64.whl", hash = "sha256:8c5aca73f94e4e40d72d549fae42d03190e493bcc4f8891715e6fb0590cb0625", size = 924310, upload-time = "2026-09-22T06:33:30.589Z" },
 ]
 
 [[package]]
