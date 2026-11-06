@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover - environment guard
     sys.exit(2)
 
 CONVERTER_NAME = "nginx2vestigo"
-CONVERTER_VERSION = "1.4.0"
+CONVERTER_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Vestigo Parquet interchange format v1 — embedded copy of the spec in
@@ -102,9 +102,29 @@ PARQUET_EVENT_SCHEMA = pa.schema(
 # swallow the quoted referer of the standard combined format.
 # Quoted fields accept \" escape sequences: some nginx builds escape quotes
 # inside request URIs / referers instead of dropping the character.
-_ACCESS_LOG_RE = re.compile(
-    r'(\S+) (\S*) (\S*) \[([^\]]+)\] "((?:[^"\\]|\\.)*)" (\d+) (\S+)(?: ([^"\s]\S*))?'
-    r' "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)"(?:\s+"((?:[^"\\]|\\.)*)")?'
+_QUOTED = r'(?:[^"\\]|\\.)*'
+_ACCESS_TAIL = (
+    rf' \[(?P<time>[^\]]+)\] "(?P<request>{_QUOTED})" (?P<status>\d+) (?P<size>\S+)'
+    rf'(?: (?P<host_field>[^"\s]\S*))?'
+    rf' "(?P<referer>{_QUOTED})" "(?P<agent>{_QUOTED})"(?:\s+"(?P<extra>{_QUOTED})")?'
+)
+
+# The client slots in front of it (converter parity with nginx2timesketch
+# 1.5.0, see its client_slot_variants/match_client_slots for the full
+# argument). %h is a comma-free element chain so an X-Forwarded-For list logged
+# there ("192.0.2.1, 198.51.100.2") parses, without exponential backtracking.
+# Multi-vhost servers prepend the virtual host ($server_name), either keeping
+# all three slots (four tokens before the timestamp) or dropping %l (three,
+# the same count as the documented layout — which then matched with every slot
+# shifted: the vhost as %h, the client address as %l, src_ip empty, #437).
+# The vhost token excludes the comma: no vhost has one, while a chain's first
+# element ends in one.
+_HOST_SLOT = r"(?P<host>[^\s,]+(?:,\s*[^\s,]+)*)"
+_VHOST_SLOT = r"(?P<vhost>[^\s,]+) "
+_ACCESS_LOG_VARIANTS = (
+    re.compile(_HOST_SLOT + r" (?P<ident>\S*) (?P<user>\S*)" + _ACCESS_TAIL),
+    re.compile(_VHOST_SLOT + _HOST_SLOT + r" (?P<ident>\S*) (?P<user>\S*)" + _ACCESS_TAIL),
+    re.compile(_VHOST_SLOT + _HOST_SLOT + r" (?P<user>\S*)" + _ACCESS_TAIL),
 )
 
 # Error log format: "2026/06/25 09:46:41 [error] 1234#1234: *1 message..."
@@ -148,24 +168,66 @@ def normalize_ip(value: str | None) -> str:
         return ""
 
 
+def client_address(token: str) -> str:
+    """Return the client address a %h token carries, or "".
+
+    A hostname (HostnameLookups, a proxy header) is no address; an
+    X-Forwarded-For chain yields its first valid entry, the original client.
+    """
+    address = normalize_ip(token)
+    if not address and "," in token:
+        for element in token.split(","):
+            address = normalize_ip(element)
+            if address:
+                break
+    return address
+
+
+def match_access_line(line: str) -> re.Match[str] | None:
+    """Match an access line against the client-slot layouts; pick the reading.
+
+    Rests on %l being an identd answer (a user name or "-"), never an address.
+    The documented layout wins when its client slot holds an address and its
+    %l slot does not. A vhost-prefixed reading wins when its client slot holds
+    an address and the documented one does not qualify, or when the documented
+    layout does not match at all. With an address in neither, the documented
+    reading is kept (HostnameLookups on).
+    """
+    plain, prefixed, prefixed_no_ident = _ACCESS_LOG_VARIANTS
+    match = plain.match(line)
+    if match is not None and client_address(match["host"]) and not normalize_ip(match["ident"]):
+        return match
+    alt = prefixed.match(line) or prefixed_no_ident.match(line)
+    if alt is not None and (match is None or client_address(alt["host"])):
+        return alt
+    return match
+
+
 def _parse_access_line(line: str, log_type: str) -> dict[str, Any] | None:
     """Parse an access/redirect log line into an event row dict."""
-    match = _ACCESS_LOG_RE.match(line)
-    if not match:
+    match = match_access_line(line)
+    if match is None:
         return None
 
-    groups = match.groups()
-    ip = groups[0]
-    remote_ident = groups[1] if groups[1] != "-" else None
-    remote_user = groups[2] if groups[2] != "-" else None
-    timestamp_str = groups[3]
-    request = groups[4]
-    status = groups[5]
-    size = groups[6]
-    vhost = groups[7]
-    referer = groups[8] if groups[8] != "-" else None
-    user_agent = groups[9]
-    additional = groups[10] if len(groups) > 10 and groups[10] else None
+    parts = match.groupdict()
+    ip = parts["host"]
+    ident = parts.get("ident")
+    remote_ident = ident if ident and ident != "-" else None
+    remote_user = parts["user"] if parts["user"] != "-" else None
+    timestamp_str = parts["time"]
+    request = parts["request"]
+    status = parts["status"]
+    size = parts["size"]
+    # A leading vhost ($server_name) and one logged after the size ($host)
+    # name the same thing; a format logging both keeps the leading one.
+    vhost = parts.get("vhost") or parts["host_field"]
+    referer = parts["referer"] if parts["referer"] != "-" else None
+    user_agent = parts["agent"]
+    additional = parts["extra"] or None
+    # Everything a custom log_format appends after the one extra quoted field
+    # this parser models (TLS protocol, cipher, SNI, timings) — kept verbatim
+    # and counted, rather than silently ending the match early (#437).
+    trailing = line[match.end() :].strip() or None
 
     request_parts = request.split(" ")
     method = request_parts[0] if len(request_parts) > 0 else None
@@ -186,7 +248,10 @@ def _parse_access_line(line: str, log_type: str) -> dict[str, Any] | None:
         "artifact_long": config["artifact_long"],
         "attributes": {
             "log_type": log_type,
-            "src_ip": normalize_ip(ip),
+            "src_ip": client_address(ip),
+            # Kept whatever it is: a hostname here is the only record of who
+            # made the request, and src_ip alone would be empty.
+            "client_host": ip,
             "remote_ident": remote_ident,
             "remote_user": remote_user,
             "http_method": method,
@@ -199,6 +264,7 @@ def _parse_access_line(line: str, log_type: str) -> dict[str, Any] | None:
             "referer": referer,
             "user_agent": user_agent,
             "additional_field": additional,
+            "trailing_fields": trailing,
         },
     }
 
@@ -296,7 +362,7 @@ def sniff_log_type(path: Path) -> str | None:
                 line = line.strip()
                 if not line:
                     continue
-                if _ACCESS_LOG_RE.match(line):
+                if match_access_line(line) is not None:
                     access_hits += 1
                 elif _ERROR_LOG_RE.match(line):
                     error_hits += 1
@@ -323,17 +389,25 @@ def find_log_files(input_path: str) -> list[tuple[Path, str]]:
             )
         return [(path, log_type)]
     if path.is_dir():
+        # At any depth and by name: multi-vhost servers lay logs out as
+        # <vhost>/access.log or <vhost>.access.log, which a top-level glob for
+        # access.log* never saw (#437).
         found: list[tuple[Path, str]] = []
-        seen: set[Path] = set()
-        for log_type, config in _LOG_TYPES.items():
-            for pattern in config["patterns"]:
-                for match in sorted(path.glob(pattern)):
-                    if match.is_file() and match not in seen:
-                        seen.add(match)
-                        found.append((match, log_type))
+        for candidate in sorted(path.rglob("*")):
+            if not candidate.is_file():
+                continue
+            log_type = detect_log_type(candidate.name)
+            if log_type is not None:
+                found.append((candidate, log_type))
         if not found:
             raise SystemExit(f"error: no supported nginx log files found in {input_path}")
         return found
+    if path.exists():
+        raise SystemExit(
+            f"error: input is neither a regular file nor a directory: {input_path} "
+            "(pipes and devices such as /dev/stdin cannot be read more than once — "
+            "the file is hashed before it is parsed; write the log to a file first)"
+        )
     raise SystemExit(f"error: input path not found: {input_path}")
 
 
@@ -420,6 +494,18 @@ def _iter_lines_with_offsets(fh: BinaryIO) -> Any:
         offset += len(raw)
 
 
+# Keys of the `row_counts` footer. The first three are the interchange
+# format's; the last two are additive and nginx-specific — how many parsed
+# rows carry a vhost and how many kept unmodelled fields in trailing_fields.
+ROW_COUNT_KEYS = (
+    "parsed",
+    "skipped_malformed",
+    "skipped_by_time",
+    "parsed_with_vhost",
+    "parsed_with_trailing_fields",
+)
+
+
 def _convert_stream(
     fh: BinaryIO,
     log_type: str,
@@ -429,33 +515,41 @@ def _convert_stream(
     start_offset: int = 0,
     since_dt: datetime.datetime | None = None,
     until_dt: datetime.datetime | None = None,
-) -> tuple[int, int, int]:
+) -> dict[str, int]:
     """Parse a binary line stream into the buffer.
 
-    Returns ``(parsed, skipped, skipped_by_time)`` line counts.
+    Returns the line counts, keyed as in ``ROW_COUNT_KEYS``.
     """
-    parsed = 0
-    skipped = 0
-    skipped_by_time = 0
+    counts = dict.fromkeys(ROW_COUNT_KEYS, 0)
     for offset, line in _iter_lines_with_offsets(fh):
         if not line.strip():
             continue
         row = parse_line(line, log_type)
         if row is None:
-            skipped += 1
+            counts["skipped_malformed"] += 1
             continue
         ts = row["timestamp"]
         if ts is not None:
             if since_dt is not None and ts < since_dt:
-                skipped_by_time += 1
+                counts["skipped_by_time"] += 1
                 continue
             if until_dt is not None and ts > until_dt:
-                skipped_by_time += 1
+                counts["skipped_by_time"] += 1
                 continue
         # ts is None (unparseable/missing) → keep, matching upstream behavior.
         buffer.append(source_file, file_hash, start_offset + offset, line, row)
-        parsed += 1
-    return parsed, skipped, skipped_by_time
+        counts["parsed"] += 1
+        attributes = row["attributes"]
+        if attributes.get("vhost"):
+            counts["parsed_with_vhost"] += 1
+        if attributes.get("trailing_fields"):
+            counts["parsed_with_trailing_fields"] += 1
+    return counts
+
+
+def _add_counts(total: dict[str, int], counts: dict[str, int]) -> None:
+    for key, value in counts.items():
+        total[key] += value
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +607,7 @@ def _parse_chunk(
     file_hash: str,
     since_dt: datetime.datetime | None = None,
     until_dt: datetime.datetime | None = None,
-) -> tuple[bytes, int, int, int]:
+) -> tuple[bytes, dict[str, int]]:
     """Worker: parse ``[start, end)`` of a plain file, return Arrow IPC bytes.
 
     Top-level so it pickles under the spawn start method.
@@ -534,7 +628,7 @@ def _parse_chunk(
     with open(path_str, "rb") as fh:
         fh.seek(start)
         window = fh.read(end - start)
-    parsed, skipped, skipped_by_time = _convert_stream(
+    counts = _convert_stream(
         io.BytesIO(window),
         log_type,
         source_file,
@@ -546,7 +640,7 @@ def _parse_chunk(
     )
     buffer.flush()
     writer_ipc.close()
-    return sink.getvalue(), parsed, skipped, skipped_by_time
+    return sink.getvalue(), counts
 
 
 def _available_ram_bytes() -> int | None:
@@ -586,15 +680,13 @@ def _convert_file_parallel(
     verbose: bool,
     since_dt: datetime.datetime | None = None,
     until_dt: datetime.datetime | None = None,
-) -> tuple[int, int, int]:
+) -> dict[str, int]:
     """Parse a large plain file across worker processes."""
     chunks = find_chunk_boundaries(path, target_chunks=workers * 4)
     if verbose:
         sys.stderr.write(f"  parallel: {len(chunks)} chunks, {workers} workers\n")
     _warn_if_ram_tight(workers)
-    parsed_total = 0
-    skipped_total = 0
-    skipped_by_time_total = 0
+    totals = dict.fromkeys(ROW_COUNT_KEYS, 0)
     ctx = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
         # Submit a bounded window and consume strictly in submit order: rows
@@ -625,16 +717,14 @@ def _convert_file_parallel(
         for _ in range(workers * 2):
             _submit_next()
         while pending:
-            ipc_bytes, parsed, skipped, skipped_by_time = pending.popleft().result()
+            ipc_bytes, counts = pending.popleft().result()
             _submit_next()
-            parsed_total += parsed
-            skipped_total += skipped
-            skipped_by_time_total += skipped_by_time
+            _add_counts(totals, counts)
             reader = pa.ipc.open_stream(ipc_bytes)
             for batch in reader:
                 if batch.num_rows:
                     buffer.write_batch(batch)
-    return parsed_total, skipped_total, skipped_by_time_total
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +917,7 @@ def convert(
         ),
     }
 
-    parsed_total = 0
-    skipped_total = 0
-    skipped_by_time_total = 0
+    totals = dict.fromkeys(ROW_COUNT_KEYS, 0)
     schema = PARQUET_EVENT_SCHEMA.with_metadata(metadata)
     with pq.ParquetWriter(write_target, schema, compression="zstd") as writer:
         buffer = _BatchBuffer(writer)
@@ -840,13 +928,13 @@ def convert(
                 path.suffix != ".gz" and workers > 1 and path.stat().st_size >= PARALLEL_MIN_BYTES
             )
             if parallel:
-                parsed, skipped, skipped_by_time = _convert_file_parallel(
+                counts = _convert_file_parallel(
                     path, log_type, hashes[path], buffer, workers, verbose, since_dt, until_dt
                 )
             else:
                 opener = gzip.open if path.suffix == ".gz" else open
                 with opener(path, "rb") as fh:
-                    parsed, skipped, skipped_by_time = _convert_stream(
+                    counts = _convert_stream(
                         fh,
                         log_type,
                         path.name,
@@ -855,20 +943,17 @@ def convert(
                         since_dt=since_dt,
                         until_dt=until_dt,
                     )
-            parsed_total += parsed
-            skipped_total += skipped
-            skipped_by_time_total += skipped_by_time
+            _add_counts(totals, counts)
         buffer.flush()
-        writer.add_key_value_metadata(
-            {
-                META_ROW_COUNTS: json.dumps(
-                    {
-                        "parsed": parsed_total,
-                        "skipped_malformed": skipped_total,
-                        "skipped_by_time": skipped_by_time_total,
-                    }
-                )
-            }
+        writer.add_key_value_metadata({META_ROW_COUNTS: json.dumps(totals)})
+
+    parsed_total = totals["parsed"]
+    skipped_total = totals["skipped_malformed"]
+    skipped_by_time_total = totals["skipped_by_time"]
+    if totals["parsed_with_trailing_fields"]:
+        sys.stderr.write(
+            f"warning: {totals['parsed_with_trailing_fields']} rows carry fields after the "
+            "user agent that this parser does not model; kept verbatim in trailing_fields\n"
         )
 
     time_note = f", {skipped_by_time_total} outside --since/--until" if (since or until) else ""

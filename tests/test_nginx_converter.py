@@ -375,3 +375,104 @@ def test_time_window_filter(converter, tmp_path):
         until="2099-01-01T00:00:00Z",
     )
     assert pq.ParquetFile(wide).metadata.num_rows == ref.metadata.num_rows
+
+
+# The anonymized line from #437: `$server_name $remote_addr - [...]` (no %l
+# slot) plus a TLS-metadata suffix the parser does not model.
+_ISSUE_437_LINE = (
+    "www.example.com 82.158.193.164 - [07/Oct/2026:10:14:42 +0200] "
+    '"POST /?rest_route=/batch/v1 HTTP/1.1" 403 239 '
+    '"http://www.example.com/?rest_route=/batch/v1" "Mozilla/5.0 (Macintosh)" '
+    '"https -" "ssl-proto TLSv1.3" "cipher TLS_AES_256_GCM_SHA384" '
+    '"tls-sni www.example.com" "-" 1099 4975 1'
+)
+_TAIL = '[07/Oct/2026:10:14:42 +0200] "GET / HTTP/1.1" 200 1 "-" "ua"'
+
+
+class TestClientSlotLayouts:
+    """#437: vhost-prefixed formats and the readings that must not change."""
+
+    def test_issue_line_is_read_unshifted(self, converter):
+        attrs = converter.parse_line(_ISSUE_437_LINE, "access")["attributes"]
+        assert attrs["src_ip"] == "82.158.193.164"
+        assert attrs["client_host"] == "82.158.193.164"
+        assert attrs["vhost"] == "www.example.com"
+        assert attrs["remote_ident"] is None
+        assert attrs["additional_field"] == "https -"
+        assert attrs["trailing_fields"] == (
+            '"ssl-proto TLSv1.3" "cipher TLS_AES_256_GCM_SHA384" '
+            '"tls-sni www.example.com" "-" 1099 4975 1'
+        )
+
+    @pytest.mark.parametrize(
+        ("prefix", "src_ip", "client_host", "vhost", "remote_user"),
+        [
+            # Documented %h %l %u — unchanged.
+            ("203.0.113.7 - alice", "203.0.113.7", "203.0.113.7", None, "alice"),
+            # %v:%p %h %l %u (four tokens) — used to be dropped as unparseable.
+            (
+                "www.example.com:443 198.51.100.9 - -",
+                "198.51.100.9",
+                "198.51.100.9",
+                "www.example.com:443",
+                None,
+            ),
+            # A vhost logged as an IP: %l is never an address, so the plain
+            # reading (server IP as client) is refused.
+            ("192.0.2.10 82.158.193.164 -", "82.158.193.164", "82.158.193.164", "192.0.2.10", None),
+            # HostnameLookups on: no address anywhere, documented reading kept.
+            ("host.example.net - -", "", "host.example.net", None, None),
+            # X-Forwarded-For chain in %h: leftmost entry is the client.
+            ("10.0.0.1, 192.0.2.4 - -", "10.0.0.1", "10.0.0.1, 192.0.2.4", None, None),
+            # ...and behind a vhost prefix.
+            (
+                "www.example.com 10.0.0.1, 192.0.2.4 - -",
+                "10.0.0.1",
+                "10.0.0.1, 192.0.2.4",
+                "www.example.com",
+                None,
+            ),
+        ],
+    )
+    def test_layouts(self, converter, prefix, src_ip, client_host, vhost, remote_user):
+        attrs = converter.parse_line(f"{prefix} {_TAIL}", "access")["attributes"]
+        assert attrs["src_ip"] == src_ip
+        assert attrs["client_host"] == client_host
+        assert attrs["vhost"] == vhost
+        assert attrs["remote_user"] == remote_user
+        assert attrs["trailing_fields"] is None
+
+    def test_chain_without_ident_slot_is_not_misattributed(self, converter):
+        # The chain's first element ends in a comma, so it can never be read as
+        # a vhost (which would make the proxy the client). The line is ambiguous
+        # and is counted as unparseable instead.
+        assert converter.parse_line(f"192.0.2.1, 198.51.100.2 - {_TAIL}", "access") is None
+
+    def test_row_counts_disclose_vhost_and_trailing_rows(self, converter, tmp_path):
+        log = tmp_path / "access.log"
+        log.write_text(f"{_ISSUE_437_LINE}\n203.0.113.7 - - {_TAIL}\nnot a log line\n")
+        pf = _convert(converter, log, tmp_path / "out.parquet")
+        counts = json.loads(pf.metadata.metadata[parquet_format.META_ROW_COUNTS.encode()])
+        assert counts == {
+            "parsed": 2,
+            "skipped_malformed": 1,
+            "skipped_by_time": 0,
+            "parsed_with_vhost": 1,
+            "parsed_with_trailing_fields": 1,
+        }
+
+    def test_directory_mode_finds_per_vhost_layouts(self, converter, tmp_path):
+        (tmp_path / "www.example.com").mkdir()
+        (tmp_path / "www.example.com" / "access.log").write_text(f"203.0.113.7 - - {_TAIL}\n")
+        (tmp_path / "shop.example.com.access.log").write_text(f"203.0.113.8 - - {_TAIL}\n")
+        found = converter.find_log_files(str(tmp_path))
+        assert sorted(p.name for p, _ in found) == ["access.log", "shop.example.com.access.log"]
+        assert {t for _, t in found} == {"access"}
+
+    def test_pipe_input_is_refused_cleanly(self, converter, tmp_path):
+        import os
+
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        with pytest.raises(SystemExit, match="neither a regular file nor a directory"):
+            converter.find_log_files(str(fifo))

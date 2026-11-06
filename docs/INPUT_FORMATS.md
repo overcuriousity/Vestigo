@@ -227,7 +227,7 @@ from the Parquet footer:
 | Key                            | Content                                                        |
 | ------------------------------ | -------------------------------------------------------------- |
 | `vestigo.converted_at`         | ISO-8601 UTC timestamp of the conversion run.                  |
-| `vestigo.row_counts`           | JSON `{"parsed", "skipped_malformed", "skipped_by_time"}`.     |
+| `vestigo.row_counts`           | JSON `{"parsed", "skipped_malformed", "skipped_by_time"}`, plus any converter-specific counts (see `nginx2vestigo.py` below). |
 | `vestigo.timezone_assumption`  | Free-text note on any timezone/year assumption.                |
 | `vestigo.parse_decisions`      | JSON of format-specific parsing choices.                       |
 
@@ -297,6 +297,39 @@ with pq.ParquetWriter("example.parquet", schema, compression="zstd") as writer:
 For a real, streaming, forensically-complete implementation see
 `src/vestigo/assets/converters/nginx2vestigo.py` — start from it rather than from
 scratch when writing a new converter.
+
+### `nginx2vestigo.py` and the vendored web-server converters: the client slots
+
+The combined format documents three slots before the timestamp, `%h %l %u`. Multi-vhost
+servers commonly prepend the virtual host (`$server_name`, `%v`, `%v:%p`), keeping all three
+slots or dropping `%l`. The last layout has the same token count as the documented one, so
+until #437 it parsed with every slot shifted: the vhost as the client, the client address as
+`remote_ident`, `src_ip` empty on every row, and the import reporting success.
+
+`nginx2vestigo`, `nginx2timesketch` and `apache2timesketch` (upstream 1.5.0, combined and
+CLF) now try `%h %l %u`, `%v %h %l %u` and `%v %h %u`, and choose by one fact: `%l` is an
+identd answer — a user name or `-`, never an address. The documented reading wins when its
+client slot holds an address and its `%l` slot does not; a prefixed reading wins when its
+client slot holds an address and the documented one does not qualify, or when only it
+matches. With an address in neither, the documented reading stands (HostnameLookups on). The
+vhost token never contains a comma, so the first element of an `X-Forwarded-For` chain
+(`192.0.2.1, …`) is never mistaken for one; a chain with no `%l` slot is ambiguous and is
+counted as unparseable rather than guessed.
+
+- **Fields.** `vhost` holds the prefix (or, for `nginx2vestigo`, a `$host` logged after the
+  response size); `client_host` always holds the raw `%h` token, so a hostname is never lost
+  to an empty `src_ip`. Anything a custom `log_format` appends after the one extra quoted
+  field the parser models (`additional_field`), such as TLS protocol, cipher, SNI or timings,
+  is kept verbatim in `trailing_fields` rather than silently ending the match.
+- **Disclosure.** `nginx2vestigo` adds `parsed_with_vhost` and `parsed_with_trailing_fields`
+  to `vestigo.row_counts` and warns on stderr when the latter is non-zero; the vendored
+  converters put `rows_unparseable`, `rows_vhost_prefixed` and `rows_with_trailing_fields`
+  in the audit report and the run summary.
+- **Input.** A directory is searched recursively and classified by file name, so
+  `<vhost>/access.log` and `<vhost>.access.log` layouts are found. A pipe or device
+  (`/dev/stdin`) is refused with a clear error: the input is hashed before it is parsed.
+  Absolute glob patterns work in every vendored converter (they raised `NotImplementedError`
+  before upstream 1.5.0).
 
 ### `evtx2vestigo.py`: binary Windows Event Logs
 
