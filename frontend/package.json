@@ -61,12 +61,18 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
 <<<<<<< HEAD
+<<<<<<< HEAD
     "@vitest/ui": "5.0.5",
 =======
     "@vitest/ui": "5.0.3",
 >>>>>>> origin/dependabot/npm_and_yarn/frontend/vitest/ui-5.0.3
     "jsdom": "30.0.1",
     "oxlint": "^1.87.0",
+=======
+    "@vitest/ui": "5.0.1",
+    "jsdom": "30.1.2",
+    "oxlint": "^1.83.0",
+>>>>>>> origin/dependabot/npm_and_yarn/frontend/jsdom-30.1.2
     "tailwindcss": "4.3.3",
     "typescript": "~7.0.2",
     "vite": "^8.3.3",
