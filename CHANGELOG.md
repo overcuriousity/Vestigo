@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.1] — 2026-11-06
+
+### Changed
+
+- **Dependency roundup** — all 33 open Dependabot PRs (#394–#443) merged, both lockfiles
+  regenerated once over the merged result. Backend: pysigma 2.0.0 (the `<2.0.0` cap is
+  lifted to `<3.0.0`; the Sigma loader, compiler and runner suites pass unchanged),
+  pydantic-ai-slim 2.53.0, fastmcp-slim 3.4.10, fastapi 0.142.2, authlib 1.9.1,
+  clickhouse-connect 1.9.0, qdrant-client 1.19.1, sentence-transformers 6.1.0, pyjwt 2.15.0,
+  urllib3 2.8.0, aiohttp 3.14.4, ruff 0.16.10, evtx 0.13.1, plus transitive updates
+  (dnspython, setuptools, filelock 4, multidict, certifi, opentelemetry-api, mako,
+  python-dotenv). Frontend: vite 8.3.6, vitest and @vitest/ui 5.0.5 together (the exact
+  peer pin; #422 and #426 alone would have split them), jsdom 30.1.2, oxlint 1.92.0,
+  lucide-react 1.52.0, @tanstack/react-query 5.104.1, @radix-ui/react-slot 1.4.0,
+  @types/node 26.6.4, undici and source-map-js. Full backend and frontend suites green
+  on the upgraded set.
+
 ## [1.20.0] — 2026-09-21
 
 ### Added

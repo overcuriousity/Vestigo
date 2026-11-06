@@ -4,8 +4,26 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-09-21 (1.20.0 released; sessions 239–242 — transition speed D15,
-time-of-day habit D12 and value correlation D13, the 1.20 detector cluster).
+Last updated: 2026-11-06 (1.20.1 released; session 243 — Dependabot roundup).
+
+## Session 243 — 2026-11-06: dependency roundup, 1.20.1
+
+All 33 open Dependabot PRs were merged on one branch and both lockfiles regenerated once
+over the result, as in session 242. Three things needed a hand:
+
+- The vitest, @vitest/ui and jsdom PRs each rewrote adjacent devDependency lines and
+  conflicted. Dependabot also opened two @vitest/ui PRs (5.0.3 and 5.0.5) and a separate
+  vitest 5.0.3 one; vitest goes to 5.0.5 with @vitest/ui, because the two are pinned as an
+  exact peer pair.
+- npm 10's arborist crashes with "Cannot read properties of null (reading 'edgesOut')"
+  when that peer pair moves. npm 11, which is what CI runs on Node 24, resolves it cleanly,
+  so the lockfile was regenerated with npm 11 from main's.
+- uv.lock was regenerated with `--upgrade-package` for every bumped package, including
+  the transitive-only ones. Taking one side of a conflicting lockfile hunk would otherwise
+  silently drop a bump.
+
+pysigma 2.0.0 is the only major runtime bump. Its PR lifts our cap to `<3.0.0`. The
+Sigma backend, loader and runner tests pass unchanged against it.
 
 ## Session 242 — 2026-09-21: review fixes, dependency sweep, 1.20.0
 
