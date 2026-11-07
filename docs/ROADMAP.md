@@ -4,12 +4,14 @@ The only open backlog. Shipped work lives in `PROGRESS.md`, `CHANGELOG.md` and t
 docs (`ANOMALY_DETECTION.md`, `AGENT.md`, `STORIES.md`). Reported defects live as GitHub
 issues; root-cause detail stays in the issue thread.
 
-**State (verified 2026-09-02, v1.18.3; D11/D18/D19 landed 2026-09-14):** three open issues — #307
-(Milestone 10 G1), #345 (Milestone 11, Hayabusa) and #346 (THOR scanner, a candidate second
-consumer of the Milestone 11 protocol; no design yet). Phase 3 is complete and the queue is
-feature-shaped. Every item below was re-verified against the code on 2026-09-02; counts are
-from that day. **Milestone 10 — AI agent log investigation — is the 2.0 thrust and outranks
-everything below**; the numbered list orders the remaining 1.x work by payoff-per-effort:
+**State (2026-11-07, v1.20.1):** three open issues — #307 (Milestone 10 G1), #345
+(Milestone 11, Hayabusa) and #346 (THOR scanner, a candidate second consumer of the
+Milestone 11 protocol; no design yet). Since the last full re-verification (2026-09-02,
+v1.18.3) the detector line shipped D11/D18/D19 (1.19.7) and D12/D13/D15 (1.20.0), and #437
+(vhost-prefixed access logs) was fixed; the Milestone 3 counts below are still from
+2026-09-02 and should be re-counted before one is worked. **Milestone 10 — AI agent log
+investigation — is the 2.0 thrust and outranks everything below**, starting with G1; the
+numbered list orders the remaining 1.x work by payoff-per-effort:
 
 1. **A12** local transform tools — no design round, no OPSEC gate.
 2. **W8** query-time field extraction — makes bespoke unstructured logs first-class.

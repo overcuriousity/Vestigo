@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vhost-prefixed access logs no longer parse shifted (#437).** A `log_format` that
+  prepends the virtual host and drops `%l` (`$server_name $remote_addr - [...]`) has the
+  same token count as `%h %l %u`, so `nginx2vestigo`, `nginx2timesketch` and
+  `apache2timesketch` matched it with every slot moved one place: `src_ip` empty on every
+  row, the client address in `remote_ident`, and a successful import. The three converters
+  now try the documented layout and the two vhost-prefixed ones, and pick the reading that
+  puts an address in the client slot but not in `%l` (an identd answer, never an address).
+  The vhost goes to `vhost`. `%v:%p %h %l %u` lines, which used to be dropped, now parse.
+  Fields a custom format appends after the user agent beyond the first are kept in
+  `trailing_fields` rather than falling out of every parsed column, and are counted (the
+  `nginx2vestigo` footer's `row_counts` gains `parsed_with_vhost` and
+  `parsed_with_trailing_fields`; the vendored converters' audit reports count them along
+  with unparseable lines, which nginx did not count before). `nginx2vestigo` 1.5.0 also
+  takes upstream's comma-joined `X-Forwarded-For` `%h` slot and `client_host` column, so a
+  proxied line is no longer dropped and a hostname client is no longer lost. Directory
+  input searches recursively, so `<vhost>/access.log` and `<vhost>.access.log` are found.
+  A pipe such as `/dev/stdin` is refused with a clear error. Vendored converters move to
+  2timesketch 1.5.0, where every converter accepts absolute glob patterns (seven of them
+  raised `NotImplementedError`).
+
 ## [1.20.1] — 2026-11-06
 
 ### Changed
