@@ -4,7 +4,7 @@ Append-only session log — what changed and why, newest first. This file keeps 
 sessions only; older ones live in git history, and every release is summarized in
 `CHANGELOG.md`. Plans belong in `ROADMAP.md`, not here.
 
-Last updated: 2026-11-07 (session 244 — #437 vhost-prefixed access logs; roadmap state
+Last updated: 2026-11-07 (1.20.2 released; session 244 — #437 vhost-prefixed access logs; roadmap state
 refreshed; sessions before 232 trimmed to git history).
 
 ## Session 244 — 2026-11-07: vhost-prefixed access logs (#437), stale roadmap state
@@ -40,6 +40,10 @@ without them a proxied line was dropped and a hostname client was lost.
 after it is now preserved verbatim in `trailing_fields` and counted (row-count footer, audit
 report, stderr warning). Parsing TLS metadata would mean guessing at a custom format, which
 the counts make visible instead.
+
+**Security.** Dependabot raised two `joserfc` advisories the day after 1.20.1. Its PR (#444)
+also moved `uv.lock` to revision 5 and rewrote unrelated platform markers, so the bump was
+redone with the repo's uv as a three-line lockfile change. It shipped with #437 as 1.20.2.
 
 **Stale state.** The `ROADMAP.md` header still described v1.18.3. It now names v1.20.1, the
 releases since the last full re-verification, and that the Milestone 3 counts are from

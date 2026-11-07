@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.2] — 2026-11-07
+
+### Security
+
+- **joserfc 1.7.6** (transitive via authlib), fixing GHSA-jpxq-7h8p-2q76 (high: CPU
+  exhaustion from an unbounded JWE General JSON `recipients` array) and GHSA-9pg5-8c7x-5hfx
+  (moderate: the compact-JWS size guard allocated attacker-controlled segments before
+  rejecting them). Vestigo's OIDC login reads identity from the userinfo endpoint and
+  decodes no JWS or JWE itself, so exposure was low; the dependency ships in the image
+  either way.
+
 ### Fixed
 
 - **Vhost-prefixed access logs no longer parse shifted (#437).** A `log_format` that
