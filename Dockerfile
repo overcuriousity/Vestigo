@@ -39,7 +39,7 @@ COPY frontend/dist /frontend/dist
 # which is the whole point of `frontend-prebuilt` for an offline host.
 FROM ${FRONTEND_STAGE} AS frontend
 
-FROM python:3.13-slim AS app
+FROM python:3.15-slim AS app
 WORKDIR /app
 
 RUN pip install --no-cache-dir uv
