@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.13.*"
 resolution-markers = [
     "sys_platform != 'darwin'",
@@ -491,16 +491,16 @@ wheels = [
 
 [[package]]
 name = "evtx"
-version = "0.13.1"
+version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/53/87d94c9e05324e47b735005bedde9a596dd3f7d200b43f99c6f058cf17fb/evtx-0.13.1-cp310-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:407a989d6041262a693c29e71194fdbd39478483b6ae416a35ada95451d07f0e", size = 2099205, upload-time = "2026-09-22T19:22:11.876Z" },
-    { url = "https://files.pythonhosted.org/packages/28/8e/25b912223a21a5e661e3ddff020263f65d00b3688c9b128d23aedaaf3f91/evtx-0.13.1-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:6c483946579b0135d6d8f71cf9a70e0617267a159034832b25473fbf83c77055", size = 1090615, upload-time = "2026-09-22T19:22:13.256Z" },
-    { url = "https://files.pythonhosted.org/packages/44/9e/80a5d847d20fd06bc5edcb01bb551a943c5bf56f3e149c37cb40b603292e/evtx-0.13.1-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5bd584873b6df1de5c2eab7a3e6dc0fbd9286fa355b054bb526311a09290267d", size = 1057461, upload-time = "2026-09-22T19:22:14.42Z" },
-    { url = "https://files.pythonhosted.org/packages/d3/fd/845cb2f6f77367db72c2a66924ea0a383d513e1dd5ac849c42fbf6f4aa58/evtx-0.13.1-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:644a61fbcb2594286e8369c3f1de62d545ba18ac604f0487cbce3c268325400c", size = 1216772, upload-time = "2026-09-22T19:22:15.882Z" },
-    { url = "https://files.pythonhosted.org/packages/89/da/b5b68cada22829d4e90799dc23a4f9b62425d908f3db31f8c52af553abec/evtx-0.13.1-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:c3f50155937a5c68294abee55dba2127dac483672a5b1bdef6a53afb092b1b51", size = 1056414, upload-time = "2026-09-22T19:22:17.036Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/37/93eb7801e06889c4ec47e0d5fbdab3e66611c799bb4945e40216a75d1ddc/evtx-0.13.1-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:7ccbde4ec779be7e05e59b7f5c13e1ea191413be3c378d2b7e07611475e2263a", size = 1086698, upload-time = "2026-09-22T19:22:18.23Z" },
-    { url = "https://files.pythonhosted.org/packages/9a/73/5b2e7bf8cd20a5720ed0bcaf5ef009b4b84e42859c601ed43f7cefe2098c/evtx-0.13.1-cp310-abi3-win_amd64.whl", hash = "sha256:6d6e4ea9ab99ef5524faf8de78c841f834f0d4f536ac70552a834373407a9a53", size = 924292, upload-time = "2026-09-22T19:22:19.316Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/73/8c44dedc1c16da90f8c17709e2afe0d57b4287e47240598479dcda1206d3/evtx-0.15.0-cp310-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:95b6f0e9605fe15f40f8590db69e7de5919a7f05b26050e67c64b559c4f858a4", size = 1967539, upload-time = "2026-11-01T08:11:26.776Z" },
+    { url = "https://files.pythonhosted.org/packages/33/cb/8b42ff4c1afa74ae38aa47f822d2883a6814418f46f57311eff4b7002eca/evtx-0.15.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:f6984eaaf9673d923d615624f28029823737a6bf1929f9b89b05481d7afab06d", size = 1015275, upload-time = "2026-11-01T08:11:28.427Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/dc/f03e29b13b86c9e848b9a77402595f2ba6cff703247c25fff9ef946fdc3b/evtx-0.15.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:92f45fffa578dc50505449e2d85584fb556e786d11579fb15174bf528f660914", size = 970360, upload-time = "2026-11-01T08:11:29.605Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/8c/b1ee8197e724ab4630c1e71550e9f4f9ff2db7d3ae93bfd164b65e218da2/evtx-0.15.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d7878b3bdf3f8b0f35d97eaf91fdc6f1c929bacbab8894aec0e5deae9364a345", size = 1152328, upload-time = "2026-11-01T08:11:31.054Z" },
+    { url = "https://files.pythonhosted.org/packages/12/98/0b5f1bd3426157fe27fabea43804bdef6f42500fc194faf8957d2f3429b2/evtx-0.15.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:67e5aac675445e8dc2196a5785188c52290ab3d5c5eb247e4c06b1e769634425", size = 968524, upload-time = "2026-11-01T08:11:32.212Z" },
+    { url = "https://files.pythonhosted.org/packages/86/b4/8b8db90ff2232eeaaa4d9efacd50f6afb10d02daad5a1fe534c8ed77f22d/evtx-0.15.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:c43d8d081257297bad1804b66b80469ec716a94ac4c1e8cb8bcd2182542087c1", size = 1016767, upload-time = "2026-11-01T08:11:33.43Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/ae/39eae06a06f5cf51fc235b3f4d2c343099ba5996f29a66ff62bc3eb25457/evtx-0.15.0-cp310-abi3-win_amd64.whl", hash = "sha256:c20a8c17bb0cc4ec77814c4af33210f32daf679619f1e898c6de8ee5e69b941d", size = 860375, upload-time = "2026-11-01T08:11:34.829Z" },
 ]
 
 [[package]]
@@ -1934,8 +1934,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'darwin'" },
-    { name = "jeepney", marker = "sys_platform != 'darwin'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -2121,13 +2121,13 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "sys_platform == 'darwin'" },
-    { name = "networkx", marker = "sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "sys_platform == 'darwin'" },
-    { name = "sympy", marker = "sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.14.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:caf6359d64c0074bcb9f8641a169239118c8165a0a0fef79110c72bfd6474bec", upload-time = "2026-09-02T00:26:15Z" },
@@ -2141,13 +2141,13 @@ resolution-markers = [
     "sys_platform != 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "sys_platform != 'darwin'" },
-    { name = "networkx", marker = "sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "sys_platform != 'darwin'" },
-    { name = "sympy", marker = "sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.14.0%2Bcpu-cp313-cp313-linux_s390x.whl", hash = "sha256:d87cfff3af33c937b88c9bc6c0dfa17f2156e2599f63447c696f2345928b518a", upload-time = "2026-09-02T18:31:55Z" },
@@ -2375,7 +2375,7 @@ provides-extras = ["embeddings"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "evtx", specifier = ">=0.12" },
+    { name = "evtx", specifier = ">=0.15.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", specifier = ">=0.25.0" },
